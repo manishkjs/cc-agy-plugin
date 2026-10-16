@@ -814,6 +814,64 @@ class TestMCPStdioServer(unittest.TestCase):
             self.assertFalse(prov["ok"])
             self.assertIn("app.py", prov["unverified_files"])
 
+    def test_round4_tracked_and_untracked_build_dirs_and_cross_session_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            _init_git_repo(repo_dir)
+            for rel in ("build/gen.py", "dist/index.html", "coverage/__init__.py", "src/build/__init__.py"):
+                p = repo_dir / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("v = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "tracked build dirs"], cwd=repo_dir, check=True, capture_output=True)
+
+            # Host-only untracked file under build/
+            (repo_dir / "build" / "notes.md").write_text("keep me\n", encoding="utf-8")
+
+            data_dir = Path(tmp) / "data"
+            store = ReceiptStore(data_dir, workspace_root=repo_dir)
+
+            # Before server start in strict mode: distinct missing-baseline message
+            pre_verdict = verify_workspace_provenance(
+                repo_dir,
+                store=store,
+                env={"CC_AGY_STRICT_MODE": "1", "CLAUDE_PROJECT_DIR": str(repo_dir)},
+            )
+            self.assertFalse(pre_verdict["ok"])
+            self.assertIn("No session baseline recorded", pre_verdict["reason"] or "")
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("print('v2')\n", encoding="utf-8")
+                (wt / "__pycache__").mkdir(exist_ok=True)
+                (wt / "__pycache__" / "app.cpython-311.pyc").write_bytes(b"\x00pyc")
+                return {"text": "updated app.py"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("update app.py", project="p", wait=True)
+            self.assertEqual(res["files_changed"], ["app.py"])
+            applied = jm.delegate_apply(res["job_id"])
+            self.assertEqual(applied["applied_files"], ["app.py"])
+            self.assertTrue((repo_dir / "build" / "gen.py").exists())
+            self.assertTrue((repo_dir / "dist" / "index.html").exists())
+            self.assertTrue((repo_dir / "coverage" / "__init__.py").exists())
+            self.assertTrue((repo_dir / "build" / "notes.md").exists())
+
+            # Human commits between sessions -> new session refreshes baseline cleanly
+            subprocess.run(["git", "add", "app.py"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "human commit"], cwd=repo_dir, check=True, capture_output=True)
+            store2 = ReceiptStore(data_dir, workspace_root=repo_dir)
+            jm2 = JobManager(workspace_root=repo_dir, store=store2, worker_backend=worker_fn)
+            self.assertTrue(verify_workspace_provenance(repo_dir, store=store2, strict=True)["ok"])
+
+            # Abandoned unapplied job + new untracked note in next session -> still ok
+            _ = jm2.delegate_start("unapplied experiment", project="p", wait=True)
+            (repo_dir / "todo.md").write_text("my notes\n", encoding="utf-8")
+            store3 = ReceiptStore(data_dir, workspace_root=repo_dir)
+            _ = JobManager(workspace_root=repo_dir, store=store3, worker_backend=worker_fn)
+            self.assertTrue(verify_workspace_provenance(repo_dir, store=store3, strict=True)["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

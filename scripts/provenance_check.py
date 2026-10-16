@@ -89,8 +89,11 @@ def verify_workspace_provenance(
     # Include pre-existing uncommitted baseline state captured at session start
     baseline_rec = receipt_store.read_baseline_record(ws_path)
     strict_active = strict or (env is not None and is_strict_mode_enabled(env))
-    if receipt_store.is_baseline_tampered(ws_path) or (strict_active and baseline_rec is None):
+    missing_session_baseline = False
+    if receipt_store.is_baseline_tampered(ws_path):
         forged_receipts.append("baseline-record")
+    elif strict_active and baseline_rec is None:
+        missing_session_baseline = True
     baseline_head_sha = (baseline_rec or {}).get("baseline_head_sha")
     baseline_prov = (baseline_rec or {}).get("provenance")
     if isinstance(baseline_prov, dict):
@@ -190,8 +193,13 @@ def verify_workspace_provenance(
         and not unverified_deletions_by_file
         and not forged_receipts
         and not dictation_violations
+        and not missing_session_baseline
     )
     reasons: list[str] = []
+    if missing_session_baseline:
+        reasons.append(
+            "No session baseline recorded: the vertex MCP server has not started in this session (check /mcp)"
+        )
     if forged_receipts:
         reasons.append(f"Receipts failed HMAC signature verification: {forged_receipts}")
     if unverified_files:

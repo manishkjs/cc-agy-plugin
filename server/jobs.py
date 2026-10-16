@@ -242,12 +242,7 @@ _EPHEMERAL_CACHE_DIRS: frozenset[str] = frozenset(
         ".tox",
         ".nox",
         ".venv",
-        "venv",
-        "dist",
-        "build",
-        "coverage",
         ".gradle",
-        "target",
         ".next",
         ".nuxt",
     }
@@ -300,34 +295,55 @@ class JobManager:
         self._ensure_baseline_recorded()
 
     def _ensure_baseline_recorded(self) -> None:
+        if self.store.is_baseline_tampered(self.workspace_root):
+            return
         head_res = _run_git(["rev-parse", "HEAD"], cwd=self.workspace_root, check=False)
         head_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
         existing = self.store.read_baseline_record(self.workspace_root)
         if existing is not None:
-            # Never overwrite an existing session baseline if unapplied jobs are pending
-            # or if tracked files have unverified modifications (prevents restart laundering).
+            # Never overwrite an existing session baseline if a job is actively running
+            # or if tracked files currently have uncommitted modifications against HEAD
+            # that are not accounted for by the existing baseline or an applied receipt
+            # (prevents laundering uncommitted host edits across an MCP server restart,
+            # while allowing clean human commits and new untracked notes across sessions).
             receipts = self.store.list_receipts(workspace_root=self.workspace_root)
             for r in receipts:
-                if r.get("kind") == "delegate" and not r.get("applied") and r.get("status") in ("ok", "running"):
+                if r.get("kind") == "delegate" and not r.get("applied") and r.get("status") == "running":
                     return
-            existing_sha = existing.get("baseline_head_sha") or "HEAD"
-            if head_sha and existing.get("baseline_head_sha") and head_sha != existing.get("baseline_head_sha"):
-                return
             tracked_diff_res = _run_git(
-                ["diff", "--name-only", existing_sha],
+                ["diff", "--name-only", "HEAD"],
                 cwd=self.workspace_root,
                 check=False,
             )
             if tracked_diff_res.returncode == 0 and tracked_diff_res.stdout.strip():
-                existing_prov_files = set((existing.get("provenance") or {}).get("files_changed") or [])
+                existing_prov = existing.get("provenance") or {}
+                existing_prov_files = set(existing_prov.get("files_changed") or [])
                 applied_files: set[str] = set()
+                latest_applied_hash: dict[str, str | None] = {}
                 for r in receipts:
                     if r.get("applied") and self.store.verify_receipt_signature(r):
                         applied_files.update(r.get("applied_files") or [])
+                        for f_k, f_h in (r.get("applied_file_hashes") or {}).items():
+                            latest_applied_hash[f_k] = f_h
+                    for hist_prov in r.get("applied_history") or []:
+                        if isinstance(hist_prov, dict):
+                            applied_files.update(hist_prov.get("files_changed") or [])
                 for fpath in tracked_diff_res.stdout.splitlines():
                     clean_f = fpath.strip()
-                    if clean_f and clean_f not in existing_prov_files and clean_f not in applied_files:
+                    if not clean_f:
+                        continue
+                    if clean_f not in existing_prov_files and clean_f not in applied_files:
                         return
+                    if clean_f in latest_applied_hash:
+                        expected_h = latest_applied_hash[clean_f]
+                        live_p = self.workspace_root / clean_f
+                        actual_h = (
+                            sha256_bytes(live_p.read_bytes())
+                            if live_p.exists() and live_p.is_file() and not live_p.is_symlink()
+                            else None
+                        )
+                        if actual_h != expected_h:
+                            return
 
         live_diff = capture_live_workspace_diff(self.workspace_root, baseline_head_sha=head_sha)
         prov = extract_diff_provenance(live_diff)
@@ -443,10 +459,6 @@ class JobManager:
                 continue
             rel = str(p.relative_to(wt_dir))
             if _is_ephemeral_build_or_test_artifact(rel):
-                if p.is_dir() and not p.is_symlink():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink(missing_ok=True)
                 continue
             if p.is_symlink():
                 try:
@@ -456,22 +468,36 @@ class JobManager:
                 except OSError:
                     symlink_escapes.append(rel)
 
-        _run_git(["add", "-N", "."], cwd=wt_dir, check=False)
+        _run_git(["reset", "-q", baseline_sha], cwd=wt_dir, check=False)
+        untracked_to_stage: list[str] = []
+        others_res = _run_git(
+            ["ls-files", "--others", "--exclude-standard"],
+            cwd=wt_dir,
+            check=False,
+        )
+        if others_res.returncode == 0 and others_res.stdout.strip():
+            for line in others_res.stdout.splitlines():
+                rel_u = line.strip()
+                if rel_u and not _is_ephemeral_build_or_test_artifact(rel_u):
+                    untracked_to_stage.append(rel_u)
+
         ign_res = _run_git(
             ["ls-files", "--others", "--ignored", "--exclude-standard"],
             cwd=wt_dir,
             check=False,
         )
         if ign_res.returncode == 0 and ign_res.stdout.strip():
-            ignored_new = [
-                line.strip()
-                for line in ign_res.stdout.splitlines()
-                if line.strip()
-                and not _is_ephemeral_build_or_test_artifact(line.strip())
-                and (not allowed_paths or _matches_allowed_paths(line.strip(), allowed_paths))
-            ]
-            if ignored_new:
-                _run_git(["add", "-f", "-N", "--", *ignored_new], cwd=wt_dir, check=False)
+            for line in ign_res.stdout.splitlines():
+                rel_i = line.strip()
+                if (
+                    rel_i
+                    and not _is_ephemeral_build_or_test_artifact(rel_i)
+                    and rel_i not in untracked_to_stage
+                ):
+                    untracked_to_stage.append(rel_i)
+
+        if untracked_to_stage:
+            _run_git(["add", "-f", "-N", "--", *untracked_to_stage], cwd=wt_dir, check=False)
 
         diff_res = _run_git(
             ["diff", "--binary", "--no-renames", baseline_sha],
@@ -864,10 +890,14 @@ class JobManager:
         limit: int = 20,
     ) -> dict[str, Any]:
         """Return status for a single job or list recent jobs within the MCP token cap."""
+        baseline_rec = self.store.read_baseline_record(self.workspace_root) or {}
+        active_baseline_sha = baseline_rec.get("baseline_head_sha")
         if job_id:
             safe_id = validate_job_id(job_id)
             receipt = self.store.read_receipt(safe_id)
-            return self._compact_digest(receipt, include_summary=True)
+            digest = self._compact_digest(receipt, include_summary=True)
+            digest["baseline_head_sha"] = active_baseline_sha
+            return digest
 
         all_receipts = self.store.list_receipts()
         max_items = max(1, min(int(limit), 50))
@@ -877,6 +907,7 @@ class JobManager:
             "jobs": summaries,
             "returned_jobs": len(summaries),
             "total_jobs": len(all_receipts),
+            "baseline_head_sha": active_baseline_sha,
             "totals": self.store.summarize_costs(),
         }
 

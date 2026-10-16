@@ -209,6 +209,7 @@ class ReceiptStore:
         self.receipts_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         self.baselines_dir.mkdir(parents=True, exist_ok=True)
+        self._recorded_workspaces: set[str] = set()
         self._hmac_key = self._load_or_create_hmac_key()
 
     @staticmethod
@@ -320,6 +321,7 @@ class ReceiptStore:
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         payload["baseline_hmac"] = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
         bpath.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._recorded_workspaces.add(str(Path(workspace_root).resolve()))
         try:
             self._baseline_marker_path(workspace_root).write_text("1\n", encoding="utf-8")
         except OSError:
@@ -329,8 +331,9 @@ class ReceiptStore:
         """Return True if a baseline file exists with an invalid HMAC/JSON or was deleted after being recorded."""
         bpath = self.baseline_path(workspace_root)
         marker = self._baseline_marker_path(workspace_root)
+        ws_key = str(Path(workspace_root).resolve())
         if not bpath.exists():
-            return marker.exists()
+            return marker.exists() or (ws_key in self._recorded_workspaces)
         return self.read_baseline_record(workspace_root) is None
 
     def read_baseline_record(self, workspace_root: str | Path) -> dict[str, Any] | None:
@@ -339,6 +342,10 @@ class ReceiptStore:
         if not bpath.exists():
             return None
         try:
+            if self.hmac_key_path.exists():
+                disk_key = self.hmac_key_path.read_bytes().strip()
+                if len(disk_key) >= 32 and disk_key != self._hmac_key:
+                    self._hmac_key = disk_key
             data = json.loads(bpath.read_text(encoding="utf-8"))
             sig = data.get("baseline_hmac")
             if not sig or not isinstance(sig, str):
