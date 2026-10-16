@@ -41,6 +41,8 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
         cwd=str(cwd),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=check,
     )
 
@@ -170,6 +172,8 @@ def capture_live_workspace_diff(
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         diff_res = subprocess.run(
@@ -178,6 +182,8 @@ def capture_live_workspace_diff(
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         return diff_res.stdout if diff_res.returncode == 0 else ""
@@ -257,6 +263,31 @@ _EPHEMERAL_CACHE_SUFFIXES: tuple[str, ...] = (
     ".DS_Store",
 )
 
+_IGNORED_BUILD_OUTPUT_DIRS: frozenset[str] = frozenset(
+    {
+        "build",
+        "dist",
+        "target",
+        "out",
+        "coverage",
+        "venv",
+        ".cache",
+        ".parcel-cache",
+        ".turbo",
+        ".svelte-kit",
+        "htmlcov",
+    }
+)
+
+_SAFE_NOTE_EXTENSIONS: tuple[str, ...] = (
+    ".md",
+    ".txt",
+    ".rst",
+    ".org",
+    ".adoc",
+    ".todo",
+)
+
 
 def _is_ephemeral_build_or_test_artifact(rel_path: str) -> bool:
     """Return True if `rel_path` is a transient test/compiler cache artifact that should never be captured or applied."""
@@ -270,6 +301,19 @@ def _is_ephemeral_build_or_test_artifact(rel_path: str) -> bool:
     name = parts[-1]
     if name in (".coverage", ".DS_Store") or name.endswith(_EPHEMERAL_CACHE_SUFFIXES):
         return True
+    return False
+
+
+def _is_ignored_build_artifact(rel_path: str) -> bool:
+    """Return True if an already-.gitignored path is inside a build/output/cache directory."""
+    if _is_ephemeral_build_or_test_artifact(rel_path):
+        return True
+    norm = rel_path.strip("/")
+    if not norm:
+        return False
+    for part in norm.split("/"):
+        if part in _IGNORED_BUILD_OUTPUT_DIRS:
+            return True
     return False
 
 
@@ -301,21 +345,24 @@ class JobManager:
         head_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
         existing = self.store.read_baseline_record(self.workspace_root)
         if existing is not None:
-            # Never overwrite an existing session baseline if a job is actively running
-            # or if tracked files currently have uncommitted modifications against HEAD
-            # that are not accounted for by the existing baseline or an applied receipt
-            # (prevents laundering uncommitted host edits across an MCP server restart,
-            # while allowing clean human commits and new untracked notes across sessions).
             receipts = self.store.list_receipts(workspace_root=self.workspace_root)
             for r in receipts:
                 if r.get("kind") == "delegate" and not r.get("applied") and r.get("status") == "running":
                     return
-            tracked_diff_res = _run_git(
-                ["diff", "--name-only", "HEAD"],
-                cwd=self.workspace_root,
-                check=False,
-            )
-            if tracked_diff_res.returncode == 0 and tracked_diff_res.stdout.strip():
+            existing_sha = existing.get("baseline_head_sha")
+            if head_sha and existing_sha and head_sha != existing_sha:
+                # HEAD moved since the prior baseline was recorded. Verify existing_sha is an
+                # ancestor of head_sha (normal human commit between sessions vs amend/reset).
+                anc_res = _run_git(
+                    ["merge-base", "--is-ancestor", str(existing_sha), str(head_sha)],
+                    cwd=self.workspace_root,
+                    check=False,
+                )
+                if anc_res.returncode != 0:
+                    return
+            else:
+                # Same HEAD commit: refuse to overwrite if tracked files or untracked code files
+                # have unverified modifications (prevents laundering host edits via MCP server restart).
                 existing_prov = existing.get("provenance") or {}
                 existing_prov_files = set(existing_prov.get("files_changed") or [])
                 applied_files: set[str] = set()
@@ -328,21 +375,46 @@ class JobManager:
                     for hist_prov in r.get("applied_history") or []:
                         if isinstance(hist_prov, dict):
                             applied_files.update(hist_prov.get("files_changed") or [])
-                for fpath in tracked_diff_res.stdout.splitlines():
-                    clean_f = fpath.strip()
-                    if not clean_f:
-                        continue
-                    if clean_f not in existing_prov_files and clean_f not in applied_files:
-                        return
-                    if clean_f in latest_applied_hash:
-                        expected_h = latest_applied_hash[clean_f]
-                        live_p = self.workspace_root / clean_f
-                        actual_h = (
-                            sha256_bytes(live_p.read_bytes())
-                            if live_p.exists() and live_p.is_file() and not live_p.is_symlink()
-                            else None
-                        )
-                        if actual_h != expected_h:
+
+                tracked_diff_res = _run_git(
+                    ["diff", "--name-only", "HEAD"],
+                    cwd=self.workspace_root,
+                    check=False,
+                )
+                if tracked_diff_res.returncode == 0 and tracked_diff_res.stdout.strip():
+                    for fpath in tracked_diff_res.stdout.splitlines():
+                        clean_f = fpath.strip()
+                        if not clean_f:
+                            continue
+                        if clean_f not in existing_prov_files and clean_f not in applied_files:
+                            return
+                        if clean_f in latest_applied_hash:
+                            expected_h = latest_applied_hash[clean_f]
+                            live_p = self.workspace_root / clean_f
+                            actual_h = (
+                                sha256_bytes(live_p.read_bytes())
+                                if live_p.exists() and live_p.is_file() and not live_p.is_symlink()
+                                else None
+                            )
+                            if actual_h != expected_h:
+                                return
+
+                untracked_res = _run_git(
+                    ["ls-files", "--others", "--exclude-standard"],
+                    cwd=self.workspace_root,
+                    check=False,
+                )
+                if untracked_res.returncode == 0 and untracked_res.stdout.strip():
+                    for line in untracked_res.stdout.splitlines():
+                        rel_u = line.strip()
+                        if (
+                            not rel_u
+                            or rel_u.startswith((".cc-agy-data/", ".worktrees/"))
+                            or rel_u in existing_prov_files
+                            or rel_u in applied_files
+                        ):
+                            continue
+                        if not rel_u.lower().endswith(_SAFE_NOTE_EXTENSIONS):
                             return
 
         live_diff = capture_live_workspace_diff(self.workspace_root, baseline_head_sha=head_sha)
@@ -491,7 +563,7 @@ class JobManager:
                 rel_i = line.strip()
                 if (
                     rel_i
-                    and not _is_ephemeral_build_or_test_artifact(rel_i)
+                    and not _is_ignored_build_artifact(rel_i)
                     and rel_i not in untracked_to_stage
                 ):
                     untracked_to_stage.append(rel_i)
@@ -630,18 +702,24 @@ class JobManager:
                 error_msg = f"{type(exc).__name__}: {exc}"
             self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
         finally:
-            hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
-            config_tampered = _restore_directory_tree(host_git_dir / "config", config_snap)
-            if hooks_tampered or config_tampered:
-                status = "security_violation"
-                error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
+            try:
+                hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
+                config_tampered = _restore_directory_tree(host_git_dir / "config", config_snap)
+                if hooks_tampered or config_tampered:
+                    status = "security_violation"
+                    error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
 
-            diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
-                wt_dir, baseline_sha, allowed_paths=allowed_paths
-            )
-            baseline_file_hashes = self._compute_changed_baseline_hashes(
-                wt_dir, baseline_sha, files_changed, baseline_file_hashes
-            )
+                diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
+                    wt_dir, baseline_sha, allowed_paths=allowed_paths
+                )
+                baseline_file_hashes = self._compute_changed_baseline_hashes(
+                    wt_dir, baseline_sha, files_changed, baseline_file_hashes
+                )
+            except Exception as fin_exc:
+                diff_text, files_changed, symlink_escapes = "", [], []
+                if status in ("running", "ok"):
+                    status = "error"
+                    error_msg = f"Failed to collect worktree diff: {type(fin_exc).__name__}: {fin_exc}"
             if symlink_escapes:
                 for esc in symlink_escapes:
                     if esc not in scope_violations:

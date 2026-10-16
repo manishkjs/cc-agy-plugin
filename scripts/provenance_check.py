@@ -43,6 +43,7 @@ def verify_workspace_provenance(
     *,
     env: dict[str, str] | None = None,
     strict: bool = False,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Verify that every modified/untracked/deleted file and line in the workspace came from an HMAC-verified applied worker receipt (or pre-existing baseline).
 
@@ -87,14 +88,15 @@ def verify_workspace_provenance(
                 rem_counter[h] += 1
 
     # Include pre-existing uncommitted baseline state captured at session start
-    baseline_rec = receipt_store.read_baseline_record(ws_path)
+    baseline_rec = receipt_store.read_baseline_record(ws_path, session_id=session_id)
     strict_active = strict or (env is not None and is_strict_mode_enabled(env))
     missing_session_baseline = False
-    if receipt_store.is_baseline_tampered(ws_path):
+    if receipt_store.is_baseline_tampered(ws_path, session_id=session_id):
         forged_receipts.append("baseline-record")
     elif strict_active and baseline_rec is None:
         missing_session_baseline = True
     baseline_head_sha = (baseline_rec or {}).get("baseline_head_sha")
+    baseline_recorded_at = float((baseline_rec or {}).get("recorded_at_epoch") or 0.0)
     baseline_prov = (baseline_rec or {}).get("provenance")
     if isinstance(baseline_prov, dict):
         _accumulate_provenance(baseline_prov)
@@ -128,8 +130,9 @@ def verify_workspace_provenance(
                 continue
             prov = r.get("provenance") or {}
             _accumulate_provenance(prov, list(r.get("applied_files") or []))
-            for fpath, fhash in (r.get("applied_file_hashes") or {}).items():
-                latest_applied_file_hash[fpath] = fhash
+            if float(r.get("updated_at_epoch") or 0.0) >= baseline_recorded_at:
+                for fpath, fhash in (r.get("applied_file_hashes") or {}).items():
+                    latest_applied_file_hash[fpath] = fhash
         for hist_prov in r.get("applied_history") or []:
             if isinstance(hist_prov, dict):
                 _accumulate_provenance(hist_prov)
@@ -244,7 +247,13 @@ def evaluate_stop_hook(
         return {}
 
     cwd = str(payload.get("cwd") or os.getcwd())
-    verdict = verify_workspace_provenance(cwd, store=store, env=source_env)
+    session_id = str(payload.get("session_id") or "").strip() or None
+    verdict = verify_workspace_provenance(
+        cwd,
+        store=store,
+        env=source_env,
+        session_id=session_id,
+    )
     if verdict["ok"]:
         return {}
 
@@ -261,24 +270,35 @@ def evaluate_stop_hook(
         "decision": "block",
         "reason": (
             f"Provenance verification failed: {verdict['reason']}. "
-            f"Revert unverified host edits or apply changes through delegate_apply."
+            f"These files changed outside a verified delegation. If they are the user's own edits, "
+            f"ask the user to commit or stash them; do not revert them. "
+            f"Otherwise, apply changes through delegate_apply."
         ),
     }
 
 
 def main() -> int:
-    raw = sys.stdin.read().strip()
-    payload: dict[str, Any] = {}
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {}
+    try:
+        raw = sys.stdin.read().strip()
+        payload: dict[str, Any] = {}
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {}
 
-    out = evaluate_stop_hook(payload)
-    if out:
-        sys.stdout.write(json.dumps(out) + "\n")
-        sys.stdout.flush()
+        out = evaluate_stop_hook(payload)
+        if out:
+            sys.stdout.write(json.dumps(out) + "\n")
+            sys.stdout.flush()
+    except Exception as exc:
+        if is_strict_mode_enabled(os.environ):
+            fallback = {
+                "decision": "block",
+                "reason": f"Provenance verification encountered an internal error: {type(exc).__name__}: {exc}",
+            }
+            sys.stdout.write(json.dumps(fallback) + "\n")
+            sys.stdout.flush()
     return 0
 
 

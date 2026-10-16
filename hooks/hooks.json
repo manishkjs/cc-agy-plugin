@@ -1,6 +1,17 @@
 {
-  "description": "Guardrails, receipt ledger logging, and outcome-based diff provenance checks for cc-agy-plugin.",
+  "description": "Guardrails, session baseline capture, receipt ledger logging, and outcome-based diff provenance checks for cc-agy-plugin.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/session_start.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Bash|mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*",

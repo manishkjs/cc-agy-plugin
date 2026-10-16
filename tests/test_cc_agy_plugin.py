@@ -872,6 +872,57 @@ class TestMCPStdioServer(unittest.TestCase):
             _ = JobManager(workspace_root=repo_dir, store=store3, worker_backend=worker_fn)
             self.assertTrue(verify_workspace_provenance(repo_dir, store=store3, strict=True)["ok"])
 
+    def test_round5_non_utf8_diffs_gitignored_build_outputs_and_session_start_baseline(self) -> None:
+        from scripts.session_start import handle_session_start
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            _init_git_repo(repo_dir)
+            (repo_dir / ".gitignore").write_text("target/\ndist/\nbuild/\n.gradle/\n", encoding="utf-8")
+            (repo_dir / "legacy.csv").write_bytes("name\nJos\xe9\n".encode("latin-1"))
+            subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add gitignore and latin1"], cwd=repo_dir, check=True, capture_output=True)
+
+            # Dirty Latin-1 file on host before JobManager starts must not crash UTF-8 decode
+            (repo_dir / "legacy.csv").write_bytes("name\nJos\xe9\nRen\xe9e\n".encode("latin-1"))
+            data_dir = Path(tmp) / "data"
+            store = ReceiptStore(data_dir, workspace_root=repo_dir)
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("print('v3')\n", encoding="utf-8")
+                for rel, raw in (
+                    ("target/debug/app", b"\x7fELF\x00bin"),
+                    ("dist/bundle.js", b"console.log(1)"),
+                    ("build/classes/App.class", b"\xca\xfe\xba\xbe"),
+                ):
+                    p = wt / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(raw)
+                return {"text": "compiled and tested"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("edit app.py and build", allowed_paths=["app.py"], project="p", wait=True)
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["files_changed"], ["app.py"])
+            applied = jm.delegate_apply(res["job_id"])
+            self.assertEqual(applied["applied_files"], ["app.py"])
+            self.assertFalse((repo_dir / "target" / "debug" / "app").exists())
+
+            # SessionStart hook with a new session_id records human WIP cleanly
+            (repo_dir / "app.py").write_text("print('human wip')\n", encoding="utf-8")
+            env = {"CC_AGY_STRICT_MODE": "1", "CLAUDE_PROJECT_DIR": str(repo_dir), "CC_AGY_DATA_DIR": str(data_dir)}
+            handle_session_start({"cwd": str(repo_dir), "session_id": "sess-alpha-1"}, env=env, store=store)
+            self.assertEqual(
+                evaluate_stop_hook(
+                    {"cwd": str(repo_dir), "session_id": "sess-alpha-1", "stop_hook_active": False},
+                    env=env,
+                    store=store,
+                ),
+                {},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

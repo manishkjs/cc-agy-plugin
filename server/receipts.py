@@ -295,10 +295,49 @@ class ReceiptStore:
         ws_hash = sha256_text(str(ws))[:16]
         return self.baselines_dir / f"baseline-{ws_hash}.json"
 
+    def session_baseline_path(self, session_id: str) -> Path:
+        safe_sid = validate_job_id(session_id)
+        return self.baselines_dir / f"session-{safe_sid}.json"
+
     def _baseline_marker_path(self, workspace_root: str | Path | None = None) -> Path:
         ws = Path(workspace_root or self.workspace_root).resolve()
         ws_hash = sha256_text(str(ws))[:16]
         return self.baselines_dir / f".recorded-{ws_hash}"
+
+    def record_session_baseline(
+        self,
+        workspace_root: str | Path,
+        provenance: dict[str, Any],
+        *,
+        baseline_head_sha: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """Record an immutable per-session baseline when a new Claude Code session_id starts.
+
+        Returns True if a new session baseline was recorded, or False if `session_id`
+        already had a recorded baseline in this session.
+        """
+        if session_id:
+            s_path = self.session_baseline_path(session_id)
+            if s_path.exists():
+                return False
+            s_payload = {
+                "workspace_root": str(Path(workspace_root).resolve()),
+                "recorded_at_epoch": round(time.time(), 3),
+                "baseline_head_sha": baseline_head_sha,
+                "provenance": provenance,
+            }
+            s_ser = json.dumps(s_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            s_payload["baseline_hmac"] = hmac.new(self._hmac_key, s_ser, hashlib.sha256).hexdigest()
+            s_path.write_text(json.dumps(s_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        self.record_baseline_dirty_state(
+            workspace_root,
+            provenance,
+            baseline_head_sha=baseline_head_sha,
+            overwrite=True,
+        )
+        return True
 
     def record_baseline_dirty_state(
         self,
@@ -327,8 +366,15 @@ class ReceiptStore:
         except OSError:
             pass
 
-    def is_baseline_tampered(self, workspace_root: str | Path) -> bool:
+    def is_baseline_tampered(self, workspace_root: str | Path, *, session_id: str | None = None) -> bool:
         """Return True if a baseline file exists with an invalid HMAC/JSON or was deleted after being recorded."""
+        if session_id:
+            try:
+                s_path = self.session_baseline_path(session_id)
+                if s_path.exists():
+                    return self._verify_and_parse_baseline_file(s_path) is None
+            except ValueError:
+                return True
         bpath = self.baseline_path(workspace_root)
         marker = self._baseline_marker_path(workspace_root)
         ws_key = str(Path(workspace_root).resolve())
@@ -336,9 +382,7 @@ class ReceiptStore:
             return marker.exists() or (ws_key in self._recorded_workspaces)
         return self.read_baseline_record(workspace_root) is None
 
-    def read_baseline_record(self, workspace_root: str | Path) -> dict[str, Any] | None:
-        """Read and verify the signed baseline record (provenance + baseline_head_sha)."""
-        bpath = self.baseline_path(workspace_root)
+    def _verify_and_parse_baseline_file(self, bpath: Path) -> dict[str, Any] | None:
         if not bpath.exists():
             return None
         try:
@@ -363,6 +407,23 @@ class ReceiptStore:
             return data
         except (OSError, json.JSONDecodeError):
             return None
+
+    def read_baseline_record(
+        self,
+        workspace_root: str | Path,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read and verify the signed baseline record (provenance + baseline_head_sha)."""
+        if session_id:
+            try:
+                s_path = self.session_baseline_path(session_id)
+                if s_path.exists():
+                    return self._verify_and_parse_baseline_file(s_path)
+            except ValueError:
+                return None
+        bpath = self.baseline_path(workspace_root)
+        return self._verify_and_parse_baseline_file(bpath)
 
     def read_baseline_dirty_state(self, workspace_root: str | Path) -> dict[str, Any] | None:
         """Read and verify the pre-existing uncommitted baseline provenance for workspace_root."""
