@@ -1,24 +1,33 @@
-"""Git-worktree isolated job manager for Antigravity SDK delegations."""
+"""Isolated job manager for Antigravity SDK delegations."""
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
 import fnmatch
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Callable
 import uuid
 
 from server.agy_runner import run_antigravity_worker
-from server.receipts import ReceiptStore, extract_diff_provenance
+from server.receipts import (
+    ReceiptStore,
+    extract_diff_provenance,
+    resolve_workspace_root,
+    sha256_bytes,
+    validate_job_id,
+)
 from server.regions import (
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
+    paginate_text_by_tokens,
     resolve_vertex_location,
     resolve_vertex_project,
     truncate_to_token_budget,
@@ -35,19 +44,67 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
     )
 
 
-def _has_git_head(repo_dir: Path) -> bool:
-    res = _run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_dir, check=False)
-    return res.returncode == 0
+def _strip_dot_slash(path_str: str) -> str:
+    """Strip leading `./` prefixes without stripping `../`."""
+    s = path_str.strip()
+    while s.startswith("./"):
+        s = s[2:]
+    return s
 
 
-def _matches_allowed_paths(rel_path: str, allowed_paths: list[str]) -> bool:
+def validate_allowed_paths(allowed_paths: Any) -> list[str]:
+    """Validate allowed_paths parameter, rejecting non-lists, parent traversal, or empty/root wildcards."""
+    if allowed_paths is None:
+        return []
+    if not isinstance(allowed_paths, list):
+        raise ValueError(
+            f"allowed_paths must be a list of relative path strings, got {type(allowed_paths).__name__}"
+        )
+    cleaned: list[str] = []
+    for item in allowed_paths:
+        if not isinstance(item, str):
+            raise ValueError(f"allowed_paths entries must be strings, got {type(item).__name__}")
+        stripped = item.strip()
+        norm = _strip_dot_slash(stripped).rstrip("/")
+        if (
+            not norm
+            or norm in (".", "..")
+            or stripped.startswith("/")
+            or ".." in Path(norm).parts
+        ):
+            raise ValueError(
+                f"Invalid allowed_paths entry {item!r}: must be a non-empty workspace-relative path without '..'"
+            )
+        cleaned.append(norm)
+    return cleaned
+
+
+def _matches_allowed_paths(rel_path: str, allowed_paths: list[str] | str | None) -> bool:
     """Return True if rel_path is inside or matches any entry in allowed_paths."""
-    if not allowed_paths:
+    if allowed_paths is None:
         return True
-    norm_path = rel_path.strip().lstrip("./")
-    for pattern in allowed_paths:
-        norm_pat = pattern.strip().lstrip("./").rstrip("/")
-        if not norm_pat or norm_pat in (".", "*"):
+    if isinstance(allowed_paths, str):
+        raw_list = [allowed_paths]
+    elif isinstance(allowed_paths, list):
+        raw_list = allowed_paths
+    else:
+        return False
+    if not raw_list:
+        return True
+    try:
+        validated = validate_allowed_paths(raw_list)
+    except ValueError:
+        return False
+    if not validated:
+        return True
+    stripped = rel_path.strip()
+    if stripped.startswith("/"):
+        return False
+    norm_path = _strip_dot_slash(stripped)
+    if not norm_path or norm_path in (".", "..") or ".." in Path(norm_path).parts:
+        return False
+    for norm_pat in validated:
+        if norm_pat == "*":
             return True
         if norm_path == norm_pat or norm_path.startswith(norm_pat + "/"):
             return True
@@ -56,8 +113,116 @@ def _matches_allowed_paths(rel_path: str, allowed_paths: list[str]) -> bool:
     return False
 
 
+def _matches_file_filter(rel_path: str, file_filter: str) -> bool:
+    """Match a diff file path against file_filter without substring false positives (a.py vs data.py)."""
+    norm_path = rel_path.strip().lstrip("./")
+    norm_filter = file_filter.strip().lstrip("./").rstrip("/")
+    if not norm_filter:
+        return True
+    if norm_path == norm_filter or norm_path.startswith(norm_filter + "/"):
+        return True
+    if Path(norm_path).name == norm_filter:
+        return True
+    if fnmatch.fnmatch(norm_path, norm_filter):
+        return True
+    # Also check if norm_filter matches a path suffix at a directory boundary
+    if norm_path.endswith("/" + norm_filter):
+        return True
+    return False
+
+
+def capture_live_workspace_diff(workspace_root: Path) -> str:
+    """Capture the unified diff of workspace_root against HEAD including untracked files.
+
+    Uses a temporary GIT_INDEX_FILE copy so the host repository's real git index is
+    never mutated.
+    """
+    git_dir_res = _run_git(["rev-parse", "--git-dir"], cwd=workspace_root, check=False)
+    if git_dir_res.returncode != 0:
+        return ""
+    raw_git_dir = Path(git_dir_res.stdout.strip())
+    git_dir = raw_git_dir if raw_git_dir.is_absolute() else (workspace_root / raw_git_dir).resolve()
+    real_index = git_dir / "index"
+
+    with tempfile.NamedTemporaryFile(prefix="cc-agy-idx-", delete=False) as tmp_idx:
+        tmp_index_path = Path(tmp_idx.name)
+    try:
+        if real_index.exists():
+            shutil.copy2(real_index, tmp_index_path)
+        else:
+            tmp_index_path.unlink(missing_ok=True)
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(tmp_index_path)
+        subprocess.run(
+            ["git", "add", "-N", "."],
+            cwd=str(workspace_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diff_res = subprocess.run(
+            ["git", "diff", "--binary", "--no-renames", "HEAD"],
+            cwd=str(workspace_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return diff_res.stdout if diff_res.returncode == 0 else ""
+    finally:
+        tmp_index_path.unlink(missing_ok=True)
+
+
+def _snapshot_directory_tree(root: Path) -> dict[str, bytes]:
+    """Capture a byte snapshot of files inside `root` (used to protect host .git/hooks and .git/config)."""
+    snap: dict[str, bytes] = {}
+    if not root.exists():
+        return snap
+    if root.is_file():
+        try:
+            snap[""] = root.read_bytes()
+        except OSError:
+            pass
+        return snap
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and not p.is_symlink():
+            rel = str(p.relative_to(root))
+            try:
+                snap[rel] = p.read_bytes()
+            except OSError:
+                pass
+    return snap
+
+
+def _restore_directory_tree(root: Path, snap: dict[str, bytes]) -> bool:
+    """Verify `root` matches `snap`; if tampered, restore `root` to `snap` and return True."""
+    current = _snapshot_directory_tree(root)
+    if current == snap:
+        return False
+    if root.is_file() or ("" in snap):
+        if "" in snap:
+            root.parent.mkdir(parents=True, exist_ok=True)
+            root.write_bytes(snap[""])
+        elif root.exists():
+            root.unlink(missing_ok=True)
+        return True
+
+    if root.exists():
+        for p in list(root.rglob("*")):
+            if p.is_file() or p.is_symlink():
+                rel = str(p.relative_to(root))
+                if rel not in snap:
+                    p.unlink(missing_ok=True)
+    for rel, content in snap.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    return True
+
+
 class JobManager:
-    """Manages isolated git worktrees, background worker execution, and diff application."""
+    """Manages isolated worker clones, background execution, conflict-safe apply, and provenance."""
 
     def __init__(
         self,
@@ -66,117 +231,132 @@ class JobManager:
         worker_backend: Callable[[dict[str, Any]], Any] | None = None,
         max_workers: int = 4,
     ) -> None:
-        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
-        self.store = store or ReceiptStore()
+        self.workspace_root = resolve_workspace_root(workspace_root)
+        self.store = store or ReceiptStore(workspace_root=self.workspace_root)
         self.worker_backend = worker_backend
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cc-agy-job")
         self._lock = threading.Lock()
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
+        self._raw_projects: dict[str, str] = {}
+        self._ensure_baseline_recorded()
 
-    def _prepare_worktree(self, job_id: str) -> Path:
-        """Create an isolated git worktree (or isolated clone) for job_id."""
-        wt_dir = (self.store.worktrees_dir / job_id).resolve()
+    def _ensure_baseline_recorded(self) -> None:
+        if self.store.read_baseline_dirty_state(self.workspace_root) is None:
+            live_diff = capture_live_workspace_diff(self.workspace_root)
+            prov = extract_diff_provenance(live_diff)
+            self.store.record_baseline_dirty_state(self.workspace_root, prov)
+
+    def _prepare_worktree(self, job_id: str) -> tuple[Path, str, dict[str, str | None]]:
+        """Create a standalone isolated git repository copy for `job_id`.
+
+        Unlike `git worktree add` (which shares `.git/hooks`, `.git/config`, and `.git/refs`
+        with the host repository), a standalone `.git` inside `wt_dir` prevents a worker
+        from installing hooks or altering git config in the host repository.
+
+        Returns (wt_dir, baseline_commit_sha, baseline_file_hashes).
+        """
+        safe_id = validate_job_id(job_id)
+        wt_dir = self.store.worktree_path(safe_id).resolve()
         if wt_dir.exists():
             shutil.rmtree(wt_dir, ignore_errors=True)
 
-        if _has_git_head(self.workspace_root):
-            res = _run_git(
-                ["worktree", "add", "--detach", str(wt_dir), "HEAD"],
-                cwd=self.workspace_root,
-                check=False,
-            )
-            if res.returncode == 0:
-                self._sync_uncommitted_state_into_worktree(wt_dir)
-                return wt_dir
-
-        # Fallback when workspace has no commits yet or git worktree add is unavailable
         shutil.copytree(
             self.workspace_root,
             wt_dir,
+            symlinks=True,
             ignore=shutil.ignore_patterns(".git", ".cc-agy-data", ".worktrees", "__pycache__"),
         )
-        _run_git(["init", "-b", "main"], cwd=wt_dir, check=False)
-        _run_git(["config", "user.email", "worker@cc-agy-plugin.local"], cwd=wt_dir, check=False)
-        _run_git(["config", "user.name", "CC-AGY Worker"], cwd=wt_dir, check=False)
-        _run_git(["add", "-A"], cwd=wt_dir, check=False)
-        _run_git(["commit", "--allow-empty", "-m", "baseline"], cwd=wt_dir, check=False)
-        return wt_dir
+        _run_git(["init", "-b", "main"], cwd=wt_dir, check=True)
+        _run_git(["config", "user.email", "worker@cc-agy-plugin.local"], cwd=wt_dir, check=True)
+        _run_git(["config", "user.name", "CC-AGY Worker"], cwd=wt_dir, check=True)
+        _run_git(["add", "-A"], cwd=wt_dir, check=True)
+        _run_git(["commit", "--allow-empty", "-m", "cc-agy-baseline"], cwd=wt_dir, check=True)
+        sha_res = _run_git(["rev-parse", "HEAD"], cwd=wt_dir, check=True)
+        baseline_sha = sha_res.stdout.strip()
 
-    def _sync_uncommitted_state_into_worktree(self, wt_dir: Path) -> None:
-        """Copy dirty tracked/untracked files from workspace_root into wt_dir and baseline-commit."""
-        diff_res = _run_git(["diff", "--binary", "HEAD"], cwd=self.workspace_root, check=False)
-        if diff_res.returncode == 0 and diff_res.stdout.strip():
-            subprocess.run(
-                ["git", "apply", "--whitespace=nowarn", "-"],
-                input=diff_res.stdout,
-                cwd=str(wt_dir),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        baseline_hashes: dict[str, str | None] = {}
+        for p in wt_dir.rglob("*"):
+            if ".git" in p.parts:
+                continue
+            if p.is_file() and not p.is_symlink():
+                rel = str(p.relative_to(wt_dir))
+                baseline_hashes[rel] = sha256_bytes(p.read_bytes())
 
-        untracked_res = _run_git(
-            ["ls-files", "--others", "--exclude-standard"],
-            cwd=self.workspace_root,
+        return wt_dir, baseline_sha, baseline_hashes
+
+    def _collect_worktree_diff(
+        self,
+        wt_dir: Path,
+        baseline_sha: str,
+    ) -> tuple[str, list[str], list[str]]:
+        """Collect unified binary diff with `--no-renames` against `baseline_sha`.
+
+        Returns (diff_text, files_changed, symlink_escapes).
+        """
+        if not wt_dir.exists():
+            return "", [], []
+
+        symlink_escapes: list[str] = []
+        wt_resolved = wt_dir.resolve()
+        for p in wt_dir.rglob("*"):
+            if ".git" in p.parts:
+                continue
+            if p.is_symlink():
+                rel = str(p.relative_to(wt_dir))
+                try:
+                    link_target = (p.parent / os.readlink(p)).resolve()
+                    if not link_target.is_relative_to(wt_resolved):
+                        symlink_escapes.append(rel)
+                except OSError:
+                    symlink_escapes.append(rel)
+
+        _run_git(["add", "-N", "."], cwd=wt_dir, check=False)
+        diff_res = _run_git(
+            ["diff", "--binary", "--no-renames", baseline_sha],
+            cwd=wt_dir,
             check=False,
         )
-        if untracked_res.returncode == 0:
-            for rel in untracked_res.stdout.splitlines():
-                rel = rel.strip()
-                if not rel or rel.startswith(".cc-agy-data") or rel.startswith(".worktrees"):
-                    continue
-                src = self.workspace_root / rel
-                dst = wt_dir / rel
-                if src.is_file():
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
-
-        _run_git(["config", "user.email", "worker@cc-agy-plugin.local"], cwd=wt_dir, check=False)
-        _run_git(["config", "user.name", "CC-AGY Worker"], cwd=wt_dir, check=False)
-        _run_git(["add", "-A"], cwd=wt_dir, check=False)
-        status_res = _run_git(["status", "--porcelain"], cwd=wt_dir, check=False)
-        if status_res.stdout.strip():
-            _run_git(["commit", "-m", "cc-agy-baseline-dirty-state"], cwd=wt_dir, check=False)
-
-    def _collect_worktree_diff(self, wt_dir: Path) -> tuple[str, list[str]]:
-        """Stage all worker edits (including new untracked files via intent-to-add) and return unified diff."""
-        if not wt_dir.exists():
-            return "", []
-        _run_git(["add", "-N", "."], cwd=wt_dir, check=False)
-        diff_res = _run_git(["diff", "HEAD"], cwd=wt_dir, check=False)
         diff_text = diff_res.stdout if diff_res.returncode == 0 else ""
 
-        name_res = _run_git(["diff", "--name-only", "HEAD"], cwd=wt_dir, check=False)
+        name_res = _run_git(
+            ["diff", "--name-only", "--no-renames", baseline_sha],
+            cwd=wt_dir,
+            check=False,
+        )
         files = [
             line.strip()
             for line in (name_res.stdout.splitlines() if name_res.returncode == 0 else [])
             if line.strip()
         ]
-        return diff_text, files
+        for esc in symlink_escapes:
+            if esc not in files:
+                files.append(esc)
+        return diff_text, files, symlink_escapes
 
     def _cleanup_worktree(self, wt_dir: Path) -> None:
         if not wt_dir.exists():
             return
-        _run_git(["worktree", "remove", "--force", str(wt_dir)], cwd=self.workspace_root, check=False)
-        if wt_dir.exists():
-            shutil.rmtree(wt_dir, ignore_errors=True)
+        shutil.rmtree(wt_dir, ignore_errors=True)
 
     def _execute_job(
         self,
         *,
         job_id: str,
-        prompts: list[str],
+        worker_prompts: list[str],
+        recorded_prompts: list[str],
         model: str,
         project: str,
         location: str,
         reroute_note: str | None,
-        allowed_paths: list[str] | None,
+        allowed_paths: list[str],
         timeout_seconds: float,
         enabled_tools: list[str] | None,
         disabled_tools: list[str] | None,
         enable_subagents: bool,
         wt_dir: Path,
+        baseline_sha: str,
+        baseline_file_hashes: dict[str, str | None],
         started_at: float,
         prior_usage: dict[str, int] | None = None,
         prior_tool_calls: list[dict[str, Any]] | None = None,
@@ -198,6 +378,10 @@ class JobManager:
         files_changed: list[str] = []
         scope_violations: list[str] = []
 
+        host_git_dir = self.workspace_root / ".git"
+        hooks_snap = _snapshot_directory_tree(host_git_dir / "hooks")
+        config_snap = _snapshot_directory_tree(host_git_dir / "config")
+
         try:
             with self._lock:
                 if job_id in self._cancelled:
@@ -206,7 +390,7 @@ class JobManager:
                     raise RuntimeError(error_msg)
 
             worker_out = run_antigravity_worker(
-                prompts=prompts,
+                prompts=worker_prompts,
                 workspace_dir=wt_dir,
                 model=model,
                 project=project,
@@ -222,12 +406,12 @@ class JobManager:
             new_usage = worker_out.get("usage") or {}
             for k in usage:
                 usage[k] += int(new_usage.get(k) or 0)
-            if usage["total_token_count"] == 0:
-                usage["total_token_count"] = (
-                    usage["prompt_token_count"]
-                    + usage["candidates_token_count"]
-                    + usage["thoughts_token_count"]
-                )
+            usage["total_token_count"] = max(
+                usage["total_token_count"],
+                usage["prompt_token_count"]
+                + usage["candidates_token_count"]
+                + usage["thoughts_token_count"],
+            )
             tool_calls.extend(worker_out.get("tool_calls") or [])
             thoughts.extend(worker_out.get("thoughts") or [])
 
@@ -238,21 +422,49 @@ class JobManager:
                 else:
                     status = "ok"
 
-        except TimeoutError as exc:
-            status = "timeout"
-            error_msg = f"TimeoutError: {exc}"
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            with self._lock:
+                is_canc = job_id in self._cancelled
+            if is_canc:
+                status = "cancelled"
+                error_msg = "Job cancelled during execution."
+            else:
+                status = "timeout"
+                error_msg = f"TimeoutError: {exc}"
             self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
         except Exception as exc:
-            if status != "cancelled":
+            with self._lock:
+                is_canc = job_id in self._cancelled
+            if is_canc or status == "cancelled":
+                status = "cancelled"
+                error_msg = "Job cancelled by user."
+            else:
                 status = "error"
                 error_msg = f"{type(exc).__name__}: {exc}"
             self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
         finally:
-            diff_text, files_changed = self._collect_worktree_diff(wt_dir)
+            hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
+            config_tampered = _restore_directory_tree(host_git_dir / "config", config_snap)
+            if hooks_tampered or config_tampered:
+                status = "security_violation"
+                error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
+
+            diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
+                wt_dir, baseline_sha
+            )
+            if symlink_escapes:
+                for esc in symlink_escapes:
+                    if esc not in scope_violations:
+                        scope_violations.append(esc)
+                if status == "ok":
+                    status = "scope_violation"
+                    error_msg = f"Worker created symlink escaping worktree: {symlink_escapes}"
+
             if allowed_paths:
                 for fpath in files_changed:
                     if not _matches_allowed_paths(fpath, allowed_paths):
-                        scope_violations.append(fpath)
+                        if fpath not in scope_violations:
+                            scope_violations.append(fpath)
                 if scope_violations and status == "ok":
                     status = "scope_violation"
                     error_msg = (
@@ -261,7 +473,11 @@ class JobManager:
                     )
 
             provenance = extract_diff_provenance(diff_text)
-            diff_path = self.store.receipts_dir / f"{job_id}.diff"
+            for fpath in files_changed:
+                if fpath not in provenance["files_changed"]:
+                    provenance["files_changed"].append(fpath)
+
+            diff_path = self.store.diff_path(job_id)
             diff_path.write_text(diff_text, encoding="utf-8")
 
             finished_at = round(time.time(), 3)
@@ -276,10 +492,16 @@ class JobManager:
                 "vertex_project": project,
                 "vertex_location": location,
                 "reroute_note": reroute_note,
-                "prompts": prompts,
-                "allowed_paths": allowed_paths or [],
+                "prompts": recorded_prompts,
+                "allowed_paths": allowed_paths,
+                "enabled_tools": enabled_tools,
+                "disabled_tools": disabled_tools,
+                "enable_subagents": enable_subagents,
+                "scrub_receipt": scrub_receipt,
                 "scope_violations": scope_violations,
                 "worktree_dir": str(wt_dir),
+                "baseline_commit_sha": baseline_sha,
+                "baseline_file_hashes": baseline_file_hashes,
                 "started_at_epoch": started_at,
                 "finished_at_epoch": finished_at,
                 "duration_seconds": round(max(0.0, finished_at - started_at), 3),
@@ -302,6 +524,9 @@ class JobManager:
                 scrub=scrub_receipt,
                 workspace_root=str(self.workspace_root),
             )
+            with self._lock:
+                if job_id in self._cancelled and wt_dir.exists():
+                    self._cleanup_worktree(wt_dir)
 
         return saved
 
@@ -316,12 +541,12 @@ class JobManager:
         if isinstance(partial_u, dict):
             for k in usage:
                 usage[k] += int(partial_u.get(k) or 0)
-            if usage["total_token_count"] == 0:
-                usage["total_token_count"] = (
-                    usage["prompt_token_count"]
-                    + usage["candidates_token_count"]
-                    + usage["thoughts_token_count"]
-                )
+            usage["total_token_count"] = max(
+                usage["total_token_count"],
+                usage["prompt_token_count"]
+                + usage["candidates_token_count"]
+                + usage["thoughts_token_count"],
+            )
         partial_tc = getattr(exc, "partial_tool_calls", None)
         if isinstance(partial_tc, list):
             tool_calls.extend(partial_tc)
@@ -344,10 +569,11 @@ class JobManager:
         wait: bool = False,
         scrub_receipt: bool = False,
     ) -> dict[str, Any]:
-        """Start an isolated Antigravity worker job in a dedicated git worktree."""
+        """Start an isolated Antigravity worker job in a dedicated standalone repo copy."""
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 
+        validated_paths = validate_allowed_paths(allowed_paths)
         chosen_model = (
             model
             or os.environ.get("CC_AGY_DEFAULT_DELEGATE_MODEL")
@@ -361,7 +587,10 @@ class JobManager:
 
         job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         started_at = round(time.time(), 3)
-        wt_dir = self._prepare_worktree(job_id)
+        wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(job_id)
+
+        with self._lock:
+            self._raw_projects[job_id] = resolved_project
 
         initial_receipt = {
             "job_id": job_id,
@@ -372,9 +601,15 @@ class JobManager:
             "vertex_location": resolved_location,
             "reroute_note": reroute_note,
             "prompts": [prompt.strip()],
-            "allowed_paths": allowed_paths or [],
+            "allowed_paths": validated_paths,
+            "enabled_tools": enabled_tools,
+            "disabled_tools": disabled_tools,
+            "enable_subagents": enable_subagents,
+            "scrub_receipt": scrub_receipt,
             "scope_violations": [],
             "worktree_dir": str(wt_dir),
+            "baseline_commit_sha": baseline_sha,
+            "baseline_file_hashes": baseline_hashes,
             "started_at_epoch": started_at,
             "usage": {
                 "prompt_token_count": 0,
@@ -396,44 +631,33 @@ class JobManager:
             workspace_root=str(self.workspace_root),
         )
 
-        if wait:
-            final_receipt = self._execute_job(
-                job_id=job_id,
-                prompts=[prompt.strip()],
-                model=chosen_model,
-                project=resolved_project,
-                location=resolved_location,
-                reroute_note=reroute_note,
-                allowed_paths=allowed_paths,
-                timeout_seconds=timeout_seconds,
-                enabled_tools=enabled_tools,
-                disabled_tools=disabled_tools,
-                enable_subagents=enable_subagents,
-                wt_dir=wt_dir,
-                started_at=started_at,
-                scrub_receipt=scrub_receipt,
-            )
-            return self._compact_digest(final_receipt)
-
         fut = self._executor.submit(
             self._execute_job,
             job_id=job_id,
-            prompts=[prompt.strip()],
+            worker_prompts=[prompt.strip()],
+            recorded_prompts=[prompt.strip()],
             model=chosen_model,
             project=resolved_project,
             location=resolved_location,
             reroute_note=reroute_note,
-            allowed_paths=allowed_paths,
+            allowed_paths=validated_paths,
             timeout_seconds=timeout_seconds,
             enabled_tools=enabled_tools,
             disabled_tools=disabled_tools,
             enable_subagents=enable_subagents,
             wt_dir=wt_dir,
+            baseline_sha=baseline_sha,
+            baseline_file_hashes=baseline_hashes,
             started_at=started_at,
             scrub_receipt=scrub_receipt,
         )
         with self._lock:
             self._futures[job_id] = fut
+
+        if wait:
+            self._wait_for_future_or_cancel(job_id, fut, timeout=max(0.5, float(timeout_seconds) + 30.0))
+            receipt = self.store.read_receipt(job_id)
+            return self._compact_digest(receipt)
 
         return {
             "job_id": job_id,
@@ -441,29 +665,72 @@ class JobManager:
             "model": chosen_model,
             "vertex_location": resolved_location,
             "reroute_note": reroute_note,
-            "allowed_paths": allowed_paths or [],
+            "allowed_paths": validated_paths,
             "worktree_dir": str(wt_dir),
         }
 
-    def delegate_status(self, job_id: str | None = None) -> dict[str, Any]:
-        """Return status for a single job or list all active/recent jobs."""
-        if job_id:
-            receipt = self.store.read_receipt(job_id)
-            return self._compact_digest(receipt)
+    def _wait_for_future_or_cancel(
+        self,
+        job_id: str,
+        fut: Future[dict[str, Any]],
+        *,
+        timeout: float,
+    ) -> None:
+        """Wait for `fut` to complete or for `job_id` to be added to `self._cancelled`."""
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while not fut.done():
+            with self._lock:
+                if job_id in self._cancelled:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                fut.result(timeout=min(0.05, remaining))
+                return
+            except TimeoutError:
+                continue
+            except Exception:
+                return
 
-        summaries = [self._compact_digest(r) for r in self.store.list_receipts()]
+    def delegate_status(
+        self,
+        job_id: str | None = None,
+        *,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return status for a single job or list recent jobs within the MCP token cap."""
+        if job_id:
+            safe_id = validate_job_id(job_id)
+            receipt = self.store.read_receipt(safe_id)
+            return self._compact_digest(receipt, include_summary=True)
+
+        all_receipts = self.store.list_receipts()
+        max_items = max(1, min(int(limit), 50))
+        recent = all_receipts[-max_items:]
+        summaries = [self._compact_digest(r, include_summary=False) for r in recent]
         return {
             "jobs": summaries,
+            "returned_jobs": len(summaries),
+            "total_jobs": len(all_receipts),
             "totals": self.store.summarize_costs(),
         }
 
-    def delegate_result(self, job_id: str, *, wait: bool = True, timeout: float = 600.0) -> dict[str, Any]:
+    def delegate_result(
+        self,
+        job_id: str,
+        *,
+        wait: bool = True,
+        timeout: float = 540.0,
+    ) -> dict[str, Any]:
         """Return the compact completion digest for job_id, optionally waiting if still running."""
+        safe_id = validate_job_id(job_id)
         with self._lock:
-            fut = self._futures.get(job_id)
+            fut = self._futures.get(safe_id)
         if fut is not None and wait and not fut.done():
-            fut.result(timeout=timeout)
-        receipt = self.store.read_receipt(job_id)
+            capped_timeout = max(0.1, min(float(timeout), 540.0))
+            self._wait_for_future_or_cancel(safe_id, fut, timeout=capped_timeout)
+        receipt = self.store.read_receipt(safe_id)
         return self._compact_digest(receipt)
 
     def get_diff(
@@ -475,9 +742,10 @@ class JobManager:
         page_tokens: int = DEFAULT_DIFF_PAGE_TOKENS,
     ) -> dict[str, Any]:
         """Return paginated unified git diff for job_id measured in tokens."""
-        receipt = self.store.read_receipt(job_id)
-        diff_path = self.store.receipts_dir / f"{job_id}.diff"
-        full_diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
+        safe_id = validate_job_id(job_id)
+        receipt = self.store.read_receipt(safe_id)
+        diff_path = self.store.diff_path(safe_id)
+        full_diff = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
 
         if file_filter and full_diff:
             filtered_chunks: list[str] = []
@@ -488,26 +756,30 @@ class JobManager:
                     if current_chunk and keep_chunk:
                         filtered_chunks.append("".join(current_chunk))
                     current_chunk = [line]
-                    keep_chunk = file_filter in line
+                    parts = line.strip().split(" b/", 1)
+                    cand_path = parts[1].strip() if len(parts) == 2 else ""
+                    keep_chunk = _matches_file_filter(cand_path, file_filter)
                 else:
-                    if line.startswith("+++ b/") and file_filter in line:
-                        keep_chunk = True
+                    if line.startswith("+++ b/"):
+                        cand_path = line[len("+++ b/") :].strip()
+                        if _matches_file_filter(cand_path, file_filter):
+                            keep_chunk = True
+                    elif line.startswith("--- a/"):
+                        cand_path = line[len("--- a/") :].strip()
+                        if _matches_file_filter(cand_path, file_filter):
+                            keep_chunk = True
                     current_chunk.append(line)
             if current_chunk and keep_chunk:
                 filtered_chunks.append("".join(current_chunk))
             full_diff = "".join(filtered_chunks)
 
-        budget_tokens = max(250, min(int(page_tokens), MAX_TOOL_RESPONSE_TOKENS))
-        bytes_per_page = budget_tokens * 4
-        encoded = full_diff.encode("utf-8")
-        total_pages = max(1, (len(encoded) + bytes_per_page - 1) // bytes_per_page)
+        pages = paginate_text_by_tokens(full_diff, page_tokens=page_tokens)
+        total_pages = len(pages)
         clamped_page = max(1, min(int(page), total_pages))
-        start_b = (clamped_page - 1) * bytes_per_page
-        end_b = start_b + bytes_per_page
-        page_slice = encoded[start_b:end_b].decode("utf-8", errors="ignore")
+        page_slice = pages[clamped_page - 1]
 
         return {
-            "job_id": job_id,
+            "job_id": safe_id,
             "status": receipt.get("status"),
             "file_filter": file_filter,
             "page": clamped_page,
@@ -519,49 +791,122 @@ class JobManager:
         }
 
     def delegate_apply(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
-        """Apply a verified worker job's changes from its isolated worktree to the main workspace."""
+        """Apply a verified worker job's changes to the main workspace with conflict detection."""
+        safe_id = validate_job_id(job_id)
         with self._lock:
-            fut = self._futures.get(job_id)
+            fut = self._futures.get(safe_id)
         if fut is not None and not fut.done():
-            raise RuntimeError(f"Job '{job_id}' is still running; wait for completion before applying.")
+            raise RuntimeError(f"Job '{safe_id}' is still running; wait for completion before applying.")
 
-        receipt = self.store.read_receipt(job_id)
+        receipt = self.store.read_receipt(safe_id)
+        if receipt.get("applied"):
+            prov = receipt.get("provenance") or {}
+            return {
+                "job_id": safe_id,
+                "applied": True,
+                "already_applied": True,
+                "applied_files": receipt.get("applied_files", []),
+                "diff_sha256": prov.get("diff_sha256"),
+            }
+
         status = receipt.get("status")
         if status != "ok":
             raise ValueError(
-                f"Cannot apply job '{job_id}' with status={status!r} "
+                f"Cannot apply job '{safe_id}' with status={status!r} "
                 f"(error={receipt.get('error')!r}). Only status='ok' jobs can be applied."
             )
 
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
-        diff_path = self.store.receipts_dir / f"{job_id}.diff"
-        diff_text = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
+        diff_path = self.store.diff_path(safe_id)
+        diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
         files_changed: list[str] = list(receipt.get("files_changed") or [])
-        allowed_paths: list[str] = list(receipt.get("allowed_paths") or [])
+        allowed_paths: list[str] = validate_allowed_paths(receipt.get("allowed_paths") or [])
+        baseline_hashes: dict[str, str | None] = dict(receipt.get("baseline_file_hashes") or {})
 
+        # 1. Pre-flight validation: scope, path traversal, symlinks, and baseline conflict check
+        conflicted_files: list[str] = []
         for rel_path in files_changed:
             if not _matches_allowed_paths(rel_path, allowed_paths):
                 raise ValueError(
                     f"Refusing to apply out-of-scope file {rel_path!r} (allowed_paths={allowed_paths})"
                 )
+            dst_raw = self.workspace_root / rel_path
+            dst_resolved = dst_raw.resolve()
+            if not dst_resolved.is_relative_to(self.workspace_root):
+                raise ValueError(f"Path traversal blocked for {rel_path!r}")
+
+            if wt_dir.exists():
+                src_raw = wt_dir / rel_path
+                if src_raw.is_symlink():
+                    link_target = (src_raw.parent / os.readlink(src_raw)).resolve()
+                    if not link_target.is_relative_to(wt_dir.resolve()):
+                        raise ValueError(
+                            f"Refusing to apply symlink {rel_path!r} pointing outside worktree"
+                        )
+
+            expected_baseline_sha = baseline_hashes.get(rel_path)
+            if dst_raw.exists() and dst_raw.is_file() and not dst_raw.is_symlink():
+                current_host_sha = sha256_bytes(dst_raw.read_bytes())
+                if expected_baseline_sha != current_host_sha:
+                    conflicted_files.append(rel_path)
+            elif expected_baseline_sha is not None and not dst_raw.exists():
+                conflicted_files.append(rel_path)
 
         applied_files: list[str] = []
-        if wt_dir.exists():
+        if conflicted_files:
+            # Attempt a clean git 3-way merge using the stored diff; if it fails, abort cleanly
+            if not diff_text.strip():
+                raise ValueError(
+                    f"Conflict detected: host files {conflicted_files} were modified since job start."
+                )
+            check_res = subprocess.run(
+                ["git", "apply", "--3way", "--binary", "--check", "-"],
+                input=diff_text,
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if check_res.returncode != 0:
+                raise ValueError(
+                    f"Conflict detected: host files {conflicted_files} were modified since job "
+                    f"'{safe_id}' started and could not be cleanly merged: {check_res.stderr.strip()}"
+                )
+            apply_3way = subprocess.run(
+                ["git", "apply", "--3way", "--binary", "--whitespace=nowarn", "-"],
+                input=diff_text,
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if apply_3way.returncode != 0:
+                raise ValueError(
+                    f"Conflict detected while applying 3-way merge for {conflicted_files}: "
+                    f"{apply_3way.stderr.strip()}"
+                )
+            applied_files = list(files_changed)
+        elif wt_dir.exists():
             for rel_path in files_changed:
-                src = (wt_dir / rel_path).resolve()
-                dst = (self.workspace_root / rel_path).resolve()
-                if not str(dst).startswith(str(self.workspace_root)):
-                    raise ValueError(f"Path traversal blocked for {rel_path!r}")
-                if src.exists() and src.is_file():
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                src_raw = wt_dir / rel_path
+                dst_raw = self.workspace_root / rel_path
+                if src_raw.is_symlink():
+                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_raw.exists() or dst_raw.is_symlink():
+                        dst_raw.unlink()
+                    os.symlink(os.readlink(src_raw), dst_raw)
                     applied_files.append(rel_path)
-                elif not src.exists() and dst.exists():
-                    dst.unlink()
+                elif src_raw.exists() and src_raw.is_file():
+                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_raw, dst_raw)
+                    applied_files.append(rel_path)
+                elif not src_raw.exists():
+                    if dst_raw.exists() or dst_raw.is_symlink():
+                        dst_raw.unlink()
                     applied_files.append(rel_path)
         elif diff_text.strip():
             subprocess.run(
-                ["git", "apply", "--whitespace=nowarn", "-"],
+                ["git", "apply", "--binary", "--whitespace=nowarn", "-"],
                 input=diff_text,
                 cwd=str(self.workspace_root),
                 capture_output=True,
@@ -573,21 +918,37 @@ class JobManager:
         if cleanup_worktree and wt_dir.exists():
             self._cleanup_worktree(wt_dir)
 
+        # Compute exact provenance and post-apply SHA-256 hashes of the applied files
+        applied_prov = extract_diff_provenance(diff_text)
+        applied_file_hashes: dict[str, str | None] = {}
+        for fpath in applied_files:
+            if fpath not in applied_prov["files_changed"]:
+                applied_prov["files_changed"].append(fpath)
+            dst_p = self.workspace_root / fpath
+            if dst_p.is_symlink():
+                applied_file_hashes[fpath] = f"symlink:{os.readlink(dst_p)}"
+            elif dst_p.exists() and dst_p.is_file():
+                applied_file_hashes[fpath] = sha256_bytes(dst_p.read_bytes())
+            else:
+                applied_file_hashes[fpath] = None
+
         receipt["applied"] = True
         receipt["applied_at_epoch"] = round(time.time(), 3)
         receipt["applied_files"] = applied_files
-        receipt["provenance"] = extract_diff_provenance(diff_text)
+        receipt["applied_file_hashes"] = applied_file_hashes
+        receipt["provenance"] = applied_prov
         self.store.write_receipt(
-            job_id,
+            safe_id,
             receipt,
+            scrub=bool(receipt.get("scrub_receipt", False)),
             workspace_root=str(self.workspace_root),
         )
 
         return {
-            "job_id": job_id,
+            "job_id": safe_id,
             "applied": True,
             "applied_files": applied_files,
-            "diff_sha256": receipt["provenance"]["diff_sha256"],
+            "diff_sha256": applied_prov["diff_sha256"],
         }
 
     def delegate_continue(
@@ -598,78 +959,113 @@ class JobManager:
         timeout_seconds: float = 300.0,
         wait: bool = True,
     ) -> dict[str, Any]:
-        """Send a follow-up prompt into the same job's isolated git worktree."""
+        """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
+        safe_id = validate_job_id(job_id)
         if not follow_up_prompt or not follow_up_prompt.strip():
             raise ValueError("follow_up_prompt must be a non-empty string")
 
-        receipt = self.store.read_receipt(job_id)
-        wt_dir = Path(str(receipt.get("worktree_dir") or ""))
-        if not wt_dir.exists():
-            wt_dir = self._prepare_worktree(job_id)
+        with self._lock:
+            fut = self._futures.get(safe_id)
+        if fut is not None and not fut.done():
+            raise RuntimeError(f"Job '{safe_id}' is currently running; wait before continuing.")
 
-        prompts = list(receipt.get("prompts") or [])
-        prompts.append(follow_up_prompt.strip())
+        receipt = self.store.read_receipt(safe_id)
+        if receipt.get("applied"):
+            raise ValueError(
+                f"Job '{safe_id}' has already been applied to the workspace. "
+                f"Start a new job with delegate_start to preserve applied provenance."
+            )
+
+        wt_dir = Path(str(receipt.get("worktree_dir") or ""))
+        baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
+        baseline_hashes = dict(receipt.get("baseline_file_hashes") or {})
+        if not wt_dir.exists():
+            wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(safe_id)
+
+        recorded_prompts = list(receipt.get("prompts") or [])
+        recorded_prompts.append(follow_up_prompt.strip())
+        # Only execute the new follow-up prompt on the existing worktree!
+        worker_prompts = [follow_up_prompt.strip()]
+
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
-        project = resolve_vertex_project(str(receipt.get("vertex_project") or ""))
+        with self._lock:
+            raw_proj = self._raw_projects.get(safe_id)
+        project = resolve_vertex_project(raw_proj or str(receipt.get("vertex_project") or ""))
         location, reroute_note = resolve_vertex_location(
             model, str(receipt.get("vertex_location") or "")
         )
-        allowed_paths = list(receipt.get("allowed_paths") or [])
+        allowed_paths = validate_allowed_paths(receipt.get("allowed_paths") or [])
+        enabled_tools = receipt.get("enabled_tools")
+        disabled_tools = receipt.get("disabled_tools")
+        enable_subagents = bool(receipt.get("enable_subagents", False))
+        scrub_receipt = bool(receipt.get("scrub_receipt", False))
         started_at = float(receipt.get("started_at_epoch") or time.time())
 
         if wait:
             updated = self._execute_job(
-                job_id=job_id,
-                prompts=prompts,
+                job_id=safe_id,
+                worker_prompts=worker_prompts,
+                recorded_prompts=recorded_prompts,
                 model=model,
                 project=project,
                 location=location,
                 reroute_note=reroute_note,
                 allowed_paths=allowed_paths,
                 timeout_seconds=timeout_seconds,
-                enabled_tools=None,
-                disabled_tools=None,
-                enable_subagents=False,
+                enabled_tools=enabled_tools,
+                disabled_tools=disabled_tools,
+                enable_subagents=enable_subagents,
                 wt_dir=wt_dir,
+                baseline_sha=baseline_sha,
+                baseline_file_hashes=baseline_hashes,
                 started_at=started_at,
                 prior_usage=receipt.get("usage"),
                 prior_tool_calls=receipt.get("tool_calls"),
+                scrub_receipt=scrub_receipt,
             )
             return self._compact_digest(updated)
 
         fut = self._executor.submit(
             self._execute_job,
-            job_id=job_id,
-            prompts=prompts,
+            job_id=safe_id,
+            worker_prompts=worker_prompts,
+            recorded_prompts=recorded_prompts,
             model=model,
             project=project,
             location=location,
             reroute_note=reroute_note,
             allowed_paths=allowed_paths,
             timeout_seconds=timeout_seconds,
-            enabled_tools=None,
-            disabled_tools=None,
-            enable_subagents=False,
+            enabled_tools=enabled_tools,
+            disabled_tools=disabled_tools,
+            enable_subagents=enable_subagents,
             wt_dir=wt_dir,
+            baseline_sha=baseline_sha,
+            baseline_file_hashes=baseline_hashes,
             started_at=started_at,
             prior_usage=receipt.get("usage"),
             prior_tool_calls=receipt.get("tool_calls"),
+            scrub_receipt=scrub_receipt,
         )
         with self._lock:
-            self._futures[job_id] = fut
-        return {"job_id": job_id, "status": "running", "prompts_count": len(prompts)}
+            self._futures[safe_id] = fut
+        return {"job_id": safe_id, "status": "running", "prompts_count": len(recorded_prompts)}
 
     def delegate_cancel(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
-        """Cancel a job and clean up its worktree while preserving its receipt."""
+        """Cancel a job and clean up its worktree while preserving its cancelled receipt status."""
+        safe_id = validate_job_id(job_id)
         with self._lock:
-            self._cancelled.add(job_id)
-            fut = self._futures.get(job_id)
+            self._cancelled.add(safe_id)
+            fut = self._futures.get(safe_id)
             if fut is not None:
                 fut.cancel()
+            still_running = fut is not None and not fut.done()
 
-        receipt = self.store.read_receipt(job_id)
+        receipt = self.store.read_receipt(safe_id)
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
-        if cleanup_worktree and wt_dir.exists():
+        # Only remove wt_dir immediately if the worker thread is not currently running inside it;
+        # if it is still running, _execute_job's finally block removes wt_dir upon exit.
+        if cleanup_worktree and wt_dir.exists() and not still_running:
             self._cleanup_worktree(wt_dir)
 
         if receipt.get("status") == "running":
@@ -677,25 +1073,30 @@ class JobManager:
             receipt["error"] = "Cancelled by user via delegate_cancel."
             receipt["finished_at_epoch"] = round(time.time(), 3)
             self.store.write_receipt(
-                job_id,
+                safe_id,
                 receipt,
+                scrub=bool(receipt.get("scrub_receipt", False)),
                 workspace_root=str(self.workspace_root),
             )
 
         return {
-            "job_id": job_id,
+            "job_id": safe_id,
             "status": receipt.get("status"),
             "cancelled": True,
         }
 
     @staticmethod
-    def _compact_digest(receipt: dict[str, Any]) -> dict[str, Any]:
+    def _compact_digest(
+        receipt: dict[str, Any],
+        *,
+        include_summary: bool = True,
+    ) -> dict[str, Any]:
         """Return a token-bounded digest suitable for Claude Code's context window."""
-        summary_text = str(receipt.get("summary") or "")
+        summary_text = str(receipt.get("summary") or "") if include_summary else ""
         clipped_summary, truncated, est_tokens = truncate_to_token_budget(
             summary_text, MAX_TOOL_RESPONSE_TOKENS
         )
-        return {
+        digest: dict[str, Any] = {
             "job_id": receipt.get("job_id"),
             "kind": receipt.get("kind", "delegate"),
             "status": receipt.get("status"),
@@ -709,9 +1110,11 @@ class JobManager:
             "tool_call_count": receipt.get("tool_call_count", 0),
             "usage": receipt.get("usage", {}),
             "cost": receipt.get("cost", {}),
-            "summary": clipped_summary,
-            "summary_truncated": bool(receipt.get("summary_truncated") or truncated),
-            "summary_tokens_estimated": est_tokens,
             "applied": bool(receipt.get("applied", False)),
             "error": receipt.get("error"),
         }
+        if include_summary:
+            digest["summary"] = clipped_summary
+            digest["summary_truncated"] = bool(receipt.get("summary_truncated") or truncated)
+            digest["summary_tokens_estimated"] = est_tokens
+        return digest

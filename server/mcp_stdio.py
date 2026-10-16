@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import sys
+import threading
 from typing import Any, BinaryIO
 
 from server.genai_ask import ask_gemini
-from server.jobs import JobManager
+from server.jobs import JobManager, validate_allowed_paths
 from server.receipts import ReceiptStore
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_MCP_VERSIONS = frozenset({"2024-11-05", "2025-03-26"})
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -48,6 +51,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional Vertex AI region override (auto-routed to global when required).",
                 },
+                "scrub_receipt": {
+                    "type": "boolean",
+                    "description": "If true, redact paying project ID and host workspace paths in the saved receipt.",
+                },
             },
             "required": ["prompt"],
         },
@@ -55,7 +62,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "delegate_start",
         "description": (
-            "Start an isolated Antigravity SDK worker in a dedicated git worktree. "
+            "Start an isolated Antigravity SDK worker in a dedicated standalone repo copy. "
             "Returns a job_id immediately (or waits if wait=true). Failed runs never "
             "pollute the main working tree."
         ),
@@ -75,6 +82,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "Optional list of workspace-relative file paths or directory prefixes this worker may modify.",
                 },
+                "enabled_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional allowlist of Antigravity worker tools.",
+                },
+                "disabled_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional denylist of Antigravity worker tools.",
+                },
+                "enable_subagents": {
+                    "type": "boolean",
+                    "description": "Enable nested subagents inside the Antigravity worker (default: false).",
+                },
+                "scrub_receipt": {
+                    "type": "boolean",
+                    "description": "Redact paying project ID and host paths in the receipt (default: false).",
+                },
                 "timeout_seconds": {
                     "type": "number",
                     "description": "Per-turn timeout in seconds (default: 300).",
@@ -91,7 +116,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "delegate_status",
         "description": (
             "Check status, token usage, and estimated cost for a specific job_id, "
-            "or omit job_id to list all jobs and cumulative session costs."
+            "or omit job_id to list recent jobs and cumulative session costs."
         ),
         "inputSchema": {
             "type": "object",
@@ -99,7 +124,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "job_id": {
                     "type": "string",
                     "description": "Optional job_id to inspect.",
-                }
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of recent jobs to return in list mode (default: 20, max: 50).",
+                },
             },
         },
     },
@@ -119,7 +148,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Max seconds to wait (default: 600).",
+                    "description": "Max seconds to wait (default: 540, capped below the 600s MCP timeout).",
                 },
             },
             "required": ["job_id"],
@@ -140,7 +169,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "file_filter": {
                     "type": "string",
-                    "description": "Optional substring or relative path filter.",
+                    "description": "Optional exact relative path, directory prefix, basename, or glob filter.",
                 },
                 "page": {
                     "type": "integer",
@@ -157,7 +186,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "delegate_apply",
         "description": (
-            "Apply a verified worker job's changes from its isolated git worktree to the main "
+            "Apply a verified worker job's changes from its isolated worktree to the main "
             "workspace tree, record provenance hashes on the receipt, and clean up the worktree."
         ),
         "inputSchema": {
@@ -222,7 +251,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "delegate_to_gemini",
         "description": (
-            "Synchronous convenience tool: runs an Antigravity worker in an isolated git "
+            "Synchronous convenience tool: runs an Antigravity worker in an isolated "
             "worktree, waits for completion, and optionally applies the verified diff if status='ok'."
         ),
         "inputSchema": {
@@ -241,6 +270,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "Optional list of allowed relative paths.",
                 },
+                "enabled_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional allowlist of Antigravity worker tools.",
+                },
+                "disabled_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional denylist of Antigravity worker tools.",
+                },
+                "enable_subagents": {
+                    "type": "boolean",
+                    "description": "Enable nested subagents inside the Antigravity worker (default: false).",
+                },
+                "scrub_receipt": {
+                    "type": "boolean",
+                    "description": "Redact paying project ID and host paths in the receipt (default: false).",
+                },
                 "auto_apply": {
                     "type": "boolean",
                     "description": "Automatically apply the worktree diff to the main workspace if status='ok' (default: true).",
@@ -254,6 +301,29 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
 ]
+
+KNOWN_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in TOOL_DEFINITIONS)
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    """Safely parse boolean tool arguments, treating string 'false'/'0'/'no' as False."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in ("false", "0", "no", "off", ""):
+            return False
+        if norm in ("true", "1", "yes", "on"):
+            return True
+    raise ValueError(f"Expected boolean value, got {value!r}")
+
+
+class InvalidParamsError(ValueError):
+    """Raised when MCP tool call parameters fail schema/type validation (-32602)."""
 
 
 class MCPServer:
@@ -269,24 +339,80 @@ class MCPServer:
         self.job_manager = job_manager or JobManager(store=self.store)
         self.ask_backend = ask_backend
 
-    def handle_Message(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        """Process a single JSON-RPC 2.0 message and return a response dict (or None for notifications)."""
+    def handle_Message(self, message: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
+        """Process a JSON-RPC 2.0 message (or batch) and return a response dict (or None for notifications)."""
+        if isinstance(message, list):
+            if not message:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+                }
+            responses = []
+            for item in message:
+                resp = self._handle_single_message(item)
+                if resp is not None:
+                    responses.append(resp)
+            return responses if responses else None
+
+        return self._handle_single_message(message)
+
+    def _handle_single_message(self, message: Any) -> dict[str, Any] | None:
+        if not isinstance(message, dict):
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32600,
+                    "message": f"Invalid Request: expected JSON object, got {type(message).__name__}",
+                },
+            }
+
         method = message.get("method")
         msg_id = message.get("id")
-        params = message.get("params") or {}
+        has_id = "id" in message and msg_id is not None
+
+        if not isinstance(method, str) or not method.strip():
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id if has_id else None,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: missing or non-string 'method'",
+                },
+            }
+
+        params = message.get("params")
+        if params is not None and not isinstance(params, dict):
+            if not has_id:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'params' must be an object",
+                },
+            }
+        params = params or {}
 
         # Notifications have no id and expect no response
-        if msg_id is None:
+        if not has_id:
             return None
 
         try:
             if method == "initialize":
-                client_version = params.get("protocolVersion") or MCP_PROTOCOL_VERSION
+                requested_version = str(params.get("protocolVersion") or "")
+                negotiated = (
+                    requested_version
+                    if requested_version in SUPPORTED_MCP_VERSIONS
+                    else MCP_PROTOCOL_VERSION
+                )
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {
-                        "protocolVersion": client_version,
+                        "protocolVersion": negotiated,
                         "capabilities": {
                             "tools": {"listChanged": False},
                         },
@@ -309,7 +435,26 @@ class MCPServer:
 
             if method == "tools/call":
                 tool_name = str(params.get("name") or "")
-                arguments = dict(params.get("arguments") or {})
+                if tool_name not in KNOWN_TOOL_NAMES:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {
+                            "code": -32602,
+                            "message": f"Invalid params: unknown tool {tool_name!r}",
+                        },
+                    }
+                raw_args = params.get("arguments")
+                if raw_args is not None and not isinstance(raw_args, dict):
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: 'arguments' must be an object",
+                        },
+                    }
+                arguments = dict(raw_args or {})
                 payload = self._dispatch_tool(tool_name, arguments)
                 return {
                     "jsonrpc": "2.0",
@@ -331,6 +476,15 @@ class MCPServer:
                 "error": {
                     "code": -32601,
                     "message": f"Method not found: {method}",
+                },
+            }
+        except InvalidParamsError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Invalid params: {exc}",
                 },
             }
         except Exception as exc:
@@ -356,35 +510,52 @@ class MCPServer:
 
     def _dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "ask_gemini":
+            ctx_files = args.get("context_files")
+            if ctx_files is not None and (
+                not isinstance(ctx_files, list) or not all(isinstance(x, str) for x in ctx_files)
+            ):
+                raise InvalidParamsError("context_files must be a list of strings")
             return ask_gemini(
                 prompt=str(args.get("prompt") or ""),
                 model=args.get("model"),
-                context_files=args.get("context_files"),
+                context_files=ctx_files,
                 system_instruction=args.get("system_instruction"),
                 temperature=args.get("temperature"),
                 location=args.get("location"),
                 workspace_root=self.job_manager.workspace_root,
                 store=self.store,
+                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
                 backend=self.ask_backend,
             )
 
         if name == "delegate_start":
+            try:
+                allowed = validate_allowed_paths(args.get("allowed_paths"))
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.delegate_start(
                 prompt=str(args.get("prompt") or ""),
                 model=args.get("model"),
-                allowed_paths=args.get("allowed_paths"),
+                allowed_paths=allowed,
+                enabled_tools=args.get("enabled_tools"),
+                disabled_tools=args.get("disabled_tools"),
+                enable_subagents=parse_bool(args.get("enable_subagents"), False),
+                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
                 timeout_seconds=float(args.get("timeout_seconds") or 300.0),
-                wait=bool(args.get("wait", False)),
+                wait=parse_bool(args.get("wait"), False),
             )
 
         if name == "delegate_status":
-            return self.job_manager.delegate_status(job_id=args.get("job_id"))
+            return self.job_manager.delegate_status(
+                job_id=args.get("job_id"),
+                limit=int(args.get("limit") or 20),
+            )
 
         if name == "delegate_result":
             return self.job_manager.delegate_result(
                 job_id=str(args.get("job_id") or ""),
-                wait=bool(args.get("wait", True)),
-                timeout=float(args.get("timeout") or 600.0),
+                wait=parse_bool(args.get("wait"), True),
+                timeout=float(args.get("timeout") or 540.0),
             )
 
         if name == "get_diff":
@@ -398,7 +569,7 @@ class MCPServer:
         if name == "delegate_apply":
             return self.job_manager.delegate_apply(
                 job_id=str(args.get("job_id") or ""),
-                cleanup_worktree=bool(args.get("cleanup_worktree", True)),
+                cleanup_worktree=parse_bool(args.get("cleanup_worktree"), True),
             )
 
         if name == "delegate_continue":
@@ -406,24 +577,32 @@ class MCPServer:
                 job_id=str(args.get("job_id") or ""),
                 follow_up_prompt=str(args.get("follow_up_prompt") or ""),
                 timeout_seconds=float(args.get("timeout_seconds") or 300.0),
-                wait=bool(args.get("wait", True)),
+                wait=parse_bool(args.get("wait"), True),
             )
 
         if name == "delegate_cancel":
             return self.job_manager.delegate_cancel(
                 job_id=str(args.get("job_id") or ""),
-                cleanup_worktree=bool(args.get("cleanup_worktree", True)),
+                cleanup_worktree=parse_bool(args.get("cleanup_worktree"), True),
             )
 
         if name == "delegate_to_gemini":
+            try:
+                allowed = validate_allowed_paths(args.get("allowed_paths"))
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             digest = self.job_manager.delegate_start(
                 prompt=str(args.get("prompt") or ""),
                 model=args.get("model"),
-                allowed_paths=args.get("allowed_paths"),
+                allowed_paths=allowed,
+                enabled_tools=args.get("enabled_tools"),
+                disabled_tools=args.get("disabled_tools"),
+                enable_subagents=parse_bool(args.get("enable_subagents"), False),
+                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
                 timeout_seconds=float(args.get("timeout_seconds") or 300.0),
                 wait=True,
             )
-            auto_apply = bool(args.get("auto_apply", True))
+            auto_apply = parse_bool(args.get("auto_apply"), True)
             if auto_apply and digest.get("status") == "ok":
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))
                 digest["applied"] = True
@@ -433,7 +612,7 @@ class MCPServer:
                 digest["is_error"] = True
             return digest
 
-        raise ValueError(f"Unknown tool: {name!r}")
+        raise InvalidParamsError(f"Unknown tool: {name!r}")
 
 
 def serve_stdio(
@@ -441,55 +620,130 @@ def serve_stdio(
     in_stream: BinaryIO | None = None,
     out_stream: BinaryIO | None = None,
 ) -> None:
-    """Run the stdio JSON-RPC loop supporting both newline-delimited JSON and Content-Length framing."""
+    """Run the stdio JSON-RPC loop supporting concurrent tool execution and both framing modes."""
     active_server = server or MCPServer()
     reader = in_stream or sys.stdin.buffer
     writer = out_stream or sys.stdout.buffer
+    write_lock = threading.Lock()
+    in_flight_futures: list[Future[None]] = []
 
-    while True:
-        first_line = reader.readline()
-        if not first_line:
-            break
-
-        stripped = first_line.strip()
-        if not stripped:
-            continue
-
-        use_content_length = False
-        if stripped.lower().startswith(b"content-length:"):
-            use_content_length = True
-            length = int(stripped.split(b":", 1)[1].strip())
-            # Consume remaining headers until blank line
-            while True:
-                hdr = reader.readline()
-                if not hdr or hdr.strip() == b"":
-                    break
-            body = reader.read(length)
-            if not body:
-                break
-            raw_msg = body.decode("utf-8")
-        else:
-            raw_msg = stripped.decode("utf-8")
-
-        try:
-            msg = json.loads(raw_msg)
-        except json.JSONDecodeError as exc:
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": f"Parse error: {exc}"},
-            }
-            _write_response(writer, err_resp, use_content_length)
-            continue
-
-        resp = active_server.handle_Message(msg)
+    def _process_and_write(msg_obj: Any, framed: bool) -> None:
+        resp = active_server.handle_Message(msg_obj)
         if resp is not None:
-            _write_response(writer, resp, use_content_length)
+            with write_lock:
+                _write_response(writer, resp, framed)
+
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="cc-agy-rpc") as rpc_pool:
+        while True:
+            first_line = reader.readline()
+            if not first_line:
+                break
+
+            stripped = first_line.strip()
+            if not stripped:
+                continue
+
+            use_content_length = False
+            if stripped.lower().startswith(b"content-length:"):
+                use_content_length = True
+                # Always consume remaining headers until blank line
+                while True:
+                    hdr = reader.readline()
+                    if not hdr or hdr.strip() == b"":
+                        break
+                try:
+                    length = int(stripped.split(b":", 1)[1].strip())
+                    if length < 0:
+                        raise ValueError("Negative Content-Length")
+                except ValueError as exc:
+                    err_resp = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Invalid Content-Length header: {exc}"},
+                    }
+                    with write_lock:
+                        _write_response(writer, err_resp, use_content_length)
+                    continue
+                body = reader.read(length) if length > 0 else b""
+                if length > 0 and not body:
+                    break
+                try:
+                    raw_msg = body.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    err_resp = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Invalid UTF-8 payload: {exc}"},
+                    }
+                    with write_lock:
+                        _write_response(writer, err_resp, use_content_length)
+                    continue
+            else:
+                try:
+                    raw_msg = stripped.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    err_resp = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Invalid UTF-8 payload: {exc}"},
+                    }
+                    with write_lock:
+                        _write_response(writer, err_resp, use_content_length)
+                    continue
+
+            parsed_messages: list[Any] = []
+            try:
+                parsed_messages.append(json.loads(raw_msg))
+            except json.JSONDecodeError as exc:
+                # Attempt multi-JSON stream recovery (e.g. concatenated JSON objects on one line)
+                decoder = json.JSONDecoder()
+                idx = 0
+                n_chars = len(raw_msg)
+                recovered: list[Any] = []
+                recovery_ok = True
+                while idx < n_chars:
+                    while idx < n_chars and raw_msg[idx].isspace():
+                        idx += 1
+                    if idx >= n_chars:
+                        break
+                    try:
+                        obj, next_idx = decoder.raw_decode(raw_msg, idx)
+                        recovered.append(obj)
+                        idx = next_idx
+                    except json.JSONDecodeError:
+                        recovery_ok = False
+                        break
+                if recovery_ok and recovered:
+                    parsed_messages.extend(recovered)
+                else:
+                    err_resp = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                    }
+                    with write_lock:
+                        _write_response(writer, err_resp, use_content_length)
+                    continue
+
+            # Dispatch tools/call concurrently so ping, delegate_status, and delegate_cancel
+            # never block behind an in-flight synchronous worker call.
+            for msg in parsed_messages:
+                if isinstance(msg, dict) and msg.get("method") == "tools/call":
+                    fut = rpc_pool.submit(_process_and_write, msg, use_content_length)
+                    in_flight_futures.append(fut)
+                else:
+                    _process_and_write(msg, use_content_length)
+
+        for fut in in_flight_futures:
+            try:
+                fut.result(timeout=60.0)
+            except Exception:
+                pass
 
 
 def _write_response(
     writer: BinaryIO,
-    response: dict[str, Any],
+    response: dict[str, Any] | list[dict[str, Any]],
     use_content_length: bool,
 ) -> None:
     encoded = json.dumps(response, separators=(",", ":")).encode("utf-8")

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable
 import uuid
 
-from server.receipts import ReceiptStore
+from server.receipts import ReceiptStore, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     resolve_vertex_location,
@@ -83,9 +85,14 @@ def ask_gemini(
     if not prompt or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
 
-    receipt_store = store or ReceiptStore()
-    ws_root = Path(workspace_root or Path.cwd()).resolve()
-    import os
+    if context_files is not None and (
+        not isinstance(context_files, list)
+        or not all(isinstance(p, str) for p in context_files)
+    ):
+        raise ValueError("context_files must be a list of relative file path strings")
+
+    ws_root = resolve_workspace_root(workspace_root)
+    receipt_store = store or ReceiptStore(workspace_root=ws_root)
 
     chosen_model = (
         model
@@ -101,8 +108,9 @@ def ask_gemini(
     assembled_parts: list[str] = []
     included_files: list[str] = []
     for rel_path in context_files or []:
-        candidate = (ws_root / rel_path).resolve()
-        if not str(candidate).startswith(str(ws_root)):
+        raw_target = ws_root / rel_path
+        candidate = raw_target.resolve()
+        if not candidate.is_relative_to(ws_root):
             raise ValueError(
                 f"context_file {rel_path!r} escapes workspace root {ws_root}"
             )
@@ -150,6 +158,14 @@ def ask_gemini(
                 + usage["thoughts_token_count"]
             )
         status = "ok"
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        status = "timeout"
+        error_msg = f"TimeoutError: {exc}"
+        partial = getattr(exc, "partial_usage", None)
+        if isinstance(partial, dict):
+            for k in usage:
+                usage[k] = int(partial.get(k) or 0)
+        raise
     except Exception as exc:
         status = "error"
         error_msg = f"{type(exc).__name__}: {exc}"
