@@ -16,7 +16,7 @@ import time
 from typing import Any, Callable
 import uuid
 
-from server.agy_runner import run_antigravity_worker
+from server.agy_runner import resolve_thinking_level, run_antigravity_worker
 from server.receipts import (
     ReceiptStore,
     extract_diff_provenance,
@@ -766,6 +766,7 @@ class JobManager:
         scrub_receipt: bool = False,
         in_place: bool = False,
         pre_untracked: dict[str, str | None] | None = None,
+        thinking_level: str | None = None,
     ) -> dict[str, Any]:
         usage: dict[str, int] = {
             "prompt_token_count": int((prior_usage or {}).get("prompt_token_count", 0)),
@@ -807,6 +808,7 @@ class JobManager:
                 disabled_tools=disabled_tools,
                 enable_subagents=enable_subagents,
                 backend=self.worker_backend,
+                thinking_level=thinking_level,
             )
 
             response_text = str(worker_out.get("text") or "")
@@ -941,6 +943,7 @@ class JobManager:
                 "provenance": provenance,
                 "applied": False,
                 "error": error_msg,
+                "thinking_level": thinking_level,
             }
             if in_place:
                 # The edits are already in the user's working tree, so the job counts as applied
@@ -1025,6 +1028,7 @@ class JobManager:
         wait: bool = False,
         scrub_receipt: bool = False,
         in_place: bool = False,
+        thinking_level: str | None = None,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
 
@@ -1037,6 +1041,7 @@ class JobManager:
             raise ValueError("prompt must be a non-empty string")
 
         validated_paths = validate_allowed_paths(allowed_paths)
+        resolved_thinking = resolve_thinking_level(thinking_level)
         if in_place and validated_paths:
             raise ValueError(
                 "allowed_paths cannot be enforced in in_place mode (edits land directly in your "
@@ -1101,6 +1106,7 @@ class JobManager:
             "files_changed": [],
             "applied": False,
             "in_place": in_place,
+            "thinking_level": resolved_thinking or "DEFAULT",
             "error": None,
         }
         self.store.write_receipt(
@@ -1131,6 +1137,7 @@ class JobManager:
             scrub_receipt=scrub_receipt,
             in_place=in_place,
             pre_untracked=pre_untracked,
+            thinking_level=resolved_thinking or "DEFAULT",
         )
         with self._lock:
             self._futures[job_id] = fut
@@ -1572,6 +1579,7 @@ class JobManager:
                 scrub_receipt=scrub_receipt,
                 in_place=in_place,
                 pre_untracked=pre_untracked,
+                thinking_level=receipt.get("thinking_level"),
             )
             return self._compact_digest(updated)
 
@@ -1598,6 +1606,7 @@ class JobManager:
             scrub_receipt=scrub_receipt,
             in_place=in_place,
             pre_untracked=pre_untracked,
+            thinking_level=receipt.get("thinking_level"),
         )
         with self._lock:
             self._futures[safe_id] = fut
@@ -1700,6 +1709,7 @@ class JobManager:
             "cost": receipt.get("cost", {}),
             "applied": bool(receipt.get("applied", False)),
             "in_place": bool(receipt.get("in_place", False)),
+            "thinking_level": receipt.get("thinking_level"),
             "error": receipt.get("error"),
         }
         if receipt.get("in_place"):

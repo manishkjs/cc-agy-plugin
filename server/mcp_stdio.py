@@ -97,6 +97,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
                 },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
+                    "description": "Worker reasoning depth (default HIGH, or CC_AGY_DELEGATE_THINKING_LEVEL). DEFAULT leaves it to the model.",
+                },
                 "in_place": {
                     "type": "boolean",
                     "description": (
@@ -292,6 +297,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "enable_subagents": {
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
+                },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
+                    "description": "Worker reasoning depth (default HIGH, or CC_AGY_DELEGATE_THINKING_LEVEL). DEFAULT leaves it to the model.",
                 },
                 "in_place": {
                     "type": "boolean",
@@ -606,6 +616,7 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
                 in_place=in_place_b,
+                thinking_level=args.get("thinking_level"),
             )
 
         if name == "delegate_status":
@@ -698,6 +709,7 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=True,
                 in_place=in_place_b,
+                thinking_level=args.get("thinking_level"),
             )
             if auto_apply and digest.get("status") == "ok":
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))

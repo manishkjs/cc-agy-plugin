@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -17,6 +18,21 @@ async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+THINKING_LEVELS = ("MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH")
+
+
+def resolve_thinking_level(value: str | None) -> str | None:
+    """Return the worker thinking level (default HIGH); "DEFAULT"/"NONE" leaves it to the model's own default."""
+    raw = (value or os.environ.get("CC_AGY_DELEGATE_THINKING_LEVEL") or "HIGH").strip().upper()
+    if raw.startswith("${"):
+        raw = "HIGH"
+    if raw in ("DEFAULT", "NONE", ""):
+        return None
+    if raw not in THINKING_LEVELS:
+        raise ValueError(f"thinking_level must be one of {THINKING_LEVELS} or DEFAULT, got {value!r}")
+    return raw
 
 
 async def resolve_turn_usage(resp: Any) -> dict[str, int]:
@@ -147,6 +163,11 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     endpoint = types.VertexEndpoint(
         project=request["project"],
         location=request["location"],
+        options=(
+            types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
+            if request.get("thinking_level")
+            else None
+        ),
     )
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     model_cfg = types.ModelTarget(
@@ -256,10 +277,12 @@ def run_antigravity_worker(
     disabled_tools: list[str] | None = None,
     enable_subagents: bool = False,
     backend: Callable[[dict[str, Any]], Any] | None = None,
+    thinking_level: str | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     resolved_project = resolve_vertex_project(project)
     resolved_location, reroute_note = resolve_vertex_location(model, location)
+    resolved_thinking = resolve_thinking_level(thinking_level)
 
     req = {
         "prompts": list(prompts),
@@ -272,6 +295,7 @@ def run_antigravity_worker(
         "enabled_tools": enabled_tools,
         "disabled_tools": disabled_tools,
         "enable_subagents": enable_subagents,
+        "thinking_level": resolved_thinking,
     }
 
     active_backend = backend or _default_antigravity_backend
@@ -289,5 +313,6 @@ def run_antigravity_worker(
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,
+        "thinking_level": resolved_thinking,
         "duration_seconds": elapsed,
     }
