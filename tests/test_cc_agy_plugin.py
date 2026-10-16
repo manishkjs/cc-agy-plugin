@@ -174,6 +174,10 @@ class TestRegionsAndCostAccounting(unittest.TestCase):
         self.assertTrue(cost["pricing_known"])
         self.assertAlmostEqual(cost["total_cost_usd"], 0.0388, places=6)
 
+        flash38_cost = estimate_cost_usd("gemini-3.8-flash", usage)
+        self.assertTrue(flash38_cost["pricing_known"])
+        self.assertAlmostEqual(flash38_cost["total_cost_usd"], 0.0530, places=6)
+
         unknown_cost = estimate_cost_usd("custom-experimental-model-v9", usage)
         self.assertFalse(unknown_cost["pricing_known"])
 
@@ -1104,8 +1108,8 @@ class TestCostControls(unittest.TestCase):
             res = jm.delegate_start("edit greet", project="p", wait=True)
             self.assertEqual(res["status"], "checkpoint")
             self.assertEqual(res["stop_reason"], "MAX_TOOL_CALLS_EXCEEDED")
-            self.assertEqual(res["budget"], {"max_tool_calls": 50, "max_total_tokens": 5_000_000})
-            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (50, 5_000_000))
+            self.assertEqual(res["budget"], {"max_tool_calls": 100, "max_total_tokens": 5_000_000})
+            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (100, 5_000_000))
             self.assertTrue(jm.delegate_apply(res["job_id"])["applied"])
 
             no_cap = jm.delegate_start("x", project="p", wait=True, max_tool_calls=0, max_total_tokens=0)
