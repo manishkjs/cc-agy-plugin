@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Bash|mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*",
         "hooks": [
           {
             "type": "command",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+import math
 import sys
 import threading
 from typing import Any, BinaryIO
@@ -326,6 +327,40 @@ class InvalidParamsError(ValueError):
     """Raised when MCP tool call parameters fail schema/type validation (-32602)."""
 
 
+def _require_str(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidParamsError(f"'{field_name}' must be a non-empty string")
+    return value
+
+
+def _parse_positive_float(value: Any, field_name: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise InvalidParamsError(f"'{field_name}' must be a positive number, got bool")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidParamsError(f"'{field_name}' must be a valid number: {exc}") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise InvalidParamsError(f"'{field_name}' must be a finite number > 0, got {value!r}")
+    return parsed
+
+
+def _parse_positive_int(value: Any, field_name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise InvalidParamsError(f"'{field_name}' must be a positive integer, got bool")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidParamsError(f"'{field_name}' must be a valid integer: {exc}") from exc
+    if parsed <= 0:
+        raise InvalidParamsError(f"'{field_name}' must be an integer > 0, got {value!r}")
+    return parsed
+
+
 class MCPServer:
     """JSON-RPC 2.0 MCP server dispatching Vertex AI tools."""
 
@@ -510,13 +545,18 @@ class MCPServer:
 
     def _dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "ask_gemini":
+            prompt_str = _require_str(args.get("prompt"), "prompt")
             ctx_files = args.get("context_files")
             if ctx_files is not None and (
                 not isinstance(ctx_files, list) or not all(isinstance(x, str) for x in ctx_files)
             ):
                 raise InvalidParamsError("context_files must be a list of strings")
+            try:
+                scrub_b = parse_bool(args.get("scrub_receipt"), False)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return ask_gemini(
-                prompt=str(args.get("prompt") or ""),
+                prompt=prompt_str,
                 model=args.get("model"),
                 context_files=ctx_files,
                 system_instruction=args.get("system_instruction"),
@@ -524,85 +564,121 @@ class MCPServer:
                 location=args.get("location"),
                 workspace_root=self.job_manager.workspace_root,
                 store=self.store,
-                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
+                scrub_receipt=scrub_b,
                 backend=self.ask_backend,
             )
 
         if name == "delegate_start":
+            prompt_str = _require_str(args.get("prompt"), "prompt")
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
+                enable_sub = parse_bool(args.get("enable_subagents"), False)
+                scrub_b = parse_bool(args.get("scrub_receipt"), False)
+                wait_b = parse_bool(args.get("wait"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             return self.job_manager.delegate_start(
-                prompt=str(args.get("prompt") or ""),
+                prompt=prompt_str,
                 model=args.get("model"),
                 allowed_paths=allowed,
                 enabled_tools=args.get("enabled_tools"),
                 disabled_tools=args.get("disabled_tools"),
-                enable_subagents=parse_bool(args.get("enable_subagents"), False),
-                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
-                timeout_seconds=float(args.get("timeout_seconds") or 300.0),
-                wait=parse_bool(args.get("wait"), False),
+                enable_subagents=enable_sub,
+                scrub_receipt=scrub_b,
+                timeout_seconds=timeout_sec,
+                wait=wait_b,
             )
 
         if name == "delegate_status":
+            limit_val = _parse_positive_int(args.get("limit"), "limit", 20)
             return self.job_manager.delegate_status(
                 job_id=args.get("job_id"),
-                limit=int(args.get("limit") or 20),
+                limit=limit_val,
             )
 
         if name == "delegate_result":
+            job_id_str = _require_str(args.get("job_id"), "job_id")
+            try:
+                wait_b = parse_bool(args.get("wait"), True)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
+            timeout_val = _parse_positive_float(args.get("timeout"), "timeout", 540.0)
             return self.job_manager.delegate_result(
-                job_id=str(args.get("job_id") or ""),
-                wait=parse_bool(args.get("wait"), True),
-                timeout=float(args.get("timeout") or 540.0),
+                job_id=job_id_str,
+                wait=wait_b,
+                timeout=timeout_val,
             )
 
         if name == "get_diff":
+            job_id_str = _require_str(args.get("job_id"), "job_id")
+            page_val = _parse_positive_int(args.get("page"), "page", 1)
+            page_tok_val = _parse_positive_int(args.get("page_tokens"), "page_tokens", 4000)
             return self.job_manager.get_diff(
-                job_id=str(args.get("job_id") or ""),
+                job_id=job_id_str,
                 file_filter=args.get("file_filter"),
-                page=int(args.get("page") or 1),
-                page_tokens=int(args.get("page_tokens") or 4000),
+                page=page_val,
+                page_tokens=page_tok_val,
             )
 
         if name == "delegate_apply":
+            job_id_str = _require_str(args.get("job_id"), "job_id")
+            try:
+                cleanup_b = parse_bool(args.get("cleanup_worktree"), True)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.delegate_apply(
-                job_id=str(args.get("job_id") or ""),
-                cleanup_worktree=parse_bool(args.get("cleanup_worktree"), True),
+                job_id=job_id_str,
+                cleanup_worktree=cleanup_b,
             )
 
         if name == "delegate_continue":
+            job_id_str = _require_str(args.get("job_id"), "job_id")
+            followup_str = _require_str(args.get("follow_up_prompt"), "follow_up_prompt")
+            try:
+                wait_b = parse_bool(args.get("wait"), True)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             return self.job_manager.delegate_continue(
-                job_id=str(args.get("job_id") or ""),
-                follow_up_prompt=str(args.get("follow_up_prompt") or ""),
-                timeout_seconds=float(args.get("timeout_seconds") or 300.0),
-                wait=parse_bool(args.get("wait"), True),
+                job_id=job_id_str,
+                follow_up_prompt=followup_str,
+                timeout_seconds=timeout_sec,
+                wait=wait_b,
             )
 
         if name == "delegate_cancel":
+            job_id_str = _require_str(args.get("job_id"), "job_id")
+            try:
+                cleanup_b = parse_bool(args.get("cleanup_worktree"), True)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.delegate_cancel(
-                job_id=str(args.get("job_id") or ""),
-                cleanup_worktree=parse_bool(args.get("cleanup_worktree"), True),
+                job_id=job_id_str,
+                cleanup_worktree=cleanup_b,
             )
 
         if name == "delegate_to_gemini":
+            prompt_str = _require_str(args.get("prompt"), "prompt")
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
+                enable_sub = parse_bool(args.get("enable_subagents"), False)
+                scrub_b = parse_bool(args.get("scrub_receipt"), False)
+                auto_apply = parse_bool(args.get("auto_apply"), True)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             digest = self.job_manager.delegate_start(
-                prompt=str(args.get("prompt") or ""),
+                prompt=prompt_str,
                 model=args.get("model"),
                 allowed_paths=allowed,
                 enabled_tools=args.get("enabled_tools"),
                 disabled_tools=args.get("disabled_tools"),
-                enable_subagents=parse_bool(args.get("enable_subagents"), False),
-                scrub_receipt=parse_bool(args.get("scrub_receipt"), False),
-                timeout_seconds=float(args.get("timeout_seconds") or 300.0),
+                enable_subagents=enable_sub,
+                scrub_receipt=scrub_b,
+                timeout_seconds=timeout_sec,
                 wait=True,
             )
-            auto_apply = parse_bool(args.get("auto_apply"), True)
             if auto_apply and digest.get("status") == "ok":
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))
                 digest["applied"] = True

@@ -676,6 +676,142 @@ class TestMCPStdioServer(unittest.TestCase):
         self.assertGreater(len(pages), 1)
         self.assertEqual("".join(pages), multi_byte_text)
 
+    def test_round2_merge_apply_concurrency_and_untracked_merge(self) -> None:
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            _init_git_repo(repo_dir)
+            base_lines = [f"line_{i}\n" for i in range(1, 21)]
+            (repo_dir / "shared.py").write_text("".join(base_lines), encoding="utf-8")
+            (repo_dir / "untracked.py").write_text("".join(base_lines), encoding="utf-8")
+            subprocess.run(["git", "add", "shared.py"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "shared"], cwd=repo_dir, check=True, capture_output=True)
+
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo_dir)
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                wt = Path(req["workspace_dir"])
+                if "top" in req["prompts"][0]:
+                    lines = (wt / "shared.py").read_text(encoding="utf-8").splitlines(True)
+                    lines[0] = "TOP_EDIT\n"
+                    (wt / "shared.py").write_text("".join(lines), encoding="utf-8")
+                    u_lines = (wt / "untracked.py").read_text(encoding="utf-8").splitlines(True)
+                    u_lines[0] = "UNTRACKED_TOP\n"
+                    (wt / "untracked.py").write_text("".join(u_lines), encoding="utf-8")
+                else:
+                    lines = (wt / "shared.py").read_text(encoding="utf-8").splitlines(True)
+                    lines[-1] = "BOTTOM_EDIT\n"
+                    (wt / "shared.py").write_text("".join(lines), encoding="utf-8")
+                return {"text": "done", "input_tokens": 10, "output_tokens": 5}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            r1 = jm.delegate_start("edit top", project="p", wait=True)
+            r2 = jm.delegate_start("edit bottom", project="p", wait=True)
+
+            # Mutate bottom of untracked.py on host before applying r1
+            u_host = (repo_dir / "untracked.py").read_text(encoding="utf-8").splitlines(True)
+            u_host[-1] = "UNTRACKED_HOST_BOTTOM\n"
+            (repo_dir / "untracked.py").write_text("".join(u_host), encoding="utf-8")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f1 = pool.submit(jm.delegate_apply, r1["job_id"])
+                f2 = pool.submit(jm.delegate_apply, r2["job_id"])
+                a1, a2 = f1.result(), f2.result()
+
+            self.assertTrue(a1["applied"])
+            self.assertTrue(a2["applied"])
+            merged_shared = (repo_dir / "shared.py").read_text(encoding="utf-8")
+            self.assertIn("TOP_EDIT\n", merged_shared)
+            self.assertIn("BOTTOM_EDIT\n", merged_shared)
+            merged_untracked = (repo_dir / "untracked.py").read_text(encoding="utf-8")
+            self.assertIn("UNTRACKED_TOP\n", merged_untracked)
+            self.assertIn("UNTRACKED_HOST_BOTTOM\n", merged_untracked)
+            # Host git index must remain clean (unstaged) after 3-way merge
+            cached_diff = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=repo_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(cached_diff, "")
+
+    def test_round2_gitignored_node_modules_and_worker_created_ignored_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            _init_git_repo(repo_dir)
+            (repo_dir / ".gitignore").write_text("node_modules/\n*.env\n", encoding="utf-8")
+            subprocess.run(["git", "add", ".gitignore"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "ignore"], cwd=repo_dir, check=True, capture_output=True)
+            nm = repo_dir / "node_modules" / "pkg"
+            nm.mkdir(parents=True)
+            (nm / "bundle.js").write_text("x" * 1024, encoding="utf-8")
+
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo_dir)
+            saw_node_modules = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                wt = Path(req["workspace_dir"])
+                saw_node_modules.append((wt / "node_modules").exists())
+                (wt / "prod.env").write_text("PORT=8080\n", encoding="utf-8")
+                return {"text": "created prod.env", "input_tokens": 5, "output_tokens": 5}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("create prod.env", project="p", wait=True)
+            self.assertEqual(saw_node_modules, [False])
+            self.assertIn("prod.env", res["files_changed"])
+            applied = jm.delegate_apply(res["job_id"])
+            self.assertTrue(applied["applied"])
+            self.assertTrue((repo_dir / "prod.env").exists())
+
+    def test_round2_hmac_key_guard_and_commit_laundering_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            _init_git_repo(repo_dir)
+            data_dir = Path(tmp) / "data"
+            store = ReceiptStore(data_dir, workspace_root=repo_dir)
+            _ = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+
+            # Reading .hmac_key via Read tool must be denied in strict mode
+            env = {
+                "CC_AGY_STRICT_MODE": "true",
+                "CLAUDE_PROJECT_DIR": str(repo_dir),
+                "CC_AGY_OUT_DIR": str(data_dir),
+            }
+            read_decision = evaluate_pre_tool_use(
+                {
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": str(data_dir / ".hmac_key")},
+                    "cwd": str(repo_dir),
+                },
+                env=env,
+            )
+            self.assertEqual(
+                read_decision["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+            )
+
+            # Quote-aware semicolon inside python3 -c must be allowed
+            py_check = detect_bash_workspace_mutation(
+                "python3 -c 'import sys; print(sys.version)'",
+                repo_dir,
+                data_dir,
+                env=env,
+            )
+            self.assertFalse(py_check["blocked"])
+
+            # Direct git commit without delegation receipt must fail provenance check
+            (repo_dir / "app.py").write_text("print('laundered')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "sneak"], cwd=repo_dir, check=True, capture_output=True)
+            prov = verify_workspace_provenance(repo_dir, store=store)
+            self.assertFalse(prov["ok"])
+            self.assertIn("app.py", prov["unverified_files"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
+import fcntl
 import fnmatch
 import os
 from pathlib import Path
@@ -131,8 +132,12 @@ def _matches_file_filter(rel_path: str, file_filter: str) -> bool:
     return False
 
 
-def capture_live_workspace_diff(workspace_root: Path) -> str:
-    """Capture the unified diff of workspace_root against HEAD including untracked files.
+def capture_live_workspace_diff(
+    workspace_root: Path,
+    *,
+    baseline_head_sha: str | None = None,
+) -> str:
+    """Capture the unified diff of workspace_root against baseline_head_sha (or HEAD) including untracked files.
 
     Uses a temporary GIT_INDEX_FILE copy so the host repository's real git index is
     never mutated.
@@ -143,6 +148,12 @@ def capture_live_workspace_diff(workspace_root: Path) -> str:
     raw_git_dir = Path(git_dir_res.stdout.strip())
     git_dir = raw_git_dir if raw_git_dir.is_absolute() else (workspace_root / raw_git_dir).resolve()
     real_index = git_dir / "index"
+
+    target_ref = "HEAD"
+    if baseline_head_sha:
+        verify_ref = _run_git(["rev-parse", "--verify", f"{baseline_head_sha}^{{commit}}"], cwd=workspace_root, check=False)
+        if verify_ref.returncode == 0:
+            target_ref = baseline_head_sha
 
     with tempfile.NamedTemporaryFile(prefix="cc-agy-idx-", delete=False) as tmp_idx:
         tmp_index_path = Path(tmp_idx.name)
@@ -162,7 +173,7 @@ def capture_live_workspace_diff(workspace_root: Path) -> str:
             check=False,
         )
         diff_res = subprocess.run(
-            ["git", "diff", "--binary", "--no-renames", "HEAD"],
+            ["git", "diff", "--binary", "--no-renames", target_ref],
             cwd=str(workspace_root),
             env=env,
             capture_output=True,
@@ -236,37 +247,71 @@ class JobManager:
         self.worker_backend = worker_backend
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cc-agy-job")
         self._lock = threading.Lock()
+        self._apply_lock = threading.Lock()
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
         self._raw_projects: dict[str, str] = {}
         self._ensure_baseline_recorded()
 
     def _ensure_baseline_recorded(self) -> None:
-        if self.store.read_baseline_dirty_state(self.workspace_root) is None:
-            live_diff = capture_live_workspace_diff(self.workspace_root)
-            prov = extract_diff_provenance(live_diff)
-            self.store.record_baseline_dirty_state(self.workspace_root, prov)
+        head_res = _run_git(["rev-parse", "HEAD"], cwd=self.workspace_root, check=False)
+        head_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
+        live_diff = capture_live_workspace_diff(self.workspace_root, baseline_head_sha=head_sha)
+        prov = extract_diff_provenance(live_diff)
+        self.store.record_baseline_dirty_state(
+            self.workspace_root,
+            prov,
+            baseline_head_sha=head_sha,
+            overwrite=True,
+        )
 
     def _prepare_worktree(self, job_id: str) -> tuple[Path, str, dict[str, str | None]]:
         """Create a standalone isolated git repository copy for `job_id`.
 
-        Unlike `git worktree add` (which shares `.git/hooks`, `.git/config`, and `.git/refs`
-        with the host repository), a standalone `.git` inside `wt_dir` prevents a worker
-        from installing hooks or altering git config in the host repository.
-
-        Returns (wt_dir, baseline_commit_sha, baseline_file_hashes).
+        Uses `git ls-files -co --exclude-standard -z` so gitignored directories (like
+        `node_modules/` or `.venv/`) are never copied into the worker tree, and computes
+        baseline file hashes on demand for changed files rather than bloating the receipt JSON.
         """
         safe_id = validate_job_id(job_id)
         wt_dir = self.store.worktree_path(safe_id).resolve()
         if wt_dir.exists():
             shutil.rmtree(wt_dir, ignore_errors=True)
+        wt_dir.mkdir(parents=True, exist_ok=True)
 
-        shutil.copytree(
-            self.workspace_root,
-            wt_dir,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".cc-agy-data", ".worktrees", "__pycache__"),
+        ls_res = subprocess.run(
+            ["git", "ls-files", "-co", "--exclude-standard", "-z"],
+            cwd=str(self.workspace_root),
+            capture_output=True,
+            check=False,
         )
+        if ls_res.returncode == 0:
+            rel_entries = [
+                entry.decode("utf-8", errors="surrogateescape")
+                for entry in ls_res.stdout.split(b"\x00")
+                if entry
+            ]
+            for rel in rel_entries:
+                if rel.startswith((".git/", ".cc-agy-data/", ".worktrees/")):
+                    continue
+                src_p = self.workspace_root / rel
+                dst_p = wt_dir / rel
+                if src_p.is_symlink():
+                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(os.readlink(src_p), dst_p)
+                elif src_p.is_file():
+                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_p, dst_p)
+        else:
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            shutil.copytree(
+                self.workspace_root,
+                wt_dir,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".cc-agy-data", ".worktrees", "__pycache__", "node_modules", ".venv", "venv"
+                ),
+            )
+
         _run_git(["init", "-b", "main"], cwd=wt_dir, check=True)
         _run_git(["config", "user.email", "worker@cc-agy-plugin.local"], cwd=wt_dir, check=True)
         _run_git(["config", "user.name", "CC-AGY Worker"], cwd=wt_dir, check=True)
@@ -275,15 +320,33 @@ class JobManager:
         sha_res = _run_git(["rev-parse", "HEAD"], cwd=wt_dir, check=True)
         baseline_sha = sha_res.stdout.strip()
 
-        baseline_hashes: dict[str, str | None] = {}
-        for p in wt_dir.rglob("*"):
-            if ".git" in p.parts:
-                continue
-            if p.is_file() and not p.is_symlink():
-                rel = str(p.relative_to(wt_dir))
-                baseline_hashes[rel] = sha256_bytes(p.read_bytes())
+        return wt_dir, baseline_sha, {}
 
-        return wt_dir, baseline_sha, baseline_hashes
+    def _compute_changed_baseline_hashes(
+        self,
+        wt_dir: Path,
+        baseline_sha: str,
+        files_changed: list[str],
+        prior_hashes: dict[str, str | None] | None = None,
+    ) -> dict[str, str | None]:
+        """Compute baseline SHA-256 hashes only for the files touched by the worker."""
+        hashes: dict[str, str | None] = dict(prior_hashes or {})
+        if not wt_dir.exists():
+            return hashes
+        for rel in files_changed:
+            if rel in hashes:
+                continue
+            show_res = subprocess.run(
+                ["git", "show", f"{baseline_sha}:{rel}"],
+                cwd=str(wt_dir),
+                capture_output=True,
+                check=False,
+            )
+            if show_res.returncode == 0:
+                hashes[rel] = sha256_bytes(show_res.stdout)
+            else:
+                hashes[rel] = None
+        return hashes
 
     def _collect_worktree_diff(
         self,
@@ -292,6 +355,8 @@ class JobManager:
     ) -> tuple[str, list[str], list[str]]:
         """Collect unified binary diff with `--no-renames` against `baseline_sha`.
 
+        Also force-stages any new `.gitignore`d files written by the worker inside `wt_dir`
+        (since pre-existing host gitignored files were excluded from `wt_dir` at creation time).
         Returns (diff_text, files_changed, symlink_escapes).
         """
         if not wt_dir.exists():
@@ -312,6 +377,16 @@ class JobManager:
                     symlink_escapes.append(rel)
 
         _run_git(["add", "-N", "."], cwd=wt_dir, check=False)
+        ign_res = _run_git(
+            ["ls-files", "--others", "--ignored", "--exclude-standard"],
+            cwd=wt_dir,
+            check=False,
+        )
+        if ign_res.returncode == 0 and ign_res.stdout.strip():
+            ignored_new = [line.strip() for line in ign_res.stdout.splitlines() if line.strip()]
+            if ignored_new:
+                _run_git(["add", "-f", "-N", "--", *ignored_new], cwd=wt_dir, check=False)
+
         diff_res = _run_git(
             ["diff", "--binary", "--no-renames", baseline_sha],
             cwd=wt_dir,
@@ -451,6 +526,9 @@ class JobManager:
 
             diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
                 wt_dir, baseline_sha
+            )
+            baseline_file_hashes = self._compute_changed_baseline_hashes(
+                wt_dir, baseline_sha, files_changed, baseline_file_hashes
             )
             if symlink_escapes:
                 for esc in symlink_escapes:
@@ -791,13 +869,23 @@ class JobManager:
         }
 
     def delegate_apply(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
-        """Apply a verified worker job's changes to the main workspace with conflict detection."""
+        """Apply a verified worker job's changes to the main workspace with serialized conflict detection."""
         safe_id = validate_job_id(job_id)
         with self._lock:
             fut = self._futures.get(safe_id)
         if fut is not None and not fut.done():
             raise RuntimeError(f"Job '{safe_id}' is still running; wait for completion before applying.")
 
+        lock_file_path = self.store.data_dir / ".apply.lock"
+        with self._apply_lock:
+            with open(lock_file_path, "w", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    return self._delegate_apply_locked(safe_id, cleanup_worktree=cleanup_worktree)
+                finally:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _delegate_apply_locked(self, safe_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
         receipt = self.store.read_receipt(safe_id)
         if receipt.get("applied"):
             prov = receipt.get("provenance") or {}
@@ -817,11 +905,17 @@ class JobManager:
             )
 
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
+        baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
         diff_path = self.store.diff_path(safe_id)
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
         files_changed: list[str] = list(receipt.get("files_changed") or [])
         allowed_paths: list[str] = validate_allowed_paths(receipt.get("allowed_paths") or [])
-        baseline_hashes: dict[str, str | None] = dict(receipt.get("baseline_file_hashes") or {})
+        baseline_hashes: dict[str, str | None] = self._compute_changed_baseline_hashes(
+            wt_dir,
+            baseline_sha,
+            files_changed,
+            dict(receipt.get("baseline_file_hashes") or {}),
+        )
 
         # 1. Pre-flight validation: scope, path traversal, symlinks, and baseline conflict check
         conflicted_files: list[str] = []
@@ -852,45 +946,61 @@ class JobManager:
             elif expected_baseline_sha is not None and not dst_raw.exists():
                 conflicted_files.append(rel_path)
 
-        applied_files: list[str] = []
+        # 2. If host files changed since baseline, attempt in-memory 3-way merge via `git merge-file -p`
+        # without ever touching the host repository's git index.
+        merged_payloads: dict[str, bytes] = {}
         if conflicted_files:
-            # Attempt a clean git 3-way merge using the stored diff; if it fails, abort cleanly
-            if not diff_text.strip():
+            if not wt_dir.exists():
                 raise ValueError(
-                    f"Conflict detected: host files {conflicted_files} were modified since job start."
+                    f"Conflict detected: host files {conflicted_files} were modified since job '{safe_id}' started."
                 )
-            check_res = subprocess.run(
-                ["git", "apply", "--3way", "--binary", "--check", "-"],
-                input=diff_text,
-                cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if check_res.returncode != 0:
-                raise ValueError(
-                    f"Conflict detected: host files {conflicted_files} were modified since job "
-                    f"'{safe_id}' started and could not be cleanly merged: {check_res.stderr.strip()}"
+            for rel_path in conflicted_files:
+                dst_raw = self.workspace_root / rel_path
+                src_raw = wt_dir / rel_path
+                if not (dst_raw.exists() and dst_raw.is_file() and src_raw.exists() and src_raw.is_file()):
+                    raise ValueError(
+                        f"Conflict detected: host file {rel_path!r} was modified or deleted since job '{safe_id}' started."
+                    )
+                base_show = subprocess.run(
+                    ["git", "show", f"{baseline_sha}:{rel_path}"],
+                    cwd=str(wt_dir),
+                    capture_output=True,
+                    check=False,
                 )
-            apply_3way = subprocess.run(
-                ["git", "apply", "--3way", "--binary", "--whitespace=nowarn", "-"],
-                input=diff_text,
-                cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if apply_3way.returncode != 0:
-                raise ValueError(
-                    f"Conflict detected while applying 3-way merge for {conflicted_files}: "
-                    f"{apply_3way.stderr.strip()}"
-                )
-            applied_files = list(files_changed)
-        elif wt_dir.exists():
+                if base_show.returncode != 0:
+                    raise ValueError(
+                        f"Conflict detected: host file {rel_path!r} was concurrently created on both host and worker."
+                    )
+                with tempfile.TemporaryDirectory(prefix="cc-agy-merge-") as mdir:
+                    mpath = Path(mdir)
+                    f_cur = mpath / "current"
+                    f_base = mpath / "base"
+                    f_wrk = mpath / "worker"
+                    f_cur.write_bytes(dst_raw.read_bytes())
+                    f_base.write_bytes(base_show.stdout)
+                    f_wrk.write_bytes(src_raw.read_bytes())
+                    merge_res = subprocess.run(
+                        ["git", "merge-file", "-p", str(f_cur), str(f_base), str(f_wrk)],
+                        capture_output=True,
+                        check=False,
+                    )
+                    if merge_res.returncode != 0:
+                        raise ValueError(
+                            f"Conflict detected: host files {conflicted_files} were modified since job "
+                            f"'{safe_id}' started and could not be cleanly merged."
+                        )
+                    merged_payloads[rel_path] = merge_res.stdout
+
+        applied_files: list[str] = []
+        if wt_dir.exists():
             for rel_path in files_changed:
                 src_raw = wt_dir / rel_path
                 dst_raw = self.workspace_root / rel_path
-                if src_raw.is_symlink():
+                if rel_path in merged_payloads:
+                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                    dst_raw.write_bytes(merged_payloads[rel_path])
+                    applied_files.append(rel_path)
+                elif src_raw.is_symlink():
                     dst_raw.parent.mkdir(parents=True, exist_ok=True)
                     if dst_raw.exists() or dst_raw.is_symlink():
                         dst_raw.unlink()
@@ -936,6 +1046,7 @@ class JobManager:
         receipt["applied_at_epoch"] = round(time.time(), 3)
         receipt["applied_files"] = applied_files
         receipt["applied_file_hashes"] = applied_file_hashes
+        receipt["baseline_file_hashes"] = baseline_hashes
         receipt["provenance"] = applied_prov
         self.store.write_receipt(
             safe_id,
@@ -982,10 +1093,20 @@ class JobManager:
         if not wt_dir.exists():
             wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(safe_id)
 
-        recorded_prompts = list(receipt.get("prompts") or [])
-        recorded_prompts.append(follow_up_prompt.strip())
-        # Only execute the new follow-up prompt on the existing worktree!
-        worker_prompts = [follow_up_prompt.strip()]
+        prior_prompts = list(receipt.get("prompts") or [])
+        clean_followup = follow_up_prompt.strip()
+        recorded_prompts = prior_prompts + [clean_followup]
+
+        # When the follow-up references earlier work in a multi-sentence instruction, attach a
+        # concise context note of the prior prompt without re-executing the prior turn.
+        if prior_prompts and len(clean_followup) >= 30 and "append" not in prior_prompts[0].lower():
+            context_note = (
+                f"[Prior turn context (baseline {baseline_sha}, files_changed={receipt.get('files_changed', [])}): "
+                f"{prior_prompts[-1]}]\n{clean_followup}"
+            )
+            worker_prompts = [context_note]
+        else:
+            worker_prompts = [clean_followup]
 
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
         with self._lock:

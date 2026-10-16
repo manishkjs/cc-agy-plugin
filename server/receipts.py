@@ -298,22 +298,26 @@ class ReceiptStore:
         self,
         workspace_root: str | Path,
         provenance: dict[str, Any],
+        *,
+        baseline_head_sha: str | None = None,
+        overwrite: bool = False,
     ) -> None:
-        """Record pre-existing uncommitted baseline provenance once per workspace session."""
+        """Record pre-existing uncommitted baseline provenance and HEAD SHA for a workspace session."""
         bpath = self.baseline_path(workspace_root)
-        if bpath.exists():
+        if bpath.exists() and not overwrite:
             return
         payload = {
             "workspace_root": str(Path(workspace_root).resolve()),
             "recorded_at_epoch": round(time.time(), 3),
+            "baseline_head_sha": baseline_head_sha,
             "provenance": provenance,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         payload["baseline_hmac"] = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
         bpath.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    def read_baseline_dirty_state(self, workspace_root: str | Path) -> dict[str, Any] | None:
-        """Read and verify the pre-existing uncommitted baseline provenance for workspace_root."""
+    def read_baseline_record(self, workspace_root: str | Path) -> dict[str, Any] | None:
+        """Read and verify the signed baseline record (provenance + baseline_head_sha)."""
         bpath = self.baseline_path(workspace_root)
         if not bpath.exists():
             return None
@@ -325,15 +329,21 @@ class ReceiptStore:
             check_copy = {
                 "workspace_root": data.get("workspace_root"),
                 "recorded_at_epoch": data.get("recorded_at_epoch"),
+                "baseline_head_sha": data.get("baseline_head_sha"),
                 "provenance": data.get("provenance"),
             }
             serialized = json.dumps(check_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
             expected = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(sig, expected):
                 return None
-            return data.get("provenance")
+            return data
         except (OSError, json.JSONDecodeError):
             return None
+
+    def read_baseline_dirty_state(self, workspace_root: str | Path) -> dict[str, Any] | None:
+        """Read and verify the pre-existing uncommitted baseline provenance for workspace_root."""
+        rec = self.read_baseline_record(workspace_root)
+        return rec.get("provenance") if isinstance(rec, dict) else None
 
     def write_receipt(
         self,

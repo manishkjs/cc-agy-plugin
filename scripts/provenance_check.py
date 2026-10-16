@@ -82,8 +82,10 @@ def verify_workspace_provenance(
             for h in info.get("removed_line_sha256") or []:
                 rem_counter[h] += 1
 
-    # Include pre-existing uncommitted baseline state captured before the first worker job
-    baseline_prov = receipt_store.read_baseline_dirty_state(ws_path)
+    # Include pre-existing uncommitted baseline state captured at session start
+    baseline_rec = receipt_store.read_baseline_record(ws_path)
+    baseline_head_sha = (baseline_rec or {}).get("baseline_head_sha")
+    baseline_prov = (baseline_rec or {}).get("provenance")
     if isinstance(baseline_prov, dict):
         _accumulate_provenance(baseline_prov)
 
@@ -106,6 +108,14 @@ def verify_workspace_provenance(
                     )
 
         if r.get("applied"):
+            diff_file = receipt_store.diff_path(job_id)
+            has_valid_diff = diff_file.exists()
+            has_hashes = isinstance(r.get("applied_file_hashes"), dict) and bool(
+                r.get("baseline_commit_sha")
+            )
+            if not (has_valid_diff and has_hashes):
+                forged_receipts.append(job_id)
+                continue
             prov = r.get("provenance") or {}
             _accumulate_provenance(prov, list(r.get("applied_files") or []))
             for fpath, fhash in (r.get("applied_file_hashes") or {}).items():
@@ -114,7 +124,7 @@ def verify_workspace_provenance(
             if isinstance(hist_prov, dict):
                 _accumulate_provenance(hist_prov)
 
-    live_diff = capture_live_workspace_diff(ws_path)
+    live_diff = capture_live_workspace_diff(ws_path, baseline_head_sha=baseline_head_sha)
     live_prov = extract_diff_provenance(live_diff)
 
     unverified_files: list[str] = []
