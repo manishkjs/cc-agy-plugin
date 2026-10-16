@@ -1235,6 +1235,23 @@ class TestCostControls(unittest.TestCase):
         )
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_straitjacket_containment_prompt_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            prompts: list[str] = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                prompts.append(req["prompts"][0])
+                return {"text": "ok", "containment": "straitjacket"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("Test containment", project="p", wait=True)
+            self.assertIn("## Shell Commands & Evidence", prompts[0])
+            self.assertIn("ctx_get", prompts[0])
+            self.assertIn("ctx_search", prompts[0])
+            receipt = store.read_receipt(res["job_id"])
+            self.assertEqual(receipt.get("containment"), "straitjacket")
+
 
 if __name__ == "__main__":
     unittest.main()

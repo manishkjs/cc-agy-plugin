@@ -125,3 +125,7 @@ python3 -m unittest discover -s tests -v
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+## Acknowledgments
+
+Special thanks to Vamsi Ramakrishnan ([github.com/vamsiramakrishnan/straitjacket](https://github.com/vamsiramakrishnan/straitjacket)) for building Straitjacket, whose bounded command execution and addressable evidence retrieval architecture inspired and powers our worker containment pipeline.

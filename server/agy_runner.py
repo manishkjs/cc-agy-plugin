@@ -245,6 +245,47 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         """
         return append_progress(progress_path, kind, message)
 
+    custom_tools: list[Any] = []
+    if progress_path:
+        custom_tools.append(report_to_lead)
+
+    containment_mode = "none"
+    use_containment = os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
+    if use_containment:
+        try:
+            from ctx.sdk import ToolSession
+
+            session = ToolSession(
+                Path(request["workspace_dir"]),
+                timeout=float(request.get("timeout_seconds") or 600.0),
+                producer="cc-agy-plugin",
+            )
+
+            async def run_command(command: str, working_directory: str = "", timeout_seconds: float = 600.0) -> str:
+                """Execute a shell command with typed status and bounded output. Large output (>240 lines or >16KB)
+                is saved to a local evidence store and returns a concise digest with a run address (run:<id>#stdout).
+                Use ctx_get or ctx_search to retrieve omitted lines."""
+                result = await session.run(command, working_directory=working_directory, timeout_seconds=timeout_seconds)
+                return result.to_json()
+
+            async def ctx_get(address: str, start_line: int = 1, end_line: int = 100) -> str:
+                """Retrieve a bounded, inclusive line range from an evidence address (e.g. 'run:<id>#stdout')."""
+                return await session.get(address, start_line=start_line, end_line=end_line)
+
+            async def ctx_search(address: str, pattern: str) -> str:
+                """Search stored evidence (e.g. 'run:<id>#stdout') or repository files for a regex pattern."""
+                return await session.search(address, pattern)
+
+            custom_tools.extend([run_command, ctx_get, ctx_search])
+            disabled_list = list(cap_kwargs.get("disabled_tools") or [])
+            if types.BuiltinTools.RUN_COMMAND not in disabled_list:
+                disabled_list.append(types.BuiltinTools.RUN_COMMAND)
+            cap_kwargs["disabled_tools"] = disabled_list
+            capabilities = types.CapabilitiesConfig(**cap_kwargs)
+            containment_mode = "straitjacket"
+        except (ImportError, Exception):
+            pass
+
     # CRITICAL (D11): Always set vertex=True at top-level of LocalAgentConfig so the
     # Antigravity SDK does not inject the default GeminiAPIEndpoint image model
     # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
@@ -260,8 +301,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     )
     if budget_cfg is not None:
         cfg_kwargs["budget_config"] = budget_cfg
-    if progress_path:
-        cfg_kwargs["tools"] = [report_to_lead]
+    if custom_tools:
+        cfg_kwargs["tools"] = custom_tools
     cfg = ag.LocalAgentConfig(**cfg_kwargs)
 
     tool_calls_log: list[dict[str, Any]] = []
@@ -326,6 +367,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "tool_calls": tool_calls_log,
         "thoughts": thoughts_log,
         "stop_reason": stop_reason,
+        "containment": containment_mode,
     }
 
 
@@ -396,6 +438,7 @@ def run_antigravity_worker(
         "tool_calls": list(result.get("tool_calls") or []),
         "thoughts": list(result.get("thoughts") or []),
         "stop_reason": result.get("stop_reason"),
+        "containment": result.get("containment", "none"),
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,
