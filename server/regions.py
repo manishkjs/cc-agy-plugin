@@ -245,19 +245,37 @@ def resolve_vertex_location(
     return raw_loc, None
 
 
+def sanitize_placeholder_env() -> None:
+    """Remove unsubstituted Claude Code ${user_config...} placeholders from credential env vars."""
+    for var in (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "VERTEX_PROJECT",
+        "GCLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "VERTEX_LOCATION",
+    ):
+        val = os.environ.get(var)
+        if val is not None and val.strip().startswith("${"):
+            os.environ.pop(var, None)
+
+
 def resolve_api_key(
     requested_key: str | None = None,
     *,
     env: dict[str, str] | None = None,
 ) -> str | None:
     """Resolve a Google AI Studio Gemini API key from arguments or environment."""
+    if requested_key is not None and not isinstance(requested_key, str):
+        raise ValueError("api_key must be a string")
     source_env = env if env is not None else os.environ
     for candidate in (
         requested_key,
         source_env.get("GEMINI_API_KEY"),
         source_env.get("GOOGLE_API_KEY"),
     ):
-        if candidate:
+        if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
             if cleaned and not cleaned.startswith("${") and cleaned != "<api-key>":
                 return cleaned
@@ -271,6 +289,8 @@ def resolve_vertex_project(
     allow_missing: bool = False,
 ) -> str | None:
     """Resolve the Google Cloud Project ID from arguments or environment."""
+    if requested_project is not None and not isinstance(requested_project, str):
+        raise ValueError("project must be a string")
     source_env = env if env is not None else os.environ
     for candidate in (
         requested_project,
@@ -278,7 +298,7 @@ def resolve_vertex_project(
         source_env.get("VERTEX_PROJECT"),
         source_env.get("GCLOUD_PROJECT"),
     ):
-        if candidate:
+        if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
             if cleaned and not cleaned.startswith("${") and cleaned != "<paying-project>":
                 return cleaned
@@ -308,12 +328,19 @@ def resolve_auth_config(
     resolved_key = resolve_api_key(requested_api_key, env=source_env)
     resolved_proj = resolve_vertex_project(requested_project, env=source_env, allow_missing=True)
 
+    # Clean requested_project so scrubbed/placeholder values do not count as an explicit project override
+    explicit_project = None
+    if isinstance(requested_project, str):
+        cleaned_req_proj = requested_project.strip()
+        if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
+            explicit_project = cleaned_req_proj
+
     # Use API key if explicitly passed, or if present in environment without an explicit project argument
-    if resolved_key and (requested_api_key or not requested_project):
+    if resolved_key and (requested_api_key or not explicit_project):
         return {
             "auth_mode": "api_key",
             "api_key": resolved_key,
-            "project": resolved_proj,
+            "project": None,
             "location": None,
             "reroute_note": None,
         }

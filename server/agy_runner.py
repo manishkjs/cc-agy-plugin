@@ -16,6 +16,7 @@ from server.regions import (
     resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
+    sanitize_placeholder_env,
 )
 
 
@@ -201,6 +202,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     from google import antigravity as ag
     from google.antigravity import policy, types
 
+    sanitize_placeholder_env()
     options = (
         types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
         if request.get("thinking_level")

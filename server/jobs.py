@@ -348,7 +348,7 @@ def _env_int(name: str, default: int) -> int:
 def resolve_budget(
     max_tool_calls: int | None, max_total_tokens: int | None
 ) -> tuple[int | None, int | None]:
-    """Per-turn worker caps (defaults 50 tool calls / 5M tokens; env overrides; 0 disables a cap)."""
+    """Per-turn worker caps (defaults 100 tool calls / 5M tokens; env overrides; 0 disables a cap)."""
     calls = max_tool_calls if max_tool_calls is not None else _env_int("CC_AGY_MAX_TOOL_CALLS", DEFAULT_MAX_TOOL_CALLS)
     tokens = (
         max_total_tokens
@@ -1204,6 +1204,7 @@ class JobManager:
                 receipt_payload,
                 scrub=scrub_receipt,
                 workspace_root=str(self.workspace_root),
+                api_key=api_key,
             )
             with self._lock:
                 if job_id in self._cancelled and wt_dir.exists():
@@ -1369,6 +1370,7 @@ class JobManager:
             initial_receipt,
             scrub=scrub_receipt,
             workspace_root=str(self.workspace_root),
+            api_key=resolved_key,
         )
 
         fut = self._executor.submit(
@@ -1830,8 +1832,12 @@ class JobManager:
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
+        prior_auth_mode = receipt.get("auth_mode")
+        inherited_project = project
+        if not inherited_project and prior_auth_mode != "api_key":
+            inherited_project = raw_proj or receipt.get("vertex_project")
         auth = resolve_auth_config(
-            requested_project=project or raw_proj or receipt.get("vertex_project"),
+            requested_project=inherited_project,
             requested_location=location or receipt.get("vertex_location"),
             requested_api_key=api_key or raw_key,
             model=model,

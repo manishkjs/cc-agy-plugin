@@ -1368,6 +1368,92 @@ class TestCostControls(unittest.TestCase):
             self.assertEqual(called_auth["api_key"], "mcp-test-key")
             self.assertEqual(called_auth["auth_mode"], "api_key")
 
+    def test_api_key_hardening_redaction_and_restart_continuity(self) -> None:
+        from server.regions import sanitize_placeholder_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+
+            # 1. Unconditional API key redaction even when scrub=False
+            special_key = 'my-custom-key-with"quotes\\and-secret'
+            aiza_key = "AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6"
+            rcpt = store.write_receipt(
+                "rcpt-unscrubbed-test",
+                {
+                    "tool": "ask_gemini",
+                    "status": "error",
+                    "auth_mode": "api_key",
+                    "error": f"Request failed with key={special_key} and url?key={aiza_key}",
+                },
+                scrub=False,
+                api_key=special_key,
+            )
+            self.assertNotIn(special_key, json.dumps(rcpt))
+            self.assertNotIn(aiza_key, json.dumps(rcpt))
+            disk_raw = (store.receipts_dir / "rcpt-unscrubbed-test.json").read_text(encoding="utf-8")
+            self.assertNotIn(special_key, disk_raw)
+            self.assertNotIn(aiza_key, disk_raw)
+            self.assertTrue(store.verify_receipt_signature(rcpt))
+
+            # 2. Cross-mode flip guard on delegate_continue across restart when both GEMINI_API_KEY and GOOGLE_CLOUD_PROJECT are set
+            old_gem_key = os.environ.get("GEMINI_API_KEY")
+            old_proj = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            os.environ["GEMINI_API_KEY"] = "env-gemini-secret-key-999"
+            os.environ["GOOGLE_CLOUD_PROJECT"] = "ambient-gcloud-proj"
+            try:
+                seen_turns: list[dict[str, Any]] = []
+
+                def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                    seen_turns.append({"auth_mode": req.get("auth_mode"), "api_key": req.get("api_key"), "project": req.get("project")})
+                    return {"text": "ok"}
+
+                jm1 = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+                first = jm1.delegate_start("initial turn", wait=True)
+                self.assertEqual(first["auth_mode"], "api_key")
+                self.assertIsNone(store.read_receipt(first["job_id"]).get("vertex_project"))
+
+                # Simulate MCP server restart with a fresh JobManager (empty _raw_api_keys)
+                jm2 = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+                second = jm2.delegate_continue(first["job_id"], "follow up after restart", wait=True)
+                self.assertEqual(second["auth_mode"], "api_key")
+                self.assertEqual(seen_turns[-1]["auth_mode"], "api_key")
+                self.assertEqual(seen_turns[-1]["api_key"], "env-gemini-secret-key-999")
+                self.assertIsNone(seen_turns[-1]["project"])
+            finally:
+                if old_gem_key is None:
+                    os.environ.pop("GEMINI_API_KEY", None)
+                else:
+                    os.environ["GEMINI_API_KEY"] = old_gem_key
+                if old_proj is None:
+                    os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+                else:
+                    os.environ["GOOGLE_CLOUD_PROJECT"] = old_proj
+
+            # 3. Placeholder env sanitization
+            os.environ["GEMINI_API_KEY"] = "${user_config.gemini_api_key}"
+            try:
+                sanitize_placeholder_env()
+                self.assertNotIn("GEMINI_API_KEY", os.environ)
+            finally:
+                if old_gem_key is not None:
+                    os.environ["GEMINI_API_KEY"] = old_gem_key
+
+            # 4. Non-string api_key / project in MCP tools/call returns -32602
+            server = MCPServer(job_manager=jm1, store=store)
+            bad_resp = server.handle_Message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "ask_gemini",
+                        "arguments": {"prompt": "hi", "api_key": 12345},
+                    },
+                }
+            )
+            self.assertEqual(bad_resp["error"]["code"], -32602)
+            self.assertIn("api_key", bad_resp["error"]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

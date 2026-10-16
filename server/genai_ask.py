@@ -15,6 +15,7 @@ from server.regions import (
     resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
+    sanitize_placeholder_env,
     truncate_to_token_budget,
 )
 
@@ -26,6 +27,7 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
     from google import genai
     from google.genai import types as genai_types
 
+    sanitize_placeholder_env()
     if request.get("api_key"):
         client = genai.Client(api_key=request["api_key"])
     else:
@@ -219,6 +221,7 @@ def ask_gemini(
             receipt_payload,
             scrub=scrub_receipt,
             workspace_root=str(ws_root),
+            api_key=resolved_key,
         )
 
     return {

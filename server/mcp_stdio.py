@@ -117,7 +117,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "max_tool_calls": {
                     "type": "integer",
-                    "description": "Per-turn worker cap (default 50, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
+                    "description": "Per-turn worker cap (default 100, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
                 },
                 "max_total_tokens": {
                     "type": "integer",
@@ -282,6 +282,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional Google AI Studio Gemini API key override.",
                 },
+                "project": {
+                    "type": "string",
+                    "description": "Optional Google Cloud project ID override for Vertex AI.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Optional Vertex AI region override.",
+                },
             },
             "required": ["job_id", "follow_up_prompt"],
         },
@@ -352,7 +360,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "max_tool_calls": {
                     "type": "integer",
-                    "description": "Per-turn worker cap (default 50, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
+                    "description": "Per-turn worker cap (default 100, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
                 },
                 "max_total_tokens": {
                     "type": "integer",
@@ -428,6 +436,14 @@ class InvalidParamsError(ValueError):
 def _require_str(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidParamsError(f"'{field_name}' must be a non-empty string")
+    return value
+
+
+def _optional_str(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidParamsError(f"'{field_name}' must be a string, got {type(value).__name__}")
     return value
 
 
@@ -670,13 +686,13 @@ class MCPServer:
                 raise InvalidParamsError(str(exc)) from exc
             return ask_gemini(
                 prompt=prompt_str,
-                model=args.get("model"),
+                model=_optional_str(args.get("model"), "model"),
                 context_files=ctx_files,
-                system_instruction=args.get("system_instruction"),
+                system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
                 temperature=args.get("temperature"),
-                api_key=args.get("api_key"),
-                project=args.get("project"),
-                location=args.get("location"),
+                api_key=_optional_str(args.get("api_key"), "api_key"),
+                project=_optional_str(args.get("project"), "project"),
+                location=_optional_str(args.get("location"), "location"),
                 workspace_root=self.job_manager.workspace_root,
                 store=self.store,
                 scrub_receipt=scrub_b,
@@ -696,7 +712,7 @@ class MCPServer:
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             return self.job_manager.delegate_start(
                 prompt=prompt_str,
-                model=args.get("model"),
+                model=_optional_str(args.get("model"), "model"),
                 allowed_paths=allowed,
                 enabled_tools=args.get("enabled_tools"),
                 disabled_tools=args.get("disabled_tools"),
@@ -705,10 +721,10 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
                 in_place=in_place_b,
-                api_key=args.get("api_key"),
-                project=args.get("project"),
-                location=args.get("location"),
-                thinking_level=args.get("thinking_level"),
+                api_key=_optional_str(args.get("api_key"), "api_key"),
+                project=_optional_str(args.get("project"), "project"),
+                location=_optional_str(args.get("location"), "location"),
+                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
                 plan=args.get("plan"),
                 acceptance=args.get("acceptance"),
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
@@ -718,7 +734,7 @@ class MCPServer:
         if name == "delegate_status":
             limit_val = _parse_positive_int(args.get("limit"), "limit", 20)
             return self.job_manager.delegate_status(
-                job_id=args.get("job_id"),
+                job_id=_optional_str(args.get("job_id"), "job_id"),
                 limit=limit_val,
             )
 
@@ -741,7 +757,7 @@ class MCPServer:
             page_tok_val = _parse_positive_int(args.get("page_tokens"), "page_tokens", 4000)
             return self.job_manager.get_diff(
                 job_id=job_id_str,
-                file_filter=args.get("file_filter"),
+                file_filter=_optional_str(args.get("file_filter"), "file_filter"),
                 page=page_val,
                 page_tokens=page_tok_val,
             )
@@ -770,9 +786,9 @@ class MCPServer:
                 follow_up_prompt=followup_str,
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
-                api_key=args.get("api_key"),
-                project=args.get("project"),
-                location=args.get("location"),
+                api_key=_optional_str(args.get("api_key"), "api_key"),
+                project=_optional_str(args.get("project"), "project"),
+                location=_optional_str(args.get("location"), "location"),
             )
 
         if name == "delegate_cancel":
@@ -799,7 +815,7 @@ class MCPServer:
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             digest = self.job_manager.delegate_start(
                 prompt=prompt_str,
-                model=args.get("model"),
+                model=_optional_str(args.get("model"), "model"),
                 allowed_paths=allowed,
                 enabled_tools=args.get("enabled_tools"),
                 disabled_tools=args.get("disabled_tools"),
@@ -808,10 +824,10 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=True,
                 in_place=in_place_b,
-                api_key=args.get("api_key"),
-                project=args.get("project"),
-                location=args.get("location"),
-                thinking_level=args.get("thinking_level"),
+                api_key=_optional_str(args.get("api_key"), "api_key"),
+                project=_optional_str(args.get("project"), "project"),
+                location=_optional_str(args.get("location"), "location"),
+                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
                 plan=args.get("plan"),
                 acceptance=args.get("acceptance"),
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),

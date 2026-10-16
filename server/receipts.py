@@ -167,6 +167,33 @@ def extract_diff_provenance(diff_text: str) -> dict[str, Any]:
     }
 
 
+def redact_api_keys(
+    receipt: dict[str, Any],
+    *,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Unconditionally redact secret API keys from a receipt before persistence."""
+    raw_json = json.dumps(receipt, sort_keys=True)
+    for candidate in (
+        api_key,
+        receipt.get("api_key"),
+        os.environ.get("GEMINI_API_KEY"),
+        os.environ.get("GOOGLE_API_KEY"),
+    ):
+        if isinstance(candidate, str):
+            cleaned = candidate.strip()
+            if cleaned and not cleaned.startswith("${") and cleaned != "<api-key>":
+                escaped = json.dumps(cleaned)[1:-1]
+                if escaped:
+                    raw_json = raw_json.replace(escaped, "<api-key>")
+    # Redact standard Google API key pattern (AIza...)
+    raw_json = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "<api-key>", raw_json)
+    redacted = json.loads(raw_json)
+    if "api_key" in redacted:
+        redacted["api_key"] = "<api-key>"
+    return redacted
+
+
 def scrub_receipt_for_export(
     receipt: dict[str, Any],
     *,
@@ -175,23 +202,23 @@ def scrub_receipt_for_export(
     workspace_root: str | None = None,
 ) -> dict[str, Any]:
     """Return a copy of a receipt with paying project IDs, API keys, and host paths scrubbed."""
-    import re
-
-    raw_json = json.dumps(receipt, sort_keys=True)
+    redacted = redact_api_keys(receipt, api_key=api_key)
+    raw_json = json.dumps(redacted, sort_keys=True)
     proj = project_id or receipt.get("vertex_project")
     if proj and isinstance(proj, str) and proj not in ("<paying-project>", ""):
-        raw_json = raw_json.replace(proj, "<paying-project>")
-    key = api_key or receipt.get("api_key")
-    if key and isinstance(key, str) and key not in ("<api-key>", ""):
-        raw_json = raw_json.replace(key, "<api-key>")
-    # Redact standard Google API key pattern (AIza...)
-    raw_json = re.sub(r"AIza[0-9A-Za-z\-_]{35}", "<api-key>", raw_json)
+        escaped_proj = json.dumps(proj)[1:-1]
+        if escaped_proj:
+            raw_json = raw_json.replace(escaped_proj, "<paying-project>")
     if workspace_root and isinstance(workspace_root, str):
         norm_ws = str(Path(workspace_root).resolve())
-        raw_json = raw_json.replace(norm_ws, "/workspace")
+        escaped_ws = json.dumps(norm_ws)[1:-1]
+        if escaped_ws:
+            raw_json = raw_json.replace(escaped_ws, "/workspace")
     home_dir = str(Path.home())
     if home_dir and home_dir != "/":
-        raw_json = raw_json.replace(home_dir, "/home/user")
+        escaped_home = json.dumps(home_dir)[1:-1]
+        if escaped_home:
+            raw_json = raw_json.replace(escaped_home, "/home/user")
     scrubbed = json.loads(raw_json)
     if "vertex_project" in scrubbed and scrubbed["vertex_project"] is not None:
         scrubbed["vertex_project"] = "<paying-project>"
@@ -452,6 +479,7 @@ class ReceiptStore:
         *,
         scrub: bool = False,
         workspace_root: str | None = None,
+        api_key: str | None = None,
     ) -> dict[str, Any]:
         """Atomically persist an HMAC-signed job receipt to disk and append to the ledger."""
         safe_id = validate_job_id(job_id)
@@ -465,10 +493,14 @@ class ReceiptStore:
         model = str(record.get("model") or "gemini-3.1-pro-preview")
         record["cost"] = estimate_cost_usd(model, usage)
 
+        # Always redact secret API keys even when scrub=False
+        record = redact_api_keys(record, api_key=api_key)
+
         if scrub:
             record = scrub_receipt_for_export(
                 record,
                 project_id=str(record.get("vertex_project") or ""),
+                api_key=api_key,
                 workspace_root=workspace_root,
             )
 

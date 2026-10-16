@@ -2,7 +2,7 @@
 
 `cc-agy-plugin` is a native Claude Code plugin that lets Claude Code delegate coding, debugging, and review tasks to Vertex AI Gemini models through a long-lived Python stdio Model Context Protocol (MCP) server.
 
-> **Status:** early. The unit tests (32) run against a fake Gemini worker. The plugin has not yet been run end to end against live Vertex AI, so expect rough edges on the first real run.
+> **Status:** early. The unit test suite (45 tests) covers the MCP server, receipt provenance, Straitjacket shell containment, and both Google AI Studio API Key and Vertex AI authentication modes, and the plugin has been verified end to end on multi-turn coding tasks with Claude Opus 5.5 and Gemini 3.5 Flash-Lite.
 
 ## Why use this: Opus plans, Gemini does the grunt work
 
