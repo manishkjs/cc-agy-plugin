@@ -1242,6 +1242,9 @@ class TestCostControls(unittest.TestCase):
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_straitjacket_containment_prompt_and_receipt(self) -> None:
+        import asyncio
+        from server.agy_runner import build_straitjacket_tools
+
         with tempfile.TemporaryDirectory() as tmp:
             repo_dir, store = self._setup(tmp)
             prompts: list[str] = []
@@ -1257,6 +1260,33 @@ class TestCostControls(unittest.TestCase):
             self.assertIn("ctx_search", prompts[0])
             receipt = store.read_receipt(res["job_id"])
             self.assertEqual(receipt.get("containment"), "straitjacket")
+
+            # Live verification of build_straitjacket_tools with default 300s turn timeout
+            tools, replaced = build_straitjacket_tools(repo_dir, timeout_seconds=300.0)
+            self.assertEqual(replaced, ["RUN_COMMAND"])
+            tool_map = {fn.__name__: fn for fn in tools}
+            self.assertEqual(set(tool_map.keys()), {"run_command", "ctx_get", "ctx_search"})
+
+            # 1. Default timeout (300s session) + oversized timeout_seconds (900s) must clamp, not raise ValueError
+            out_json = asyncio.run(
+                tool_map["run_command"](
+                    "python3 -c 'for i in range(1, 350): print(f\"LINE_{i:03d}_PAYLOAD_TEXT\")'",
+                    timeout_seconds=900.0,
+                )
+            )
+            parsed = json.loads(out_json)
+            self.assertEqual(parsed["command_exit_code"], 0)
+            ref = parsed["ref"]
+            self.assertTrue(ref.startswith("run:"))
+
+            # 2. ctx_get with 0-indexed start_line=0 coerces cleanly to 1-indexed and retrieves lines
+            slice_text = asyncio.run(tool_map["ctx_get"](f"{ref}#stdout", start_line=0, end_line=5))
+            self.assertIn("LINE_001_PAYLOAD_TEXT", slice_text)
+            self.assertIn("LINE_005_PAYLOAD_TEXT", slice_text)
+
+            # 3. ctx_search locates matching lines in the stored stdout artifact
+            search_text = asyncio.run(tool_map["ctx_search"](f"{ref}#stdout", "LINE_250_PAYLOAD_TEXT"))
+            self.assertIn("LINE_250_PAYLOAD_TEXT", search_text)
 
     def test_resolve_api_key_and_auth_config(self) -> None:
         self.assertEqual(resolve_api_key("my-api-key"), "my-api-key")

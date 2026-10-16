@@ -197,6 +197,94 @@ def _serialize_tool_call(tc: Any) -> dict[str, Any]:
     }
 
 
+def build_straitjacket_tools(
+    workspace_dir: str | Path,
+    *,
+    timeout_seconds: float = 300.0,
+    profile: str | None = None,
+) -> tuple[list[Any], list[str]]:
+    """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
+
+    Fixes three integration hazards:
+    1. Clamps per-command timeout to `session.timeout` so a default 300s turn never raises
+       `ValueError("command timeout exceeds the session timeout")` when `run_command` defaults to 600s.
+    2. Coerces `start_line` / `end_line` in `ctx_get` to 1-indexed ints (`1 <= start_line <= end_line`)
+       so 0-indexed or float tool arguments from the model do not fail `ToolSession.get` type checks.
+    3. Supports both `command-output` (default) and `full` (`CC_AGY_CONTAINMENT_PROFILE=full`) profiles.
+    """
+    from ctx.sdk import ToolSession
+
+    resolved_profile = (profile or os.environ.get("CC_AGY_CONTAINMENT_PROFILE") or "command-output").strip().lower()
+    if resolved_profile not in ("command-output", "full"):
+        resolved_profile = "command-output"
+
+    session_timeout = max(60.0, float(timeout_seconds or 600.0))
+    default_cmd_timeout = min(600.0, session_timeout)
+    session = ToolSession(
+        Path(workspace_dir),
+        timeout=session_timeout,
+        producer="cc-agy-plugin",
+    )
+
+    async def run_command(
+        command: str,
+        working_directory: str = "",
+        timeout_seconds: float = default_cmd_timeout,
+    ) -> str:
+        """Execute a shell command with typed status and bounded output. Large output (>240 lines or >16KB)
+        is saved to a local evidence store and returns a concise digest with a run address (run:<id>#stdout).
+        Use ctx_get or ctx_search to retrieve omitted lines."""
+        eff_timeout = min(max(1.0, float(timeout_seconds or default_cmd_timeout)), session_timeout)
+        result = await session.run(
+            command,
+            working_directory=working_directory,
+            timeout_seconds=eff_timeout,
+        )
+        return result.to_json()
+
+    async def ctx_get(address: str, start_line: int = 1, end_line: int = 100) -> str:
+        """Retrieve a bounded, inclusive line range from an evidence address (e.g. 'run:<id>#stdout')."""
+        s_line = max(1, int(start_line))
+        e_line = max(s_line, int(end_line))
+        return await session.get(address, start_line=s_line, end_line=e_line)
+
+    async def ctx_search(address: str, pattern: str) -> str:
+        """Search stored evidence (e.g. 'run:<id>#stdout') or repository files for a regex pattern."""
+        return await session.search(address, pattern)
+
+    if resolved_profile == "command-output":
+        return [run_command, ctx_get, ctx_search], ["RUN_COMMAND"]
+
+    import shlex
+
+    async def view_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
+        """Read a bounded, 1-indexed file span; omitted evidence remains addressable."""
+        s_line = max(1, int(start_line))
+        e_line = max(s_line, int(end_line))
+        return await session.get(f"repo:{path}", start_line=s_line, end_line=e_line)
+
+    async def search_dir(pattern: str, path: str = "") -> str:
+        """Search repository files with a bounded hit census."""
+        return await session.search(f"repo:{path}", pattern)
+
+    async def list_dir(path: str = "") -> str:
+        """Summarise a directory's file counts, languages and size."""
+        return await session.retrieve("stats", ref=f"repo:{path}")
+
+    async def find_file(name: str) -> str:
+        """List files matching a path glob, including empty files."""
+        return await session.query(f"corpus --glob {shlex.quote(name)}")
+
+    async def ctx_query(pipeline: str) -> str:
+        """Compose observation in one bounded query, e.g. refs Foo | group file | top 3."""
+        return await session.query(pipeline)
+
+    return (
+        [run_command, ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query],
+        ["RUN_COMMAND", "VIEW_FILE", "SEARCH_DIR", "LIST_DIR", "FIND_FILE"],
+    )
+
+
 async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any]:
     """Execute an agentic task inside `workspace_dir` using `google.antigravity`."""
     from google import antigravity as ag
@@ -267,34 +355,26 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     use_containment = os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
     if use_containment:
         try:
-            from ctx.sdk import ToolSession
-
-            session = ToolSession(
+            sj_tools, replaced_names = build_straitjacket_tools(
                 Path(request["workspace_dir"]),
-                timeout=float(request.get("timeout_seconds") or 600.0),
-                producer="cc-agy-plugin",
+                timeout_seconds=float(request.get("timeout_seconds") or 300.0),
             )
-
-            async def run_command(command: str, working_directory: str = "", timeout_seconds: float = 600.0) -> str:
-                """Execute a shell command with typed status and bounded output. Large output (>240 lines or >16KB)
-                is saved to a local evidence store and returns a concise digest with a run address (run:<id>#stdout).
-                Use ctx_get or ctx_search to retrieve omitted lines."""
-                result = await session.run(command, working_directory=working_directory, timeout_seconds=timeout_seconds)
-                return result.to_json()
-
-            async def ctx_get(address: str, start_line: int = 1, end_line: int = 100) -> str:
-                """Retrieve a bounded, inclusive line range from an evidence address (e.g. 'run:<id>#stdout')."""
-                return await session.get(address, start_line=start_line, end_line=end_line)
-
-            async def ctx_search(address: str, pattern: str) -> str:
-                """Search stored evidence (e.g. 'run:<id>#stdout') or repository files for a regex pattern."""
-                return await session.search(address, pattern)
-
-            custom_tools.extend([run_command, ctx_get, ctx_search])
+            custom_tools.extend(sj_tools)
             disabled_list = list(cap_kwargs.get("disabled_tools") or [])
-            if types.BuiltinTools.RUN_COMMAND not in disabled_list:
-                disabled_list.append(types.BuiltinTools.RUN_COMMAND)
+            enabled_list = list(cap_kwargs.get("enabled_tools") or []) if "enabled_tools" in cap_kwargs else None
+            for b_name in replaced_names:
+                b_enum = getattr(types.BuiltinTools, b_name, None)
+                if b_enum is not None:
+                    if b_enum not in disabled_list:
+                        disabled_list.append(b_enum)
+                    if enabled_list is not None:
+                        enabled_list = [
+                            x for x in enabled_list
+                            if x != b_enum and str(x).upper() != b_name
+                        ]
             cap_kwargs["disabled_tools"] = disabled_list
+            if enabled_list is not None:
+                cap_kwargs["enabled_tools"] = enabled_list
             capabilities = types.CapabilitiesConfig(**cap_kwargs)
             containment_mode = "straitjacket"
         except (ImportError, Exception):

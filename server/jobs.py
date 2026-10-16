@@ -431,12 +431,13 @@ def render_worker_prompt(
             "(questions and blockers end your turn). Finish with a short summary that marks each plan step "
             "DONE or BLOCKED."
         )
-    parts.append(
-        "## Shell Commands & Evidence\n"
-        "Commands execute with bounded output. If a test or build produces large output, it returns a concise "
-        "digest and an address (e.g. `run:<id>#stdout`). Use `ctx_get(address, start_line, end_line)` or "
-        "`ctx_search(address, pattern)` to retrieve specific omitted lines or tracebacks instead of rerunning commands."
-    )
+    if os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no"):
+        parts.append(
+            "## Shell Commands & Evidence\n"
+            "Commands execute with bounded output. If a test or build produces large output, it returns a concise "
+            "digest and an address (e.g. `run:<id>#stdout`). Use `ctx_get(address, start_line, end_line)` or "
+            "`ctx_search(address, pattern)` to retrieve specific omitted lines or tracebacks instead of rerunning commands."
+        )
     return "\n\n".join(parts)
 
 
