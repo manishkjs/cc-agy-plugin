@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "vertex": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/main.py"
+      ],
+      "env": {
+        "GOOGLE_CLOUD_PROJECT": "${user_config.google_cloud_project}",
+        "GOOGLE_CLOUD_LOCATION": "${user_config.google_cloud_location}",
+        "CC_AGY_DEFAULT_DELEGATE_MODEL": "${user_config.default_delegate_model}",
+        "CC_AGY_DEFAULT_ASK_MODEL": "${user_config.default_ask_model}",
+        "CC_AGY_STRICT_MODE": "${user_config.strict_delegation_mode}",
+        "CC_AGY_DATA_DIR": "${CLAUDE_PLUGIN_DATA}"
+      },
+      "timeout": 600000
+    }
+  }
+}

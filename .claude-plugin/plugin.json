@@ -1,0 +1,53 @@
+{
+  "name": "cc-agy-plugin",
+  "version": "0.1.0",
+  "description": "Delegate coding, review, and research tasks from Claude Code to Vertex AI Gemini models via the Google Antigravity SDK and google-genai.",
+  "author": {
+    "name": "Manish Kumar"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "vertex-ai",
+    "gemini",
+    "antigravity-sdk",
+    "multi-agent",
+    "delegation",
+    "mcp"
+  ],
+  "userConfig": {
+    "google_cloud_project": {
+      "title": "Google Cloud Project ID",
+      "description": "GCP project ID with Vertex AI API enabled for Gemini billing and quota.",
+      "type": "string",
+      "sensitive": false
+    },
+    "google_cloud_location": {
+      "title": "Default Vertex AI Region",
+      "description": "Default Vertex AI region (for example us-central1 or global). Models that only exist in global are routed automatically.",
+      "type": "string",
+      "default": "us-central1",
+      "sensitive": false
+    },
+    "default_delegate_model": {
+      "title": "Default Agentic Worker Model",
+      "description": "Default Gemini model ID for Antigravity SDK worktree delegations.",
+      "type": "string",
+      "default": "gemini-3.1-pro-preview",
+      "sensitive": false
+    },
+    "default_ask_model": {
+      "title": "Default Single-Shot Review Model",
+      "description": "Default Gemini model ID for single-shot google-genai queries.",
+      "type": "string",
+      "default": "gemini-2.5-flash",
+      "sensitive": false
+    },
+    "strict_delegation_mode": {
+      "title": "Strict Orchestrator Mode",
+      "description": "When enabled, PreToolUse and Stop hooks block direct host file edits and require all diffs to trace back to verified worker receipts.",
+      "type": "boolean",
+      "default": false,
+      "sensitive": false
+    }
+  }
+}
