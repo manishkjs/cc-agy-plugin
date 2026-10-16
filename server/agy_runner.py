@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from pathlib import Path
+import tempfile
 import time
 from typing import Any, Callable
 
@@ -16,6 +17,35 @@ async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def resolve_turn_usage(resp: Any) -> dict[str, int]:
+    """Read one chat turn's usage from `resp.usage_metadata` (awaitable on google-antigravity 0.1.x)."""
+    usage = {
+        "prompt_token_count": 0,
+        "cached_content_token_count": 0,
+        "candidates_token_count": 0,
+        "thoughts_token_count": 0,
+        "total_token_count": 0,
+    }
+    if resp is None:
+        return usage
+    try:
+        raw = await maybe_await(getattr(resp, "usage_metadata", None))
+    except Exception:
+        return usage
+    if raw is None:
+        return usage
+    data = raw.model_dump() if hasattr(raw, "model_dump") else (dict(raw) if isinstance(raw, dict) else {})
+    if not data:
+        data = {k: getattr(raw, k, 0) for k in usage}
+    for k in usage:
+        usage[k] = int(data.get(k) or 0)
+    if usage["total_token_count"] == 0:
+        usage["total_token_count"] = (
+            usage["prompt_token_count"] + usage["candidates_token_count"] + usage["thoughts_token_count"]
+        )
+    return usage
 
 
 def extract_usage_from_session(agent: Any, resp: Any = None) -> dict[str, int]:
@@ -118,8 +148,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         project=request["project"],
         location=request["location"],
     )
-    model_cfg = types.ModelConfig(
-        model=request["model"],
+    # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
+    model_cfg = types.ModelTarget(
+        name=request["model"],
+        types=[types.ModelType.TEXT],
         endpoint=endpoint,
     )
 
@@ -133,15 +165,21 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
     capabilities = types.CapabilitiesConfig(**cap_kwargs)
 
+    # Keep the SDK's own session/artifact files outside the repo so they never show up in the diff.
+    save_dir = tempfile.mkdtemp(prefix="cc-agy-save-")
+
     # CRITICAL (D11): Always set vertex=True at top-level of LocalAgentConfig so the
     # Antigravity SDK does not inject the default GeminiAPIEndpoint image model
     # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
     cfg = ag.LocalAgentConfig(
-        workspace=Path(request["workspace_dir"]),
+        workspaces=[str(Path(request["workspace_dir"]))],
         vertex=True,
+        project=request["project"],
+        location=request["location"],
         model=model_cfg,
         policies=[policy.allow_all()],
         capabilities=capabilities,
+        save_dir=save_dir,
     )
 
     tool_calls_log: list[dict[str, Any]] = []
@@ -176,9 +214,13 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                     text_out = str((await maybe_await(text_fn())) or "")
                 elif isinstance(text_fn, str):
                     text_out = text_fn
-                turn_usage = extract_usage_from_session(agent, resp)
+                # usage_metadata is awaitable on the real SDK; each chat turn reports its own
+                # usage, so turns are summed (not maxed).
+                turn_usage = await resolve_turn_usage(resp)
+                if not any(turn_usage.values()):
+                    turn_usage = extract_usage_from_session(agent, resp)
                 for k in usage:
-                    usage[k] = max(usage[k], turn_usage[k])
+                    usage[k] += turn_usage[k]
     except Exception as exc:
         # Attach partial usage and tool calls so the caller's finally block
         # records everything consumed prior to the failure or timeout.

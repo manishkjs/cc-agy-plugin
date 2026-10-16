@@ -96,6 +96,12 @@ MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
         "cached_input": 0.05,
         "output": 3.00,
     },
+    # Introductory Vertex AI rate through 2026-12-31 ($1.50 / $0.15 / $7.50 from 2027-01-01).
+    "gemini-3.8-flash": {
+        "input": 0.75,
+        "cached_input": 0.075,
+        "output": 3.75,
+    },
     "gemini-2.5-pro": {
         "input": 1.25,
         "cached_input": 0.125,
