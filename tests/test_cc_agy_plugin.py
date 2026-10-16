@@ -924,5 +924,144 @@ class TestMCPStdioServer(unittest.TestCase):
             )
 
 
+def _git(repo_dir: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=str(repo_dir), check=True, capture_output=True, text=True
+    ).stdout
+
+
+class TestInPlaceMode(unittest.TestCase):
+    """in_place=True: the worker edits the real working tree instead of an isolated copy."""
+
+    def _setup(self, tmp: str) -> tuple[Path, ReceiptStore]:
+        repo_dir = Path(tmp) / "repo"
+        repo_dir.mkdir()
+        _init_git_repo(repo_dir)
+        return repo_dir, ReceiptStore(Path(tmp) / "data", workspace_root=repo_dir)
+
+    def test_in_place_edits_real_tree_undoes_worker_commits_and_skips_preexisting_untracked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            (repo_dir / "notes.md").write_text("my own notes\n", encoding="utf-8")
+            baseline = _git(repo_dir, "rev-parse", "HEAD").strip()
+            seen_dirs: list[str] = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                seen_dirs.append(str(wd))
+                (wd / "app.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+                (wd / "new.py").write_text("X = 1\n", encoding="utf-8")
+                (wd / "__pycache__").mkdir(exist_ok=True)
+                (wd / "__pycache__" / "app.cpython-313.pyc").write_bytes(b"\x00pyc")
+                subprocess.run(["git", "add", "-A"], cwd=str(wd), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "worker"], cwd=str(wd), check=True, capture_output=True)
+                return {"text": "done"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("edit greet", project="p", wait=True, in_place=True)
+
+            self.assertEqual(seen_dirs, [str(repo_dir.resolve())])
+            self.assertEqual(res["status"], "ok")
+            self.assertTrue(res["in_place"])
+            self.assertTrue(res["applied"])
+            self.assertEqual(
+                sorted(res["files_changed"]), ["__pycache__/app.cpython-313.pyc", "app.py", "new.py"]
+            )
+            self.assertTrue(any("undone" in n for n in res["in_place_notes"]))
+            self.assertIn("git checkout", res["undo_hint"])
+            self.assertIn("new.py", res["undo_hint"].split("rm -- ", 1)[1])
+            # Worker's commit was unwound: HEAD back at baseline, index clean, edits kept on disk.
+            self.assertEqual(_git(repo_dir, "rev-parse", "HEAD").strip(), baseline)
+            self.assertEqual(_git(repo_dir, "diff", "--cached", "--name-only").strip(), "")
+            self.assertIn("'hi'", (repo_dir / "app.py").read_text(encoding="utf-8"))
+            self.assertEqual((repo_dir / "notes.md").read_text(encoding="utf-8"), "my own notes\n")
+            # Nothing left to apply, and the Stop-hook provenance check accepts the worker's lines.
+            self.assertTrue(jm.delegate_apply(res["job_id"])["already_applied"])
+            self.assertTrue(verify_workspace_provenance(repo_dir, store=store, strict=True)["ok"])
+
+    def test_in_place_refuses_dirty_tree_allowed_paths_and_concurrent_jobs(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            gate = threading.Event()
+
+            def slow_worker(req: dict[str, Any]) -> dict[str, Any]:
+                gate.wait(5)
+                return {"text": "ok"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=slow_worker)
+            with self.assertRaises(ValueError):
+                jm.delegate_start("x", project="p", in_place=True, allowed_paths=["app.py"])
+
+            first = jm.delegate_start("first", project="p", in_place=True)
+            with self.assertRaises(RuntimeError):
+                jm.delegate_start("second", project="p", in_place=True)
+            gate.set()
+            jm.delegate_result(first["job_id"], wait=True, timeout=10)
+
+            (repo_dir / "app.py").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                jm.delegate_start("x", project="p", in_place=True)
+            self.assertIn("clean working tree", str(ctx.exception))
+
+    def test_in_place_cancel_and_cleanup_never_delete_the_real_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+            res = jm.delegate_start("noop", project="p", wait=True, in_place=True)
+            jm.delegate_cancel(res["job_id"], cleanup_worktree=True)
+            jm._cleanup_worktree(repo_dir)
+            self.assertTrue((repo_dir / "app.py").exists())
+            self.assertTrue((repo_dir / ".git").exists())
+
+    def test_in_place_partial_failure_keeps_edits_marked_applied_with_undo_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+
+            def failing_worker(req: dict[str, Any]) -> dict[str, Any]:
+                (Path(req["workspace_dir"]) / "half.py").write_text("partial = True\n", encoding="utf-8")
+                raise RuntimeError("model crashed")
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=failing_worker)
+            res = jm.delegate_start("x", project="p", wait=True, in_place=True)
+            self.assertEqual(res["status"], "error")
+            self.assertTrue(res["applied"])
+            self.assertEqual(res["files_changed"], ["half.py"])
+            self.assertIn("Partial in_place edits", res["error"])
+            self.assertIn("rm -- half.py", res["undo_hint"])
+
+    def test_in_place_continue_is_cumulative_and_refuses_if_tree_changed_by_someone_else(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            turns: list[int] = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                turns.append(1)
+                wd = Path(req["workspace_dir"])
+                with open(wd / "app.py", "a", encoding="utf-8") as fh:
+                    fh.write(f"TURN_{len(turns)} = True\n")
+                return {"text": "ok"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            first = jm.delegate_start("turn one", project="p", wait=True, in_place=True)
+            second = jm.delegate_continue(first["job_id"], "turn two", wait=True)
+            self.assertEqual(second["files_changed"], ["app.py"])
+            text = (repo_dir / "app.py").read_text(encoding="utf-8")
+            self.assertIn("TURN_1", text)
+            self.assertIn("TURN_2", text)
+            self.assertTrue(verify_workspace_provenance(repo_dir, store=store, strict=True)["ok"])
+
+            (repo_dir / "README.md").write_text("human edit\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                jm.delegate_continue(first["job_id"], "turn three", wait=True)
+
+    def test_mcp_tools_expose_in_place(self) -> None:
+        from server.mcp_stdio import TOOL_DEFINITIONS
+
+        with_in_place = {t["name"] for t in TOOL_DEFINITIONS if "in_place" in t["inputSchema"]["properties"]}
+        self.assertEqual(with_in_place, {"delegate_start", "delegate_to_gemini"})
+
+
 if __name__ == "__main__":
     unittest.main()

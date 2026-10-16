@@ -97,6 +97,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
                 },
+                "in_place": {
+                    "type": "boolean",
+                    "description": (
+                        "Edit the real working tree directly instead of an isolated copy (default: false). "
+                        "Needs a clean tracked tree; one in_place job at a time; cannot be combined with "
+                        "allowed_paths. The job counts as applied when it finishes; undo_hint shows how to revert."
+                    ),
+                },
                 "scrub_receipt": {
                     "type": "boolean",
                     "description": "Redact paying project ID and host paths in the receipt (default: false).",
@@ -284,6 +292,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "enable_subagents": {
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
+                },
+                "in_place": {
+                    "type": "boolean",
+                    "description": (
+                        "Edit the real working tree directly instead of an isolated copy (default: false). "
+                        "Needs a clean tracked tree; one in_place job at a time; cannot be combined with "
+                        "allowed_paths. The job counts as applied when it finishes; undo_hint shows how to revert."
+                    ),
                 },
                 "scrub_receipt": {
                     "type": "boolean",
@@ -575,6 +591,7 @@ class MCPServer:
                 enable_sub = parse_bool(args.get("enable_subagents"), False)
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 wait_b = parse_bool(args.get("wait"), False)
+                in_place_b = parse_bool(args.get("in_place"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
@@ -588,6 +605,7 @@ class MCPServer:
                 scrub_receipt=scrub_b,
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
+                in_place=in_place_b,
             )
 
         if name == "delegate_status":
@@ -665,6 +683,7 @@ class MCPServer:
                 enable_sub = parse_bool(args.get("enable_subagents"), False)
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 auto_apply = parse_bool(args.get("auto_apply"), True)
+                in_place_b = parse_bool(args.get("in_place"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
@@ -678,6 +697,7 @@ class MCPServer:
                 scrub_receipt=scrub_b,
                 timeout_seconds=timeout_sec,
                 wait=True,
+                in_place=in_place_b,
             )
             if auto_apply and digest.get("status") == "ok":
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))

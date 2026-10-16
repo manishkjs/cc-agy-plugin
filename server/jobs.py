@@ -317,6 +317,53 @@ def _is_ignored_build_artifact(rel_path: str) -> bool:
     return False
 
 
+def _hash_path(p: Path) -> str | None:
+    """Return a content fingerprint for a workspace path (symlink target, file SHA-256, or None if absent)."""
+    if p.is_symlink():
+        return f"symlink:{os.readlink(p)}"
+    if p.exists() and p.is_file():
+        return sha256_bytes(p.read_bytes())
+    return None
+
+
+def _snapshot_untracked_hashes(root: Path) -> dict[str, str | None]:
+    """Fingerprint every untracked, non-ignored file so in_place jobs can skip ones they did not touch."""
+    res = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=str(root),
+        capture_output=True,
+        check=False,
+    )
+    snap: dict[str, str | None] = {}
+    if res.returncode != 0:
+        return snap
+    for raw in res.stdout.split(b"\x00"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8", errors="surrogateescape")
+        snap[rel] = _hash_path(root / rel)
+    return snap
+
+
+def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
+    """Split a unified git diff into (path, chunk) pairs keyed by the `b/` path of each header."""
+    chunks: list[tuple[str, str]] = []
+    current: list[str] = []
+    current_path = ""
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                chunks.append((current_path, "".join(current)))
+            current = [line]
+            parts = line.rstrip("\n").split(" b/", 1)
+            current_path = parts[1].strip() if len(parts) == 2 else ""
+        elif current:
+            current.append(line)
+    if current:
+        chunks.append((current_path, "".join(current)))
+    return chunks
+
+
 class JobManager:
     """Manages isolated worker clones, background execution, conflict-safe apply, and provenance."""
 
@@ -336,6 +383,7 @@ class JobManager:
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
         self._raw_projects: dict[str, str] = {}
+        self._in_place_job: str | None = None
         self._ensure_baseline_recorded()
 
     def _ensure_baseline_recorded(self) -> None:
@@ -596,7 +644,103 @@ class JobManager:
     def _cleanup_worktree(self, wt_dir: Path) -> None:
         if not wt_dir.exists():
             return
+        # Never delete anything outside the plugin's own worktrees directory. In in_place mode
+        # the "worktree" is the user's real repository, so this guard must never be removed.
+        try:
+            resolved = wt_dir.resolve()
+            if not resolved.is_relative_to(self.store.worktrees_dir.resolve()):
+                return
+            if resolved == self.workspace_root.resolve():
+                return
+        except (OSError, ValueError):
+            return
         shutil.rmtree(wt_dir, ignore_errors=True)
+
+    def _check_in_place_ready(self) -> tuple[str, dict[str, str | None]]:
+        """Verify the host repo can be edited in place; return (HEAD sha, untracked file hashes)."""
+        head_res = _run_git(["rev-parse", "--verify", "HEAD"], cwd=self.workspace_root, check=False)
+        if head_res.returncode != 0 or not head_res.stdout.strip():
+            raise ValueError("in_place mode needs a git repository with at least one commit.")
+        dirty_res = _run_git(
+            ["status", "--porcelain", "--untracked-files=no"],
+            cwd=self.workspace_root,
+            check=False,
+        )
+        dirty = [line for line in dirty_res.stdout.splitlines() if line.strip()]
+        if dirty:
+            raise ValueError(
+                "in_place mode needs a clean working tree for tracked files, so git can undo the "
+                "worker's edits. Commit or stash these first, or use the default isolated copy: "
+                f"{dirty[:10]}"
+            )
+        return head_res.stdout.strip(), _snapshot_untracked_hashes(self.workspace_root)
+
+    def _acquire_in_place_slot(self, job_id: str) -> None:
+        with self._lock:
+            active = self._in_place_job
+            if active is not None and active != job_id:
+                active_fut = self._futures.get(active)
+                if active_fut is None or not active_fut.done():
+                    raise RuntimeError(
+                        f"Another in_place job ({active}) is still running in this repository. "
+                        f"Wait for it to finish or use the default isolated copy."
+                    )
+            self._in_place_job = job_id
+
+    def _release_in_place_slot(self, job_id: str) -> None:
+        with self._lock:
+            if self._in_place_job == job_id:
+                self._in_place_job = None
+
+    def _finalize_in_place(
+        self,
+        baseline_sha: str,
+        pre_untracked: dict[str, str | None],
+    ) -> tuple[str, list[str], list[str], list[str]]:
+        """Collect the worker's in-place edits against baseline_sha.
+
+        Undoes any commits the worker made (keeping their changes in the working tree),
+        restores the index, and skips untracked files that existed before the job and are
+        unchanged. Returns (diff_text, files_changed, symlink_escapes, notes).
+        """
+        root = self.workspace_root
+        notes: list[str] = []
+        head_res = _run_git(["rev-parse", "HEAD"], cwd=root, check=False)
+        head_now = head_res.stdout.strip() if head_res.returncode == 0 else ""
+        if head_now and head_now != baseline_sha:
+            notes.append(
+                f"Worker moved HEAD to {head_now[:12]}; its commits were undone with "
+                f"`git reset --mixed {baseline_sha[:12]}` and the changes kept in the working tree."
+            )
+        _run_git(["reset", "-q", baseline_sha], cwd=root, check=False)
+
+        live_diff = capture_live_workspace_diff(root, baseline_head_sha=baseline_sha)
+        kept_chunks: list[str] = []
+        files: list[str] = []
+        for rel, chunk in _split_diff_by_file(live_diff):
+            if not rel or rel in files:
+                continue
+            if rel.startswith((".cc-agy-data/", ".worktrees/")):
+                continue
+            # Unlike the isolated copy, caches the worker writes here (e.g. __pycache__) really are
+            # in the user's tree, so they are recorded rather than filtered (and never deleted).
+            if rel in pre_untracked and _hash_path(root / rel) == pre_untracked[rel]:
+                continue
+            kept_chunks.append(chunk)
+            files.append(rel)
+
+        escapes: list[str] = []
+        root_resolved = root.resolve()
+        for rel in files:
+            p = root / rel
+            if p.is_symlink():
+                try:
+                    target = (p.parent / os.readlink(p)).resolve()
+                    if not target.is_relative_to(root_resolved):
+                        escapes.append(rel)
+                except OSError:
+                    escapes.append(rel)
+        return "".join(kept_chunks), files, escapes, notes
 
     def _execute_job(
         self,
@@ -620,6 +764,8 @@ class JobManager:
         prior_usage: dict[str, int] | None = None,
         prior_tool_calls: list[dict[str, Any]] | None = None,
         scrub_receipt: bool = False,
+        in_place: bool = False,
+        pre_untracked: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         usage: dict[str, int] = {
             "prompt_token_count": int((prior_usage or {}).get("prompt_token_count", 0)),
@@ -636,6 +782,8 @@ class JobManager:
         diff_text = ""
         files_changed: list[str] = []
         scope_violations: list[str] = []
+        in_place_notes: list[str] = []
+        symlink_escapes: list[str] = []
 
         host_git_dir = self.workspace_root / ".git"
         hooks_snap = _snapshot_directory_tree(host_git_dir / "hooks")
@@ -709,12 +857,20 @@ class JobManager:
                     status = "security_violation"
                     error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
 
-                diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
-                    wt_dir, baseline_sha, allowed_paths=allowed_paths
-                )
-                baseline_file_hashes = self._compute_changed_baseline_hashes(
-                    wt_dir, baseline_sha, files_changed, baseline_file_hashes
-                )
+                if in_place:
+                    diff_text, files_changed, symlink_escapes, in_place_notes = self._finalize_in_place(
+                        baseline_sha, pre_untracked or {}
+                    )
+                    baseline_file_hashes = self._compute_changed_baseline_hashes(
+                        self.workspace_root, baseline_sha, files_changed, {}
+                    )
+                else:
+                    diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
+                        wt_dir, baseline_sha, allowed_paths=allowed_paths
+                    )
+                    baseline_file_hashes = self._compute_changed_baseline_hashes(
+                        wt_dir, baseline_sha, files_changed, baseline_file_hashes
+                    )
             except Exception as fin_exc:
                 diff_text, files_changed, symlink_escapes = "", [], []
                 if status in ("running", "ok"):
@@ -786,6 +942,36 @@ class JobManager:
                 "applied": False,
                 "error": error_msg,
             }
+            if in_place:
+                # The edits are already in the user's working tree, so the job counts as applied
+                # the moment it finishes (even on error or timeout, partial edits are on disk).
+                applied_file_hashes = {
+                    fpath: _hash_path(self.workspace_root / fpath) for fpath in files_changed
+                }
+                new_files = [f for f in files_changed if baseline_file_hashes.get(f) is None]
+                tracked_files = [f for f in files_changed if baseline_file_hashes.get(f) is not None]
+                undo_parts: list[str] = []
+                if tracked_files:
+                    undo_parts.append(f"git checkout {baseline_sha[:12]} -- " + " ".join(tracked_files))
+                if new_files:
+                    undo_parts.append("rm -- " + " ".join(new_files))
+                receipt_payload.update(
+                    {
+                        "in_place": True,
+                        "in_place_notes": in_place_notes,
+                        "pre_untracked_hashes": pre_untracked or {},
+                        "applied": True,
+                        "applied_at_epoch": finished_at,
+                        "applied_files": list(files_changed),
+                        "applied_file_hashes": applied_file_hashes,
+                        "undo_hint": " && ".join(undo_parts) if undo_parts else None,
+                    }
+                )
+                if status != "ok" and files_changed:
+                    receipt_payload["error"] = (
+                        f"{error_msg or status}. Partial in_place edits remain in the working tree; "
+                        f"see undo_hint to revert them."
+                    )
             saved = self.store.write_receipt(
                 job_id,
                 receipt_payload,
@@ -795,6 +981,8 @@ class JobManager:
             with self._lock:
                 if job_id in self._cancelled and wt_dir.exists():
                     self._cleanup_worktree(wt_dir)
+            if in_place:
+                self._release_in_place_slot(job_id)
 
         return saved
 
@@ -836,12 +1024,24 @@ class JobManager:
         enable_subagents: bool = False,
         wait: bool = False,
         scrub_receipt: bool = False,
+        in_place: bool = False,
     ) -> dict[str, Any]:
-        """Start an isolated Antigravity worker job in a dedicated standalone repo copy."""
+        """Start an Antigravity worker job.
+
+        By default the worker edits an isolated standalone copy of the repo and its diff is
+        applied later with delegate_apply. With in_place=True the worker edits the real working
+        tree directly (requires a clean tracked tree, one in_place job at a time, and no
+        allowed_paths); the job is recorded as applied as soon as it finishes.
+        """
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 
         validated_paths = validate_allowed_paths(allowed_paths)
+        if in_place and validated_paths:
+            raise ValueError(
+                "allowed_paths cannot be enforced in in_place mode (edits land directly in your "
+                "files). Drop allowed_paths or use the default isolated copy."
+            )
         chosen_model = (
             model
             or os.environ.get("CC_AGY_DEFAULT_DELEGATE_MODEL")
@@ -855,7 +1055,17 @@ class JobManager:
 
         job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         started_at = round(time.time(), 3)
-        wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(job_id)
+        pre_untracked: dict[str, str | None] = {}
+        if in_place:
+            self._acquire_in_place_slot(job_id)
+            try:
+                baseline_sha, pre_untracked = self._check_in_place_ready()
+            except Exception:
+                self._release_in_place_slot(job_id)
+                raise
+            wt_dir, baseline_hashes = self.workspace_root, {}
+        else:
+            wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(job_id)
 
         with self._lock:
             self._raw_projects[job_id] = resolved_project
@@ -890,6 +1100,7 @@ class JobManager:
             "tool_calls": [],
             "files_changed": [],
             "applied": False,
+            "in_place": in_place,
             "error": None,
         }
         self.store.write_receipt(
@@ -918,6 +1129,8 @@ class JobManager:
             baseline_file_hashes=baseline_hashes,
             started_at=started_at,
             scrub_receipt=scrub_receipt,
+            in_place=in_place,
+            pre_untracked=pre_untracked,
         )
         with self._lock:
             self._futures[job_id] = fut
@@ -935,6 +1148,7 @@ class JobManager:
             "reroute_note": reroute_note,
             "allowed_paths": validated_paths,
             "worktree_dir": str(wt_dir),
+            "in_place": in_place,
         }
 
     def _wait_for_future_or_cancel(
@@ -1276,17 +1490,27 @@ class JobManager:
             raise RuntimeError(f"Job '{safe_id}' is currently running; wait before continuing.")
 
         receipt = self.store.read_receipt(safe_id)
-        if receipt.get("applied"):
-            raise ValueError(
-                f"Job '{safe_id}' has already been applied to the workspace. "
-                f"Start a new job with delegate_start to preserve applied provenance."
-            )
+        in_place = bool(receipt.get("in_place"))
+        pre_untracked: dict[str, str | None] = {}
+        if in_place:
+            baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
+            self._verify_in_place_unchanged(receipt)
+            self._acquire_in_place_slot(safe_id)
+            wt_dir = self.workspace_root
+            baseline_hashes: dict[str, str | None] = {}
+            pre_untracked = dict(receipt.get("pre_untracked_hashes") or {})
+        else:
+            if receipt.get("applied"):
+                raise ValueError(
+                    f"Job '{safe_id}' has already been applied to the workspace. "
+                    f"Start a new job with delegate_start to preserve applied provenance."
+                )
 
-        wt_dir = Path(str(receipt.get("worktree_dir") or ""))
-        baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
-        baseline_hashes = dict(receipt.get("baseline_file_hashes") or {})
-        if not wt_dir.exists():
-            wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(safe_id)
+            wt_dir = Path(str(receipt.get("worktree_dir") or ""))
+            baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
+            baseline_hashes = dict(receipt.get("baseline_file_hashes") or {})
+            if not wt_dir.exists():
+                wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(safe_id)
 
         prior_prompts = list(receipt.get("prompts") or [])
         clean_followup = follow_up_prompt.strip()
@@ -1346,6 +1570,8 @@ class JobManager:
                 prior_usage=receipt.get("usage"),
                 prior_tool_calls=receipt.get("tool_calls"),
                 scrub_receipt=scrub_receipt,
+                in_place=in_place,
+                pre_untracked=pre_untracked,
             )
             return self._compact_digest(updated)
 
@@ -1370,10 +1596,48 @@ class JobManager:
             prior_usage=receipt.get("usage"),
             prior_tool_calls=receipt.get("tool_calls"),
             scrub_receipt=scrub_receipt,
+            in_place=in_place,
+            pre_untracked=pre_untracked,
         )
         with self._lock:
             self._futures[safe_id] = fut
         return {"job_id": safe_id, "status": "running", "prompts_count": len(recorded_prompts)}
+
+    def _verify_in_place_unchanged(self, receipt: dict[str, Any]) -> None:
+        """Refuse to continue an in_place job if anyone else changed the tree since its last turn."""
+        root = self.workspace_root
+        baseline_sha = str(receipt.get("baseline_commit_sha") or "")
+        head_res = _run_git(["rev-parse", "HEAD"], cwd=root, check=False)
+        if head_res.stdout.strip() != baseline_sha:
+            raise ValueError(
+                "HEAD moved since this in_place job ran (a commit was made). "
+                "Start a new in_place job instead of continuing this one."
+            )
+        applied_files = set(receipt.get("applied_files") or [])
+        for fpath, expected in (receipt.get("applied_file_hashes") or {}).items():
+            if _hash_path(root / fpath) != expected:
+                raise ValueError(
+                    f"{fpath} changed after this in_place job finished. Commit or revert that edit, "
+                    f"then start a new in_place job."
+                )
+        tracked_res = _run_git(["diff", "--name-only", "--no-renames", baseline_sha], cwd=root, check=False)
+        extra_tracked = [
+            f.strip() for f in tracked_res.stdout.splitlines() if f.strip() and f.strip() not in applied_files
+        ]
+        pre_untracked = receipt.get("pre_untracked_hashes") or {}
+        extra_untracked = [
+            rel
+            for rel, h in _snapshot_untracked_hashes(root).items()
+            if rel not in applied_files
+            and not rel.startswith((".cc-agy-data/", ".worktrees/"))
+            and not _is_ephemeral_build_or_test_artifact(rel)
+            and pre_untracked.get(rel, "__absent__") != h
+        ]
+        if extra_tracked or extra_untracked:
+            raise ValueError(
+                "Files outside this in_place job changed since its last turn: "
+                f"{(extra_tracked + extra_untracked)[:10]}. Commit or revert them, then start a new job."
+            )
 
     def delegate_cancel(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
         """Cancel a job and clean up its worktree while preserving its cancelled receipt status."""
@@ -1435,8 +1699,12 @@ class JobManager:
             "usage": receipt.get("usage", {}),
             "cost": receipt.get("cost", {}),
             "applied": bool(receipt.get("applied", False)),
+            "in_place": bool(receipt.get("in_place", False)),
             "error": receipt.get("error"),
         }
+        if receipt.get("in_place"):
+            digest["in_place_notes"] = receipt.get("in_place_notes", [])
+            digest["undo_hint"] = receipt.get("undo_hint")
         if include_summary:
             digest["summary"] = clipped_summary
             digest["summary_truncated"] = bool(receipt.get("summary_truncated") or truncated)

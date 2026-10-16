@@ -2,7 +2,7 @@
 
 `cc-agy-plugin` is a native Claude Code plugin that lets Claude Code delegate coding, debugging, and review tasks to Vertex AI Gemini models through a long-lived Python stdio Model Context Protocol (MCP) server.
 
-> **Status:** early. The unit tests (26) run against a fake Gemini worker. The plugin has not yet been run end to end against live Vertex AI, so expect rough edges on the first real run.
+> **Status:** early. The unit tests (32) run against a fake Gemini worker. The plugin has not yet been run end to end against live Vertex AI, so expect rough edges on the first real run.
 
 ## Why use this: Opus plans, Gemini does the grunt work
 
@@ -48,6 +48,18 @@ claude --plugin-dir /path/to/cc-agy-plugin
 ```
 
 Claude Code asks for the plugin settings (GCP project, region, default models, strict mode). Run `/mcp` to confirm the `vertex` server is connected, then try a small task such as "use delegate_start to add a hello() function in hello.py, then show me get_diff".
+
+## Isolated copy vs. `in_place`
+
+By default every job runs on a **copy** of your repo. Think of it as handing a contractor a photocopy: they mark up the copy, you review the diff (`get_diff`), and only `delegate_apply` pastes the changes into your real files. This is safest when you want to review first, run several jobs at once, or keep editing while Gemini works. The trade-off is that the copy skips gitignored folders such as `node_modules/` and `.venv/`, so the worker may not be able to run your tests.
+
+Pass `in_place=true` to `delegate_start` or `delegate_to_gemini` to let the worker edit your real working tree directly. It is faster on big repos and the worker sees your installed dependencies. To keep it safe:
+
+- The tracked files must be clean (no uncommitted edits), so git can always undo the worker.
+- Only one `in_place` job runs at a time, and `allowed_paths` is refused because it can't be enforced on live files.
+- If the worker commits, its commits are undone (`git reset --mixed`) with the changes kept on disk, and your index is restored.
+- The job counts as applied when it finishes, even after an error or timeout. The result includes an `undo_hint` with the exact `git checkout` / `rm` commands to revert.
+- `delegate_continue` works on an `in_place` job only if nothing else in the tree changed since the last turn.
 
 ## Architecture
 
