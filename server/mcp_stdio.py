@@ -48,6 +48,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "number",
                     "description": "Optional sampling temperature.",
                 },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional Google Cloud project ID override for Vertex AI.",
+                },
                 "location": {
                     "type": "string",
                     "description": "Optional Vertex AI region override (auto-routed to global when required).",
@@ -131,6 +139,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "scrub_receipt": {
                     "type": "boolean",
                     "description": "Redact paying project ID and host paths in the receipt (default: false).",
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional Google Cloud project ID for Vertex AI.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Optional Vertex AI region override.",
                 },
                 "timeout_seconds": {
                     "type": "number",
@@ -258,6 +278,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Wait for the follow-up turn to finish (default: true).",
                 },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional Google AI Studio Gemini API key override.",
+                },
             },
             "required": ["job_id", "follow_up_prompt"],
         },
@@ -350,6 +374,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "scrub_receipt": {
                     "type": "boolean",
                     "description": "Redact paying project ID and host paths in the receipt (default: false).",
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional Google Cloud project ID for Vertex AI.",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Optional Vertex AI region override.",
                 },
                 "auto_apply": {
                     "type": "boolean",
@@ -638,6 +674,8 @@ class MCPServer:
                 context_files=ctx_files,
                 system_instruction=args.get("system_instruction"),
                 temperature=args.get("temperature"),
+                api_key=args.get("api_key"),
+                project=args.get("project"),
                 location=args.get("location"),
                 workspace_root=self.job_manager.workspace_root,
                 store=self.store,
@@ -667,6 +705,9 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
                 in_place=in_place_b,
+                api_key=args.get("api_key"),
+                project=args.get("project"),
+                location=args.get("location"),
                 thinking_level=args.get("thinking_level"),
                 plan=args.get("plan"),
                 acceptance=args.get("acceptance"),
@@ -729,6 +770,9 @@ class MCPServer:
                 follow_up_prompt=followup_str,
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
+                api_key=args.get("api_key"),
+                project=args.get("project"),
+                location=args.get("location"),
             )
 
         if name == "delegate_cancel":
@@ -764,6 +808,9 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=True,
                 in_place=in_place_b,
+                api_key=args.get("api_key"),
+                project=args.get("project"),
+                location=args.get("location"),
                 thinking_level=args.get("thinking_level"),
                 plan=args.get("plan"),
                 acceptance=args.get("acceptance"),

@@ -37,6 +37,26 @@ These numbers are illustrative, not measured. Prompt caching lowers the all-Opus
 
 ## Quick start
 
+### Option A: Google AI Studio API Key (Simplest Setup)
+
+If you have a Gemini API key from [Google AI Studio](https://aistudio.google.com), you do not need a Google Cloud project, billing account, or `gcloud` CLI:
+
+```bash
+# Python packages for the MCP server (it runs with the python3 on your PATH)
+python3 -m pip install google-genai pydantic google-antigravity
+
+# Set your Gemini API key (or configure userConfig.gemini_api_key in Claude Code)
+export GEMINI_API_KEY="your-api-key-here"
+
+# Start Claude Code in a git repo with the plugin loaded
+cd /path/to/your/repo
+claude --plugin-dir /path/to/cc-agy-plugin
+```
+
+### Option B: Google Cloud Vertex AI (Service Account / Application Default Credentials)
+
+If you prefer using Vertex AI with enterprise billing or service accounts:
+
 ```bash
 # Python packages for the MCP server (it runs with the python3 on your PATH)
 python3 -m pip install google-genai pydantic google-antigravity
@@ -49,7 +69,7 @@ cd /path/to/your/repo
 claude --plugin-dir /path/to/cc-agy-plugin
 ```
 
-Claude Code asks for the plugin settings (GCP project, region, default models, strict mode). Run `/mcp` to confirm the `vertex` server is connected, then try a small task such as "use delegate_start to add a hello() function in hello.py, then show me get_diff".
+Claude Code prompts for the plugin settings (Google AI Studio API key, GCP project, region, default models, strict mode). Run `/mcp` to confirm the `vertex` server is connected, then try a small task such as "use delegate_start to add a hello() function in hello.py, then show me get_diff".
 
 ## Isolated copy vs. `in_place`
 
@@ -65,9 +85,9 @@ Pass `in_place=true` to `delegate_start` or `delegate_to_gemini` to let the work
 
 ## Architecture
 
-1. **Two Execution Tiers on Vertex AI**:
-   - **`ask_gemini` (`server/genai_ask.py`)**: Single-shot Vertex AI call via `google-genai` (`genai.Client(vertexai=True, ...)`). Avoids the 11,554-token per-turn system prompt floor of the full Antigravity agent loop when asking for code reviews or architectural second opinions.
-   - **`delegate_start` / `delegate_result` / `get_diff` / `delegate_apply` / `delegate_continue` / `delegate_cancel` / `delegate_to_gemini` (`server/jobs.py`, `server/agy_runner.py`)**: Runs `google.antigravity.Agent` (`vertex=True` on `LocalAgentConfig`) inside a standalone isolated repository copy per job.
+1. **Flexible Dual Authentication (Google AI Studio API Key or Vertex AI)**:
+   - **`ask_gemini` (`server/genai_ask.py`)**: Single-shot call via `google-genai` (`genai.Client(api_key=...)` or `genai.Client(vertexai=True, ...)`). Avoids the 11,554-token per-turn system prompt floor of the full Antigravity agent loop when asking for code reviews or architectural second opinions.
+   - **`delegate_start` / `delegate_result` / `get_diff` / `delegate_apply` / `delegate_continue` / `delegate_cancel` / `delegate_to_gemini` (`server/jobs.py`, `server/agy_runner.py`)**: Runs `google.antigravity.Agent` using `GeminiAPIEndpoint` with your API key or `VertexEndpoint` with Vertex AI project credentials inside a standalone isolated repository copy per job.
 2. **Standalone Repository Isolation & Conflict-Safe Apply**:
    - Every worker job runs in its own standalone repository copy under `<data_dir>/worktrees/<job_id>` with its own independent `.git` directory and baseline commit SHA (so workers do not share `.git/hooks` or `.git/config` with the host repository, and host `.git/hooks` and `.git/config` are snapshot-verified around every worker run).
    - Diffs are collected against the recorded baseline commit SHA with `git diff --binary --no-renames <baseline_sha>`, capturing worker commits, file renames/deletions, untracked files, and binary diffs while blocking symlinks that point outside the worktree.

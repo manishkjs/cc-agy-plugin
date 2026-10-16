@@ -245,11 +245,31 @@ def resolve_vertex_location(
     return raw_loc, None
 
 
+def resolve_api_key(
+    requested_key: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve a Google AI Studio Gemini API key from arguments or environment."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_key,
+        source_env.get("GEMINI_API_KEY"),
+        source_env.get("GOOGLE_API_KEY"),
+    ):
+        if candidate:
+            cleaned = candidate.strip()
+            if cleaned and not cleaned.startswith("${") and cleaned != "<api-key>":
+                return cleaned
+    return None
+
+
 def resolve_vertex_project(
     requested_project: str | None = None,
     *,
     env: dict[str, str] | None = None,
-) -> str:
+    allow_missing: bool = False,
+) -> str | None:
     """Resolve the Google Cloud Project ID from arguments or environment."""
     source_env = env if env is not None else os.environ
     for candidate in (
@@ -262,9 +282,56 @@ def resolve_vertex_project(
             cleaned = candidate.strip()
             if cleaned and not cleaned.startswith("${") and cleaned != "<paying-project>":
                 return cleaned
+    if allow_missing:
+        return None
     raise ValueError(
         "Missing Google Cloud project ID. Set userConfig.google_cloud_project in Claude Code "
         "or export GOOGLE_CLOUD_PROJECT."
+    )
+
+
+def resolve_auth_config(
+    requested_project: str | None = None,
+    requested_location: str | None = None,
+    requested_api_key: str | None = None,
+    *,
+    model: str = "gemini-2.5-flash",
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve authentication credentials for Google AI Studio (API key) or Vertex AI.
+
+    If an API key is provided directly or found via GEMINI_API_KEY / GOOGLE_API_KEY,
+    the auth mode is 'api_key' and Vertex project/ADC credentials are not required.
+    Otherwise, resolves the Vertex AI project and location (auth mode 'vertex').
+    """
+    source_env = env if env is not None else os.environ
+    resolved_key = resolve_api_key(requested_api_key, env=source_env)
+    resolved_proj = resolve_vertex_project(requested_project, env=source_env, allow_missing=True)
+
+    # Use API key if explicitly passed, or if present in environment without an explicit project argument
+    if resolved_key and (requested_api_key or not requested_project):
+        return {
+            "auth_mode": "api_key",
+            "api_key": resolved_key,
+            "project": resolved_proj,
+            "location": None,
+            "reroute_note": None,
+        }
+
+    if resolved_proj:
+        resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
+        return {
+            "auth_mode": "vertex",
+            "api_key": None,
+            "project": resolved_proj,
+            "location": resolved_loc,
+            "reroute_note": reroute_note,
+        }
+
+    raise ValueError(
+        "Missing credentials. Provide a Google AI Studio Gemini API key "
+        "(userConfig.gemini_api_key or GEMINI_API_KEY), or a Google Cloud project ID "
+        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT)."
     )
 
 

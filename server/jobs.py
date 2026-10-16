@@ -31,6 +31,7 @@ from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
     paginate_text_by_tokens,
+    resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
     truncate_to_token_budget,
@@ -565,6 +566,7 @@ class JobManager:
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
         self._raw_projects: dict[str, str] = {}
+        self._raw_api_keys: dict[str, str] = {}
         self._in_place_job: str | None = None
         self._ensure_baseline_recorded()
 
@@ -932,8 +934,10 @@ class JobManager:
         worker_prompts: list[str],
         recorded_prompts: list[str],
         model: str,
-        project: str,
-        location: str,
+        auth_mode: str = "vertex",
+        api_key: str | None = None,
+        project: str | None = None,
+        location: str | None = None,
         reroute_note: str | None,
         allowed_paths: list[str],
         timeout_seconds: float,
@@ -995,6 +999,7 @@ class JobManager:
                 model=model,
                 project=project,
                 location=location,
+                api_key=api_key,
                 timeout_seconds=timeout_seconds,
                 enabled_tools=enabled_tools,
                 disabled_tools=disabled_tools,
@@ -1123,6 +1128,7 @@ class JobManager:
                 "job_id": job_id,
                 "kind": "delegate",
                 "status": status,
+                "auth_mode": auth_mode,
                 "model": model,
                 "vertex_project": project,
                 "vertex_location": location,
@@ -1239,6 +1245,7 @@ class JobManager:
         allowed_paths: list[str] | None = None,
         project: str | None = None,
         location: str | None = None,
+        api_key: str | None = None,
         timeout_seconds: float = 300.0,
         enabled_tools: list[str] | None = None,
         disabled_tools: list[str] | None = None,
@@ -1287,8 +1294,17 @@ class JobManager:
         if chosen_model.startswith("${"):
             chosen_model = "gemini-3.1-pro-preview"
 
-        resolved_project = resolve_vertex_project(project)
-        resolved_location, reroute_note = resolve_vertex_location(chosen_model, location)
+        auth = resolve_auth_config(
+            requested_project=project,
+            requested_location=location,
+            requested_api_key=api_key,
+            model=chosen_model,
+        )
+        auth_mode = auth["auth_mode"]
+        resolved_key = auth.get("api_key")
+        resolved_project = auth.get("project")
+        resolved_location = auth.get("location")
+        reroute_note = auth.get("reroute_note")
 
         job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         started_at = round(time.time(), 3)
@@ -1305,12 +1321,16 @@ class JobManager:
             wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(job_id)
 
         with self._lock:
-            self._raw_projects[job_id] = resolved_project
+            if resolved_project:
+                self._raw_projects[job_id] = resolved_project
+            if resolved_key:
+                self._raw_api_keys[job_id] = resolved_key
 
         initial_receipt = {
             "job_id": job_id,
             "kind": "delegate",
             "status": "running",
+            "auth_mode": auth_mode,
             "model": chosen_model,
             "vertex_project": resolved_project,
             "vertex_location": resolved_location,
@@ -1357,6 +1377,8 @@ class JobManager:
             worker_prompts=[worker_prompt],
             recorded_prompts=[prompt.strip()],
             model=chosen_model,
+            auth_mode=auth_mode,
+            api_key=resolved_key,
             project=resolved_project,
             location=resolved_location,
             reroute_note=reroute_note,
@@ -1724,6 +1746,9 @@ class JobManager:
         *,
         timeout_seconds: float = 300.0,
         wait: bool = True,
+        api_key: str | None = None,
+        project: str | None = None,
+        location: str | None = None,
     ) -> dict[str, Any]:
         """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
         safe_id = validate_job_id(job_id)
@@ -1804,10 +1829,25 @@ class JobManager:
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
-        project = resolve_vertex_project(raw_proj or str(receipt.get("vertex_project") or ""))
-        location, reroute_note = resolve_vertex_location(
-            model, str(receipt.get("vertex_location") or "")
+            raw_key = self._raw_api_keys.get(safe_id)
+        auth = resolve_auth_config(
+            requested_project=project or raw_proj or receipt.get("vertex_project"),
+            requested_location=location or receipt.get("vertex_location"),
+            requested_api_key=api_key or raw_key,
+            model=model,
         )
+        auth_mode = auth["auth_mode"]
+        resolved_key = auth.get("api_key")
+        resolved_project = auth.get("project")
+        resolved_location = auth.get("location")
+        reroute_note = auth.get("reroute_note")
+
+        with self._lock:
+            if resolved_project:
+                self._raw_projects[safe_id] = resolved_project
+            if resolved_key:
+                self._raw_api_keys[safe_id] = resolved_key
+
         allowed_paths = validate_allowed_paths(receipt.get("allowed_paths") or [])
         enabled_tools = receipt.get("enabled_tools")
         disabled_tools = receipt.get("disabled_tools")
@@ -1821,8 +1861,10 @@ class JobManager:
                 worker_prompts=worker_prompts,
                 recorded_prompts=recorded_prompts,
                 model=model,
-                project=project,
-                location=location,
+                auth_mode=auth_mode,
+                api_key=resolved_key,
+                project=resolved_project,
+                location=resolved_location,
                 reroute_note=reroute_note,
                 allowed_paths=allowed_paths,
                 timeout_seconds=timeout_seconds,
@@ -1852,8 +1894,10 @@ class JobManager:
             worker_prompts=worker_prompts,
             recorded_prompts=recorded_prompts,
             model=model,
-            project=project,
-            location=location,
+            auth_mode=auth_mode,
+            api_key=resolved_key,
+            project=resolved_project,
+            location=resolved_location,
             reroute_note=reroute_note,
             allowed_paths=allowed_paths,
             timeout_seconds=timeout_seconds,
@@ -2013,6 +2057,7 @@ class JobManager:
             "job_id": receipt.get("job_id"),
             "kind": receipt.get("kind", "delegate"),
             "status": receipt.get("status"),
+            "auth_mode": receipt.get("auth_mode", "vertex"),
             "model": receipt.get("model"),
             "vertex_location": receipt.get("vertex_location"),
             "reroute_note": receipt.get("reroute_note"),

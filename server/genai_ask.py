@@ -12,6 +12,7 @@ import uuid
 from server.receipts import ReceiptStore, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
+    resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
     truncate_to_token_budget,
@@ -21,15 +22,18 @@ GenaiBackend = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
-    """Invoke Vertex AI via the official google-genai SDK."""
+    """Invoke Google AI Studio or Vertex AI via the official google-genai SDK."""
     from google import genai
     from google.genai import types as genai_types
 
-    client = genai.Client(
-        vertexai=True,
-        project=request["project"],
-        location=request["location"],
-    )
+    if request.get("api_key"):
+        client = genai.Client(api_key=request["api_key"])
+    else:
+        client = genai.Client(
+            vertexai=True,
+            project=request.get("project"),
+            location=request.get("location"),
+        )
     cfg_kwargs: dict[str, Any] = {}
     if request.get("system_instruction"):
         cfg_kwargs["system_instruction"] = request["system_instruction"]
@@ -71,12 +75,13 @@ def ask_gemini(
     temperature: float | None = None,
     project: str | None = None,
     location: str | None = None,
+    api_key: str | None = None,
     workspace_root: str | Path | None = None,
     store: ReceiptStore | None = None,
     scrub_receipt: bool = False,
     backend: GenaiBackend | None = None,
 ) -> dict[str, Any]:
-    """Run a single-shot Vertex AI Gemini query without spinning up the Antigravity agent loop.
+    """Run a single-shot Google AI Studio or Vertex AI Gemini query without spinning up Antigravity.
 
     Ideal for code reviews, architecture checks, or second opinions where the
     11,554-token Antigravity SDK system prompt floor is unnecessary.
@@ -102,8 +107,17 @@ def ask_gemini(
     if chosen_model.startswith("${"):
         chosen_model = "gemini-2.5-flash"
 
-    resolved_project = resolve_vertex_project(project)
-    resolved_location, reroute_note = resolve_vertex_location(chosen_model, location)
+    auth = resolve_auth_config(
+        requested_project=project,
+        requested_location=location,
+        requested_api_key=api_key,
+        model=chosen_model,
+    )
+    auth_mode = auth["auth_mode"]
+    resolved_key = auth.get("api_key")
+    resolved_project = auth.get("project")
+    resolved_location = auth.get("location")
+    reroute_note = auth.get("reroute_note")
 
     assembled_parts: list[str] = []
     included_files: list[str] = []
@@ -139,6 +153,8 @@ def ask_gemini(
     try:
         result = active_backend(
             {
+                "auth_mode": auth_mode,
+                "api_key": resolved_key,
                 "project": resolved_project,
                 "location": resolved_location,
                 "model": chosen_model,
@@ -183,6 +199,7 @@ def ask_gemini(
             "job_id": job_id,
             "kind": "ask",
             "status": status,
+            "auth_mode": auth_mode,
             "model": chosen_model,
             "vertex_project": resolved_project,
             "vertex_location": resolved_location,
@@ -207,6 +224,7 @@ def ask_gemini(
     return {
         "job_id": job_id,
         "status": status,
+        "auth_mode": auth_mode,
         "model": chosen_model,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,

@@ -171,13 +171,21 @@ def scrub_receipt_for_export(
     receipt: dict[str, Any],
     *,
     project_id: str | None = None,
+    api_key: str | None = None,
     workspace_root: str | None = None,
 ) -> dict[str, Any]:
-    """Return a copy of a receipt with paying project IDs and host paths scrubbed."""
+    """Return a copy of a receipt with paying project IDs, API keys, and host paths scrubbed."""
+    import re
+
     raw_json = json.dumps(receipt, sort_keys=True)
     proj = project_id or receipt.get("vertex_project")
     if proj and isinstance(proj, str) and proj not in ("<paying-project>", ""):
         raw_json = raw_json.replace(proj, "<paying-project>")
+    key = api_key or receipt.get("api_key")
+    if key and isinstance(key, str) and key not in ("<api-key>", ""):
+        raw_json = raw_json.replace(key, "<api-key>")
+    # Redact standard Google API key pattern (AIza...)
+    raw_json = re.sub(r"AIza[0-9A-Za-z\-_]{35}", "<api-key>", raw_json)
     if workspace_root and isinstance(workspace_root, str):
         norm_ws = str(Path(workspace_root).resolve())
         raw_json = raw_json.replace(norm_ws, "/workspace")
@@ -185,8 +193,10 @@ def scrub_receipt_for_export(
     if home_dir and home_dir != "/":
         raw_json = raw_json.replace(home_dir, "/home/user")
     scrubbed = json.loads(raw_json)
-    if "vertex_project" in scrubbed:
+    if "vertex_project" in scrubbed and scrubbed["vertex_project"] is not None:
         scrubbed["vertex_project"] = "<paying-project>"
+    if "api_key" in scrubbed:
+        scrubbed["api_key"] = "<api-key>"
     return scrubbed
 
 

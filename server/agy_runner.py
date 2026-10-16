@@ -12,7 +12,11 @@ import threading
 import time
 from typing import Any, Callable
 
-from server.regions import resolve_vertex_location, resolve_vertex_project
+from server.regions import (
+    resolve_auth_config,
+    resolve_vertex_location,
+    resolve_vertex_project,
+)
 
 
 async def maybe_await(value: Any) -> Any:
@@ -197,15 +201,23 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     from google import antigravity as ag
     from google.antigravity import policy, types
 
-    endpoint = types.VertexEndpoint(
-        project=request["project"],
-        location=request["location"],
-        options=(
-            types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
-            if request.get("thinking_level")
-            else None
-        ),
+    options = (
+        types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
+        if request.get("thinking_level")
+        else None
     )
+
+    if request.get("api_key"):
+        endpoint = types.GeminiAPIEndpoint(
+            api_key=request["api_key"],
+            options=options,
+        )
+    else:
+        endpoint = types.VertexEndpoint(
+            project=request["project"],
+            location=request["location"],
+            options=options,
+        )
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     model_cfg = types.ModelTarget(
         name=request["model"],
@@ -286,19 +298,24 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         except (ImportError, Exception):
             pass
 
-    # CRITICAL (D11): Always set vertex=True at top-level of LocalAgentConfig so the
+    # For Vertex AI: Always set vertex=True at top-level of LocalAgentConfig so the
     # Antigravity SDK does not inject the default GeminiAPIEndpoint image model
     # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
+    # For Google AI Studio direct API key: set vertex=False and pass api_key.
+    is_api_key = bool(request.get("api_key"))
     cfg_kwargs: dict[str, Any] = dict(
         workspaces=[str(Path(request["workspace_dir"]))],
-        vertex=True,
-        project=request["project"],
-        location=request["location"],
+        vertex=not is_api_key,
         model=model_cfg,
         policies=[policy.allow_all()],
         capabilities=capabilities,
         save_dir=save_dir,
     )
+    if is_api_key:
+        cfg_kwargs["api_key"] = request["api_key"]
+    else:
+        cfg_kwargs["project"] = request.get("project")
+        cfg_kwargs["location"] = request.get("location")
     if budget_cfg is not None:
         cfg_kwargs["budget_config"] = budget_cfg
     if custom_tools:
@@ -393,6 +410,7 @@ def run_antigravity_worker(
     model: str,
     project: str | None = None,
     location: str | None = None,
+    api_key: str | None = None,
     timeout_seconds: float = 300.0,
     enabled_tools: list[str] | None = None,
     disabled_tools: list[str] | None = None,
@@ -404,14 +422,25 @@ def run_antigravity_worker(
     progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
-    resolved_project = resolve_vertex_project(project)
-    resolved_location, reroute_note = resolve_vertex_location(model, location)
+    auth = resolve_auth_config(
+        requested_project=project,
+        requested_location=location,
+        requested_api_key=api_key,
+        model=model,
+    )
+    auth_mode = auth["auth_mode"]
+    resolved_key = auth.get("api_key")
+    resolved_project = auth.get("project")
+    resolved_location = auth.get("location")
+    reroute_note = auth.get("reroute_note")
     resolved_thinking = resolve_thinking_level(thinking_level)
 
     req = {
         "prompts": list(prompts),
         "workspace_dir": str(Path(workspace_dir).resolve()),
         "model": model,
+        "auth_mode": auth_mode,
+        "api_key": resolved_key,
         "project": resolved_project,
         "location": resolved_location,
         "reroute_note": reroute_note,
@@ -439,6 +468,7 @@ def run_antigravity_worker(
         "thoughts": list(result.get("thoughts") or []),
         "stop_reason": result.get("stop_reason"),
         "containment": result.get("containment", "none"),
+        "auth_mode": auth_mode,
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,

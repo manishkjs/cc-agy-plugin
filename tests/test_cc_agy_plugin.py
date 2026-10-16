@@ -33,6 +33,8 @@ from server.regions import (
     estimate_cost_usd,
     normalize_model_id,
     paginate_text_by_tokens,
+    resolve_api_key,
+    resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
 )
@@ -1255,6 +1257,116 @@ class TestCostControls(unittest.TestCase):
             self.assertIn("ctx_search", prompts[0])
             receipt = store.read_receipt(res["job_id"])
             self.assertEqual(receipt.get("containment"), "straitjacket")
+
+    def test_resolve_api_key_and_auth_config(self) -> None:
+        self.assertEqual(resolve_api_key("my-api-key"), "my-api-key")
+        self.assertEqual(resolve_api_key(None, env={"GEMINI_API_KEY": "gem-env-key"}), "gem-env-key")
+        self.assertEqual(resolve_api_key(None, env={"GOOGLE_API_KEY": "goog-env-key"}), "goog-env-key")
+        self.assertIsNone(resolve_api_key("${user_config.gemini_api_key}", env={}))
+        self.assertIsNone(resolve_api_key("<api-key>", env={}))
+        self.assertIsNone(resolve_api_key("", env={}))
+
+        auth_key = resolve_auth_config(requested_api_key="my-key", env={})
+        self.assertEqual(auth_key["auth_mode"], "api_key")
+        self.assertEqual(auth_key["api_key"], "my-key")
+        self.assertIsNone(auth_key["location"])
+
+        auth_vertex = resolve_auth_config(requested_project="my-proj", env={"GOOGLE_CLOUD_LOCATION": "us-central1"})
+        self.assertEqual(auth_vertex["auth_mode"], "vertex")
+        self.assertEqual(auth_vertex["project"], "my-proj")
+        self.assertEqual(auth_vertex["location"], "us-central1")
+
+        with self.assertRaises(ValueError):
+            resolve_auth_config(env={})
+
+    def test_scrub_receipt_scrubs_api_key(self) -> None:
+        raw_receipt = {
+            "vertex_project": "my-secret-project",
+            "api_key": "AIzaSySecretTestingKey1234567890abc",
+            "summary": "Invoked model with key AIzaSySecretTestingKey1234567890abc in project my-secret-project",
+        }
+        scrubbed = scrub_receipt_for_export(raw_receipt, api_key="AIzaSySecretTestingKey1234567890abc")
+        self.assertEqual(scrubbed["vertex_project"], "<paying-project>")
+        self.assertEqual(scrubbed["api_key"], "<api-key>")
+        self.assertNotIn("AIzaSySecretTestingKey1234567890abc", json.dumps(scrubbed))
+        self.assertNotIn("my-secret-project", json.dumps(scrubbed))
+
+    def test_api_key_mode_for_ask_gemini_and_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+
+            def mock_ask_backend(req: dict[str, Any]) -> dict[str, Any]:
+                self.assertEqual(req.get("api_key"), "AIzaTestKey")
+                self.assertEqual(req.get("auth_mode"), "api_key")
+                return {"text": "Answer from API key", "usage": {"total_token_count": 50}}
+
+            ask_res = ask_gemini(
+                "Review this code",
+                api_key="AIzaTestKey",
+                workspace_root=repo_dir,
+                store=store,
+                backend=mock_ask_backend,
+            )
+            self.assertEqual(ask_res["status"], "ok")
+            self.assertEqual(ask_res["auth_mode"], "api_key")
+            ask_rcpt = store.read_receipt(ask_res["job_id"])
+            self.assertEqual(ask_rcpt["auth_mode"], "api_key")
+
+            def mock_worker(req: dict[str, Any]) -> dict[str, Any]:
+                self.assertEqual(req.get("api_key"), "AIzaTestKey")
+                self.assertEqual(req.get("auth_mode"), "api_key")
+                (Path(req["workspace_dir"]) / "output.txt").write_text("done\n", encoding="utf-8")
+                return {"text": "Worker done", "usage": {"total_token_count": 100}}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=mock_worker)
+            start_res = jm.delegate_start(
+                "Implement feature",
+                api_key="AIzaTestKey",
+                wait=True,
+            )
+            self.assertEqual(start_res["status"], "ok")
+            self.assertEqual(start_res["auth_mode"], "api_key")
+            job_rcpt = store.read_receipt(start_res["job_id"])
+            self.assertEqual(job_rcpt["auth_mode"], "api_key")
+
+            # delegate_continue should automatically reuse the job's api_key
+            cont_res = jm.delegate_continue(
+                start_res["job_id"],
+                "Fix extra detail",
+                wait=True,
+            )
+            self.assertEqual(cont_res["status"], "ok")
+            self.assertEqual(cont_res["auth_mode"], "api_key")
+
+    def test_mcp_schema_and_stdio_expose_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+            server = MCPServer(job_manager=jm, store=store)
+
+            # Check tools have api_key in inputSchema
+            tools_list = server.handle_Message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
+            schemas = {t["name"]: t["inputSchema"]["properties"] for t in tools_list}
+            self.assertIn("api_key", schemas["ask_gemini"])
+            self.assertIn("api_key", schemas["delegate_start"])
+            self.assertIn("api_key", schemas["delegate_continue"])
+            self.assertIn("api_key", schemas["delegate_to_gemini"])
+
+            called_auth = {}
+
+            def mock_ask(req: dict[str, Any]) -> dict[str, Any]:
+                called_auth["api_key"] = req.get("api_key")
+                called_auth["auth_mode"] = req.get("auth_mode")
+                return {"text": "mcp ask ok"}
+
+            server.ask_backend = mock_ask
+            res = server._dispatch_tool(
+                "ask_gemini",
+                {"prompt": "hello", "api_key": "mcp-test-key"},
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(called_auth["api_key"], "mcp-test-key")
+            self.assertEqual(called_auth["auth_mode"], "api_key")
 
 
 if __name__ == "__main__":

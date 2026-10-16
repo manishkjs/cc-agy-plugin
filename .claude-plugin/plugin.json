@@ -15,6 +15,12 @@
     "mcp"
   ],
   "userConfig": {
+    "gemini_api_key": {
+      "title": "Google AI Studio API Key",
+      "description": "Optional Gemini API Key from Google AI Studio (aistudio.google.com). If provided, delegations use the direct Gemini API without requiring a Google Cloud project or service account.",
+      "type": "string",
+      "sensitive": true
+    },
     "google_cloud_project": {
       "title": "Google Cloud Project ID",
       "description": "GCP project ID with Vertex AI API enabled for Gemini billing and quota.",

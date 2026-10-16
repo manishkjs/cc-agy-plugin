@@ -6,6 +6,7 @@
         "${CLAUDE_PLUGIN_ROOT}/server/main.py"
       ],
       "env": {
+        "GEMINI_API_KEY": "${user_config.gemini_api_key}",
         "GOOGLE_CLOUD_PROJECT": "${user_config.google_cloud_project}",
         "GOOGLE_CLOUD_LOCATION": "${user_config.google_cloud_location}",
         "CC_AGY_DEFAULT_DELEGATE_MODEL": "${user_config.default_delegate_model}",
