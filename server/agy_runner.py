@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 
@@ -21,6 +23,41 @@ async def maybe_await(value: Any) -> Any:
 
 
 THINKING_LEVELS = ("MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH")
+PROGRESS_KINDS = ("milestone", "question", "blocker")
+_progress_lock = threading.Lock()
+
+
+def append_progress(progress_path: str | Path | None, kind: str, message: str) -> str:
+    """Append one worker -> lead signal (milestone / question / blocker) as a JSON line."""
+    if not progress_path:
+        return "No progress channel is configured for this job."
+    clean_kind = str(kind or "milestone").strip().lower()
+    if clean_kind not in PROGRESS_KINDS:
+        clean_kind = "milestone"
+    entry = {"ts": round(time.time(), 3), "kind": clean_kind, "message": str(message or "")[:2000]}
+    with _progress_lock:
+        Path(progress_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(progress_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    if clean_kind in ("question", "blocker"):
+        return (
+            "Reported to the lead. Stop now: end your turn with a short summary of what is done and what "
+            "you need. The lead will reply with a follow-up."
+        )
+    return "Milestone recorded. Continue."
+
+
+def read_progress(progress_path: str | Path | None, limit: int = 8) -> list[dict[str, Any]]:
+    """Return the most recent worker -> lead signals for a job."""
+    if not progress_path or not Path(progress_path).exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in Path(progress_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries[-max(1, limit):]
 
 
 def resolve_thinking_level(value: str | None) -> str | None:
@@ -189,10 +226,29 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     # Keep the SDK's own session/artifact files outside the repo so they never show up in the diff.
     save_dir = tempfile.mkdtemp(prefix="cc-agy-save-")
 
+    # Hard caps so one job cannot read tens of millions of tokens; when hit, the turn stops with a
+    # MAX_*_EXCEEDED stop reason and the job becomes a "checkpoint" the lead can continue or redirect.
+    budget_kwargs = {
+        k: int(request[k]) for k in ("max_tool_calls", "max_total_tokens") if request.get(k)
+    }
+    budget_cfg = types.BudgetConfig(**budget_kwargs) if budget_kwargs else None
+
+    progress_path = request.get("progress_path")
+
+    def report_to_lead(kind: str, message: str) -> str:
+        """Send a short signal to the lead engineer.
+
+        Args:
+            kind: "milestone" for progress (e.g. tests now 40/42 passing), "question" when a requirement
+                is ambiguous, or "blocker" when you cannot proceed. Questions and blockers end your turn.
+            message: One or two sentences for the lead.
+        """
+        return append_progress(progress_path, kind, message)
+
     # CRITICAL (D11): Always set vertex=True at top-level of LocalAgentConfig so the
     # Antigravity SDK does not inject the default GeminiAPIEndpoint image model
     # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
-    cfg = ag.LocalAgentConfig(
+    cfg_kwargs: dict[str, Any] = dict(
         workspaces=[str(Path(request["workspace_dir"]))],
         vertex=True,
         project=request["project"],
@@ -202,6 +258,11 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         capabilities=capabilities,
         save_dir=save_dir,
     )
+    if budget_cfg is not None:
+        cfg_kwargs["budget_config"] = budget_cfg
+    if progress_path:
+        cfg_kwargs["tools"] = [report_to_lead]
+    cfg = ag.LocalAgentConfig(**cfg_kwargs)
 
     tool_calls_log: list[dict[str, Any]] = []
     thoughts_log: list[str] = []
@@ -216,6 +277,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     resp = None
     agent_ref = None
     timeout_sec = float(request.get("timeout_seconds") or 300.0)
+    stop_reason: str | None = None
 
     try:
         async with ag.Agent(cfg) as agent:
@@ -242,6 +304,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                     turn_usage = extract_usage_from_session(agent, resp)
                 for k in usage:
                     usage[k] += turn_usage[k]
+                stop_reason = await resolve_stop_reason(resp)
     except Exception as exc:
         # Attach partial usage and tool calls so the caller's finally block
         # records everything consumed prior to the failure or timeout.
@@ -262,7 +325,23 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "usage": usage,
         "tool_calls": tool_calls_log,
         "thoughts": thoughts_log,
+        "stop_reason": stop_reason,
     }
+
+
+async def resolve_stop_reason(resp: Any) -> str | None:
+    """Return the SDK stop reason name (e.g. MAX_TOOL_CALLS_EXCEEDED) or None for a normal finish."""
+    try:
+        raw = await maybe_await(getattr(resp, "stop_reason", None))
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    name = str(getattr(raw, "name", None) or getattr(raw, "value", None) or raw).upper()
+    name = name.rsplit(".", 1)[-1]
+    if name in ("", "NONE", "UNSPECIFIED", "STOP_REASON_UNSPECIFIED"):
+        return None
+    return name
 
 
 def run_antigravity_worker(
@@ -278,6 +357,9 @@ def run_antigravity_worker(
     enable_subagents: bool = False,
     backend: Callable[[dict[str, Any]], Any] | None = None,
     thinking_level: str | None = None,
+    max_tool_calls: int | None = None,
+    max_total_tokens: int | None = None,
+    progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     resolved_project = resolve_vertex_project(project)
@@ -296,6 +378,9 @@ def run_antigravity_worker(
         "disabled_tools": disabled_tools,
         "enable_subagents": enable_subagents,
         "thinking_level": resolved_thinking,
+        "max_tool_calls": max_tool_calls,
+        "max_total_tokens": max_total_tokens,
+        "progress_path": str(progress_path) if progress_path else None,
     }
 
     active_backend = backend or _default_antigravity_backend
@@ -310,6 +395,7 @@ def run_antigravity_worker(
         "usage": dict(result.get("usage") or {}),
         "tool_calls": list(result.get("tool_calls") or []),
         "thoughts": list(result.get("thoughts") or []),
+        "stop_reason": result.get("stop_reason"),
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,

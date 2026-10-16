@@ -286,6 +286,11 @@ class ReceiptStore:
         safe_id = validate_job_id(job_id)
         return self.receipts_dir / f"{safe_id}.diff"
 
+    def progress_path(self, job_id: str) -> Path:
+        """Worker -> lead signals (report_to_lead) for a job, one JSON object per line."""
+        safe_id = validate_job_id(job_id)
+        return self.receipts_dir / f"{safe_id}.progress.jsonl"
+
     def worktree_path(self, job_id: str) -> Path:
         safe_id = validate_job_id(job_id)
         return self.worktrees_dir / safe_id

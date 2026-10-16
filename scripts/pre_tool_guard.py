@@ -1210,8 +1210,10 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
 
     # 1. Always lint delegation prompts (including follow_up_prompt) for >=9-line code dictation
     if tool_name.endswith(("delegate_start", "delegate_to_gemini", "delegate_continue")):
-        prompt_text = str(
-            tool_input.get("prompt") or tool_input.get("follow_up_prompt") or ""
+        plan_items = tool_input.get("plan") if isinstance(tool_input.get("plan"), list) else []
+        prompt_text = "\n".join(
+            [str(tool_input.get("prompt") or tool_input.get("follow_up_prompt") or "")]
+            + [str(step) for step in plan_items]
         )
         lint = lint_delegation_prompt(prompt_text)
         if not lint["ok"]:

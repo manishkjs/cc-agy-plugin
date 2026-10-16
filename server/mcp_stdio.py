@@ -97,6 +97,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
                 },
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered plan steps for the worker (outcomes, not code). The worker reports each step DONE or BLOCKED.",
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Up to 5 read-only check commands (e.g. focused pytest runs). The plugin runs them after the worker finishes and returns pass/fail with output tails, so you do not need to re-run them.",
+                },
+                "max_tool_calls": {
+                    "type": "integer",
+                    "description": "Per-turn worker cap (default 50, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
+                },
+                "max_total_tokens": {
+                    "type": "integer",
+                    "description": "Per-turn worker token cap (default 5,000,000, env CC_AGY_MAX_TOTAL_TOKENS; 0 = no cap).",
+                },
                 "thinking_level": {
                     "type": "string",
                     "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
@@ -162,7 +180,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Max seconds to wait (default: 540, capped below the 600s MCP timeout).",
+                    "description": "Max seconds to wait (default: 240, so your prompt cache stays warm between polls; max 540).",
                 },
             },
             "required": ["job_id"],
@@ -298,6 +316,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Enable nested subagents inside the Antigravity worker (default: false).",
                 },
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered plan steps for the worker (outcomes, not code). The worker reports each step DONE or BLOCKED.",
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Up to 5 read-only check commands (e.g. focused pytest runs). The plugin runs them after the worker finishes and returns pass/fail with output tails, so you do not need to re-run them.",
+                },
+                "max_tool_calls": {
+                    "type": "integer",
+                    "description": "Per-turn worker cap (default 50, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
+                },
+                "max_total_tokens": {
+                    "type": "integer",
+                    "description": "Per-turn worker token cap (default 5,000,000, env CC_AGY_MAX_TOTAL_TOKENS; 0 = no cap).",
+                },
                 "thinking_level": {
                     "type": "string",
                     "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
@@ -384,6 +420,21 @@ def _parse_positive_int(value: Any, field_name: str, default: int) -> int:
         raise InvalidParamsError(f"'{field_name}' must be a valid integer: {exc}") from exc
     if parsed <= 0:
         raise InvalidParamsError(f"'{field_name}' must be an integer > 0, got {value!r}")
+    return parsed
+
+
+def _parse_optional_nonneg_int(value: Any, field_name: str) -> int | None:
+    """None keeps the plugin default; 0 disables the cap; otherwise a positive integer."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise InvalidParamsError(f"'{field_name}' must be an integer, got bool")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidParamsError(f"'{field_name}' must be a valid integer: {exc}") from exc
+    if parsed < 0:
+        raise InvalidParamsError(f"'{field_name}' must be >= 0, got {value!r}")
     return parsed
 
 
@@ -617,6 +668,10 @@ class MCPServer:
                 wait=wait_b,
                 in_place=in_place_b,
                 thinking_level=args.get("thinking_level"),
+                plan=args.get("plan"),
+                acceptance=args.get("acceptance"),
+                max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
+                max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
             )
 
         if name == "delegate_status":
@@ -632,7 +687,7 @@ class MCPServer:
                 wait_b = parse_bool(args.get("wait"), True)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            timeout_val = _parse_positive_float(args.get("timeout"), "timeout", 540.0)
+            timeout_val = _parse_positive_float(args.get("timeout"), "timeout", 240.0)
             return self.job_manager.delegate_result(
                 job_id=job_id_str,
                 wait=wait_b,
@@ -710,6 +765,10 @@ class MCPServer:
                 wait=True,
                 in_place=in_place_b,
                 thinking_level=args.get("thinking_level"),
+                plan=args.get("plan"),
+                acceptance=args.get("acceptance"),
+                max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
+                max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
             )
             if auto_apply and digest.get("status") == "ok":
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))

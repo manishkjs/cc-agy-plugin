@@ -409,7 +409,11 @@ class TestWorktreeIsolationAndAdversarialEdgeCases(unittest.TestCase):
                 wait=True,
             )
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0]["prompts"], ["Turn 1 prompt"])
+            # The lead's brief is sent first, followed by the plugin's budget and reporting sections.
+            self.assertEqual(len(calls[0]["prompts"]), 1)
+            self.assertTrue(calls[0]["prompts"][0].startswith("Turn 1 prompt"))
+            self.assertIn("## Budget", calls[0]["prompts"][0])
+            self.assertEqual(store.read_receipt(d1["job_id"])["prompts"], ["Turn 1 prompt"])
             saved_r1 = store.read_receipt(d1["job_id"])
             self.assertEqual(saved_r1["vertex_project"], "<paying-project>")
 
@@ -695,7 +699,7 @@ class TestMCPStdioServer(unittest.TestCase):
 
             def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
                 wt = Path(req["workspace_dir"])
-                if "top" in req["prompts"][0]:
+                if req["prompts"][0].startswith("edit top"):
                     lines = (wt / "shared.py").read_text(encoding="utf-8").splitlines(True)
                     lines[0] = "TOP_EDIT\n"
                     (wt / "shared.py").write_text("".join(lines), encoding="utf-8")
@@ -1052,15 +1056,184 @@ class TestInPlaceMode(unittest.TestCase):
             self.assertIn("TURN_2", text)
             self.assertTrue(verify_workspace_provenance(repo_dir, store=store, strict=True)["ok"])
 
+            # A stray untracked file (e.g. written by a test run) no longer blocks recovery: it is treated
+            # as pre-existing and never credited to the worker.
             (repo_dir / "README.md").write_text("human edit\n", encoding="utf-8")
+            third = jm.delegate_continue(first["job_id"], "turn three", wait=True)
+            self.assertEqual(third["files_changed"], ["app.py"])
+            self.assertNotIn("README.md", third["files_changed"])
+
+            # A foreign change to a *tracked* file still blocks the in_place continue.
+            (repo_dir / "README.md").unlink()
+            subprocess.run(["git", "stash", "-q"], cwd=repo_dir, check=True, capture_output=True)
+            (repo_dir / "notes.txt").write_text("n\n", encoding="utf-8")
+            subprocess.run(["git", "add", "notes.txt"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "notes"], cwd=repo_dir, check=True, capture_output=True)
+            fresh = jm.delegate_start("turn a", project="p", wait=True, in_place=True)
+            (repo_dir / "notes.txt").write_text("someone else\n", encoding="utf-8")
             with self.assertRaises(ValueError):
-                jm.delegate_continue(first["job_id"], "turn three", wait=True)
+                jm.delegate_continue(fresh["job_id"], "turn b", wait=True)
 
     def test_mcp_tools_expose_in_place(self) -> None:
         from server.mcp_stdio import TOOL_DEFINITIONS
 
         with_in_place = {t["name"] for t in TOOL_DEFINITIONS if "in_place" in t["inputSchema"]["properties"]}
         self.assertEqual(with_in_place, {"delegate_start", "delegate_to_gemini"})
+
+
+class TestCostControls(unittest.TestCase):
+    """Budget checkpoints, worker -> lead signals, plugin-run acceptance checks, structured plans."""
+
+    def _setup(self, tmp: str) -> tuple[Path, ReceiptStore]:
+        repo_dir = Path(tmp) / "repo"
+        repo_dir.mkdir()
+        _init_git_repo(repo_dir)
+        return repo_dir, ReceiptStore(Path(tmp) / "data", workspace_root=repo_dir)
+
+    def test_budget_stop_becomes_checkpoint_with_default_caps_and_can_be_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            seen: list[dict[str, Any]] = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                seen.append(req)
+                (Path(req["workspace_dir"]) / "app.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+                return {"text": "", "stop_reason": "MAX_TOOL_CALLS_EXCEEDED"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start("edit greet", project="p", wait=True)
+            self.assertEqual(res["status"], "checkpoint")
+            self.assertEqual(res["stop_reason"], "MAX_TOOL_CALLS_EXCEEDED")
+            self.assertEqual(res["budget"], {"max_tool_calls": 50, "max_total_tokens": 5_000_000})
+            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (50, 5_000_000))
+            self.assertTrue(jm.delegate_apply(res["job_id"])["applied"])
+
+            no_cap = jm.delegate_start("x", project="p", wait=True, max_tool_calls=0, max_total_tokens=0)
+            self.assertEqual(no_cap["budget"], {"max_tool_calls": None, "max_total_tokens": None})
+            self.assertNotIn("## Budget", seen[-1]["prompts"][0])
+
+    def test_report_to_lead_question_sets_needs_input_and_progress_is_visible(self) -> None:
+        import threading
+
+        from server.agy_runner import append_progress
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            gate = threading.Event()
+            reported = threading.Event()
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                append_progress(req["progress_path"], "milestone", "read the code")
+                reported.set()
+                gate.wait(5)
+                msg = append_progress(req["progress_path"], "question", "Should empty bodies raise?")
+                self.assertIn("Stop now", msg)
+                return {"text": "need an answer"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            started = jm.delegate_start("x", project="p")
+            reported.wait(5)
+            live = jm.delegate_status(started["job_id"])
+            self.assertEqual(live["status"], "running")
+            self.assertEqual(live["progress"][-1]["message"], "read the code")
+            gate.set()
+            done = jm.delegate_result(started["job_id"], wait=True, timeout=10)
+            self.assertEqual(done["status"], "needs_input")
+            self.assertEqual(done["progress"][-1]["kind"], "question")
+
+    def test_acceptance_runs_after_worker_reports_pass_fail_timeout_and_cleans_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            (repo_dir / "test_check.py").write_text(
+                "open('artifact.out', 'w').write('x')\nprint('3 passed in 0.1s')\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "test_check.py"], cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "check"], cwd=repo_dir, check=True, capture_output=True)
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                (Path(req["workspace_dir"]) / "app.py").write_text("x = 2\n", encoding="utf-8")
+                return {"text": "done"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            os.environ["CC_AGY_ACCEPTANCE_TIMEOUT"] = "2"
+            try:
+                res = jm.delegate_start(
+                    "x",
+                    project="p",
+                    wait=True,
+                    in_place=True,
+                    acceptance=["python3 test_check.py", "python3 -c 'import sys; sys.exit(1)'", "sleep 30"],
+                )
+            finally:
+                os.environ.pop("CC_AGY_ACCEPTANCE_TIMEOUT", None)
+            results = res["acceptance_results"]
+            self.assertEqual([r["passed"] for r in results], [True, False, False])
+            self.assertEqual(results[0]["counts"]["passed"], 3)
+            self.assertTrue(results[2]["timed_out"])
+            self.assertLess(results[2]["duration_seconds"], 10)
+            self.assertFalse(res["acceptance_passed"])
+            self.assertEqual(res["files_changed"], ["app.py"])
+            self.assertFalse((repo_dir / "artifact.out").exists())
+            self.assertIn("artifact.out", results[-1]["cleaned_artifacts"])
+
+    def test_acceptance_commands_that_modify_the_repo_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+            for bad in ("cp /tmp/x app.py", "rm -rf .", "echo hi > app.py"):
+                with self.assertRaises(ValueError):
+                    jm.delegate_start("x", project="p", acceptance=[bad])
+
+    def test_plan_and_acceptance_are_rendered_for_worker_and_carried_into_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            prompts: list[str] = []
+
+            def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
+                prompts.append(req["prompts"][0])
+                return {"text": "ok"}
+
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
+            res = jm.delegate_start(
+                "Implement greet()", project="p", wait=True,
+                plan=["Read app.py", "Change greet"], acceptance=["python3 -c 'pass'"], max_tool_calls=12,
+            )
+            self.assertIn("## Plan from the lead\n1. Read app.py\n2. Change greet", prompts[0])
+            self.assertIn("- `python3 -c 'pass'`", prompts[0])
+            self.assertIn("12 tool calls", prompts[0])
+            self.assertIn("report_to_lead", prompts[0])
+            jm.delegate_continue(res["job_id"], "Also add a docstring", wait=True)
+            self.assertIn("Also add a docstring", prompts[1])
+            self.assertIn("12 tool calls", prompts[1])
+            self.assertIn("2. Change greet", prompts[1])
+            with self.assertRaises(ValueError):
+                jm.delegate_start("x", project="p", plan=[f"step {i}" for i in range(20)])
+
+    def test_unfinished_jobs_are_marked_interrupted_on_shutdown(self) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir, store = self._setup(tmp)
+            gate = threading.Event()
+            jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: (gate.wait(5), {"text": ""})[1])
+            started = jm.delegate_start("x", project="p")
+            self.assertEqual(jm.mark_running_interrupted(), [started["job_id"]])
+            self.assertEqual(store.read_receipt(started["job_id"])["status"], "interrupted")
+            gate.set()
+            jm.shutdown(wait=True)
+
+    def test_mcp_schema_and_guard_cover_plan_acceptance_budget(self) -> None:
+        from server.mcp_stdio import TOOL_DEFINITIONS
+
+        start = next(t for t in TOOL_DEFINITIONS if t["name"] == "delegate_start")["inputSchema"]["properties"]
+        for field in ("plan", "acceptance", "max_tool_calls", "max_total_tokens"):
+            self.assertIn(field, start)
+        code_plan = [f"x{i} = compute({i})" for i in range(12)]
+        decision = evaluate_pre_tool_use(
+            {"tool_name": "mcp__vertex__delegate_start", "tool_input": {"prompt": "do it", "plan": code_plan}, "cwd": "/tmp"},
+            env={},
+        )
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 if __name__ == "__main__":

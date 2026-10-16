@@ -8,7 +8,9 @@ import fcntl
 import fnmatch
 import os
 from pathlib import Path
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -16,7 +18,7 @@ import time
 from typing import Any, Callable
 import uuid
 
-from server.agy_runner import resolve_thinking_level, run_antigravity_worker
+from server.agy_runner import read_progress, resolve_thinking_level, run_antigravity_worker
 from server.receipts import (
     ReceiptStore,
     extract_diff_provenance,
@@ -315,6 +317,180 @@ def _is_ignored_build_artifact(rel_path: str) -> bool:
         if part in _IGNORED_BUILD_OUTPUT_DIRS:
             return True
     return False
+
+
+DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MAX_TOTAL_TOKENS = 5_000_000
+DEFAULT_ACCEPTANCE_TIMEOUT = 300.0
+MAX_ACCEPTANCE_COMMANDS = 5
+MAX_PLAN_STEPS = 15
+ACCEPTANCE_OUTPUT_TOKENS = 600
+CHECKPOINT_STOP_REASONS = (
+    "MAX_TOOL_CALLS_EXCEEDED",
+    "MAX_TOTAL_TOKENS_EXCEEDED",
+    "MAX_INPUT_TOKENS_EXCEEDED",
+    "MAX_OUTPUT_TOKENS_EXCEEDED",
+    "MAX_MODEL_CALLS_EXCEEDED",
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw or raw.startswith("${"):
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+def resolve_budget(
+    max_tool_calls: int | None, max_total_tokens: int | None
+) -> tuple[int | None, int | None]:
+    """Per-turn worker caps (defaults 50 tool calls / 5M tokens; env overrides; 0 disables a cap)."""
+    calls = max_tool_calls if max_tool_calls is not None else _env_int("CC_AGY_MAX_TOOL_CALLS", DEFAULT_MAX_TOOL_CALLS)
+    tokens = (
+        max_total_tokens
+        if max_total_tokens is not None
+        else _env_int("CC_AGY_MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS)
+    )
+    if int(calls) < 0 or int(tokens) < 0:
+        raise ValueError("max_tool_calls and max_total_tokens must be >= 0 (0 disables the cap)")
+    return (int(calls) or None), (int(tokens) or None)
+
+
+def validate_plan(plan: Any) -> list[str]:
+    if plan is None:
+        return []
+    if not isinstance(plan, list) or not all(isinstance(s, str) for s in plan):
+        raise ValueError("plan must be a list of step strings")
+    steps = [s.strip() for s in plan if s.strip()]
+    if len(steps) > MAX_PLAN_STEPS:
+        raise ValueError(f"plan has {len(steps)} steps; keep it to at most {MAX_PLAN_STEPS}")
+    return steps
+
+
+def validate_acceptance(acceptance: Any, workdir: Path) -> list[str]:
+    """Acceptance commands must be read-only checks (tests, linters); mutating commands are refused.
+
+    The plugin itself runs them, so a mutating command would be an unguarded way to edit the repo.
+    """
+    if acceptance is None:
+        return []
+    if not isinstance(acceptance, list) or not all(isinstance(c, str) for c in acceptance):
+        raise ValueError("acceptance must be a list of shell command strings")
+    cmds = [c.strip() for c in acceptance if c.strip()]
+    if len(cmds) > MAX_ACCEPTANCE_COMMANDS:
+        raise ValueError(f"acceptance has {len(cmds)} commands; at most {MAX_ACCEPTANCE_COMMANDS} allowed")
+    from scripts.pre_tool_guard import detect_bash_workspace_mutation
+
+    for cmd in cmds:
+        verdict = detect_bash_workspace_mutation(cmd, workdir, cwd=workdir)
+        if verdict.get("blocked"):
+            raise ValueError(
+                f"acceptance command {cmd!r} is refused because it can modify the workspace: "
+                f"{verdict.get('reason')}"
+            )
+    return cmds
+
+
+def render_worker_prompt(
+    brief: str,
+    *,
+    plan: list[str],
+    acceptance: list[str],
+    max_tool_calls: int | None,
+    max_total_tokens: int | None,
+    progress_channel: bool = True,
+) -> str:
+    """Wrap the lead's brief with its plan, acceptance checks, budget, and reporting rules."""
+    parts = [brief.strip()]
+    if plan:
+        parts.append("## Plan from the lead\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1)))
+    if acceptance:
+        parts.append(
+            "## Acceptance\nWhen you finish, the plugin runs these commands and reports the results to the lead. "
+            "Make them pass:\n" + "\n".join(f"- `{c}`" for c in acceptance)
+        )
+    budget_bits = []
+    if max_tool_calls:
+        budget_bits.append(f"{max_tool_calls} tool calls")
+    if max_total_tokens:
+        budget_bits.append(f"{max_total_tokens:,} total tokens")
+    if budget_bits:
+        parts.append(
+            "## Budget\nThis turn stops automatically after " + " or ".join(budget_bits) + ". Work efficiently: "
+            "read only the code you need (targeted line ranges, not whole large files), run focused tests "
+            "instead of full suites, and do not re-read files you have already seen."
+        )
+    if progress_channel:
+        parts.append(
+            "## Reporting\nUse the report_to_lead tool: kind=\"milestone\" after each plan step or when tests "
+            "pass; kind=\"question\" if a requirement is ambiguous; kind=\"blocker\" if you cannot proceed "
+            "(questions and blockers end your turn). Finish with a short summary that marks each plan step "
+            "DONE or BLOCKED."
+        )
+    return "\n\n".join(parts)
+
+
+def _parse_test_counts(output: str) -> dict[str, int]:
+    counts = {"passed": 0, "failed": 0, "errors": 0}
+    for key, pat in (("passed", r"(\d+) passed"), ("failed", r"(\d+) failed"), ("errors", r"(\d+) errors?\b")):
+        found = re.findall(pat, output)
+        if found:
+            counts[key] = int(found[-1])
+    return counts
+
+
+def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> list[dict[str, Any]]:
+    """Run acceptance checks with a hard timeout (whole process group is killed), then delete any new
+    untracked files the checks themselves created (e.g. caches or TLS key logs), so they never land in
+    the diff or block later turns."""
+    limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(DEFAULT_ACCEPTANCE_TIMEOUT)))
+    before = set(_snapshot_untracked_hashes(cwd))
+    results: list[dict[str, Any]] = []
+    for cmd in cmds:
+        started = time.time()
+        proc = subprocess.Popen(
+            ["bash", "-c", cmd],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            out, _ = proc.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            out, _ = proc.communicate()
+        tail, _, _ = truncate_to_token_budget((out or "")[-20000:], ACCEPTANCE_OUTPUT_TOKENS)
+        results.append(
+            {
+                "command": cmd,
+                "exit_code": None if timed_out else proc.returncode,
+                "timed_out": timed_out,
+                "passed": (not timed_out) and proc.returncode == 0,
+                "duration_seconds": round(time.time() - started, 1),
+                "counts": _parse_test_counts(out or ""),
+                "output_tail": tail,
+            }
+        )
+    created = [rel for rel in _snapshot_untracked_hashes(cwd) if rel not in before]
+    for rel in created:
+        p = cwd / rel
+        if p.is_file() or p.is_symlink():
+            p.unlink(missing_ok=True)
+    if created and results:
+        results[-1]["cleaned_artifacts"] = created[:20]
+    return results
 
 
 def _hash_path(p: Path) -> str | None:
@@ -670,7 +846,8 @@ class JobManager:
         if dirty:
             raise ValueError(
                 "in_place mode needs a clean working tree for tracked files, so git can undo the "
-                "worker's edits. Commit or stash these first, or use the default isolated copy: "
+                "worker's edits. If they come from an earlier in_place job, send it a follow-up with "
+                "delegate_continue instead. Otherwise commit or stash them, or use the default isolated copy: "
                 f"{dirty[:10]}"
             )
         return head_res.stdout.strip(), _snapshot_untracked_hashes(self.workspace_root)
@@ -767,6 +944,10 @@ class JobManager:
         in_place: bool = False,
         pre_untracked: dict[str, str | None] | None = None,
         thinking_level: str | None = None,
+        plan: list[str] | None = None,
+        acceptance: list[str] | None = None,
+        max_tool_calls: int | None = None,
+        max_total_tokens: int | None = None,
     ) -> dict[str, Any]:
         usage: dict[str, int] = {
             "prompt_token_count": int((prior_usage or {}).get("prompt_token_count", 0)),
@@ -785,6 +966,10 @@ class JobManager:
         scope_violations: list[str] = []
         in_place_notes: list[str] = []
         symlink_escapes: list[str] = []
+        stop_reason: str | None = None
+        acceptance_results: list[dict[str, Any]] = []
+        progress_path = self.store.progress_path(job_id)
+        progress_before = len(read_progress(progress_path, limit=10**6))
 
         host_git_dir = self.workspace_root / ".git"
         hooks_snap = _snapshot_directory_tree(host_git_dir / "hooks")
@@ -809,6 +994,9 @@ class JobManager:
                 enable_subagents=enable_subagents,
                 backend=self.worker_backend,
                 thinking_level=thinking_level,
+                max_tool_calls=max_tool_calls,
+                max_total_tokens=max_total_tokens,
+                progress_path=progress_path,
             )
 
             response_text = str(worker_out.get("text") or "")
@@ -823,6 +1011,7 @@ class JobManager:
             )
             tool_calls.extend(worker_out.get("tool_calls") or [])
             thoughts.extend(worker_out.get("thoughts") or [])
+            stop_reason = worker_out.get("stop_reason")
 
             with self._lock:
                 if job_id in self._cancelled:
@@ -830,6 +1019,12 @@ class JobManager:
                     error_msg = "Job cancelled during execution."
                 else:
                     status = "ok"
+                    new_signals = read_progress(progress_path, limit=10**6)[progress_before:]
+                    if stop_reason in CHECKPOINT_STOP_REASONS:
+                        # Budget reached: not an error. The lead reviews and continues or redirects.
+                        status = "checkpoint"
+                    elif new_signals and new_signals[-1].get("kind") in ("question", "blocker"):
+                        status = "needs_input"
 
         except (TimeoutError, asyncio.TimeoutError) as exc:
             with self._lock:
@@ -878,6 +1073,13 @@ class JobManager:
                 if status in ("running", "ok"):
                     status = "error"
                     error_msg = f"Failed to collect worktree diff: {type(fin_exc).__name__}: {fin_exc}"
+            if acceptance and status in ("ok", "checkpoint", "needs_input"):
+                try:
+                    acceptance_results = run_acceptance(acceptance, self.workspace_root if in_place else wt_dir)
+                except Exception as acc_exc:
+                    acceptance_results = [
+                        {"command": "<acceptance>", "passed": False, "error": f"{type(acc_exc).__name__}: {acc_exc}"}
+                    ]
             if symlink_escapes:
                 for esc in symlink_escapes:
                     if esc not in scope_violations:
@@ -944,6 +1146,14 @@ class JobManager:
                 "applied": False,
                 "error": error_msg,
                 "thinking_level": thinking_level,
+                "plan": plan or [],
+                "acceptance": acceptance or [],
+                "budget": {"max_tool_calls": max_tool_calls, "max_total_tokens": max_total_tokens},
+                "stop_reason": stop_reason,
+                "acceptance_results": acceptance_results,
+                "acceptance_passed": (
+                    all(r.get("passed") for r in acceptance_results) if acceptance_results else None
+                ),
             }
             if in_place:
                 # The edits are already in the user's working tree, so the job counts as applied
@@ -970,7 +1180,7 @@ class JobManager:
                         "undo_hint": " && ".join(undo_parts) if undo_parts else None,
                     }
                 )
-                if status != "ok" and files_changed:
+                if status not in ("ok", "checkpoint", "needs_input") and files_changed:
                     receipt_payload["error"] = (
                         f"{error_msg or status}. Partial in_place edits remain in the working tree; "
                         f"see undo_hint to revert them."
@@ -1029,6 +1239,10 @@ class JobManager:
         scrub_receipt: bool = False,
         in_place: bool = False,
         thinking_level: str | None = None,
+        plan: list[str] | None = None,
+        acceptance: list[str] | None = None,
+        max_tool_calls: int | None = None,
+        max_total_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
 
@@ -1042,6 +1256,16 @@ class JobManager:
 
         validated_paths = validate_allowed_paths(allowed_paths)
         resolved_thinking = resolve_thinking_level(thinking_level)
+        plan_steps = validate_plan(plan)
+        acceptance_cmds = validate_acceptance(acceptance, self.workspace_root)
+        budget_calls, budget_tokens = resolve_budget(max_tool_calls, max_total_tokens)
+        worker_prompt = render_worker_prompt(
+            prompt,
+            plan=plan_steps,
+            acceptance=acceptance_cmds,
+            max_tool_calls=budget_calls,
+            max_total_tokens=budget_tokens,
+        )
         if in_place and validated_paths:
             raise ValueError(
                 "allowed_paths cannot be enforced in in_place mode (edits land directly in your "
@@ -1107,6 +1331,9 @@ class JobManager:
             "applied": False,
             "in_place": in_place,
             "thinking_level": resolved_thinking or "DEFAULT",
+            "plan": plan_steps,
+            "acceptance": acceptance_cmds,
+            "budget": {"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
             "error": None,
         }
         self.store.write_receipt(
@@ -1119,7 +1346,7 @@ class JobManager:
         fut = self._executor.submit(
             self._execute_job,
             job_id=job_id,
-            worker_prompts=[prompt.strip()],
+            worker_prompts=[worker_prompt],
             recorded_prompts=[prompt.strip()],
             model=chosen_model,
             project=resolved_project,
@@ -1138,6 +1365,10 @@ class JobManager:
             in_place=in_place,
             pre_untracked=pre_untracked,
             thinking_level=resolved_thinking or "DEFAULT",
+            plan=plan_steps,
+            acceptance=acceptance_cmds,
+            max_tool_calls=budget_calls,
+            max_total_tokens=budget_tokens,
         )
         with self._lock:
             self._futures[job_id] = fut
@@ -1145,7 +1376,7 @@ class JobManager:
         if wait:
             self._wait_for_future_or_cancel(job_id, fut, timeout=max(0.5, float(timeout_seconds) + 30.0))
             receipt = self.store.read_receipt(job_id)
-            return self._compact_digest(receipt)
+            return self._digest_with_progress(receipt)
 
         return {
             "job_id": job_id,
@@ -1194,7 +1425,7 @@ class JobManager:
         if job_id:
             safe_id = validate_job_id(job_id)
             receipt = self.store.read_receipt(safe_id)
-            digest = self._compact_digest(receipt, include_summary=True)
+            digest = self._digest_with_progress(receipt, include_summary=True)
             digest["baseline_head_sha"] = active_baseline_sha
             return digest
 
@@ -1215,7 +1446,7 @@ class JobManager:
         job_id: str,
         *,
         wait: bool = True,
-        timeout: float = 540.0,
+        timeout: float = 240.0,
     ) -> dict[str, Any]:
         """Return the compact completion digest for job_id, optionally waiting if still running."""
         safe_id = validate_job_id(job_id)
@@ -1225,7 +1456,7 @@ class JobManager:
             capped_timeout = max(0.1, min(float(timeout), 540.0))
             self._wait_for_future_or_cancel(safe_id, fut, timeout=capped_timeout)
         receipt = self.store.read_receipt(safe_id)
-        return self._compact_digest(receipt)
+        return self._digest_with_progress(receipt)
 
     def get_diff(
         self,
@@ -1314,10 +1545,10 @@ class JobManager:
             }
 
         status = receipt.get("status")
-        if status != "ok":
+        if status not in ("ok", "checkpoint", "needs_input"):
             raise ValueError(
                 f"Cannot apply job '{safe_id}' with status={status!r} "
-                f"(error={receipt.get('error')!r}). Only status='ok' jobs can be applied."
+                f"(error={receipt.get('error')!r}). Only ok / checkpoint / needs_input jobs can be applied."
             )
 
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
@@ -1501,11 +1732,14 @@ class JobManager:
         pre_untracked: dict[str, str | None] = {}
         if in_place:
             baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
-            self._verify_in_place_unchanged(receipt)
+            stray_untracked = self._verify_in_place_unchanged(receipt)
             self._acquire_in_place_slot(safe_id)
             wt_dir = self.workspace_root
             baseline_hashes: dict[str, str | None] = {}
             pre_untracked = dict(receipt.get("pre_untracked_hashes") or {})
+            # New untracked files that someone else created (e.g. a test run's artifacts) are treated
+            # as pre-existing: never credited to the worker, and the Stop hook still checks them.
+            pre_untracked.update(stray_untracked)
         else:
             if receipt.get("applied"):
                 raise ValueError(
@@ -1541,6 +1775,23 @@ class JobManager:
             worker_prompts = [context_note]
         else:
             worker_prompts = [clean_followup]
+        plan_steps = list(receipt.get("plan") or [])
+        acceptance_cmds = list(receipt.get("acceptance") or [])
+        budget = receipt.get("budget") or {}
+        # A stored None means the lead disabled that cap; a missing key (older receipt) means defaults.
+        budget_calls, budget_tokens = resolve_budget(
+            (budget.get("max_tool_calls") or 0) if "max_tool_calls" in budget else None,
+            (budget.get("max_total_tokens") or 0) if "max_total_tokens" in budget else None,
+        )
+        worker_prompts = [
+            render_worker_prompt(
+                worker_prompts[0],
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=budget_calls,
+                max_total_tokens=budget_tokens,
+            )
+        ]
 
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
         with self._lock:
@@ -1580,8 +1831,12 @@ class JobManager:
                 in_place=in_place,
                 pre_untracked=pre_untracked,
                 thinking_level=receipt.get("thinking_level"),
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=budget_calls,
+                max_total_tokens=budget_tokens,
             )
-            return self._compact_digest(updated)
+            return self._digest_with_progress(updated)
 
         fut = self._executor.submit(
             self._execute_job,
@@ -1607,12 +1862,16 @@ class JobManager:
             in_place=in_place,
             pre_untracked=pre_untracked,
             thinking_level=receipt.get("thinking_level"),
+            plan=plan_steps,
+            acceptance=acceptance_cmds,
+            max_tool_calls=budget_calls,
+            max_total_tokens=budget_tokens,
         )
         with self._lock:
             self._futures[safe_id] = fut
         return {"job_id": safe_id, "status": "running", "prompts_count": len(recorded_prompts)}
 
-    def _verify_in_place_unchanged(self, receipt: dict[str, Any]) -> None:
+    def _verify_in_place_unchanged(self, receipt: dict[str, Any]) -> dict[str, str | None]:
         """Refuse to continue an in_place job if anyone else changed the tree since its last turn."""
         root = self.workspace_root
         baseline_sha = str(receipt.get("baseline_commit_sha") or "")
@@ -1642,11 +1901,13 @@ class JobManager:
             and not _is_ephemeral_build_or_test_artifact(rel)
             and pre_untracked.get(rel, "__absent__") != h
         ]
-        if extra_tracked or extra_untracked:
+        if extra_tracked:
             raise ValueError(
-                "Files outside this in_place job changed since its last turn: "
-                f"{(extra_tracked + extra_untracked)[:10]}. Commit or revert them, then start a new job."
+                "Tracked files outside this in_place job changed since its last turn: "
+                f"{extra_tracked[:10]}. Commit or revert them, then start a new job."
             )
+        current = _snapshot_untracked_hashes(root)
+        return {rel: current.get(rel) for rel in extra_untracked}
 
     def delegate_cancel(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
         """Cancel a job and clean up its worktree while preserving its cancelled receipt status."""
@@ -1682,6 +1943,53 @@ class JobManager:
             "cancelled": True,
         }
 
+    def _digest_with_progress(self, receipt: dict[str, Any], *, include_summary: bool = True) -> dict[str, Any]:
+        """Compact digest plus the worker's latest report_to_lead signals (visible while it is running)."""
+        digest = self._compact_digest(receipt, include_summary=include_summary)
+        job_id = str(receipt.get("job_id") or "")
+        if job_id:
+            try:
+                digest["progress"] = read_progress(self.store.progress_path(job_id), limit=5)
+            except ValueError:
+                digest["progress"] = []
+        if digest.get("status") == "running":
+            digest["poll_hint"] = (
+                "Still running. Poll again with delegate_result(wait=true) (waits up to 240s, which keeps "
+                "your prompt cache warm), or check progress with delegate_status."
+            )
+        return digest
+
+    def mark_running_interrupted(self) -> list[str]:
+        """Called when the MCP server is shutting down: record unfinished jobs as interrupted instead of
+        leaving them 'running' forever. Token usage for the unfinished turn cannot be recovered."""
+        marked: list[str] = []
+        with self._lock:
+            live = {jid for jid, fut in self._futures.items() if not fut.done()}
+        for jid in live:
+            try:
+                receipt = self.store.read_receipt(jid)
+            except Exception:
+                continue
+            receipt["status"] = "interrupted"
+            receipt["error"] = (
+                "The MCP server stopped before this job finished; the unfinished turn's token usage was not "
+                "recorded by the SDK."
+            )
+            receipt["finished_at_epoch"] = round(time.time(), 3)
+            try:
+                self.store.write_receipt(
+                    jid, receipt, scrub=bool(receipt.get("scrub_receipt", False)),
+                    workspace_root=str(self.workspace_root),
+                )
+                marked.append(jid)
+            except Exception:
+                continue
+        return marked
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Shutdown the underlying thread pool executor."""
+        self._executor.shutdown(wait=wait)
+
     @staticmethod
     def _compact_digest(
         receipt: dict[str, Any],
@@ -1710,6 +2018,10 @@ class JobManager:
             "applied": bool(receipt.get("applied", False)),
             "in_place": bool(receipt.get("in_place", False)),
             "thinking_level": receipt.get("thinking_level"),
+            "stop_reason": receipt.get("stop_reason"),
+            "budget": receipt.get("budget"),
+            "acceptance_passed": receipt.get("acceptance_passed"),
+            "acceptance_results": receipt.get("acceptance_results") or [],
             "error": receipt.get("error"),
         }
         if receipt.get("in_place"):
