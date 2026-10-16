@@ -88,8 +88,16 @@ def classify_path(
     else:
         resolved = candidate.resolve()
 
+    out_candidates: list[str] = []
     if out_dir is not None:
-        out_str = str(out_dir).strip()
+        out_candidates.append(str(out_dir).strip())
+    source_env = env if env is not None else os.environ
+    for env_key in ("CC_AGY_OUT_DIR", "CC_AGY_DATA_DIR", "CLAUDE_PLUGIN_DATA"):
+        val = source_env.get(env_key, "").strip()
+        if val:
+            out_candidates.append(val)
+
+    for out_str in out_candidates:
         if out_str and not out_str.startswith("${"):
             out_resolved = Path(out_str).resolve()
             if resolved.is_relative_to(out_resolved):
@@ -264,13 +272,28 @@ _ALWAYS_BLOCKED_BINARIES: frozenset[str] = frozenset(
         "unxz",
         "pip",
         "pip3",
-        "black",
         "autopep8",
         "yapf",
-        "isort",
-        "prettier",
-        "gofmt",
-        "rustfmt",
+        "kill",
+        "pkill",
+        "killall",
+    }
+)
+
+_BLOCKED_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "PERL5OPT",
+        "GIT_SSH_COMMAND",
+        "GIT_EXEC_PATH",
+        "BASH_ENV",
+        "ENV",
     }
 )
 
@@ -465,16 +488,16 @@ def detect_bash_workspace_mutation(
     ws_root = resolve_project_root(workdir, env=env)
     active_cwd = Path(cwd).resolve() if cwd is not None else Path(workdir).resolve()
 
-    # 0. Block direct access to .hmac_key, ${IFS} obfuscation, process substitution <( / >(, and awk system()/redirect
+    # 0. Block direct access to .hmac_key, ${IFS} / $'...' obfuscation, and process substitution <( / >(
     if ".hmac_key" in cmd:
         return {
             "blocked": True,
             "reason": "Strict orchestrator mode blocked reading or modifying the internal `.hmac_key`.",
         }
-    if "${IFS}" in cmd or "$IFS" in cmd:
+    if "${IFS}" in cmd or "$IFS" in cmd or "$'" in cmd:
         return {
             "blocked": True,
-            "reason": "Strict orchestrator mode blocked `$IFS` shell token obfuscation.",
+            "reason": "Strict orchestrator mode blocked `$IFS` or ANSI-C `$'...'` shell token obfuscation.",
         }
     if re.search(r"[<>]\(", cmd):
         return {
@@ -482,18 +505,20 @@ def detect_bash_workspace_mutation(
             "reason": "Strict orchestrator mode blocked bash process substitution `<(...)` / `>(...)`.",
         }
 
-    # 1. Check inline sed/awk/perl in-place flags or awk system()/redirection anywhere in the command
-    if re.search(r"\bsed\s+(?:-[a-zA-Z]*i|--in-place)\b", cmd):
+    # 1. Compute unquoted mask and check inline sed/perl in-place flags outside quotes
+    cmd_without_herestrings = re.sub(r"<<<", "   ", cmd)
+    cmd_without_heredocs = re.sub(r"<<-?\s*['\"]?\w+['\"]?", "   ", cmd_without_herestrings)
+    unquoted = _unquoted_mask(cmd_without_heredocs)
+    cmd_unquoted = "".join(
+        ch if (i < len(unquoted) and unquoted[i]) else " "
+        for i, ch in enumerate(cmd_without_heredocs)
+    )
+    if re.search(r"\bsed\s+(?:-[a-zA-Z]*i|--in-place)\b", cmd_unquoted):
         return {
             "blocked": True,
             "reason": "Strict orchestrator mode blocked `sed -i` in-place edit.",
         }
-    if re.search(r"\bawk\b[^;|&\n]*(?:-i\s+inplace|\bsystem\s*\(|>\s*['\"])", cmd):
-        return {
-            "blocked": True,
-            "reason": "Strict orchestrator mode blocked mutating `awk` command (`-i inplace`, `system()`, or file redirect).",
-        }
-    if re.search(r"\bperl\s+-[a-zA-Z]*[pi]", cmd):
+    if re.search(r"\bperl\s+-[a-zA-Z]*[pi]", cmd_unquoted):
         return {
             "blocked": True,
             "reason": "Strict orchestrator mode blocked `perl -p/-i` in-place mutation.",
@@ -501,9 +526,6 @@ def detect_bash_workspace_mutation(
 
     # 2. Check shell output redirections (>, >>, >|, &>, &>>, 1>, 2>, <>),
     # ignoring here-strings (<<<), heredocs (<<), and fd duplicates (2>&1, >/dev/null).
-    cmd_without_herestrings = re.sub(r"<<<", "   ", cmd)
-    cmd_without_heredocs = re.sub(r"<<-?\s*['\"]?\w+['\"]?", "   ", cmd_without_herestrings)
-    unquoted = _unquoted_mask(cmd_without_heredocs)
     redir_pattern = re.compile(
         r"(?:&>>?|\d?>>?|\d?>[|&]?|<>|\b(?:tee|sponge)\s+(?:-[a-zA-Z]+\s+)*)\s*([^\s;|&\n]+)"
     )
@@ -622,8 +644,14 @@ def _inspect_segment_tokens(
 
     while idx < n:
         tok = Path(tokens[idx]).name if tokens[idx].startswith("/") else tokens[idx]
-        # Skip leading VAR=val assignments
+        # Inspect and skip leading VAR=val assignments
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+            var_name = tok.split("=", 1)[0]
+            if var_name in _BLOCKED_ENV_VARS:
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked environment override `{var_name}=...`.",
+                }, active_cwd
             idx += 1
             continue
         if tok in ("command", "nohup", "time", "exec", "builtin", "setsid", "busybox"):
@@ -692,6 +720,12 @@ def _inspect_segment_tokens(
                 elif etok.startswith("-"):
                     idx += 1
                 elif "=" in etok and etok.split("=", 1)[0].isidentifier():
+                    var_name = etok.split("=", 1)[0]
+                    if var_name in _BLOCKED_ENV_VARS:
+                        return {
+                            "blocked": True,
+                            "reason": f"Strict orchestrator mode blocked `env {var_name}=...`.",
+                        }, active_cwd
                     idx += 1
                 else:
                     break
@@ -733,6 +767,22 @@ def _inspect_segment_tokens(
 
     binary = Path(raw_cmd_tok).name
     args = tokens[idx + 1 :]
+
+    # Block any non-`ls` command from reading, searching, or archiving `out_dir` (.hmac_key / receipts)
+    if binary != "ls":
+        for arg in args:
+            if arg.startswith("-"):
+                continue
+            clean_arg = arg.split("=", 1)[-1] if "=" in arg else arg
+            if "/" in clean_arg or clean_arg.startswith("."):
+                if classify_path(clean_arg, ws_root, out_dir, cwd=active_cwd, env=env) == "out_dir":
+                    return {
+                        "blocked": True,
+                        "reason": (
+                            f"Strict orchestrator mode blocked `{binary}` on internal receipt/key directory {clean_arg!r}. "
+                            f"Use delegate_status or get_diff instead."
+                        ),
+                    }, active_cwd
 
     # Track directory changes (`cd <dir>`) across chained segments
     if binary in ("cd", "pushd"):
@@ -779,6 +829,31 @@ def _inspect_segment_tokens(
             "reason": f"Strict orchestrator mode blocked mutating binary `{binary}`.",
         }, active_cwd
 
+    # Check awk (`-i inplace`, `system(...)`, or internal output redirection `>`)
+    if binary in ("awk", "gawk", "mawk", "nawk"):
+        joined_awk = " ".join(args)
+        if (
+            "inplace" in args
+            or any(a.startswith("-i") for a in args)
+            or re.search(r"\bsystem\s*\(|>\s*['\"]?", joined_awk)
+        ):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked mutating `{binary}` command.",
+            }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
+    # Check formatters: allow read-only `--check` / `--diff` / `-l`, block in-place formatting
+    if binary in ("black", "isort", "gofmt", "rustfmt", "prettier"):
+        has_check = any(a in ("--check", "--diff", "-c", "-l", "--list-different") for a in args)
+        has_write = any(a in ("-w", "--write") for a in args)
+        if not has_check or has_write:
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked in-place formatter `{binary}` (use `--check` for read-only verification).",
+            }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
     # Check ruff / npm / npx / make / pytest
     if binary == "ruff":
         if any(a in ("--fix", "--unsafe-fixes", "format") for a in args):
@@ -789,9 +864,13 @@ def _inspect_segment_tokens(
         return {"blocked": False, "reason": None}, active_cwd
 
     if binary in ("npm", "pnpm", "yarn", "npx"):
-        if binary == "npx" or any(
-            a in ("install", "i", "add", "remove", "uninstall", "update", "ci", "link", " audit", "fmt", "format")
-            for a in args
+        if (
+            binary == "npx"
+            or any(
+                a in ("install", "i", "add", "remove", "uninstall", "update", "ci", "link", "audit", "fmt", "format", "--prefix", "-C")
+                or a.startswith("--prefix=")
+                for a in args
+            )
         ):
             return {
                 "blocked": True,
@@ -815,6 +894,11 @@ def _inspect_segment_tokens(
 
     if binary in ("pytest", "py.test"):
         for parg in args:
+            if parg in ("-p", "--confcutdir", "--rootdir", "-o", "--override-ini") or parg.startswith(("-p", "--confcutdir=", "--rootdir=")):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                }, active_cwd
             if parg.startswith("-"):
                 continue
             target_file = parg.split("::", 1)[0]

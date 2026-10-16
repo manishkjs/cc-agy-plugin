@@ -416,8 +416,10 @@ class TestWorktreeIsolationAndAdversarialEdgeCases(unittest.TestCase):
             d2 = jm.delegate_continue(d1["job_id"], "Turn 2 follow-up", wait=True)
             self.assertEqual(d2["status"], "ok")
             self.assertEqual(len(calls), 2)
-            # Only the follow-up prompt was sent on Turn 2, with the real project and enabled_tools preserved!
-            self.assertEqual(calls[1]["prompts"], ["Turn 2 follow-up"])
+            # A single prompt is sent on Turn 2 with prior context summary + follow-up, and real project/tools preserved!
+            self.assertEqual(len(calls[1]["prompts"]), 1)
+            self.assertIn("Turn 1 prompt", calls[1]["prompts"][0])
+            self.assertIn("Turn 2 follow-up", calls[1]["prompts"][0])
             self.assertEqual(calls[1]["project"], "real-secret-project")
             self.assertEqual(calls[1]["enabled_tools"], ["edit_file"])
 

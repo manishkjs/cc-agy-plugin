@@ -39,9 +39,10 @@ def _is_git_repository(path: Path) -> bool:
 
 def verify_workspace_provenance(
     workspace_root: str | Path | None = None,
-    store: ReceiptStore | None = None,
+    store: ReceiptStore | str | Path | None = None,
     *,
     env: dict[str, str] | None = None,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Verify that every modified/untracked/deleted file and line in the workspace came from an HMAC-verified applied worker receipt (or pre-existing baseline).
 
@@ -59,7 +60,10 @@ def verify_workspace_provenance(
             "reason": f"Workspace path {ws_path} is not inside a git repository.",
         }
 
-    receipt_store = store or ReceiptStore(workspace_root=ws_path)
+    if isinstance(store, (str, Path)):
+        receipt_store = ReceiptStore(store, workspace_root=ws_path)
+    else:
+        receipt_store = store or ReceiptStore(workspace_root=ws_path)
     receipts = receipt_store.list_receipts(workspace_root=ws_path)
 
     dictation_violations: list[dict[str, Any]] = []
@@ -84,6 +88,9 @@ def verify_workspace_provenance(
 
     # Include pre-existing uncommitted baseline state captured at session start
     baseline_rec = receipt_store.read_baseline_record(ws_path)
+    strict_active = strict or (env is not None and is_strict_mode_enabled(env))
+    if receipt_store.is_baseline_tampered(ws_path) or (strict_active and baseline_rec is None):
+        forged_receipts.append("baseline-record")
     baseline_head_sha = (baseline_rec or {}).get("baseline_head_sha")
     baseline_prov = (baseline_rec or {}).get("provenance")
     if isinstance(baseline_prov, dict):

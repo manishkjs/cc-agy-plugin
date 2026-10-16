@@ -232,6 +232,52 @@ def _restore_directory_tree(root: Path, snap: dict[str, bytes]) -> bool:
     return True
 
 
+_EPHEMERAL_CACHE_DIRS: frozenset[str] = frozenset(
+    {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "node_modules",
+        ".tox",
+        ".nox",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "coverage",
+        ".gradle",
+        "target",
+        ".next",
+        ".nuxt",
+    }
+)
+
+_EPHEMERAL_CACHE_SUFFIXES: tuple[str, ...] = (
+    ".pyc",
+    ".pyo",
+    ".pyd",
+    ".egg-info",
+    ".coverage",
+    ".DS_Store",
+)
+
+
+def _is_ephemeral_build_or_test_artifact(rel_path: str) -> bool:
+    """Return True if `rel_path` is a transient test/compiler cache artifact that should never be captured or applied."""
+    norm = rel_path.strip("/")
+    if not norm:
+        return False
+    parts = norm.split("/")
+    for part in parts:
+        if part in _EPHEMERAL_CACHE_DIRS or part.endswith(".egg-info"):
+            return True
+    name = parts[-1]
+    if name in (".coverage", ".DS_Store") or name.endswith(_EPHEMERAL_CACHE_SUFFIXES):
+        return True
+    return False
+
+
 class JobManager:
     """Manages isolated worker clones, background execution, conflict-safe apply, and provenance."""
 
@@ -256,6 +302,33 @@ class JobManager:
     def _ensure_baseline_recorded(self) -> None:
         head_res = _run_git(["rev-parse", "HEAD"], cwd=self.workspace_root, check=False)
         head_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
+        existing = self.store.read_baseline_record(self.workspace_root)
+        if existing is not None:
+            # Never overwrite an existing session baseline if unapplied jobs are pending
+            # or if tracked files have unverified modifications (prevents restart laundering).
+            receipts = self.store.list_receipts(workspace_root=self.workspace_root)
+            for r in receipts:
+                if r.get("kind") == "delegate" and not r.get("applied") and r.get("status") in ("ok", "running"):
+                    return
+            existing_sha = existing.get("baseline_head_sha") or "HEAD"
+            if head_sha and existing.get("baseline_head_sha") and head_sha != existing.get("baseline_head_sha"):
+                return
+            tracked_diff_res = _run_git(
+                ["diff", "--name-only", existing_sha],
+                cwd=self.workspace_root,
+                check=False,
+            )
+            if tracked_diff_res.returncode == 0 and tracked_diff_res.stdout.strip():
+                existing_prov_files = set((existing.get("provenance") or {}).get("files_changed") or [])
+                applied_files: set[str] = set()
+                for r in receipts:
+                    if r.get("applied") and self.store.verify_receipt_signature(r):
+                        applied_files.update(r.get("applied_files") or [])
+                for fpath in tracked_diff_res.stdout.splitlines():
+                    clean_f = fpath.strip()
+                    if clean_f and clean_f not in existing_prov_files and clean_f not in applied_files:
+                        return
+
         live_diff = capture_live_workspace_diff(self.workspace_root, baseline_head_sha=head_sha)
         prov = extract_diff_provenance(live_diff)
         self.store.record_baseline_dirty_state(
@@ -352,11 +425,12 @@ class JobManager:
         self,
         wt_dir: Path,
         baseline_sha: str,
+        allowed_paths: list[str] | None = None,
     ) -> tuple[str, list[str], list[str]]:
         """Collect unified binary diff with `--no-renames` against `baseline_sha`.
 
         Also force-stages any new `.gitignore`d files written by the worker inside `wt_dir`
-        (since pre-existing host gitignored files were excluded from `wt_dir` at creation time).
+        (excluding transient build/test caches such as `__pycache__/` or `.pytest_cache/`).
         Returns (diff_text, files_changed, symlink_escapes).
         """
         if not wt_dir.exists():
@@ -364,11 +438,17 @@ class JobManager:
 
         symlink_escapes: list[str] = []
         wt_resolved = wt_dir.resolve()
-        for p in wt_dir.rglob("*"):
+        for p in list(wt_dir.rglob("*")):
             if ".git" in p.parts:
                 continue
+            rel = str(p.relative_to(wt_dir))
+            if _is_ephemeral_build_or_test_artifact(rel):
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
+                continue
             if p.is_symlink():
-                rel = str(p.relative_to(wt_dir))
                 try:
                     link_target = (p.parent / os.readlink(p)).resolve()
                     if not link_target.is_relative_to(wt_resolved):
@@ -383,7 +463,13 @@ class JobManager:
             check=False,
         )
         if ign_res.returncode == 0 and ign_res.stdout.strip():
-            ignored_new = [line.strip() for line in ign_res.stdout.splitlines() if line.strip()]
+            ignored_new = [
+                line.strip()
+                for line in ign_res.stdout.splitlines()
+                if line.strip()
+                and not _is_ephemeral_build_or_test_artifact(line.strip())
+                and (not allowed_paths or _matches_allowed_paths(line.strip(), allowed_paths))
+            ]
             if ignored_new:
                 _run_git(["add", "-f", "-N", "--", *ignored_new], cwd=wt_dir, check=False)
 
@@ -525,7 +611,7 @@ class JobManager:
                 error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
 
             diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
-                wt_dir, baseline_sha
+                wt_dir, baseline_sha, allowed_paths=allowed_paths
             )
             baseline_file_hashes = self._compute_changed_baseline_hashes(
                 wt_dir, baseline_sha, files_changed, baseline_file_hashes
@@ -1097,12 +1183,20 @@ class JobManager:
         clean_followup = follow_up_prompt.strip()
         recorded_prompts = prior_prompts + [clean_followup]
 
-        # When the follow-up references earlier work in a multi-sentence instruction, attach a
-        # concise context note of the prior prompt without re-executing the prior turn.
-        if prior_prompts and len(clean_followup) >= 30 and "append" not in prior_prompts[0].lower():
+        # Attach a concise context note of the original task and latest turn so the fresh
+        # Antigravity session retains task context without re-executing prior turns.
+        if prior_prompts:
+            orig_task = prior_prompts[0]
+            last_turn = prior_prompts[-1] if len(prior_prompts) > 1 else None
+            prior_summary = (
+                f"original_task={orig_task!r}, latest_turn={last_turn!r}"
+                if last_turn is not None
+                else f"{orig_task}"
+            )
             context_note = (
-                f"[Prior turn context (baseline {baseline_sha}, files_changed={receipt.get('files_changed', [])}): "
-                f"{prior_prompts[-1]}]\n{clean_followup}"
+                f"[Prior turn context (baseline {baseline_sha}, files_changed={receipt.get('files_changed', [])}, "
+                f"run `git diff {baseline_sha}` to inspect prior work): "
+                f"{prior_summary}]\n{clean_followup}"
             )
             worker_prompts = [context_note]
         else:

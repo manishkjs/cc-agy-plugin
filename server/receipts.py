@@ -294,6 +294,11 @@ class ReceiptStore:
         ws_hash = sha256_text(str(ws))[:16]
         return self.baselines_dir / f"baseline-{ws_hash}.json"
 
+    def _baseline_marker_path(self, workspace_root: str | Path | None = None) -> Path:
+        ws = Path(workspace_root or self.workspace_root).resolve()
+        ws_hash = sha256_text(str(ws))[:16]
+        return self.baselines_dir / f".recorded-{ws_hash}"
+
     def record_baseline_dirty_state(
         self,
         workspace_root: str | Path,
@@ -315,6 +320,18 @@ class ReceiptStore:
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         payload["baseline_hmac"] = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
         bpath.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            self._baseline_marker_path(workspace_root).write_text("1\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    def is_baseline_tampered(self, workspace_root: str | Path) -> bool:
+        """Return True if a baseline file exists with an invalid HMAC/JSON or was deleted after being recorded."""
+        bpath = self.baseline_path(workspace_root)
+        marker = self._baseline_marker_path(workspace_root)
+        if not bpath.exists():
+            return marker.exists()
+        return self.read_baseline_record(workspace_root) is None
 
     def read_baseline_record(self, workspace_root: str | Path) -> dict[str, Any] | None:
         """Read and verify the signed baseline record (provenance + baseline_head_sha)."""
