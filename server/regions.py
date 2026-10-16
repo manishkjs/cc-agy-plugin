@@ -9,6 +9,8 @@ from typing import Any
 # asia-south1 or europe-west4) and require the "global" Vertex endpoint.
 GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
     {
+        "gemini-4-argon",
+        "argon",
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.5-flash-lite-preview",
@@ -115,6 +117,18 @@ MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
         "long_context_multiplier": 2.0,
     },
     "gemini-3.1-pro-preview": {
+        "input": 2.00,
+        "cached_input": 0.20,
+        "output": 12.00,
+        "long_context_multiplier": 2.0,
+    },
+    "gemini-4-argon": {
+        "input": 2.00,
+        "cached_input": 0.20,
+        "output": 12.00,
+        "long_context_multiplier": 2.0,
+    },
+    "argon": {
         "input": 2.00,
         "cached_input": 0.20,
         "output": 12.00,

@@ -20,6 +20,7 @@ List prices per 1M tokens at the time of writing (check the current Anthropic an
 | Model | Input | Output |
 |---|---|---|
 | Claude Opus 5.5 | $4.00 | $20.00 |
+| Gemini 4 Argon | $2.00 | $12.00 |
 | Gemini 3.8 Flash | $0.50 | $3.00 |
 | Gemini 3.5 Flash-Lite | $0.10 | $0.40 |
 
@@ -28,6 +29,7 @@ Take a task that needs 1M input tokens and 100k output tokens of agent work (the
 | Setup | Opus cost | Worker cost | Total | vs. all-Opus |
 |---|---|---|---|---|
 | All Opus | $4.00 + $2.00 | none | **$6.00** | baseline |
+| Opus lead + Gemini 4 Argon worker | $0.40 + $0.20 | $2.00 + $1.20 | **$3.80** | about 37% less |
 | Opus lead + Gemini 3.8 Flash worker | $0.40 + $0.20 | $0.50 + $0.30 | **$1.40** | about 77% less |
 | Opus lead + Gemini 3.5 Flash-Lite worker | $0.40 + $0.20 | $0.10 + $0.04 | **$0.74** | about 88% less |
 
@@ -74,7 +76,7 @@ Pass `in_place=true` to `delegate_start` or `delegate_to_gemini` to let the work
    - Every `ask_gemini` and `delegate_*` call writes an HMAC-SHA256 signed JSON receipt inside a `finally:` block, preserving partial token counts (`prompt_token_count`, `cached_content_token_count`, `candidates_token_count`, `thoughts_token_count`) and tool-call logs even when a turn times out or raises an exception.
    - `scrub_receipt_for_export()` (also available via `scrub_receipt=true` on MCP tool calls) redacts paying GCP project IDs (`<paying-project>`) and local host paths (`/workspace`).
 4. **Automatic Per-Model Vertex Region Routing (`server/regions.py`)**:
-   - Global-only models that return `404 NOT_FOUND` on regional endpoints (`gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview`, `gemini-3-pro-preview`) are automatically routed to `location="global"` with an audit note on the receipt.
+   - Global-only models that return `404 NOT_FOUND` on regional endpoints (`gemini-4-argon`, `argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview`, `gemini-3-pro-preview`) are automatically routed to `location="global"` with an audit note on the receipt.
 5. **Strict Orchestrator Mode & Provenance Verification (`scripts/pre_tool_guard.py`, `scripts/provenance_check.py`)**:
    - `classify_path()` anchors the project root via `CLAUDE_PROJECT_DIR` and `git rev-parse --show-toplevel`, and checks `out_dir` and `workdir` **before** `/tmp` so repositories located under `/tmp/...` on Linux are protected as `"workspace"` paths rather than exempted as scratch paths.
    - `hooks/hooks.json` registers two `PreToolUse` matcher groups: one for `Edit|Write|MultiEdit|NotebookEdit|Bash` and one for `mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*` so the 9-line code dictation linter runs pre-flight before any Vertex worker is billed.
