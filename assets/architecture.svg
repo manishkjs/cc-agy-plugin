@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 470" width="100%" height="auto" role="img" aria-label="cc-agy-plugin architecture: Claude Code calling Google Antigravity SDK via MCP">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; rx: 16px; stroke: #cbd5e1; stroke-width: 1.5; }
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 20px; font-weight: 700; fill: #0f172a; }
+      .subtitle { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 500; fill: #475569; }
+      .box-lead { fill: #ffffff; stroke: #d97706; stroke-width: 2.2; rx: 12px; }
+      .box-mcp { fill: #ffffff; stroke: #2563eb; stroke-width: 2.2; rx: 12px; }
+      .box-worker { fill: #ffffff; stroke: #059669; stroke-width: 2.2; rx: 12px; }
+      .hdr-lead { fill: #fef3c7; rx: 10px; }
+      .hdr-mcp { fill: #dbeafe; rx: 10px; }
+      .hdr-worker { fill: #d1fae5; rx: 10px; }
+      .subbox { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.2; rx: 8px; }
+      .subbox-sj { fill: #ecfdf5; stroke: #34d399; stroke-width: 1.4; rx: 8px; }
+      .subbox-guard { fill: #fffbeb; stroke: #fbbf24; stroke-width: 1.4; rx: 8px; }
+      .card-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .card-badge { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 600; fill: #334155; }
+      .body-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #1e293b; }
+      .body-bold { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; fill: #0f172a; }
+      .arrow-label { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 600; fill: #1e40af; }
+      .arrow-label-ret { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 600; fill: #047857; }
+      .footer-pill { fill: #0f172a; rx: 8px; }
+      .footer-text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 600; fill: #f8fafc; }
+    </style>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Canvas -->
+  <rect class="bg" x="8" y="8" width="1104" height="454"/>
+
+  <!-- Top Banner -->
+  <text class="title" x="560" y="42" text-anchor="middle">Claude Code Calling Google Antigravity SDK via MCP (cc-agy-plugin)</text>
+  <text class="subtitle" x="560" y="64" text-anchor="middle">Flagship reasoning where it matters (10% of tokens) + low-cost isolated execution for file reads, edits, and test loops (90% of tokens)</text>
+
+  <!-- ================= LEFT BOX: CLAUDE CODE LEAD ================= -->
+  <rect class="box-lead" x="28" y="84" width="310" height="312"/>
+  <rect class="hdr-lead" x="34" y="90" width="298" height="48"/>
+  <text class="card-title" x="48" y="112">1. Lead Agent: Claude Code</text>
+  <text class="card-badge" x="48" y="129">Claude Opus 5.5 ($4 / $20 per 1M tokens)</text>
+
+  <text class="body-bold" x="46" y="162">What the Lead Does (~10% of tokens):</text>
+  <text class="body-text" x="46" y="182">• Understands user goal &amp; architecture</text>
+  <text class="body-text" x="46" y="201">• Sends outcome-only brief + plan + checks</text>
+  <text class="body-text" x="46" y="220">• Reviews token-paginated diff (get_diff)</text>
+  <text class="body-text" x="46" y="239">• Merges verified work (delegate_apply)</text>
+
+  <rect class="subbox-guard" x="42" y="256" width="282" height="124"/>
+  <text class="body-bold" x="54" y="276">Hook Guardrails (hooks/hooks.json)</text>
+  <text class="mono" x="54" y="296">PreToolUse (pre_tool_guard.py):</text>
+  <text class="body-text" x="54" y="313">Blocks direct file edits &amp; &gt;8-line code</text>
+  <text class="body-text" x="54" y="329">dictation before any worker is billed.</text>
+  <text class="mono" x="54" y="350">Stop (provenance_check.py):</text>
+  <text class="body-text" x="54" y="367">Verifies git diff against HMAC receipts.</text>
+
+  <!-- ================= CENTER BOX: MCP BRIDGE ================= -->
+  <rect class="box-mcp" x="418" y="84" width="276" height="312"/>
+  <rect class="hdr-mcp" x="424" y="90" width="264" height="48"/>
+  <text class="card-title" x="438" y="112">2. MCP Stdio Bridge</text>
+  <text class="card-badge" x="438" y="129">server/mcp_stdio.py (JSON-RPC 2.0)</text>
+
+  <rect class="subbox" x="432" y="150" width="248" height="66"/>
+  <text class="body-bold" x="444" y="169">Dual Auth (server/regions.py)</text>
+  <text class="body-text" x="444" y="188">• Option A: GEMINI_API_KEY (AI Studio)</text>
+  <text class="body-text" x="444" y="205">• Option B: Vertex AI + global reroute</text>
+
+  <rect class="subbox" x="432" y="226" width="248" height="76"/>
+  <text class="body-bold" x="444" y="245">Two Execution Paths</text>
+  <text class="mono" x="444" y="264">1. ask_gemini (genai_ask.py)</text>
+  <text class="body-text" x="444" y="280">Fast review (no 11.5k prompt floor)</text>
+  <text class="mono" x="444" y="296">2. delegate_* (jobs.py)</text>
+
+  <rect class="subbox" x="432" y="312" width="248" height="68"/>
+  <text class="body-bold" x="444" y="331">Receipt Store (receipts.py)</text>
+  <text class="body-text" x="444" y="349">• Redacts API keys unconditionally</text>
+  <text class="body-text" x="444" y="366">• Signs HMAC-SHA256 + USD/¢ ledger</text>
+
+  <!-- ================= RIGHT BOX: ANTIGRAVITY WORKER ================= -->
+  <rect class="box-worker" x="774" y="84" width="318" height="312"/>
+  <rect class="hdr-worker" x="780" y="90" width="306" height="48"/>
+  <text class="card-title" x="794" y="112">3. Worker: Antigravity SDK</text>
+  <text class="card-badge" x="794" y="129">Gemini 3.5 Lite / 3.8 Flash / 4 Argon</text>
+
+  <text class="body-bold" x="792" y="162">Isolated Sandbox (~90% of tokens):</text>
+  <text class="body-text" x="792" y="182">• Standalone git worktree copy (or in_place)</text>
+  <text class="body-text" x="792" y="201">• Reads files, edits code, runs test loops</text>
+  <text class="body-text" x="792" y="220">• Budget cap: 100 tool calls / 5M tokens</text>
+  <text class="body-text" x="792" y="239">• Plugin runs read-only acceptance checks</text>
+
+  <rect class="subbox-sj" x="788" y="256" width="290" height="124"/>
+  <text class="body-bold" x="800" y="276">Straitjacket Containment (ctx.sdk)</text>
+  <text class="body-text" x="800" y="295">Replaces unbounded RUN_COMMAND:</text>
+  <text class="mono" x="800" y="315">• run_command() -&gt; run:&lt;id&gt;#stdout</text>
+  <text class="body-text" x="812" y="331">Caps output &gt;240 lines into local store</text>
+  <text class="mono" x="800" y="350">• ctx_get(addr, start, end)</text>
+  <text class="mono" x="800" y="368">• ctx_search(addr, pattern)</text>
+
+  <!-- ================= ARROWS: LEAD <-> MCP ================= -->
+  <line x1="338" y1="195" x2="414" y2="195" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <text class="arrow-label" x="378" y="175" text-anchor="middle">stdin</text>
+  <text class="arrow-label" x="378" y="188" text-anchor="middle">tools/call</text>
+
+  <line x1="418" y1="265" x2="342" y2="265" stroke="#059669" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <text class="arrow-label-ret" x="378" y="283" text-anchor="middle">stdout</text>
+  <text class="arrow-label-ret" x="378" y="296" text-anchor="middle">digest/diff</text>
+
+  <!-- ================= ARROWS: MCP <-> WORKER ================= -->
+  <line x1="694" y1="195" x2="770" y2="195" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <text class="arrow-label" x="734" y="175" text-anchor="middle">Agent(cfg)</text>
+  <text class="arrow-label" x="734" y="188" text-anchor="middle">brief+plan</text>
+
+  <line x1="774" y1="265" x2="698" y2="265" stroke="#059669" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <text class="arrow-label-ret" x="734" y="283" text-anchor="middle">git diff +</text>
+  <text class="arrow-label-ret" x="734" y="296" text-anchor="middle">token usage</text>
+
+  <!-- ================= BOTTOM VALUE PROP BAR ================= -->
+  <rect class="footer-pill" x="28" y="410" width="1064" height="38"/>
+  <text class="footer-text" x="560" y="434" text-anchor="middle">Result: 37% to 88% lower session cost • Main working tree stays clean until verified • Cryptographic HMAC diff provenance</text>
+</svg>

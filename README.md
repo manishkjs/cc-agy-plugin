@@ -1,122 +1,153 @@
-# `cc-agy-plugin`: Claude Code Plugin for Vertex AI & Google Antigravity SDK
+# `cc-agy-plugin`: Call Google Antigravity SDK from Claude Code via MCP
 
-`cc-agy-plugin` is a native Claude Code plugin that lets Claude Code delegate coding, debugging, and review tasks to Vertex AI Gemini models through a long-lived Python stdio Model Context Protocol (MCP) server.
+![Architecture: Claude Code calling Google Antigravity SDK via MCP](assets/architecture.svg)
 
-> **Status:** early. The unit test suite (45 tests) covers the MCP server, receipt provenance, Straitjacket shell containment, and both Google AI Studio API Key and Vertex AI authentication modes, and the plugin has been verified end to end on multi-turn coding tasks with Claude Opus 5.5 and Gemini 3.5 Flash-Lite.
+`cc-agy-plugin` connects two coding agent harnesses over the Model Context Protocol (MCP): **Claude Code** acts as the lead engineer, while **Google Antigravity SDK** (powered by Gemini 3.5 Flash-Lite, Gemini 3.8 Flash, or Gemini 4 Argon) acts as the execution worker inside an isolated copy of your repository.
 
-## Why use this: Opus plans, Gemini does the grunt work
+> **Status:** 45 unit tests cover the MCP stdio server, HMAC receipt provenance, Straitjacket shell containment, and both Google AI Studio API Key and Vertex AI authentication modes. Verified end to end on multi-turn coding tasks with Claude Opus 5.5 and Gemini 3.5 Flash-Lite.
 
-Most of the tokens in a coding session are grunt work: reading files, writing boilerplate, fixing lint, running tests, retrying. Paying flagship rates for that is the expensive part. This plugin splits the job in two:
+---
 
-- **Claude Opus is the lead.** It reads the task, decides what needs to change, writes a short outcome-only brief, reviews the diff, and decides whether to apply it.
-- **A cheaper Gemini model is the worker.** It does the file reading, editing, and test running inside an isolated copy of your repo, then hands back a diff.
+## The Value Proposition: Why Connect Two Harnesses?
 
-Output tokens are where flagship models cost the most, so the plugin keeps Opus from writing the code itself. In strict mode, Opus's direct file edits are blocked, and a pre-flight linter rejects delegation briefs that paste more than 8 consecutive lines of code.
+In a typical coding session, **90% of tokens go to mechanical execution**: reading files, grepping symbols, editing boilerplate, running test suites, reading tracebacks, and retrying. Paying flagship model rates ($4/$20 per 1M tokens) for every test loop is expensive, while running an inexpensive model alone can miss subtle architectural constraints.
 
-### Back-of-envelope example
+`cc-agy-plugin` splits the work by role:
 
-List prices per 1M tokens at the time of writing (check the current Anthropic and Vertex AI pricing pages before relying on these):
+1. **Claude Opus 5.5 plans and reviews (~10% of session tokens)**:
+   - Reads the user prompt, inspects key interfaces, and writes a short outcome-only task brief with ordered plan steps and read-only acceptance checks (`pytest`, `ruff`, `mypy`).
+   - Reviews the paginated git diff returned by the worker and decides whether to merge it (`delegate_apply`) or send follow-up instructions (`delegate_continue`).
+2. **Google Antigravity SDK + Gemini executes (~90% of session tokens)**:
+   - Spins up a headless Antigravity agent inside an isolated git worktree copy (or `in_place` when requested).
+   - Performs the file reads, code edits, and iterative test runs at Gemini rates ($0.10 to $2.00 per 1M input tokens).
+   - **Straitjacket (`ctx`) shell containment** intercepts noisy test and build outputs (>240 lines or >16 KB), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite never floods the worker's context window.
+3. **Your main working tree stays clean until verified**:
+   - Failed worker runs never pollute your checkout. Changes are only merged when `delegate_apply` verifies baseline SHA-256 hashes (using a 3-way merge when needed) and records a cryptographic HMAC-SHA256 receipt.
 
-| Model | Input | Output |
-|---|---|---|
-| Claude Opus 5.5 | $4.00 | $20.00 |
-| Gemini 4 Argon | $2.00 | $12.00 |
-| Gemini 3.8 Flash | $0.50 | $3.00 |
-| Gemini 3.5 Flash-Lite | $0.10 | $0.40 |
+### Cost Comparison (1M Input + 100k Output Worker Tokens)
 
-Take a task that needs 1M input tokens and 100k output tokens of agent work (the input figure includes the Antigravity SDK's ~11.5k-token system prompt on every worker turn). Assume Opus spends 100k input and 10k output tokens on briefing and reviewing.
+List prices per 1M tokens:
 
-| Setup | Opus cost | Worker cost | Total | vs. all-Opus |
+| Model | Role | Input / 1M | Output / 1M |
+|---|---|---|---|
+| **Claude Opus 5.5** | Lead Planner & Reviewer | $4.00 | $20.00 |
+| **Gemini 4 Argon** | Frontier Reasoning Worker | $2.00 | $12.00 |
+| **Gemini 3.8 Flash** | Fast Daily Coding Worker | $0.50 | $3.00 |
+| **Gemini 3.5 Flash-Lite** | High-Volume Execution Worker | $0.10 | $0.40 |
+
+For a task requiring **1M input tokens and 100k output tokens** of worker execution (plus **100k input and 10k output tokens** for Opus to brief and review):
+
+| Workflow | Lead Cost (Opus) | Worker Cost (Gemini) | Total Session Cost | Savings vs. All-Opus |
 |---|---|---|---|---|
-| All Opus | $4.00 + $2.00 | none | **$6.00** | baseline |
-| Opus lead + Gemini 4 Argon worker | $0.40 + $0.20 | $2.00 + $1.20 | **$3.80** | about 37% less |
-| Opus lead + Gemini 3.8 Flash worker | $0.40 + $0.20 | $0.50 + $0.30 | **$1.40** | about 77% less |
-| Opus lead + Gemini 3.5 Flash-Lite worker | $0.40 + $0.20 | $0.10 + $0.04 | **$0.74** | about 88% less |
+| **All Claude Opus 5.5** | $4.00 + $2.00 | $0.00 | **$6.00** | Baseline |
+| **Opus Lead + Gemini 4 Argon** | $0.40 + $0.20 | $2.00 + $1.20 | **$3.80** | **37% less** |
+| **Opus Lead + Gemini 3.8 Flash** | $0.40 + $0.20 | $0.50 + $0.30 | **$1.40** | **77% less** |
+| **Opus Lead + Gemini 3.5 Flash-Lite** | $0.40 + $0.20 | $0.10 + $0.04 | **$0.74** | **88% less** |
 
-These numbers are illustrative, not measured. Prompt caching lowers the all-Opus figure, a weaker worker may need extra rounds, and quality varies by task. Every call writes a receipt with real token counts, so `/cc-agy-plugin:cost` shows what you actually spent and you can measure the split on your own work.
+Every tool call writes a signed receipt with actual token usage, and `/cc-agy-plugin:cost` reports exact session spend in USD and cents.
 
-## Quick start
+---
 
-### Option A: Google AI Studio API Key (Simplest Setup)
+## Quick Start
 
-If you have a Gemini API key from [Google AI Studio](https://aistudio.google.com), you do not need a Google Cloud project, billing account, or `gcloud` CLI:
+### Option A: Google AI Studio API Key (Fastest Setup)
+
+If you have a Gemini API key from [Google AI Studio](https://aistudio.google.com), no Google Cloud project or `gcloud` CLI is required:
 
 ```bash
-# Python packages for the MCP server (it runs with the python3 on your PATH)
+# 1. Install Python dependencies for the MCP server
 python3 -m pip install google-genai pydantic google-antigravity
 
-# Set your Gemini API key (or configure userConfig.gemini_api_key in Claude Code)
+# 2. Export your Gemini API key (or set userConfig.gemini_api_key in Claude Code)
 export GEMINI_API_KEY="your-api-key-here"
 
-# Start Claude Code in a git repo with the plugin loaded
+# 3. Launch Claude Code with the plugin loaded
 cd /path/to/your/repo
 claude --plugin-dir /path/to/cc-agy-plugin
 ```
 
-### Option B: Google Cloud Vertex AI (Service Account / Application Default Credentials)
+### Option B: Google Cloud Vertex AI (ADC / Service Account)
 
-If you prefer using Vertex AI with enterprise billing or service accounts:
+If you use Google Cloud enterprise billing or service accounts:
 
 ```bash
-# Python packages for the MCP server (it runs with the python3 on your PATH)
+# 1. Install Python dependencies for the MCP server
 python3 -m pip install google-genai pydantic google-antigravity
 
-# Google Cloud credentials for the Gemini calls
+# 2. Authenticate with Google Cloud Application Default Credentials
 gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
 
-# Start Claude Code in a git repo with the plugin loaded
+# 3. Launch Claude Code with the plugin loaded
 cd /path/to/your/repo
 claude --plugin-dir /path/to/cc-agy-plugin
 ```
 
-Claude Code prompts for the plugin settings (Google AI Studio API key, GCP project, region, default models, strict mode). Run `/mcp` to confirm the `vertex` server is connected, then try a small task such as "use delegate_start to add a hello() function in hello.py, then show me get_diff".
+Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, then try:
+> *"Use `delegate_start` with `gemini-3.5-flash-lite` to add a `hello()` function in `hello.py`, inspect the change with `get_diff`, and apply it with `delegate_apply`."*
 
-## Isolated copy vs. `in_place`
+---
 
-By default every job runs on a **copy** of your repo. Think of it as handing a contractor a photocopy: they mark up the copy, you review the diff (`get_diff`), and only `delegate_apply` pastes the changes into your real files. This is safest when you want to review first, run several jobs at once, or keep editing while Gemini works. The trade-off is that the copy skips gitignored folders such as `node_modules/` and `.venv/`, so the worker may not be able to run your tests.
+## How One Harness Calls the Other (End-to-End Flow)
 
-Pass `in_place=true` to `delegate_start` or `delegate_to_gemini` to let the worker edit your real working tree directly. It is faster on big repos and the worker sees your installed dependencies. To keep it safe:
+1. **Hook Pre-Flight Check (`scripts/pre_tool_guard.py`)**:
+   - In strict mode (`CC_AGY_STRICT_MODE=true`), Claude Code's direct `Edit`/`Write` tools on workspace files are blocked so Opus delegates implementation work.
+   - A pre-flight linter rejects delegation prompts containing more than 8 consecutive lines of code so Opus writes concise outcome briefs instead of paying $20/1M output tokens to dictate code into the prompt.
+2. **MCP Stdio Request (`server/mcp_stdio.py`)**:
+   - Claude Code sends a JSON-RPC 2.0 `tools/call` message over `stdin` to the plugin's persistent Python process.
+   - An 8-thread worker pool handles requests concurrently so `delegate_status`, `ping`, and `delegate_cancel` never block behind a running worker turn.
+3. **Sandbox Snapshot & Worker Execution (`server/jobs.py`, `server/agy_runner.py`)**:
+   - `JobManager` snapshots tracked files (`git ls-files -co --exclude-standard`) into an isolated worktree under `<data_dir>/worktrees/<job_id>` and records the baseline commit SHA.
+   - `run_antigravity_worker()` launches `google.antigravity.Agent` with per-turn safety caps (default: `100` tool calls and `5,000,000` total tokens) and Straitjacket's bounded shell tools (`run_command`, `ctx_get`, `ctx_search`).
+4. **Plugin-Run Acceptance Checks & Token-Bounded Diff**:
+   - When the worker finishes, the plugin automatically executes any read-only `acceptance` commands (for example, `["pytest -q"]`), cleans up temporary test artifacts, and returns pass/fail counts with a compact output tail.
+   - Opus inspects the changes via `get_diff` (paginated at `4,000` tokens per page so large diffs never overflow Claude Code's MCP token cap) and merges verified work with `delegate_apply`.
+5. **Cryptographic Provenance Check (`scripts/provenance_check.py`)**:
+   - Every run writes an HMAC-SHA256 signed receipt in `.cc-agy-data/receipts/<job_id>.json` (with API keys unconditionally redacted).
+   - When Claude Code finishes its turn, the `Stop` hook verifies that every modified line in the workspace matches a signed worker receipt.
 
-- The tracked files must be clean (no uncommitted edits), so git can always undo the worker.
-- Only one `in_place` job runs at a time, and `allowed_paths` is refused because it can't be enforced on live files.
-- If the worker commits, its commits are undone (`git reset --mixed`) with the changes kept on disk, and your index is restored.
-- The job counts as applied when it finishes, even after an error or timeout. The result includes an `undo_hint` with the exact `git checkout` / `rm` commands to revert.
-- `delegate_continue` works on an `in_place` job only if nothing else in the tree changed since the last turn.
+---
 
-## Architecture
+## MCP Tools Reference
 
-1. **Flexible Dual Authentication (Google AI Studio API Key or Vertex AI)**:
-   - **`ask_gemini` (`server/genai_ask.py`)**: Single-shot call via `google-genai` (`genai.Client(api_key=...)` or `genai.Client(vertexai=True, ...)`). Avoids the 11,554-token per-turn system prompt floor of the full Antigravity agent loop when asking for code reviews or architectural second opinions.
-   - **`delegate_start` / `delegate_result` / `get_diff` / `delegate_apply` / `delegate_continue` / `delegate_cancel` / `delegate_to_gemini` (`server/jobs.py`, `server/agy_runner.py`)**: Runs `google.antigravity.Agent` using `GeminiAPIEndpoint` with your API key or `VertexEndpoint` with Vertex AI project credentials inside a standalone isolated repository copy per job.
-2. **Standalone Repository Isolation & Conflict-Safe Apply**:
-   - Every worker job runs in its own standalone repository copy under `<data_dir>/worktrees/<job_id>` with its own independent `.git` directory and baseline commit SHA (so workers do not share `.git/hooks` or `.git/config` with the host repository, and host `.git/hooks` and `.git/config` are snapshot-verified around every worker run).
-   - Diffs are collected against the recorded baseline commit SHA with `git diff --binary --no-renames <baseline_sha>`, capturing worker commits, file renames/deletions, untracked files, and binary diffs while blocking symlinks that point outside the worktree.
-   - `delegate_apply(job_id)` verifies each modified file's host SHA-256 against the job's baseline hashes (falling back to `git apply --3way --binary` or aborting on conflict so uncommitted host edits or parallel worker edits are never silently overwritten).
-3. **Crash-Safe `finally:` Receipts, HMAC Signing, and Scrubbing (`server/receipts.py`)**:
-   - Every `ask_gemini` and `delegate_*` call writes an HMAC-SHA256 signed JSON receipt inside a `finally:` block, preserving partial token counts (`prompt_token_count`, `cached_content_token_count`, `candidates_token_count`, `thoughts_token_count`) and tool-call logs even when a turn times out or raises an exception.
-   - `scrub_receipt_for_export()` (also available via `scrub_receipt=true` on MCP tool calls) redacts paying GCP project IDs (`<paying-project>`) and local host paths (`/workspace`).
-4. **Automatic Per-Model Vertex Region Routing (`server/regions.py`)**:
-   - Global-only models that return `404 NOT_FOUND` on regional endpoints (`gemini-4-argon`, `argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview`, `gemini-3-pro-preview`) are automatically routed to `location="global"` with an audit note on the receipt.
-5. **Strict Orchestrator Mode & Provenance Verification (`scripts/pre_tool_guard.py`, `scripts/provenance_check.py`)**:
-   - `classify_path()` anchors the project root via `CLAUDE_PROJECT_DIR` and `git rev-parse --show-toplevel`, and checks `out_dir` and `workdir` **before** `/tmp` so repositories located under `/tmp/...` on Linux are protected as `"workspace"` paths rather than exempted as scratch paths.
-   - `hooks/hooks.json` registers two `PreToolUse` matcher groups: one for `Edit|Write|MultiEdit|NotebookEdit|Bash` and one for `mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*` so the 9-line code dictation linter runs pre-flight before any Vertex worker is billed.
-   - `verify_workspace_provenance()` on the `Stop` hook uses a temporary git index copy (`git add -N .` + `git diff --binary --no-renames HEAD`) to verify added lines, deleted lines, deleted files, untracked files, and binary files against HMAC-verified applied worker receipts and the pre-existing workspace baseline.
+| Tool | Purpose |
+|---|---|
+| `ask_gemini` | Fast single-shot query via `google-genai` (skips the 11,554-token Antigravity system prompt floor). Best for code reviews, architecture checks, and second opinions. |
+| `delegate_start` | Start an Antigravity worker in an isolated repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, `api_key`, and `project`. |
+| `delegate_result` | Wait for a background job to finish (default `240s` wait cap so Claude Code's 5-minute prompt cache stays warm) and return its compact digest. |
+| `delegate_status` | Inspect live progress signals (`report_to_lead`), token usage, and USD/cents cost for a single `job_id` or list recent jobs and cumulative session totals. |
+| `get_diff` | Retrieve the unified git diff from a job's worktree, filtered by file or glob and paginated by token budget (`default: 4000`, `max: 8000` tokens per page). |
+| `delegate_apply` | Verify host file SHA-256 hashes against the job's baseline, apply the diff (with 3-way merge fallback), record provenance hashes on the HMAC receipt, and clean up the worktree. |
+| `delegate_continue` | Send a follow-up instruction into an existing job's worktree (preserving the job's `auth_mode`, `plan`, `acceptance`, and budget caps across turns). |
+| `delegate_cancel` | Cancel an in-flight worker job and remove its temporary worktree. |
+| `delegate_to_gemini` | Synchronous convenience wrapper: runs `delegate_start(..., wait=true)` and automatically calls `delegate_apply` if `status == "ok"`. |
 
-## Plugin Layout
+---
+
+## Isolated Copy vs. `in_place` Mode
+
+- **Isolated copy (default, `in_place=false`)**: Every job runs in its own standalone copy of tracked files under `<data_dir>/worktrees/<job_id>`. Multiple jobs can run in parallel, failed runs leave your working tree untouched, and host `.git/hooks` and `.git/config` are snapshot-verified around every run.
+- **Direct working-tree mode (`in_place=true`)**: Edits your live checkout directly so the worker can use gitignored virtual environments (`.venv/`, `node_modules/`) without copying them. Requires a clean tracked tree, allows one `in_place` job at a time, automatically unwinds any worker git commits (`git reset --mixed`) while keeping file edits on disk, and returns an `undo_hint` command to revert if needed.
+
+---
+
+## Repository Layout
 
 ```text
 cc-agy-plugin/
+├── assets/
+│   └── architecture.svg     # Cross-harness MCP architecture diagram
 ├── .claude-plugin/
 │   └── plugin.json          # Claude Code plugin manifest + userConfig schema
 ├── .mcp.json                # Long-lived stdio MCP server definition (600s timeout)
 ├── server/
 │   ├── main.py              # MCP stdio entry point
 │   ├── mcp_stdio.py         # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
-│   ├── regions.py           # Model-to-region routing, pricing table, UTF-8 token pagination
-│   ├── receipts.py          # Atomic finally-safe HMAC receipt store & diff provenance hashing
-│   ├── genai_ask.py         # Single-shot google-genai Vertex helper
-│   ├── agy_runner.py        # Antigravity SDK async context-manager runner
-│   └── jobs.py              # Standalone repo isolation, conflict-safe apply, and pagination
+│   ├── regions.py           # Dual auth (API Key / Vertex), region routing, pricing, token pagination
+│   ├── receipts.py          # Atomic finally-safe HMAC receipt store, API key redaction & diff hashing
+│   ├── genai_ask.py         # Single-shot google-genai helper (no Antigravity prompt floor)
+│   ├── agy_runner.py        # Antigravity SDK runner + Straitjacket (ctx.sdk) tool containment
+│   └── jobs.py              # Worktree isolation, acceptance runner, 3-way apply, and pagination
 ├── skills/
 │   └── vertex/
 │       └── SKILL.md         # /cc-agy-plugin:vertex skill instructions
@@ -130,18 +161,18 @@ cc-agy-plugin/
 │   └── hooks.json           # SessionStart, PreToolUse, PostToolUse, and Stop hook registrations
 ├── scripts/
 │   ├── session_start.py     # SessionStart hook: records the per-session baseline
-│   ├── pre_tool_guard.py    # Strict mode PreToolUse guard + 9-line dictation linter
+│   ├── pre_tool_guard.py    # Strict mode PreToolUse guard + 9-line code dictation linter
 │   ├── post_tool_ledger.py  # PostToolUse MCP audit logger
 │   └── provenance_check.py  # Stop-hook git diff vs HMAC-receipt provenance verifier
-└── tests/
-    └── test_cc_agy_plugin.py
-LICENSE                      # Apache License 2.0
+├── tests/
+│   └── test_cc_agy_plugin.py
+└── LICENSE                  # Apache License 2.0
 ```
 
 ## Running Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+pytest tests/test_cc_agy_plugin.py -v
 ```
 
 ## License
