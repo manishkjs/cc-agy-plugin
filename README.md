@@ -2,6 +2,53 @@
 
 `cc-agy-plugin` is a native Claude Code plugin that lets Claude Code delegate coding, debugging, and review tasks to Vertex AI Gemini models through a long-lived Python stdio Model Context Protocol (MCP) server.
 
+> **Status:** early. The unit tests (26) run against a fake Gemini worker. The plugin has not yet been run end to end against live Vertex AI, so expect rough edges on the first real run.
+
+## Why use this: Opus plans, Gemini does the grunt work
+
+Most of the tokens in a coding session are grunt work: reading files, writing boilerplate, fixing lint, running tests, retrying. Paying flagship rates for that is the expensive part. This plugin splits the job in two:
+
+- **Claude Opus is the lead.** It reads the task, decides what needs to change, writes a short outcome-only brief, reviews the diff, and decides whether to apply it.
+- **A cheaper Gemini model is the worker.** It does the file reading, editing, and test running inside an isolated copy of your repo, then hands back a diff.
+
+Output tokens are where flagship models cost the most, so the plugin keeps Opus from writing the code itself. In strict mode, Opus's direct file edits are blocked, and a pre-flight linter rejects delegation briefs that paste more than 8 consecutive lines of code.
+
+### Back-of-envelope example
+
+List prices per 1M tokens at the time of writing (check the current Anthropic and Vertex AI pricing pages before relying on these):
+
+| Model | Input | Output |
+|---|---|---|
+| Claude Opus 5.5 | $4.00 | $20.00 |
+| Gemini 3 Flash (preview) | $0.50 | $3.00 |
+| Gemini 3.5 Flash-Lite | $0.10 | $0.40 |
+
+Take a task that needs 1M input tokens and 100k output tokens of agent work (the input figure includes the Antigravity SDK's ~11.5k-token system prompt on every worker turn). Assume Opus spends 100k input and 10k output tokens on briefing and reviewing.
+
+| Setup | Opus cost | Worker cost | Total | vs. all-Opus |
+|---|---|---|---|---|
+| All Opus | $4.00 + $2.00 | none | **$6.00** | baseline |
+| Opus lead + Gemini 3 Flash worker | $0.40 + $0.20 | $0.50 + $0.30 | **$1.40** | about 77% less |
+| Opus lead + Gemini 3.5 Flash-Lite worker | $0.40 + $0.20 | $0.10 + $0.04 | **$0.74** | about 88% less |
+
+These numbers are illustrative, not measured. Prompt caching lowers the all-Opus figure, a weaker worker may need extra rounds, and quality varies by task. Every call writes a receipt with real token counts, so `/cc-agy-plugin:cost` shows what you actually spent and you can measure the split on your own work.
+
+## Quick start
+
+```bash
+# Python packages for the MCP server (it runs with the python3 on your PATH)
+python3 -m pip install google-genai pydantic google-antigravity
+
+# Google Cloud credentials for the Gemini calls
+gcloud auth application-default login
+
+# Start Claude Code in a git repo with the plugin loaded
+cd /path/to/your/repo
+claude --plugin-dir /path/to/cc-agy-plugin
+```
+
+Claude Code asks for the plugin settings (GCP project, region, default models, strict mode). Run `/mcp` to confirm the `vertex` server is connected, then try a small task such as "use delegate_start to add a hello() function in hello.py, then show me get_diff".
+
 ## Architecture
 
 1. **Two Execution Tiers on Vertex AI**:
@@ -46,13 +93,15 @@ cc-agy-plugin/
 │   ├── jobs.md              # /cc-agy-plugin:jobs slash command
 │   └── cost.md              # /cc-agy-plugin:cost slash command
 ├── hooks/
-│   └── hooks.json           # PreToolUse, PostToolUse, and Stop hook registrations
+│   └── hooks.json           # SessionStart, PreToolUse, PostToolUse, and Stop hook registrations
 ├── scripts/
+│   ├── session_start.py     # SessionStart hook: records the per-session baseline
 │   ├── pre_tool_guard.py    # Strict mode PreToolUse guard + 9-line dictation linter
 │   ├── post_tool_ledger.py  # PostToolUse MCP audit logger
 │   └── provenance_check.py  # Stop-hook git diff vs HMAC-receipt provenance verifier
 └── tests/
     └── test_cc_agy_plugin.py
+LICENSE                      # Apache License 2.0
 ```
 
 ## Running Tests
@@ -60,3 +109,7 @@ cc-agy-plugin/
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
