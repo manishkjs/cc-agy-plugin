@@ -1,7 +1,7 @@
 {
   "name": "cc-agy-plugin",
   "version": "0.1.0",
-  "description": "Delegate coding, review, and research tasks from Claude Code to Vertex AI Gemini models via the Google Antigravity SDK and google-genai.",
+  "description": "Delegate coding, review, and research tasks from Claude Code to Google AI Studio or Vertex AI Gemini models via the Google Antigravity SDK, google-genai, and Straitjacket shell containment.",
   "author": {
     "name": "Manish Kumar"
   },
@@ -9,7 +9,9 @@
   "keywords": [
     "vertex-ai",
     "gemini",
+    "ai-studio",
     "antigravity-sdk",
+    "straitjacket",
     "multi-agent",
     "delegation",
     "mcp"
@@ -17,13 +19,13 @@
   "userConfig": {
     "gemini_api_key": {
       "title": "Google AI Studio API Key",
-      "description": "Optional Gemini API Key from Google AI Studio (aistudio.google.com). If provided, delegations use the direct Gemini API without requiring a Google Cloud project or service account.",
+      "description": "Optional Gemini API Key from Google AI Studio (aistudio.google.com). Takes precedence over GOOGLE_CLOUD_PROJECT in the environment unless an explicit project argument is passed.",
       "type": "string",
       "sensitive": true
     },
     "google_cloud_project": {
       "title": "Google Cloud Project ID",
-      "description": "GCP project ID with Vertex AI API enabled for Gemini billing and quota.",
+      "description": "GCP project ID with Vertex AI API enabled for Gemini billing and quota (used when no Gemini API key is active or when project is explicitly passed).",
       "type": "string",
       "sensitive": false
     },
@@ -36,7 +38,7 @@
     },
     "default_delegate_model": {
       "title": "Default Agentic Worker Model",
-      "description": "Default Gemini model ID for Antigravity SDK worktree delegations.",
+      "description": "Default Gemini model ID for Antigravity SDK delegations (for example gemini-3.1-pro-preview, gemini-3.5-flash-lite, gemini-3.8-flash, or gemini-4-argon).",
       "type": "string",
       "default": "gemini-3.1-pro-preview",
       "sensitive": false

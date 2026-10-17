@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import fcntl
 import fnmatch
+import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -18,12 +20,20 @@ import time
 from typing import Any, Callable
 import uuid
 
-from server.agy_runner import read_progress, resolve_thinking_level, run_antigravity_worker
+from server.agy_runner import (
+    is_straitjacket_available,
+    read_progress,
+    resolve_thinking_level,
+    run_antigravity_worker,
+)
 from server.receipts import (
     ReceiptStore,
     extract_diff_provenance,
+    parse_diff_git_header,
+    parse_unified_header_path,
     resolve_workspace_root,
     sha256_bytes,
+    unquote_git_path,
     validate_job_id,
 )
 from server.regions import (
@@ -31,6 +41,7 @@ from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
     paginate_text_by_tokens,
+    resolve_api_key,
     resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
@@ -40,7 +51,7 @@ from server.regions import (
 
 def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.quotePath=false", *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -121,8 +132,8 @@ def _matches_allowed_paths(rel_path: str, allowed_paths: list[str] | str | None)
 
 def _matches_file_filter(rel_path: str, file_filter: str) -> bool:
     """Match a diff file path against file_filter without substring false positives (a.py vs data.py)."""
-    norm_path = rel_path.strip().lstrip("./")
-    norm_filter = file_filter.strip().lstrip("./").rstrip("/")
+    norm_path = _strip_dot_slash(rel_path.strip())
+    norm_filter = _strip_dot_slash(file_filter.strip()).rstrip("/")
     if not norm_filter:
         return True
     if norm_path == norm_filter or norm_path.startswith(norm_filter + "/"):
@@ -170,7 +181,7 @@ def capture_live_workspace_diff(
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = str(tmp_index_path)
         subprocess.run(
-            ["git", "add", "-N", "."],
+            ["git", "-c", "core.quotePath=false", "add", "-N", "."],
             cwd=str(workspace_root),
             env=env,
             capture_output=True,
@@ -180,7 +191,7 @@ def capture_live_workspace_diff(
             check=False,
         )
         diff_res = subprocess.run(
-            ["git", "diff", "--binary", "--no-renames", target_ref],
+            ["git", "-c", "core.quotePath=false", "diff", "--binary", "--no-renames", target_ref],
             cwd=str(workspace_root),
             env=env,
             capture_output=True,
@@ -431,7 +442,10 @@ def render_worker_prompt(
             "(questions and blockers end your turn). Finish with a short summary that marks each plan step "
             "DONE or BLOCKED."
         )
-    if os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no"):
+    if (
+        os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
+        and is_straitjacket_available()
+    ):
         parts.append(
             "## Shell Commands & Evidence\n"
             "Commands execute with bounded output. If a test or build produces large output, it returns a concise "
@@ -534,14 +548,26 @@ def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
     chunks: list[tuple[str, str]] = []
     current: list[str] = []
     current_path = ""
+    in_hunk = False
     for line in diff_text.splitlines(keepends=True):
         if line.startswith("diff --git "):
             if current:
                 chunks.append((current_path, "".join(current)))
             current = [line]
-            parts = line.rstrip("\n").split(" b/", 1)
-            current_path = parts[1].strip() if len(parts) == 2 else ""
+            hdr = parse_diff_git_header(line)
+            current_path = (hdr[1] or hdr[0]) if hdr else ""
+            in_hunk = False
         elif current:
+            if line.startswith("@@ "):
+                in_hunk = True
+            elif not in_hunk and line.startswith("+++ "):
+                plus_path = parse_unified_header_path(line, "+++")
+                if plus_path and plus_path != "/dev/null":
+                    current_path = plus_path
+            elif not in_hunk and line.startswith("--- ") and not current_path:
+                minus_path = parse_unified_header_path(line, "---")
+                if minus_path and minus_path != "/dev/null":
+                    current_path = minus_path
             current.append(line)
     if current:
         chunks.append((current_path, "".join(current)))
@@ -841,6 +867,18 @@ class JobManager:
             return
         shutil.rmtree(wt_dir, ignore_errors=True)
 
+    def _snapshot_branches(self) -> tuple[str | None, list[str]]:
+        """Capture (current symbolic branch name or None, list of local branch names)."""
+        sym_res = _run_git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=self.workspace_root, check=False)
+        orig_branch = sym_res.stdout.strip() if sym_res.returncode == 0 and sym_res.stdout.strip() else None
+        refs_res = _run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+            cwd=self.workspace_root,
+            check=False,
+        )
+        branches = [b.strip() for b in refs_res.stdout.splitlines() if b.strip()] if refs_res.returncode == 0 else []
+        return orig_branch, branches
+
     def _check_in_place_ready(self) -> tuple[str, dict[str, str | None]]:
         """Verify the host repo can be edited in place; return (HEAD sha, untracked file hashes)."""
         head_res = _run_git(["rev-parse", "--verify", "HEAD"], cwd=self.workspace_root, check=False)
@@ -882,17 +920,62 @@ class JobManager:
         self,
         baseline_sha: str,
         pre_untracked: dict[str, str | None],
+        orig_branch: str | None = None,
+        pre_branches: list[str] | None = None,
     ) -> tuple[str, list[str], list[str], list[str]]:
         """Collect the worker's in-place edits against baseline_sha.
 
-        Undoes any commits the worker made (keeping their changes in the working tree),
-        restores the index, and skips untracked files that existed before the job and are
-        unchanged. Returns (diff_text, files_changed, symlink_escapes, notes).
+        Undoes any commits or branch switches the worker made (keeping their changes in the
+        working tree), restores the index, and skips untracked files that existed before the job
+        and are unchanged. Returns (diff_text, files_changed, symlink_escapes, notes).
         """
         root = self.workspace_root
         notes: list[str] = []
+        sym_res = _run_git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=root, check=False)
+        cur_branch = sym_res.stdout.strip() if sym_res.returncode == 0 and sym_res.stdout.strip() else None
         head_res = _run_git(["rev-parse", "HEAD"], cwd=root, check=False)
         head_now = head_res.stdout.strip() if head_res.returncode == 0 else ""
+
+        if orig_branch:
+            _run_git(["update-ref", f"refs/heads/{orig_branch}", baseline_sha], cwd=root, check=False)
+            if cur_branch != orig_branch:
+                _run_git(["symbolic-ref", "HEAD", f"refs/heads/{orig_branch}"], cwd=root, check=False)
+                notes.append(
+                    f"Worker switched branch to {cur_branch or 'detached HEAD'!r}; "
+                    f"restored HEAD to branch {orig_branch!r} at {baseline_sha[:12]}."
+                )
+        elif cur_branch:
+            _run_git(["symbolic-ref", "--delete", "HEAD"], cwd=root, check=False)
+            _run_git(["update-ref", "--no-deref", "HEAD", baseline_sha], cwd=root, check=False)
+            notes.append(
+                f"Worker switched to branch {cur_branch!r}; restored detached HEAD at {baseline_sha[:12]}."
+            )
+
+        if pre_branches is not None:
+            refs_res = _run_git(
+                ["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                cwd=root,
+                check=False,
+            )
+            now_branches = (
+                [b.strip() for b in refs_res.stdout.splitlines() if b.strip()]
+                if refs_res.returncode == 0
+                else []
+            )
+            pre_set = set(pre_branches)
+            for b in now_branches:
+                if b not in pre_set and b != orig_branch:
+                    b_rev = _run_git(["rev-parse", "--verify", f"refs/heads/{b}"], cwd=root, check=False)
+                    b_sha = b_rev.stdout.strip() if b_rev.returncode == 0 else ""
+                    if b_sha and b_sha != baseline_sha and b_sha != head_now:
+                        _run_git(["checkout", b_sha, "--", "."], cwd=root, check=False)
+                        notes.append(
+                            f"Recovered committed changes from worker branch {b!r} ({b_sha[:12]}) "
+                            f"into working tree before deleting branch."
+                        )
+                    _run_git(["branch", "-D", b], cwd=root, check=False)
+                    notes.append(f"Deleted worker-created branch {b!r}.")
+
         if head_now and head_now != baseline_sha:
             notes.append(
                 f"Worker moved HEAD to {head_now[:12]}; its commits were undone with "
@@ -949,7 +1032,7 @@ class JobManager:
         baseline_sha: str,
         baseline_file_hashes: dict[str, str | None],
         started_at: float,
-        prior_usage: dict[str, int] | None = None,
+        prior_usage: dict[str, Any] | None = None,
         prior_tool_calls: list[dict[str, Any]] | None = None,
         scrub_receipt: bool = False,
         in_place: bool = False,
@@ -960,13 +1043,23 @@ class JobManager:
         max_tool_calls: int | None = None,
         max_total_tokens: int | None = None,
     ) -> dict[str, Any]:
-        usage: dict[str, int] = {
-            "prompt_token_count": int((prior_usage or {}).get("prompt_token_count", 0)),
-            "cached_content_token_count": int((prior_usage or {}).get("cached_content_token_count", 0)),
-            "candidates_token_count": int((prior_usage or {}).get("candidates_token_count", 0)),
-            "thoughts_token_count": int((prior_usage or {}).get("thoughts_token_count", 0)),
-            "total_token_count": int((prior_usage or {}).get("total_token_count", 0)),
+        token_keys = (
+            "prompt_token_count",
+            "cached_content_token_count",
+            "candidates_token_count",
+            "thoughts_token_count",
+            "total_token_count",
+        )
+        usage: dict[str, Any] = {
+            k: int((prior_usage or {}).get(k, 0)) for k in token_keys
         }
+        prior_requests = list((prior_usage or {}).get("requests") or []) if isinstance(prior_usage, dict) else []
+        prior_max_req_prompt = int((prior_usage or {}).get("max_request_prompt_tokens") or 0) if isinstance(prior_usage, dict) else 0
+        if prior_requests:
+            usage["requests"] = prior_requests
+        if prior_max_req_prompt > 0:
+            usage["max_request_prompt_tokens"] = prior_max_req_prompt
+
         tool_calls: list[dict[str, Any]] = list(prior_tool_calls or [])
         thoughts: list[str] = []
         response_text = ""
@@ -985,7 +1078,30 @@ class JobManager:
         host_git_dir = self.workspace_root / ".git"
         hooks_snap = _snapshot_directory_tree(host_git_dir / "hooks")
         config_snap = _snapshot_directory_tree(host_git_dir / "config")
+        orig_branch, pre_branches = self._snapshot_branches() if in_place else (None, [])
         worker_out: dict[str, Any] = {}
+        workspace_dir_accessed = False
+
+        class _TrackedReq(dict[str, Any]):
+            def __getitem__(self, key: str) -> Any:
+                nonlocal workspace_dir_accessed
+                if key == "workspace_dir":
+                    workspace_dir_accessed = True
+                return super().__getitem__(key)
+
+            def get(self, key: str, default: Any = None) -> Any:
+                nonlocal workspace_dir_accessed
+                if key == "workspace_dir":
+                    workspace_dir_accessed = True
+                return super().get(key, default)
+
+        raw_backend = self.worker_backend
+        if raw_backend is None:
+            workspace_dir_accessed = True
+            tracked_backend = None
+        else:
+            def tracked_backend(req: dict[str, Any]) -> Any:
+                return raw_backend(_TrackedReq(req))
 
         try:
             with self._lock:
@@ -1005,7 +1121,7 @@ class JobManager:
                 enabled_tools=enabled_tools,
                 disabled_tools=disabled_tools,
                 enable_subagents=enable_subagents,
-                backend=self.worker_backend,
+                backend=tracked_backend,
                 thinking_level=thinking_level,
                 max_tool_calls=max_tool_calls,
                 max_total_tokens=max_total_tokens,
@@ -1014,7 +1130,7 @@ class JobManager:
 
             response_text = str(worker_out.get("text") or "")
             new_usage = worker_out.get("usage") or {}
-            for k in usage:
+            for k in token_keys:
                 usage[k] += int(new_usage.get(k) or 0)
             usage["total_token_count"] = max(
                 usage["total_token_count"],
@@ -1022,6 +1138,15 @@ class JobManager:
                 + usage["candidates_token_count"]
                 + usage["thoughts_token_count"],
             )
+            new_requests = new_usage.get("requests")
+            if isinstance(new_requests, list) and new_requests:
+                usage.setdefault("requests", []).extend(new_requests)
+            new_max_req = int(new_usage.get("max_request_prompt_tokens") or 0)
+            if new_max_req > 0 or usage.get("max_request_prompt_tokens"):
+                usage["max_request_prompt_tokens"] = max(
+                    int(usage.get("max_request_prompt_tokens") or 0),
+                    new_max_req,
+                )
             tool_calls.extend(worker_out.get("tool_calls") or [])
             thoughts.extend(worker_out.get("thoughts") or [])
             stop_reason = worker_out.get("stop_reason")
@@ -1069,7 +1194,10 @@ class JobManager:
 
                 if in_place:
                     diff_text, files_changed, symlink_escapes, in_place_notes = self._finalize_in_place(
-                        baseline_sha, pre_untracked or {}
+                        baseline_sha,
+                        pre_untracked or {},
+                        orig_branch=orig_branch,
+                        pre_branches=pre_branches,
                     )
                     baseline_file_hashes = self._compute_changed_baseline_hashes(
                         self.workspace_root, baseline_sha, files_changed, {}
@@ -1165,10 +1293,14 @@ class JobManager:
                 "budget": {"max_tool_calls": max_tool_calls, "max_total_tokens": max_total_tokens},
                 "stop_reason": stop_reason,
                 "containment": worker_out.get("containment", "none") if isinstance(worker_out, dict) else "none",
+                "containment_warning": (
+                    worker_out.get("containment_warning") if isinstance(worker_out, dict) else None
+                ),
                 "acceptance_results": acceptance_results,
                 "acceptance_passed": (
                     all(r.get("passed") for r in acceptance_results) if acceptance_results else None
                 ),
+                "external_worktree_tamper": bool(not in_place and files_changed and not workspace_dir_accessed),
             }
             if in_place:
                 # The edits are already in the user's working tree, so the job counts as applied
@@ -1180,9 +1312,12 @@ class JobManager:
                 tracked_files = [f for f in files_changed if baseline_file_hashes.get(f) is not None]
                 undo_parts: list[str] = []
                 if tracked_files:
-                    undo_parts.append(f"git checkout {baseline_sha[:12]} -- " + " ".join(tracked_files))
+                    undo_parts.append(
+                        f"git checkout {baseline_sha[:12]} -- "
+                        + " ".join(shlex.quote(f) for f in tracked_files)
+                    )
                 if new_files:
-                    undo_parts.append("rm -- " + " ".join(new_files))
+                    undo_parts.append("rm -- " + " ".join(shlex.quote(f) for f in new_files))
                 receipt_payload.update(
                     {
                         "in_place": True,
@@ -1218,20 +1353,35 @@ class JobManager:
     @staticmethod
     def _merge_partial_exception_data(
         exc: BaseException,
-        usage: dict[str, int],
+        usage: dict[str, Any],
         tool_calls: list[dict[str, Any]],
         thoughts: list[str],
     ) -> None:
         partial_u = getattr(exc, "partial_usage", None)
         if isinstance(partial_u, dict):
-            for k in usage:
-                usage[k] += int(partial_u.get(k) or 0)
+            for k in (
+                "prompt_token_count",
+                "cached_content_token_count",
+                "candidates_token_count",
+                "thoughts_token_count",
+                "total_token_count",
+            ):
+                usage[k] = int(usage.get(k) or 0) + int(partial_u.get(k) or 0)
             usage["total_token_count"] = max(
                 usage["total_token_count"],
                 usage["prompt_token_count"]
                 + usage["candidates_token_count"]
                 + usage["thoughts_token_count"],
             )
+            partial_reqs = partial_u.get("requests")
+            if isinstance(partial_reqs, list) and partial_reqs:
+                usage.setdefault("requests", []).extend(partial_reqs)
+            partial_max_req = int(partial_u.get("max_request_prompt_tokens") or 0)
+            if partial_max_req > 0:
+                usage["max_request_prompt_tokens"] = max(
+                    int(usage.get("max_request_prompt_tokens") or 0),
+                    partial_max_req,
+                )
         partial_tc = getattr(exc, "partial_tool_calls", None)
         if isinstance(partial_tc, list):
             tool_calls.extend(partial_tc)
@@ -1414,6 +1564,7 @@ class JobManager:
         return {
             "job_id": job_id,
             "status": "running",
+            "auth_mode": auth_mode,
             "model": chosen_model,
             "vertex_location": resolved_location,
             "reroute_note": reroute_note,
@@ -1441,7 +1592,7 @@ class JobManager:
             try:
                 fut.result(timeout=min(0.05, remaining))
                 return
-            except TimeoutError:
+            except (TimeoutError, FuturesTimeoutError):
                 continue
             except Exception:
                 return
@@ -1462,16 +1613,30 @@ class JobManager:
             digest["baseline_head_sha"] = active_baseline_sha
             return digest
 
-        all_receipts = self.store.list_receipts()
+        all_receipts = self.store.list_receipts(workspace_root=self.workspace_root)
         max_items = max(1, min(int(limit), 50))
         recent = all_receipts[-max_items:]
-        summaries = [self._compact_digest(r, include_summary=False) for r in recent]
+        totals = self.store.summarize_costs(workspace_root=self.workspace_root)
+        summaries: list[dict[str, Any]] = []
+        for r in reversed(recent):
+            item = self._compact_digest(r, include_summary=False, include_acceptance_details=False)
+            candidate_list = [item] + summaries
+            probe = {
+                "jobs": candidate_list,
+                "returned_jobs": len(candidate_list),
+                "total_jobs": len(all_receipts),
+                "baseline_head_sha": active_baseline_sha,
+                "totals": totals,
+            }
+            if summaries and estimate_tokens(json.dumps(probe, indent=2, sort_keys=True)) > MAX_TOOL_RESPONSE_TOKENS - 200:
+                break
+            summaries.insert(0, item)
         return {
             "jobs": summaries,
             "returned_jobs": len(summaries),
             "total_jobs": len(all_receipts),
             "baseline_head_sha": active_baseline_sha,
-            "totals": self.store.summarize_costs(),
+            "totals": totals,
         }
 
     def delegate_result(
@@ -1509,22 +1674,26 @@ class JobManager:
             filtered_chunks: list[str] = []
             current_chunk: list[str] = []
             keep_chunk = False
+            in_hunk = False
             for line in full_diff.splitlines(keepends=True):
                 if line.startswith("diff --git "):
                     if current_chunk and keep_chunk:
                         filtered_chunks.append("".join(current_chunk))
                     current_chunk = [line]
-                    parts = line.strip().split(" b/", 1)
-                    cand_path = parts[1].strip() if len(parts) == 2 else ""
-                    keep_chunk = _matches_file_filter(cand_path, file_filter)
+                    hdr = parse_diff_git_header(line)
+                    cand_path = (hdr[1] or hdr[0]) if hdr else ""
+                    keep_chunk = bool(cand_path and _matches_file_filter(cand_path, file_filter))
+                    in_hunk = False
                 else:
-                    if line.startswith("+++ b/"):
-                        cand_path = line[len("+++ b/") :].strip()
-                        if _matches_file_filter(cand_path, file_filter):
+                    if line.startswith("@@ "):
+                        in_hunk = True
+                    elif not in_hunk and line.startswith("+++ "):
+                        cand_path = parse_unified_header_path(line, "+++")
+                        if cand_path and cand_path != "/dev/null" and _matches_file_filter(cand_path, file_filter):
                             keep_chunk = True
-                    elif line.startswith("--- a/"):
-                        cand_path = line[len("--- a/") :].strip()
-                        if _matches_file_filter(cand_path, file_filter):
+                    elif not in_hunk and line.startswith("--- "):
+                        cand_path = parse_unified_header_path(line, "---")
+                        if cand_path and cand_path != "/dev/null" and _matches_file_filter(cand_path, file_filter):
                             keep_chunk = True
                     current_chunk.append(line)
             if current_chunk and keep_chunk:
@@ -1760,8 +1929,9 @@ class JobManager:
 
         with self._lock:
             fut = self._futures.get(safe_id)
-        if fut is not None and not fut.done():
-            raise RuntimeError(f"Job '{safe_id}' is currently running; wait before continuing.")
+            if fut is not None and not fut.done():
+                raise RuntimeError(f"Job '{safe_id}' is currently running; wait before continuing.")
+            self._cancelled.discard(safe_id)
 
         receipt = self.store.read_receipt(safe_id)
         in_place = bool(receipt.get("in_place"))
@@ -1834,6 +2004,12 @@ class JobManager:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
         prior_auth_mode = receipt.get("auth_mode")
+        if prior_auth_mode == "api_key" and not project:
+            if not resolve_api_key(api_key or raw_key):
+                raise ValueError(
+                    "Job was started in api_key mode, but no Gemini API key is available after server restart. "
+                    "Pass api_key=... or set GEMINI_API_KEY."
+                )
         inherited_project = project
         if not inherited_project and prior_auth_mode != "api_key":
             inherited_project = raw_proj or receipt.get("vertex_project")
@@ -1928,7 +2104,12 @@ class JobManager:
         )
         with self._lock:
             self._futures[safe_id] = fut
-        return {"job_id": safe_id, "status": "running", "prompts_count": len(recorded_prompts)}
+        return {
+            "job_id": safe_id,
+            "status": "running",
+            "auth_mode": auth_mode,
+            "prompts_count": len(recorded_prompts),
+        }
 
     def _verify_in_place_unchanged(self, receipt: dict[str, Any]) -> dict[str, str | None]:
         """Refuse to continue an in_place job if anyone else changed the tree since its last turn."""
@@ -2054,12 +2235,41 @@ class JobManager:
         receipt: dict[str, Any],
         *,
         include_summary: bool = True,
+        include_acceptance_details: bool = True,
     ) -> dict[str, Any]:
         """Return a token-bounded digest suitable for Claude Code's context window."""
-        summary_text = str(receipt.get("summary") or "") if include_summary else ""
-        clipped_summary, truncated, est_tokens = truncate_to_token_budget(
-            summary_text, MAX_TOOL_RESPONSE_TOKENS
-        )
+        if not include_acceptance_details and not include_summary:
+            raw_usage = receipt.get("usage") or {}
+            raw_cost = receipt.get("cost") or {}
+            slim: dict[str, Any] = {
+                "job_id": receipt.get("job_id"),
+                "kind": receipt.get("kind", "delegate"),
+                "status": receipt.get("status"),
+                "auth_mode": receipt.get("auth_mode", "vertex"),
+                "model": receipt.get("model"),
+                "files_changed": receipt.get("files_changed", []),
+                "applied": bool(receipt.get("applied", False)),
+                "in_place": bool(receipt.get("in_place", False)),
+                "usage": {
+                    "prompt_token_count": int(raw_usage.get("prompt_token_count") or 0),
+                    "cached_content_token_count": int(raw_usage.get("cached_content_token_count") or 0),
+                    "candidates_token_count": int(raw_usage.get("candidates_token_count") or 0),
+                    "thoughts_token_count": int(raw_usage.get("thoughts_token_count") or 0),
+                    "total_token_count": int(raw_usage.get("total_token_count") or 0),
+                },
+                "cost": {
+                    "total_cost_usd": float(raw_cost.get("total_cost_usd") or 0.0),
+                    "total_cost_cents": float(raw_cost.get("total_cost_cents") or 0.0),
+                },
+            }
+            if receipt.get("acceptance_passed") is not None:
+                slim["acceptance_passed"] = receipt.get("acceptance_passed")
+            if receipt.get("error"):
+                slim["error"] = receipt.get("error")
+            if receipt.get("stop_reason"):
+                slim["stop_reason"] = receipt.get("stop_reason")
+            return slim
+
         digest: dict[str, Any] = {
             "job_id": receipt.get("job_id"),
             "kind": receipt.get("kind", "delegate"),
@@ -2080,14 +2290,23 @@ class JobManager:
             "thinking_level": receipt.get("thinking_level"),
             "stop_reason": receipt.get("stop_reason"),
             "budget": receipt.get("budget"),
+            "containment": receipt.get("containment", "none"),
+            "containment_warning": receipt.get("containment_warning"),
             "acceptance_passed": receipt.get("acceptance_passed"),
-            "acceptance_results": receipt.get("acceptance_results") or [],
             "error": receipt.get("error"),
         }
+        if include_acceptance_details:
+            digest["acceptance_results"] = receipt.get("acceptance_results") or []
         if receipt.get("in_place"):
             digest["in_place_notes"] = receipt.get("in_place_notes", [])
             digest["undo_hint"] = receipt.get("undo_hint")
         if include_summary:
+            summary_text = str(receipt.get("summary") or "")
+            meta_tokens = estimate_tokens(json.dumps(digest, indent=2, sort_keys=True))
+            summary_budget = max(500, MAX_TOOL_RESPONSE_TOKENS - meta_tokens - 250)
+            clipped_summary, truncated, est_tokens = truncate_to_token_budget(
+                summary_text, summary_budget
+            )
             digest["summary"] = clipped_summary
             digest["summary_truncated"] = bool(receipt.get("summary_truncated") or truncated)
             digest["summary_tokens_estimated"] = est_tokens

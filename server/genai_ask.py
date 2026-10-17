@@ -86,7 +86,7 @@ def ask_gemini(
     """Run a single-shot Google AI Studio or Vertex AI Gemini query without spinning up Antigravity.
 
     Ideal for code reviews, architecture checks, or second opinions where the
-    11,554-token Antigravity SDK system prompt floor is unnecessary.
+    Antigravity SDK's built-in agent system prompt and tool declarations are unnecessary.
     Always writes a receipt in a `finally:` block so errors still record partial usage.
     """
     if not prompt or not prompt.strip():
@@ -130,10 +130,11 @@ def ask_gemini(
             raise ValueError(
                 f"context_file {rel_path!r} escapes workspace root {ws_root}"
             )
-        if candidate.is_file():
-            content = candidate.read_text(encoding="utf-8", errors="replace")
-            assembled_parts.append(f"### File: {rel_path}\n```\n{content}\n```")
-            included_files.append(rel_path)
+        if not candidate.is_file():
+            raise ValueError(f"context_file not found: {rel_path!r}")
+        content = candidate.read_text(encoding="utf-8", errors="replace")
+        assembled_parts.append(f"### File: {rel_path}\n```\n{content}\n```")
+        included_files.append(rel_path)
 
     assembled_parts.append(prompt.strip())
     full_prompt = "\n\n".join(assembled_parts)
@@ -231,6 +232,7 @@ def ask_gemini(
         "model": chosen_model,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,
+        "context_files": included_files,
         "text": clipped_text,
         "response_truncated": was_truncated,
         "response_tokens_estimated": orig_tokens,

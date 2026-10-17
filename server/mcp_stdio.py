@@ -10,7 +10,7 @@ import threading
 from typing import Any, BinaryIO
 
 from server.genai_ask import ask_gemini
-from server.jobs import JobManager, validate_allowed_paths
+from server.jobs import JobManager, validate_acceptance, validate_allowed_paths, validate_plan
 from server.receipts import ReceiptStore
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -20,9 +20,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "ask_gemini",
         "description": (
-            "Run a fast single-shot Vertex AI Gemini query via google-genai (without the "
-            "11,554-token Antigravity SDK system prompt floor). Best for code reviews, "
-            "architecture feedback, and second opinions."
+            "Run a fast single-shot Vertex AI or AI Studio Gemini query via google-genai "
+            "(without loading the Antigravity SDK's built-in agent system prompt and tool "
+            "declarations). Best for code reviews, architecture feedback, and second opinions."
         ),
         "inputSchema": {
             "type": "object",
@@ -454,10 +454,24 @@ def _parse_positive_float(value: Any, field_name: str, default: float) -> float:
         raise InvalidParamsError(f"'{field_name}' must be a positive number, got bool")
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InvalidParamsError(f"'{field_name}' must be a valid number: {exc}") from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise InvalidParamsError(f"'{field_name}' must be a finite number > 0, got {value!r}")
+    return parsed
+
+
+def _parse_optional_finite_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise InvalidParamsError(f"'{field_name}' must be a finite number, got bool")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidParamsError(f"'{field_name}' must be a valid number: {exc}") from exc
+    if not math.isfinite(parsed):
+        raise InvalidParamsError(f"'{field_name}' must be a finite number, got {value!r}")
     return parsed
 
 
@@ -468,7 +482,7 @@ def _parse_positive_int(value: Any, field_name: str, default: int) -> int:
         raise InvalidParamsError(f"'{field_name}' must be a positive integer, got bool")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InvalidParamsError(f"'{field_name}' must be a valid integer: {exc}") from exc
     if parsed <= 0:
         raise InvalidParamsError(f"'{field_name}' must be an integer > 0, got {value!r}")
@@ -483,11 +497,19 @@ def _parse_optional_nonneg_int(value: Any, field_name: str) -> int | None:
         raise InvalidParamsError(f"'{field_name}' must be an integer, got bool")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InvalidParamsError(f"'{field_name}' must be a valid integer: {exc}") from exc
     if parsed < 0:
         raise InvalidParamsError(f"'{field_name}' must be >= 0, got {value!r}")
     return parsed
+
+
+def _validate_optional_str_list(value: Any, field_name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise InvalidParamsError(f"'{field_name}' must be a list of strings")
+    return value
 
 
 class MCPServer:
@@ -675,11 +697,8 @@ class MCPServer:
     def _dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "ask_gemini":
             prompt_str = _require_str(args.get("prompt"), "prompt")
-            ctx_files = args.get("context_files")
-            if ctx_files is not None and (
-                not isinstance(ctx_files, list) or not all(isinstance(x, str) for x in ctx_files)
-            ):
-                raise InvalidParamsError("context_files must be a list of strings")
+            ctx_files = _validate_optional_str_list(args.get("context_files"), "context_files")
+            temp_val = _parse_optional_finite_float(args.get("temperature"), "temperature")
             try:
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
             except ValueError as exc:
@@ -689,7 +708,7 @@ class MCPServer:
                 model=_optional_str(args.get("model"), "model"),
                 context_files=ctx_files,
                 system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
-                temperature=args.get("temperature"),
+                temperature=temp_val,
                 api_key=_optional_str(args.get("api_key"), "api_key"),
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
@@ -701,8 +720,12 @@ class MCPServer:
 
         if name == "delegate_start":
             prompt_str = _require_str(args.get("prompt"), "prompt")
+            enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
+            disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
+                plan_steps = validate_plan(args.get("plan"))
+                acceptance_cmds = validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
                 enable_sub = parse_bool(args.get("enable_subagents"), False)
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 wait_b = parse_bool(args.get("wait"), False)
@@ -714,8 +737,8 @@ class MCPServer:
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
                 allowed_paths=allowed,
-                enabled_tools=args.get("enabled_tools"),
-                disabled_tools=args.get("disabled_tools"),
+                enabled_tools=enabled_t,
+                disabled_tools=disabled_t,
                 enable_subagents=enable_sub,
                 scrub_receipt=scrub_b,
                 timeout_seconds=timeout_sec,
@@ -725,8 +748,8 @@ class MCPServer:
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
                 thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-                plan=args.get("plan"),
-                acceptance=args.get("acceptance"),
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
             )
@@ -804,21 +827,30 @@ class MCPServer:
 
         if name == "delegate_to_gemini":
             prompt_str = _require_str(args.get("prompt"), "prompt")
+            enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
+            disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
+                plan_steps = validate_plan(args.get("plan"))
+                acceptance_cmds = validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
                 enable_sub = parse_bool(args.get("enable_subagents"), False)
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 auto_apply = parse_bool(args.get("auto_apply"), True)
                 in_place_b = parse_bool(args.get("in_place"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            if in_place_b and not auto_apply:
+                raise InvalidParamsError(
+                    "in_place=True cannot be combined with auto_apply=False because in_place edits "
+                    "are applied directly to the working tree."
+                )
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
             digest = self.job_manager.delegate_start(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
                 allowed_paths=allowed,
-                enabled_tools=args.get("enabled_tools"),
-                disabled_tools=args.get("disabled_tools"),
+                enabled_tools=enabled_t,
+                disabled_tools=disabled_t,
                 enable_subagents=enable_sub,
                 scrub_receipt=scrub_b,
                 timeout_seconds=timeout_sec,
@@ -828,17 +860,17 @@ class MCPServer:
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
                 thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-                plan=args.get("plan"),
-                acceptance=args.get("acceptance"),
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
             )
-            if auto_apply and digest.get("status") == "ok":
+            if auto_apply and digest.get("status") == "ok" and not in_place_b:
                 apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))
                 digest["applied"] = True
                 digest["applied_files"] = apply_res.get("applied_files", [])
                 digest["diff_sha256"] = apply_res.get("diff_sha256")
-            elif digest.get("status") != "ok":
+            elif digest.get("status") not in ("ok", "checkpoint", "needs_input"):
                 digest["is_error"] = True
             return digest
 

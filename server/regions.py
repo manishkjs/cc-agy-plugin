@@ -108,31 +108,36 @@ MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
         "input": 1.25,
         "cached_input": 0.125,
         "output": 10.00,
-        "long_context_multiplier": 2.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
     },
     "gemini-3-pro-preview": {
         "input": 2.00,
         "cached_input": 0.20,
         "output": 12.00,
-        "long_context_multiplier": 2.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
     },
     "gemini-3.1-pro-preview": {
         "input": 2.00,
         "cached_input": 0.20,
         "output": 12.00,
-        "long_context_multiplier": 2.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
     },
     "gemini-4-argon": {
         "input": 2.00,
         "cached_input": 0.20,
         "output": 12.00,
-        "long_context_multiplier": 2.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
     },
     "argon": {
         "input": 2.00,
         "cached_input": 0.20,
         "output": 12.00,
-        "long_context_multiplier": 2.0,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
     },
 }
 
@@ -250,9 +255,12 @@ def sanitize_placeholder_env() -> None:
     for var in (
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
+        "CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY",
         "GOOGLE_CLOUD_PROJECT",
         "VERTEX_PROJECT",
         "GCLOUD_PROJECT",
+        "CLOUD_ML_PROJECT_ID",
+        "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_LOCATION",
         "VERTEX_LOCATION",
     ):
@@ -274,6 +282,7 @@ def resolve_api_key(
         requested_key,
         source_env.get("GEMINI_API_KEY"),
         source_env.get("GOOGLE_API_KEY"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY"),
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
@@ -297,6 +306,8 @@ def resolve_vertex_project(
         source_env.get("GOOGLE_CLOUD_PROJECT"),
         source_env.get("VERTEX_PROJECT"),
         source_env.get("GCLOUD_PROJECT"),
+        source_env.get("CLOUD_ML_PROJECT_ID"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT"),
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
@@ -362,12 +373,49 @@ def resolve_auth_config(
     )
 
 
-def estimate_cost_usd(model: str, usage: dict[str, Any]) -> dict[str, Any]:
-    """Calculate exact USD and cents cost from raw Vertex usage_metadata token counts.
+def _cost_for_turn(
+    rates: dict[str, float],
+    turn_usage: dict[str, Any],
+    *,
+    apply_long_context: bool,
+) -> tuple[float, float, float]:
+    prompt_tokens = int(turn_usage.get("prompt_token_count") or 0)
+    cached_tokens = int(turn_usage.get("cached_content_token_count") or 0)
+    candidates_tokens = int(turn_usage.get("candidates_token_count") or 0)
+    thoughts_tokens = int(turn_usage.get("thoughts_token_count") or 0)
+
+    in_mult = 1.0
+    out_mult = 1.0
+    if apply_long_context:
+        in_mult = float(rates.get("long_context_input_multiplier", 1.0))
+        out_mult = float(rates.get("long_context_output_multiplier", 1.0))
+
+    uncached_input_tokens = max(0, prompt_tokens - cached_tokens)
+    billable_output_tokens = candidates_tokens + thoughts_tokens
+
+    input_cost = (uncached_input_tokens / 1_000_000.0) * rates["input"] * in_mult
+    cached_cost = (cached_tokens / 1_000_000.0) * rates["cached_input"] * in_mult
+    output_cost = (billable_output_tokens / 1_000_000.0) * rates["output"] * out_mult
+    return input_cost, cached_cost, output_cost
+
+
+def estimate_cost_usd(
+    model: str,
+    usage: dict[str, Any],
+    *,
+    single_request: bool = False,
+) -> dict[str, Any]:
+    """Calculate estimated USD and cents cost from Vertex usage_metadata token counts.
 
     Vertex prompt_token_count includes cached_content_token_count. Uncached input
     tokens equal max(0, prompt_token_count - cached_content_token_count).
     Thinking tokens (thoughts_token_count) are billed at the output token rate.
+
+    Long-context (>200k prompt tokens) pricing is evaluated per single model call rather than
+    on aggregated multi-step turn totals: the >200k tier applies only when `single_request=True`
+    (such as `ask_gemini`) or on individual `usage["requests"]` entries marked `per_call=True`
+    / `single_request=True`. Total token volume is always anchored to the turn totals so partial
+    per-step entries never undercount total usage.
     """
     normalized_model = normalize_model_id(model)
     pricing_known = normalized_model in MODEL_PRICING_PER_1M_USD
@@ -385,19 +433,87 @@ def estimate_cost_usd(model: str, usage: dict[str, Any]) -> dict[str, Any]:
 
     prompt_tokens = int(usage.get("prompt_token_count") or 0)
     cached_tokens = int(usage.get("cached_content_token_count") or 0)
-    candidates_tokens = int(usage.get("candidates_token_count") or 0)
-    thoughts_tokens = int(usage.get("thoughts_token_count") or 0)
+    cand_tokens = int(usage.get("candidates_token_count") or 0)
+    think_tokens = int(usage.get("thoughts_token_count") or 0)
+    requests_list = usage.get("requests")
+    long_context_applied = False
 
-    multiplier = 1.0
-    if prompt_tokens > 200_000 and "long_context_multiplier" in rates:
-        multiplier = float(rates["long_context_multiplier"])
+    if isinstance(requests_list, list) and requests_list:
+        req_input_cost = 0.0
+        req_cached_cost = 0.0
+        req_output_cost = 0.0
+        sum_req_prompt = 0
+        sum_req_cached = 0
+        sum_req_out = 0
+        for req_u in requests_list:
+            if not isinstance(req_u, dict):
+                continue
+            req_prompt = int(req_u.get("prompt_token_count") or 0)
+            req_cached = int(req_u.get("cached_content_token_count") or 0)
+            req_out = int(req_u.get("candidates_token_count") or 0) + int(req_u.get("thoughts_token_count") or 0)
+            sum_req_prompt += req_prompt
+            sum_req_cached += req_cached
+            sum_req_out += req_out
+            is_single_call = bool(
+                single_request
+                or req_u.get("per_call")
+                or req_u.get("single_request")
+            )
+            req_long = is_single_call and (req_prompt > 200_000)
+            if req_long:
+                long_context_applied = True
+            ic, cc, oc = _cost_for_turn(
+                rates,
+                req_u,
+                apply_long_context=req_long,
+            )
+            req_input_cost += ic
+            req_cached_cost += cc
+            req_output_cost += oc
 
-    uncached_input_tokens = max(0, prompt_tokens - cached_tokens)
-    billable_output_tokens = candidates_tokens + thoughts_tokens
+        # Anchor total priced volume to top-level turn totals when provided:
+        # 1) If per-step entries sum to MORE than the turn totals (e.g. multiple steps
+        #    reporting cumulative/shared usage for one invocation), scale costs down proportionally.
+        total_out = cand_tokens + think_tokens
+        if prompt_tokens > 0 and sum_req_prompt > prompt_tokens:
+            req_input_cost *= prompt_tokens / sum_req_prompt
+        if sum_req_cached > cached_tokens and (cached_tokens > 0 or prompt_tokens > 0):
+            req_cached_cost *= (cached_tokens / sum_req_cached) if cached_tokens > 0 else 0.0
+        if total_out > 0 and sum_req_out > total_out:
+            req_output_cost *= total_out / sum_req_out
 
-    input_cost = (uncached_input_tokens / 1_000_000.0) * rates["input"] * multiplier
-    cached_cost = (cached_tokens / 1_000_000.0) * rates["cached_input"] * multiplier
-    output_cost = (billable_output_tokens / 1_000_000.0) * rates["output"] * multiplier
+        # 2) If top-level totals exceed the sum of reported per-call entries, price the remainder at base rates
+        rem_prompt = max(0, prompt_tokens - sum_req_prompt)
+        rem_cached = max(0, cached_tokens - sum_req_cached)
+        rem_out = max(0, total_out - sum_req_out)
+        if rem_prompt > 0 or rem_cached > 0 or rem_out > 0:
+            rem_ic, rem_cc, rem_oc = _cost_for_turn(
+                rates,
+                {
+                    "prompt_token_count": rem_prompt,
+                    "cached_content_token_count": rem_cached,
+                    "candidates_token_count": rem_out,
+                    "thoughts_token_count": 0,
+                },
+                apply_long_context=False,
+            )
+            req_input_cost += rem_ic
+            req_cached_cost += rem_cc
+            req_output_cost += rem_oc
+        input_cost, cached_cost, output_cost = req_input_cost, req_cached_cost, req_output_cost
+    else:
+        is_single_call = bool(
+            single_request
+            or usage.get("per_call")
+            or usage.get("single_request")
+        )
+        long_context_applied = is_single_call and (prompt_tokens > 200_000)
+        input_cost, cached_cost, output_cost = _cost_for_turn(
+            rates,
+            usage,
+            apply_long_context=long_context_applied,
+        )
+
     total_usd = input_cost + cached_cost + output_cost
 
     return {
@@ -407,4 +523,5 @@ def estimate_cost_usd(model: str, usage: dict[str, Any]) -> dict[str, Any]:
         "total_cost_usd": round(total_usd, 8),
         "total_cost_cents": round(total_usd * 100.0, 6),
         "pricing_known": pricing_known,
+        "long_context_multiplier_applied": long_context_applied,
     }

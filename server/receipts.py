@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import hmac
 import json
@@ -17,8 +18,118 @@ from typing import Any
 from server.regions import estimate_cost_usd
 
 _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$")
-_BINARY_DIFF_RE = re.compile(r"^Binary files (?:a/(.+?)|/dev/null) and (?:b/(.+?)|/dev/null) differ$")
+_BINARY_DIFF_RE = re.compile(r"^Binary files (.+?) and (.+?) differ$")
+
+
+def unquote_git_path(raw: str) -> str:
+    """Unquote a git C-quoted path (e.g. '\"a/r\\303\\251sum\\303\\251.py\"') into a UTF-8 string."""
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        inner = s[1:-1]
+        buf = bytearray()
+        i = 0
+        n = len(inner)
+        escape_map = {
+            "a": 0x07,
+            "b": 0x08,
+            "t": 0x09,
+            "n": 0x0A,
+            "v": 0x0B,
+            "f": 0x0C,
+            "r": 0x0D,
+            "\\": 0x5C,
+            '"': 0x22,
+        }
+        while i < n:
+            ch = inner[i]
+            if ch == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt in "01234567":
+                    oct_digits = nxt
+                    j = i + 2
+                    while j < n and j < i + 4 and inner[j] in "01234567":
+                        oct_digits += inner[j]
+                        j += 1
+                    buf.append(int(oct_digits, 8) & 0xFF)
+                    i = j
+                    continue
+                if nxt in escape_map:
+                    buf.append(escape_map[nxt])
+                    i += 2
+                    continue
+                buf.extend(nxt.encode("utf-8"))
+                i += 2
+                continue
+            buf.extend(ch.encode("utf-8"))
+            i += 1
+        return buf.decode("utf-8", errors="replace")
+    return s
+
+
+def _strip_ab_prefix(path: str, prefix: str) -> str:
+    unq = unquote_git_path(path)
+    if unq.startswith(prefix):
+        return unq[len(prefix) :]
+    return unq
+
+
+def parse_diff_git_header(line: str) -> tuple[str, str] | None:
+    """Parse `diff --git a/... b/...` (supporting C-quoted and space-containing paths)."""
+    stripped = line.rstrip("\r\n")
+    if not stripped.startswith("diff --git "):
+        return None
+    rem = stripped[len("diff --git ") :].strip()
+    if not rem:
+        return None
+    if rem.startswith('"'):
+        i = 1
+        n = len(rem)
+        while i < n:
+            if rem[i] == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if rem[i] == '"':
+                first_tok = rem[: i + 1]
+                second_tok = rem[i + 1 :].strip()
+                return _strip_ab_prefix(first_tok, "a/"), _strip_ab_prefix(second_tok, "b/")
+            i += 1
+    q_pos = rem.find(' "b/')
+    if q_pos != -1:
+        first_tok = rem[:q_pos]
+        second_tok = rem[q_pos + 1 :].strip()
+        return _strip_ab_prefix(first_tok, "a/"), _strip_ab_prefix(second_tok, "b/")
+    idx = 0
+    candidates: list[tuple[str, str]] = []
+    while True:
+        pos = rem.find(" b/", idx)
+        if pos == -1:
+            break
+        left = _strip_ab_prefix(rem[:pos], "a/")
+        right = _strip_ab_prefix(rem[pos + 1 :], "b/")
+        if left == right:
+            return left, right
+        candidates.append((left, right))
+        idx = pos + 3
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def parse_unified_header_path(line: str, marker: str) -> str | None:
+    """Parse `--- a/...` or `+++ b/...` or `--- /dev/null` (including C-quoted paths)."""
+    prefix = f"{marker} "
+    if not line.startswith(prefix):
+        return None
+    raw_rest = line[len(prefix) :].rstrip("\r\n")
+    if not raw_rest.startswith('"') and "\t" in raw_rest:
+        raw_rest = raw_rest.split("\t", 1)[0]
+    unq = unquote_git_path(raw_rest)
+    if unq == "/dev/null":
+        return "/dev/null"
+    ab = "a/" if marker == "---" else "b/"
+    if unq.startswith(ab):
+        return unq[len(ab) :]
+    return None
 
 
 def sha256_text(text: str) -> str:
@@ -85,6 +196,7 @@ def extract_diff_provenance(diff_text: str) -> dict[str, Any]:
     per_file_removed_hashes: dict[str, list[str]] = {}
     current_file: str | None = None
     pending_old_file: str | None = None
+    in_hunk = False
 
     def _register_file(path: str) -> None:
         if path and path != "/dev/null":
@@ -94,56 +206,70 @@ def extract_diff_provenance(diff_text: str) -> dict[str, Any]:
             per_file_removed_hashes.setdefault(path, [])
 
     for raw_line in diff_text.splitlines():
-        git_hdr = _DIFF_GIT_HEADER_RE.match(raw_line)
-        if git_hdr:
-            old_p, new_p = git_hdr.group(1).strip(), git_hdr.group(2).strip()
+        git_hdr = parse_diff_git_header(raw_line)
+        if git_hdr is not None:
+            old_p, new_p = git_hdr
             pending_old_file = old_p
             current_file = new_p or old_p
+            in_hunk = False
             _register_file(current_file)
             continue
 
-        bin_hdr = _BINARY_DIFF_RE.match(raw_line)
-        if bin_hdr:
-            old_b, new_b = bin_hdr.group(1), bin_hdr.group(2)
-            target_b = (new_b or old_b or current_file or "").strip()
-            if target_b:
-                _register_file(target_b)
-                if target_b not in binary_files:
-                    binary_files.append(target_b)
-            continue
+        if not in_hunk:
+            bin_hdr = _BINARY_DIFF_RE.match(raw_line)
+            if bin_hdr:
+                old_raw = _strip_ab_prefix(bin_hdr.group(1), "a/")
+                new_raw = _strip_ab_prefix(bin_hdr.group(2), "b/")
+                target_b = (
+                    new_raw
+                    if new_raw and new_raw != "/dev/null"
+                    else (old_raw if old_raw and old_raw != "/dev/null" else (current_file or ""))
+                ).strip()
+                if target_b:
+                    _register_file(target_b)
+                    if target_b not in binary_files:
+                        binary_files.append(target_b)
+                continue
 
-        if raw_line.startswith("--- a/"):
-            pending_old_file = raw_line[len("--- a/") :].strip()
-            continue
-        if raw_line.startswith("--- /dev/null"):
-            pending_old_file = None
-            continue
-        if raw_line.startswith("+++ /dev/null"):
-            if pending_old_file:
-                current_file = pending_old_file
-                _register_file(current_file)
-                if current_file not in deleted_files:
+            old_hdr = parse_unified_header_path(raw_line, "---")
+            if old_hdr is not None:
+                pending_old_file = None if old_hdr == "/dev/null" else old_hdr
+                continue
+
+            new_hdr = parse_unified_header_path(raw_line, "+++")
+            if new_hdr is not None:
+                if new_hdr == "/dev/null":
+                    if pending_old_file:
+                        current_file = pending_old_file
+                        _register_file(current_file)
+                        if current_file not in deleted_files:
+                            deleted_files.append(current_file)
+                else:
+                    current_file = new_hdr
+                    _register_file(current_file)
+                continue
+
+            if raw_line.startswith("deleted file mode"):
+                if current_file and current_file not in deleted_files:
                     deleted_files.append(current_file)
+                continue
+            if raw_line.startswith("GIT binary patch"):
+                if current_file and current_file not in binary_files:
+                    binary_files.append(current_file)
+                continue
+            if raw_line.startswith("@@"):
+                in_hunk = True
+                continue
             continue
-        if raw_line.startswith("+++ b/"):
-            current_file = raw_line[len("+++ b/") :].strip()
-            _register_file(current_file)
-            continue
-        if raw_line.startswith("deleted file mode"):
-            if current_file and current_file not in deleted_files:
-                deleted_files.append(current_file)
-            continue
-        if raw_line.startswith("GIT binary patch"):
-            if current_file and current_file not in binary_files:
-                binary_files.append(current_file)
-            continue
+
         if raw_line.startswith("@@"):
+            in_hunk = True
             continue
 
         if current_file is not None:
-            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            if raw_line.startswith("+"):
                 per_file_added_hashes[current_file].append(sha256_text(raw_line[1:]))
-            elif raw_line.startswith("-") and not raw_line.startswith("---"):
+            elif raw_line.startswith("-"):
                 per_file_removed_hashes[current_file].append(sha256_text(raw_line[1:]))
 
     per_file_summary = {
@@ -167,31 +293,54 @@ def extract_diff_provenance(diff_text: str) -> dict[str, Any]:
     }
 
 
+_ENUM_METADATA_KEYS: frozenset[str] = frozenset(
+    {"status", "kind", "auth_mode", "model", "vertex_location", "containment", "thinking_level", "stop_reason"}
+)
+
+
+def _redact_obj_values(obj: Any, secrets: list[str], *, parent_key: str = "") -> Any:
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "api_key":
+                out[k] = "<api-key>"
+            else:
+                out[k] = _redact_obj_values(v, secrets, parent_key=str(k))
+        return out
+    if isinstance(obj, list):
+        return [_redact_obj_values(item, secrets, parent_key=parent_key) for item in obj]
+    if isinstance(obj, str):
+        s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "<api-key>", obj)
+        for sec in secrets:
+            if len(sec) >= 4 and parent_key not in _ENUM_METADATA_KEYS:
+                s = s.replace(sec, "<api-key>")
+        return s
+    return obj
+
+
 def redact_api_keys(
     receipt: dict[str, Any],
     *,
     api_key: str | None = None,
 ) -> dict[str, Any]:
-    """Unconditionally redact secret API keys from a receipt before persistence."""
-    raw_json = json.dumps(receipt, sort_keys=True)
+    """Unconditionally redact secret API keys from a receipt before persistence without corrupting dict keys."""
+    secrets: list[str] = []
     for candidate in (
         api_key,
         receipt.get("api_key"),
         os.environ.get("GEMINI_API_KEY"),
         os.environ.get("GOOGLE_API_KEY"),
+        os.environ.get("CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY"),
     ):
         if isinstance(candidate, str):
             cleaned = candidate.strip()
-            if cleaned and not cleaned.startswith("${") and cleaned != "<api-key>":
-                escaped = json.dumps(cleaned)[1:-1]
-                if escaped:
-                    raw_json = raw_json.replace(escaped, "<api-key>")
-    # Redact standard Google API key pattern (AIza...)
-    raw_json = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "<api-key>", raw_json)
-    redacted = json.loads(raw_json)
-    if "api_key" in redacted:
-        redacted["api_key"] = "<api-key>"
-    return redacted
+            if len(cleaned) >= 2 and not cleaned.startswith("${") and cleaned != "<api-key>":
+                if cleaned not in secrets:
+                    secrets.append(cleaned)
+    # Sort longest secrets first to avoid partial substring replacement
+    secrets.sort(key=len, reverse=True)
+    cloned = json.loads(json.dumps(receipt, sort_keys=True))
+    return _redact_obj_values(cloned, secrets)
 
 
 def scrub_receipt_for_export(
@@ -227,6 +376,25 @@ def scrub_receipt_for_export(
     return scrubbed
 
 
+_REGISTERED_WORKTREE_DIRS: set[Path] = set()
+
+
+def _cleanup_empty_worktree_dirs() -> None:
+    for d in list(_REGISTERED_WORKTREE_DIRS):
+        try:
+            if d.exists() and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_empty_worktree_dirs)
+
+
+def _register_empty_worktree_dir_cleanup(path: Path) -> None:
+    _REGISTERED_WORKTREE_DIRS.add(path)
+
+
 class ReceiptStore:
     """Atomic, HMAC-signed, crash-safe receipt storage for Vertex AI delegations and queries."""
 
@@ -239,13 +407,28 @@ class ReceiptStore:
         self.workspace_root = resolve_workspace_root(workspace_root)
         self.data_dir = self._resolve_data_dir(data_dir, self.workspace_root)
         self.receipts_dir = self.data_dir / "receipts"
-        self.worktrees_dir = self.data_dir / "worktrees"
+        # Place worker worktrees in a separate 0o700 sibling/temp directory outside `data_dir`
+        # so relative paths like `../../.hmac_key` from inside a worker's worktree cannot
+        # reach `.hmac_key` or tamper with receipts/baselines.
+        wt_slug = sha256_text(f"{self.data_dir}:{self.workspace_root}")[:12]
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        if self.data_dir.parent != tmp_root and self.data_dir.parent != self.workspace_root:
+            self.worktrees_dir = self.data_dir.parent / f".cc-agy-worktrees-{wt_slug}"
+        else:
+            self.worktrees_dir = tmp_root / f"cc-agy-worktrees-{wt_slug}"
         self.baselines_dir = self.data_dir / "baselines"
         self.ledger_path = self.data_dir / "ledger.jsonl"
         self.hmac_key_path = self.data_dir / ".hmac_key"
-        self.receipts_dir.mkdir(parents=True, exist_ok=True)
-        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
-        self.baselines_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.receipts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.worktrees_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.baselines_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for priv_dir in (self.data_dir, self.receipts_dir, self.worktrees_dir, self.baselines_dir):
+            try:
+                os.chmod(priv_dir, 0o700)
+            except OSError:
+                pass
+        _register_empty_worktree_dir_cleanup(self.worktrees_dir)
         self._recorded_workspaces: set[str] = set()
         self._hmac_key = self._load_or_create_hmac_key()
 
@@ -491,7 +674,11 @@ class ReceiptStore:
 
         usage = record.get("usage") or {}
         model = str(record.get("model") or "gemini-3.1-pro-preview")
-        record["cost"] = estimate_cost_usd(model, usage)
+        record["cost"] = estimate_cost_usd(
+            model,
+            usage,
+            single_request=(record.get("kind") == "ask"),
+        )
 
         # Always redact secret API keys even when scrub=False
         record = redact_api_keys(record, api_key=api_key)
@@ -549,12 +736,22 @@ class ReceiptStore:
         receipts.sort(key=lambda r: float(r.get("started_at_epoch") or 0.0))
         return receipts
 
-    def summarize_costs(self) -> dict[str, Any]:
-        """Aggregate token usage and cost across all receipts, including failed runs."""
-        receipts = self.list_receipts()
+    def summarize_costs(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate token usage and cost across receipts for the active workspace, including failed runs."""
+        target_ws = workspace_root if workspace_root is not None else self.workspace_root
+        receipts = self.list_receipts(workspace_root=target_ws)
         totals: dict[str, Any] = {
             "total_jobs": len(receipts),
             "completed_jobs": 0,
+            "in_progress_or_paused_jobs": 0,
+            "checkpoint_jobs": 0,
+            "needs_input_jobs": 0,
+            "running_jobs": 0,
+            "interrupted_jobs": 0,
             "failed_or_timed_out_jobs": 0,
             "applied_jobs": 0,
             "prompt_token_count": 0,
@@ -571,6 +768,18 @@ class ReceiptStore:
             status = str(r.get("status") or "")
             if status in ("ok", "completed"):
                 totals["completed_jobs"] += 1
+            elif status == "checkpoint":
+                totals["checkpoint_jobs"] += 1
+                totals["in_progress_or_paused_jobs"] += 1
+            elif status == "needs_input":
+                totals["needs_input_jobs"] += 1
+                totals["in_progress_or_paused_jobs"] += 1
+            elif status == "running":
+                totals["running_jobs"] += 1
+                totals["in_progress_or_paused_jobs"] += 1
+            elif status == "interrupted":
+                totals["interrupted_jobs"] += 1
+                totals["failed_or_timed_out_jobs"] += 1
             elif status in ("error", "timeout", "cancelled", "scope_violation", "security_violation"):
                 totals["failed_or_timed_out_jobs"] += 1
             if r.get("applied"):
@@ -578,7 +787,9 @@ class ReceiptStore:
 
             usage = r.get("usage") or {}
             cost = r.get("cost") or estimate_cost_usd(
-                str(r.get("model") or "gemini-3.1-pro-preview"), usage
+                str(r.get("model") or "gemini-3.1-pro-preview"),
+                usage,
+                single_request=(r.get("kind") == "ask"),
             )
             if not cost.get("pricing_known", True):
                 totals["all_pricing_known"] = False

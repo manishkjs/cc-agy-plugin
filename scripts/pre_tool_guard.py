@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -92,7 +93,7 @@ def classify_path(
     if out_dir is not None:
         out_candidates.append(str(out_dir).strip())
     source_env = env if env is not None else os.environ
-    for env_key in ("CC_AGY_OUT_DIR", "CC_AGY_DATA_DIR", "CLAUDE_PLUGIN_DATA"):
+    for env_key in ("CC_AGY_OUT_DIR", "CC_AGY_DATA_DIR", "CC_AGY_WORKTREES_DIR", "CLAUDE_PLUGIN_DATA"):
         val = source_env.get(env_key, "").strip()
         if val:
             out_candidates.append(val)
@@ -102,6 +103,10 @@ def classify_path(
             out_resolved = Path(out_str).resolve()
             if resolved.is_relative_to(out_resolved):
                 return "out_dir"
+
+    for part in resolved.parts:
+        if part.startswith(("cc-agy-worktrees-", ".cc-agy-worktrees-")):
+            return "out_dir"
 
     for data_candidate in (
         ws_resolved / ".cc-agy-data",
@@ -156,14 +161,41 @@ _CODE_LINE_RE = re.compile(
 
 _COMMENT_LINE_RE = re.compile(r"^\s*(?:#|//|/\*|\*)")
 _PROSE_LIST_RE = re.compile(r"^\s*(?:[-*+]\s+\S|\d+\.\s+\S)")
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^\s*(?:>\s*)+")
+_LIST_ITEM_PREFIX_RE = re.compile(r"^(\s*)(?:[-*+]|\d+\.)\s+(.*)$")
+
+
+def _unwrap_markdown_code_line(line: str) -> tuple[str, bool]:
+    """Strip markdown blockquote (`> `), list-item (`- `), and inline backtick wrappers for code linting."""
+    s = line
+    had_blockquote = False
+    for _ in range(3):
+        prev = s
+        if _BLOCKQUOTE_PREFIX_RE.match(s):
+            s = _BLOCKQUOTE_PREFIX_RE.sub("", s, count=1)
+            had_blockquote = True
+        m_list = _LIST_ITEM_PREFIX_RE.match(s)
+        if m_list:
+            s = m_list.group(2)
+        stripped = s.strip()
+        if (
+            len(stripped) >= 2
+            and stripped.startswith("`")
+            and stripped.endswith("`")
+            and not stripped.startswith("```")
+        ):
+            s = stripped[1:-1]
+        if s == prev:
+            break
+    return s, had_blockquote
 
 
 def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8) -> dict[str, Any]:
     """Detect whether a delegation prompt dictates >= 9 consecutive lines of code.
 
     Checks both fenced code blocks (``` or ~~~) and unfenced consecutive code-like
-    or 4-space indented code lines. Interleaved comments inside a code run do not
-    reset the consecutive code counter.
+    or 4-space indented code lines (including code wrapped in markdown blockquotes or list items).
+    Interleaved comments inside a code run do not reset the consecutive code counter.
     """
     lines = prompt_text.splitlines()
     in_fence = False
@@ -175,8 +207,9 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
 
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            marker = stripped[:3]
+        unwrapped_fence_check = _BLOCKQUOTE_PREFIX_RE.sub("", stripped, count=1).strip()
+        if unwrapped_fence_check.startswith("```") or unwrapped_fence_check.startswith("~~~"):
+            marker = unwrapped_fence_check[:3]
             if in_fence and marker == fence_marker:
                 if fence_run > max_fence_run:
                     max_fence_run = fence_run
@@ -190,24 +223,25 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
             continue
 
         if in_fence:
-            if stripped:
+            if unwrapped_fence_check:
                 fence_run += 1
                 if fence_run > max_fence_run:
                     max_fence_run = fence_run
             continue
 
-        if stripped == "":
+        if stripped == "" or unwrapped_fence_check == "":
             continue
 
-        if _COMMENT_LINE_RE.match(line):
+        unwrapped, had_blockquote = _unwrap_markdown_code_line(line)
+        if _COMMENT_LINE_RE.match(unwrapped):
             # Comments inside an active code block do not reset code_run
             continue
 
         is_indented_code = (
-            (line.startswith("    ") or line.startswith("\t"))
-            and not _PROSE_LIST_RE.match(line)
+            ((line.startswith("    ") or line.startswith("\t")) and not _PROSE_LIST_RE.match(line))
+            or (had_blockquote and (unwrapped.startswith("    ") or unwrapped.startswith("\t")))
         )
-        if _CODE_LINE_RE.match(line) or is_indented_code:
+        if _CODE_LINE_RE.match(line) or _CODE_LINE_RE.match(unwrapped) or is_indented_code:
             code_run += 1
             if code_run > max_code_run:
                 max_code_run = code_run
@@ -333,17 +367,149 @@ _SUDO_OPTS_WITH_VALUE: frozenset[str] = frozenset(
     {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U"}
 )
 
-_INLINE_MUTATION_KEYWORDS_RE = re.compile(
-    r"(?:"
-    r"\bopen\s*\(|"
-    r"\b(?:exec|eval|compile|__import__|getattr|setattr|delattr|globals|locals|vars|fromhex|b64decode)\b|"
-    r"\.(?:write\w*|unlink|rmdir|rename|replace|mkdir|makedirs|touch|chmod|chown|symlink_to|hardlink_to|copyFile\w*|appendFile\w*|openSync|createWriteStream)\s*\(|"
-    r"\b(?:shutil|subprocess|tempfile|pathlib)\b|"
-    r"\b(?:writeFile\w*|appendFile\w*|openSync|createWriteStream|file_put_contents|fopen|fwrite|unlink|rmdir|mkdir|rename|copyFile\w*)\s*\(|"
-    r"\bos\.(?:remove|unlink|rmdir|removedirs|rename|renames|replace|mkdir|makedirs|chmod|chown|link|symlink|truncate|system|popen|exec\w*|spawn\w*|open)|"
-    r"\bfs\.(?:write|append|unlink|rm|cp|mv|rename|mkdir|rmdir|chmod|chown|truncate|copyFile|createWriteStream)"
-    r")"
+_STANDALONE_REDIR_OP_RE = re.compile(r"^(?:&>>?|\d*>>?|\d*>\|?|\d*>&|\d*<>|\d*<&?)$")
+_ATTACHED_REDIR_TOKEN_RE = re.compile(r"^(?:&>>?|\d*>>?|\d*>\|?|\d*>&|\d*<>|\d*<&?).+$")
+
+
+def _strip_shell_redirects_from_args(raw_args: list[str]) -> list[str]:
+    """Remove shell redirect operators and their target tokens from tokenized command arguments."""
+    cleaned: list[str] = []
+    i = 0
+    n = len(raw_args)
+    while i < n:
+        tok = raw_args[i]
+        if _STANDALONE_REDIR_OP_RE.match(tok):
+            i += 2
+            continue
+        if _ATTACHED_REDIR_TOKEN_RE.match(tok):
+            i += 1
+            continue
+        cleaned.append(tok)
+        i += 1
+    return cleaned
+
+_SAFE_INLINE_PYTHON_MODULES: frozenset[str] = frozenset(
+    {
+        "sys",
+        "math",
+        "json",
+        "re",
+        "time",
+        "datetime",
+        "collections",
+        "itertools",
+        "decimal",
+        "fractions",
+        "statistics",
+        "hashlib",
+        "ast",
+    }
 )
+
+_FORBIDDEN_INLINE_PYTHON_NAMES: frozenset[str] = frozenset(
+    {
+        "open",
+        "exec",
+        "eval",
+        "compile",
+        "getattr",
+        "setattr",
+        "delattr",
+        "globals",
+        "locals",
+        "vars",
+        "input",
+        "breakpoint",
+        "memoryview",
+        "help",
+        "license",
+        "copyright",
+        "credits",
+    }
+)
+
+_FORBIDDEN_INLINE_PYTHON_ATTRS: frozenset[str] = frozenset(
+    {
+        "modules",
+        "meta_path",
+        "path_hooks",
+        "path_importer_cache",
+        "builtins",
+        "audit",
+        "addaudithook",
+        "write",
+        "writelines",
+        "write_text",
+        "write_bytes",
+        "unlink",
+        "rmdir",
+        "rename",
+        "replace",
+        "mkdir",
+        "makedirs",
+        "touch",
+        "chmod",
+        "chown",
+        "symlink_to",
+        "hardlink_to",
+        "system",
+        "popen",
+        "spawn",
+        "fork",
+        "kill",
+        "remove",
+        "truncate",
+    }
+)
+
+
+def _is_safe_python_inline_ast(code_str: str) -> bool:
+    """Validate `python -c <code>` using an AST allowlist so dynamic/obfuscated mutations are rejected."""
+    try:
+        tree = ast.parse(code_str, mode="exec")
+    except (SyntaxError, ValueError, TypeError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_mod = alias.name.split(".", 1)[0]
+                if root_mod not in _SAFE_INLINE_PYTHON_MODULES:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if not node.module:
+                return False
+            root_mod = node.module.split(".", 1)[0]
+            if root_mod not in _SAFE_INLINE_PYTHON_MODULES:
+                return False
+            for alias in node.names:
+                if alias.name.startswith("_") or alias.name in _FORBIDDEN_INLINE_PYTHON_ATTRS:
+                    return False
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("_") or node.id in _FORBIDDEN_INLINE_PYTHON_NAMES:
+                return False
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") or node.attr in _FORBIDDEN_INLINE_PYTHON_ATTRS:
+                return False
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            segments = [seg for seg in re.split(r"[.\[\]:!]", node.value) if seg]
+            if (
+                node.value.startswith("__")
+                or node.value in _FORBIDDEN_INLINE_PYTHON_ATTRS
+                or node.value in _FORBIDDEN_INLINE_PYTHON_NAMES
+                or any(
+                    seg.startswith("__")
+                    or seg in _FORBIDDEN_INLINE_PYTHON_ATTRS
+                    or seg in _FORBIDDEN_INLINE_PYTHON_NAMES
+                    for seg in segments
+                )
+            ):
+                return False
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "print":
+                if any(kw.arg in ("file", None) for kw in node.keywords):
+                    return False
+    return True
 
 
 def _unquoted_mask(s: str) -> list[bool]:
@@ -527,14 +693,22 @@ def detect_bash_workspace_mutation(
     # 2. Check shell output redirections (>, >>, >|, &>, &>>, 1>, 2>, <>),
     # ignoring here-strings (<<<), heredocs (<<), and fd duplicates (2>&1, >/dev/null).
     redir_pattern = re.compile(
-        r"(?:&>>?|\d?>>?|\d?>[|&]?|<>|\b(?:tee|sponge)\s+(?:-[a-zA-Z]+\s+)*)\s*([^\s;|&\n]+)"
+        r"(?:&>>?|\d?>>?|\d?>\|?|<>|\b(?:tee|sponge)\s+(?:-[a-zA-Z]+\s+)*)\s*(&?[^\s;|&\n]+)"
     )
     for match in redir_pattern.finditer(cmd_without_heredocs):
         if match.start() < len(unquoted) and not unquoted[match.start()]:
             continue
         raw_target = match.group(1).strip("'\"()")
-        if not raw_target or raw_target.startswith("&") or raw_target in ("/dev/null", "/dev/stderr", "/dev/stdout"):
+        if (
+            not raw_target
+            or re.match(r"^&(?:\d+|-)$", raw_target)
+            or raw_target in ("/dev/null", "/dev/stderr", "/dev/stdout")
+        ):
             continue
+        if raw_target.startswith("&"):
+            raw_target = raw_target[1:].strip("'\"()")
+            if not raw_target:
+                continue
         target = _expand_shell_vars_in_path(raw_target, active_cwd, ws_root)
         classification = classify_path(target, ws_root, out_dir, cwd=active_cwd, env=env)
         if classification in ("workspace", "out_dir"):
@@ -766,11 +940,11 @@ def _inspect_segment_tokens(
         }, active_cwd
 
     binary = Path(raw_cmd_tok).name
-    args = tokens[idx + 1 :]
+    raw_args = tokens[idx + 1 :]
 
     # Block any non-`ls` command from reading, searching, or archiving `out_dir` (.hmac_key / receipts)
     if binary != "ls":
-        for arg in args:
+        for arg in raw_args:
             if arg.startswith("-"):
                 continue
             clean_arg = arg.split("=", 1)[-1] if "=" in arg else arg
@@ -784,6 +958,8 @@ def _inspect_segment_tokens(
                         ),
                     }, active_cwd
 
+    args = _strip_shell_redirects_from_args(raw_args)
+
     # Track directory changes (`cd <dir>`) across chained segments
     if binary in ("cd", "pushd"):
         non_flags = [a for a in args if not a.startswith("-")]
@@ -793,13 +969,25 @@ def _inspect_segment_tokens(
 
     # Unwrap nested shells (`sh -c`, `bash -c`, `zsh -c`, `eval`)
     if binary in ("sh", "bash", "zsh", "dash", "ksh"):
+        if used_xargs:
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `xargs {binary}` shell execution.",
+            }, active_cwd
         for i, arg in enumerate(args):
             if arg == "-c" or (arg.startswith("-") and "c" in arg[1:] and not arg.startswith("--")):
                 if i + 1 < len(args):
+                    if "{}" in args[i + 1]:
+                        return {
+                            "blocked": True,
+                            "reason": f"Strict orchestrator mode blocked `{binary} -c` with placeholder substitution.",
+                        }, active_cwd
                     sub_v = detect_bash_workspace_mutation(
                         args[i + 1], ws_root, out_dir, cwd=active_cwd, env=env, _depth=depth + 1
                     )
                     return sub_v, active_cwd
+        if any(a in ("--version", "-V", "--help", "-h") for a in args):
+            return {"blocked": False, "reason": None}, active_cwd
         non_flags = [a for a in args if not a.startswith("-")]
         if non_flags:
             return {
@@ -809,7 +997,13 @@ def _inspect_segment_tokens(
                     f"Delegate workspace modifications via delegate_start."
                 ),
             }, active_cwd
-        return {"blocked": False, "reason": None}, active_cwd
+        return {
+            "blocked": True,
+            "reason": (
+                f"Strict orchestrator mode blocked `{binary}` reading commands from stdin/pipe. "
+                f"Delegate workspace modifications via delegate_start."
+            ),
+        }, active_cwd
 
     if binary == "eval":
         joined = " ".join(args)
@@ -828,6 +1022,29 @@ def _inspect_segment_tokens(
             "blocked": True,
             "reason": f"Strict orchestrator mode blocked mutating binary `{binary}`.",
         }, active_cwd
+
+    # Check sed / gsed in-place flags anywhere in the argument list
+    if binary in ("sed", "gsed"):
+        skip_sed_arg = False
+        for sarg in args:
+            if skip_sed_arg:
+                skip_sed_arg = False
+                continue
+            if sarg == "--":
+                break
+            if sarg in ("-e", "-f", "--expression", "--file"):
+                skip_sed_arg = True
+                continue
+            if (
+                sarg in ("-i", "--in-place")
+                or sarg.startswith(("-i", "--in-place="))
+                or (sarg.startswith("-") and not sarg.startswith("--") and not sarg.startswith(("-e", "-f")) and "i" in sarg[1:])
+            ):
+                return {
+                    "blocked": True,
+                    "reason": "Strict orchestrator mode blocked `sed -i` in-place edit.",
+                }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
 
     # Check awk (`-i inplace`, `system(...)`, or internal output redirection `>`)
     if binary in ("awk", "gawk", "mawk", "nawk"):
@@ -925,12 +1142,27 @@ def _inspect_segment_tokens(
                     }, active_cwd
         return {"blocked": False, "reason": None}, active_cwd
 
-    # Check python / node / ruby / perl / php inline scripts and script files
-    if binary.startswith(("python", "pypy")) or binary in ("node", "ruby", "perl", "php"):
+    # Check python / node / ruby / perl / php / lua inline scripts and script files
+    if binary.startswith(("python", "pypy")) or binary in ("node", "ruby", "perl", "php", "lua"):
+        if used_xargs:
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `xargs {binary}` execution.",
+            }, active_cwd
         for i, arg in enumerate(args):
-            if arg in ("-c", "-e", "-r", "--eval") and i + 1 < len(args):
-                code_str = args[i + 1]
-                if binary in ("ruby", "perl", "php") or _INLINE_MUTATION_KEYWORDS_RE.search(code_str):
+            inline_code: str | None = None
+            if (
+                arg in ("-c", "-e", "-r", "--eval")
+                or (arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and arg[1:-1].isalpha() and arg[-1] in ("c", "e"))
+            ) and i + 1 < len(args):
+                inline_code = args[i + 1]
+            elif arg.startswith(("-c", "-e", "-r")) and not arg.startswith("--") and len(arg) > 2:
+                inline_code = arg[2:]
+            elif arg.startswith("--eval="):
+                inline_code = arg.split("=", 1)[1]
+
+            if inline_code is not None:
+                if binary in ("node", "ruby", "perl", "php", "lua") or not _is_safe_python_inline_ast(inline_code):
                     return {
                         "blocked": True,
                         "reason": (
@@ -939,10 +1171,19 @@ def _inspect_segment_tokens(
                         ),
                     }, active_cwd
                 return {"blocked": False, "reason": None}, active_cwd
+
+            mod: str | None = None
+            mod_extra_args: list[str] = []
             if arg == "-m" and i + 1 < len(args):
                 mod = args[i + 1]
+                mod_extra_args = args[i + 2 :]
+            elif arg.startswith("-m") and not arg.startswith("--") and len(arg) > 2:
+                mod = arg[2:]
+                mod_extra_args = args[i + 1 :]
+
+            if mod is not None:
                 if mod in ("unittest", "pytest", "json.tool", "py_compile", "compileall"):
-                    for mod_arg in args[i + 2 :]:
+                    for mod_arg in mod_extra_args:
                         if mod_arg.startswith("-"):
                             continue
                         if mod_arg in ("discover", "tests"):
@@ -983,7 +1224,15 @@ def _inspect_segment_tokens(
                     f"Use `python3 -m unittest` / `pytest` for tests or delegate edits to Vertex."
                 ),
             }, active_cwd
-        return {"blocked": False, "reason": None}, active_cwd
+        if any(a in ("--version", "-V", "--help", "-h") for a in args):
+            return {"blocked": False, "reason": None}, active_cwd
+        return {
+            "blocked": True,
+            "reason": (
+                f"Strict orchestrator mode blocked `{binary}` reading script from stdin/pipe. "
+                f"Use `python3 -m unittest` / `pytest` for tests or delegate edits via delegate_start."
+            ),
+        }, active_cwd
 
     # Check git subcommands (skipping -C / --git-dir / -c options)
     if binary == "git":
@@ -1171,8 +1420,11 @@ def _inspect_segment_tokens(
             candidate_targets.append(target_dir_opt)
             if binary == "mv":
                 candidate_targets.extend(positional)
-        elif binary in ("cp", "install", "rsync", "ln") and len(positional) >= 2:
-            candidate_targets.append(positional[-1])
+        elif binary in ("cp", "install", "rsync", "ln"):
+            if len(positional) >= 2:
+                candidate_targets.append(positional[-1])
+            elif len(positional) == 1:
+                candidate_targets.append(".")
         else:
             candidate_targets.extend(positional)
 
@@ -1201,9 +1453,12 @@ def _inspect_segment_tokens(
 
 def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = None) -> dict[str, Any]:
     """Evaluate a Claude Code PreToolUse event and return hookSpecificOutput if blocked."""
+    if not isinstance(payload, dict):
+        return {}
     source_env = env if env is not None else os.environ
     tool_name = str(payload.get("tool_name") or "")
-    tool_input = dict(payload.get("tool_input") or {})
+    raw_tool_input = payload.get("tool_input")
+    tool_input = dict(raw_tool_input) if isinstance(raw_tool_input, dict) else {}
     cwd = str(payload.get("cwd") or os.getcwd())
     ws_root = resolve_project_root(cwd, env=source_env)
     out_dir = source_env.get("CC_AGY_DATA_DIR") or source_env.get("CLAUDE_PLUGIN_DATA")
@@ -1230,23 +1485,24 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
 
     # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts)
     if tool_name in ("Read", "Grep", "Glob"):
-        target_path = (
-            tool_input.get("file_path")
-            or tool_input.get("path")
-            or tool_input.get("pattern")
-            or ""
-        )
-        if target_path:
-            raw_t = str(target_path)
+        for field in ("file_path", "path", "pattern", "glob"):
+            target_val = tool_input.get(field)
+            if not target_val:
+                continue
+            raw_t = str(target_val)
             classification = classify_path(raw_t, ws_root, out_dir, cwd=cwd, env=source_env)
-            if classification == "out_dir" or ".hmac_key" in raw_t:
+            if (
+                classification == "out_dir"
+                or ".hmac_key" in raw_t
+                or ".cc-agy-data" in raw_t
+            ):
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
                             f"Strict orchestrator mode is active: {tool_name} on internal receipt/key store "
-                            f"{target_path!r} is disabled. Use delegate_status or get_diff instead."
+                            f"{raw_t!r} is disabled. Use delegate_status or get_diff instead."
                         ),
                     }
                 }
@@ -1301,6 +1557,8 @@ def main() -> int:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
         return 0
 
     decision = evaluate_pre_tool_use(payload)

@@ -36,7 +36,7 @@
 
   <!-- Top Banner -->
   <text class="title" x="560" y="42" text-anchor="middle">Claude Code Calling Google Antigravity SDK via MCP (cc-agy-plugin)</text>
-  <text class="subtitle" x="560" y="64" text-anchor="middle">Flagship reasoning where it matters (10% of tokens) + low-cost isolated execution for file reads, edits, and test loops (90% of tokens)</text>
+  <text class="subtitle" x="560" y="64" text-anchor="middle">Flagship reasoning for planning and diff review + low-cost isolated Gemini execution for file reads, edits, and test loops</text>
 
   <!-- ================= LEFT BOX: CLAUDE CODE LEAD ================= -->
   <rect class="box-lead" x="28" y="84" width="310" height="312"/>
@@ -44,7 +44,7 @@
   <text class="card-title" x="48" y="112">1. Lead Agent: Claude Code</text>
   <text class="card-badge" x="48" y="129">Claude Opus 5.5 ($4 / $20 per 1M tokens)</text>
 
-  <text class="body-bold" x="46" y="162">What the Lead Does (~10% of tokens):</text>
+  <text class="body-bold" x="46" y="162">What the Lead Does:</text>
   <text class="body-text" x="46" y="182">• Understands user goal &amp; architecture</text>
   <text class="body-text" x="46" y="201">• Sends outcome-only brief + plan + checks</text>
   <text class="body-text" x="46" y="220">• Reviews token-paginated diff (get_diff)</text>
@@ -53,10 +53,10 @@
   <rect class="subbox-guard" x="42" y="256" width="282" height="124"/>
   <text class="body-bold" x="54" y="276">Hook Guardrails (hooks/hooks.json)</text>
   <text class="mono" x="54" y="296">PreToolUse (pre_tool_guard.py):</text>
-  <text class="body-text" x="54" y="313">Blocks direct file edits &amp; &gt;8-line code</text>
-  <text class="body-text" x="54" y="329">dictation before any worker is billed.</text>
+  <text class="body-text" x="54" y="313">Always blocks &gt;8-line code dictation;</text>
+  <text class="body-text" x="54" y="329">in strict mode, blocks direct file edits.</text>
   <text class="mono" x="54" y="350">Stop (provenance_check.py):</text>
-  <text class="body-text" x="54" y="367">Verifies git diff against HMAC receipts.</text>
+  <text class="body-text" x="54" y="367">In strict mode, verifies diff vs HMAC.</text>
 
   <!-- ================= CENTER BOX: MCP BRIDGE ================= -->
   <rect class="box-mcp" x="418" y="84" width="276" height="312"/>
@@ -72,7 +72,7 @@
   <rect class="subbox" x="432" y="226" width="248" height="76"/>
   <text class="body-bold" x="444" y="245">Two Execution Paths</text>
   <text class="mono" x="444" y="264">1. ask_gemini (genai_ask.py)</text>
-  <text class="body-text" x="444" y="280">Fast review (no 11.5k prompt floor)</text>
+  <text class="body-text" x="444" y="280">Fast review (skips agent tool declarations)</text>
   <text class="mono" x="444" y="296">2. delegate_* (jobs.py)</text>
 
   <rect class="subbox" x="432" y="312" width="248" height="68"/>
@@ -84,10 +84,10 @@
   <rect class="box-worker" x="774" y="84" width="318" height="312"/>
   <rect class="hdr-worker" x="780" y="90" width="306" height="48"/>
   <text class="card-title" x="794" y="112">3. Worker: Antigravity SDK</text>
-  <text class="card-badge" x="794" y="129">Gemini 3.5 Lite / 3.8 Flash / 4 Argon</text>
+  <text class="card-badge" x="794" y="129">Gemini 3.1 Pro / 3.5 Lite / 3.8 Flash / 4 Argon</text>
 
-  <text class="body-bold" x="792" y="162">Isolated Sandbox (~90% of tokens):</text>
-  <text class="body-text" x="792" y="182">• Standalone git worktree copy (or in_place)</text>
+  <text class="body-bold" x="792" y="162">Isolated Repo Copy (Git-Level Isolation):</text>
+  <text class="body-text" x="792" y="182">• Standalone git repo copy (or in_place)</text>
   <text class="body-text" x="792" y="201">• Reads files, edits code, runs test loops</text>
   <text class="body-text" x="792" y="220">• Budget cap: 100 tool calls / 5M tokens</text>
   <text class="body-text" x="792" y="239">• Plugin runs read-only acceptance checks</text>
@@ -96,7 +96,7 @@
   <text class="body-bold" x="800" y="276">Straitjacket Containment (ctx.sdk)</text>
   <text class="body-text" x="800" y="295">Replaces unbounded RUN_COMMAND:</text>
   <text class="mono" x="800" y="315">• run_command() -&gt; run:&lt;id&gt;#stdout</text>
-  <text class="body-text" x="812" y="331">Caps output &gt;240 lines into local store</text>
+  <text class="body-text" x="812" y="331">Caps output &gt;240 lines / &gt;4,000 tokens</text>
   <text class="mono" x="800" y="350">• ctx_get(addr, start, end)</text>
   <text class="mono" x="800" y="368">• ctx_search(addr, pattern)</text>
 
@@ -120,5 +120,5 @@
 
   <!-- ================= BOTTOM VALUE PROP BAR ================= -->
   <rect class="footer-pill" x="28" y="410" width="1064" height="38"/>
-  <text class="footer-text" x="560" y="434" text-anchor="middle">Result: 37% to 88% lower session cost • Main working tree stays clean until verified • Cryptographic HMAC diff provenance</text>
+  <text class="footer-text" x="560" y="434" text-anchor="middle">Result: 42% to 89% lower session cost • Working tree stays clean until verified • Cryptographic HMAC diff provenance</text>
 </svg>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 from scripts.pre_tool_guard import (
     classify_path,
@@ -183,10 +185,16 @@ class TestRegionsAndCostAccounting(unittest.TestCase):
         unknown_cost = estimate_cost_usd("custom-experimental-model-v9", usage)
         self.assertFalse(unknown_cost["pricing_known"])
 
-        # >200k long-context multiplier (2x) on Pro models
+        # >200k long-context multiplier on Pro/Argon models applies per request (2.0x input, 1.5x output)
         long_usage = {"prompt_token_count": 250_000, "candidates_token_count": 10_000}
-        pro_cost = estimate_cost_usd("gemini-3.1-pro-preview", long_usage)
-        self.assertAlmostEqual(pro_cost["input_cost_usd"], 250_000 / 1e6 * 2.0 * 2.0, places=6)
+        pro_single_cost = estimate_cost_usd("gemini-3.1-pro-preview", long_usage, single_request=True)
+        self.assertAlmostEqual(pro_single_cost["input_cost_usd"], 250_000 / 1e6 * 2.0 * 2.0, places=6)
+        self.assertAlmostEqual(pro_single_cost["output_cost_usd"], 10_000 / 1e6 * 12.0 * 1.5, places=6)
+
+        # Aggregated multi-turn worker usage (e.g. 1M input + 100k output across 25 turns) uses standard tier
+        multi_turn_usage = {"prompt_token_count": 1_000_000, "candidates_token_count": 100_000}
+        argon_multi_cost = estimate_cost_usd("gemini-4-argon", multi_turn_usage)
+        self.assertAlmostEqual(argon_multi_cost["total_cost_usd"], 3.20, places=6)
 
 
 class TestReceiptsAndCrashSafety(unittest.TestCase):
@@ -1186,9 +1194,31 @@ class TestCostControls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_dir, store = self._setup(tmp)
             jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
-            for bad in ("cp /tmp/x app.py", "rm -rf .", "echo hi > app.py"):
-                with self.assertRaises(ValueError):
+            for bad in (
+                "cp /tmp/x app.py",
+                "rm -rf .",
+                "echo hi > app.py",
+                "python3 -c \"import sys, operator as o; m=o.attrgetter('modules')(sys); o.attrgetter('system')(m['os'])('touch pwned')\"",
+                "python3 -c \"import sys, operator as o; o.methodcaller('system','touch pwned')(o.attrgetter('modules')(sys)['os'])\"",
+                "python3 -c \"import sys, string; F=string.Formatter(); m=F.get_field('0.modules', (sys,), {})[0]; F.get_field('0.system', (m['os'],), {})[0]('touch pwned_fmt')\"",
+                "echo 'touch pwned' | sh",
+                "echo 'touch pwned' | bash",
+                "printf 'import os\\nos.system(\\\"touch pwned\\\")' | python3",
+                "echo 'touch pwned' | xargs -I{} sh -c {}",
+            ):
+                with self.assertRaises(ValueError, msg=f"Expected ValueError for {bad!r}"):
                     jm.delegate_start("x", project="p", acceptance=[bad])
+            from server.jobs import validate_acceptance
+            for good_acc in (
+                "pytest -q 2>&1 | tail -5",
+                "make test 2>&1 | tail -5",
+                "pytest -q > /tmp/out.txt 2>&1",
+                "pytest -q > /dev/null",
+            ):
+                validate_acceptance([good_acc], repo_dir)
+                self.assertFalse(detect_bash_workspace_mutation(good_acc, repo_dir, cwd=repo_dir)["blocked"])
+            self.assertTrue(detect_bash_workspace_mutation("pytest /tmp/evil_test.py", repo_dir, cwd=repo_dir)["blocked"])
+            jm.shutdown()
 
     def test_plan_and_acceptance_are_rendered_for_worker_and_carried_into_continue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1426,11 +1456,14 @@ class TestCostControls(unittest.TestCase):
             self.assertTrue(store.verify_receipt_signature(rcpt))
 
             # 2. Cross-mode flip guard on delegate_continue across restart when both GEMINI_API_KEY and GOOGLE_CLOUD_PROJECT are set
-            old_gem_key = os.environ.get("GEMINI_API_KEY")
-            old_proj = os.environ.get("GOOGLE_CLOUD_PROJECT")
-            os.environ["GEMINI_API_KEY"] = "env-gemini-secret-key-999"
-            os.environ["GOOGLE_CLOUD_PROJECT"] = "ambient-gcloud-proj"
-            try:
+            with unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "env-gemini-secret-key-999",
+                    "GOOGLE_CLOUD_PROJECT": "ambient-gcloud-proj",
+                },
+                clear=False,
+            ):
                 seen_turns: list[dict[str, Any]] = []
 
                 def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
@@ -1449,27 +1482,39 @@ class TestCostControls(unittest.TestCase):
                 self.assertEqual(seen_turns[-1]["auth_mode"], "api_key")
                 self.assertEqual(seen_turns[-1]["api_key"], "env-gemini-secret-key-999")
                 self.assertIsNone(seen_turns[-1]["project"])
-            finally:
-                if old_gem_key is None:
-                    os.environ.pop("GEMINI_API_KEY", None)
-                else:
-                    os.environ["GEMINI_API_KEY"] = old_gem_key
-                if old_proj is None:
-                    os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
-                else:
-                    os.environ["GOOGLE_CLOUD_PROJECT"] = old_proj
+                jm1.shutdown()
+                jm2.shutdown()
+
+            # 2b. Argument-only API key across server restart must NOT silently flip to ambient GOOGLE_CLOUD_PROJECT
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"GOOGLE_CLOUD_PROJECT": "ambient-gcloud-proj"},
+                clear=False,
+            ):
+                os.environ.pop("GEMINI_API_KEY", None)
+                os.environ.pop("GOOGLE_API_KEY", None)
+                jm_a = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+                arg_job = jm_a.delegate_start("arg key turn", api_key="AIzaArgOnlyKey000000000", wait=True)
+                self.assertEqual(arg_job["auth_mode"], "api_key")
+                jm_b = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+                with self.assertRaises(ValueError) as ctx_err:
+                    jm_b.delegate_continue(arg_job["job_id"], "continue after restart without key", wait=True)
+                self.assertIn("api_key mode", str(ctx_err.exception))
+                jm_a.shutdown()
+                jm_b.shutdown()
 
             # 3. Placeholder env sanitization
-            os.environ["GEMINI_API_KEY"] = "${user_config.gemini_api_key}"
-            try:
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "${user_config.gemini_api_key}"},
+                clear=False,
+            ):
                 sanitize_placeholder_env()
                 self.assertNotIn("GEMINI_API_KEY", os.environ)
-            finally:
-                if old_gem_key is not None:
-                    os.environ["GEMINI_API_KEY"] = old_gem_key
 
             # 4. Non-string api_key / project in MCP tools/call returns -32602
-            server = MCPServer(job_manager=jm1, store=store)
+            jm_mcp = JobManager(workspace_root=repo_dir, store=store, worker_backend=lambda _r: {"text": "ok"})
+            server = MCPServer(job_manager=jm_mcp, store=store)
             bad_resp = server.handle_Message(
                 {
                     "jsonrpc": "2.0",
@@ -1483,6 +1528,413 @@ class TestCostControls(unittest.TestCase):
             )
             self.assertEqual(bad_resp["error"]["code"], -32602)
             self.assertIn("api_key", bad_resp["error"]["message"])
+            jm_mcp.shutdown()
+
+
+class TestGauntletRound1Regressions(unittest.TestCase):
+    """Regression suite covering all Round 1 adversarial findings across Opus, Fable, and Argon."""
+
+    def test_non_ascii_and_shell_metachar_filenames_and_in_place_branch_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            (repo / "r\u00e9sum\u00e9.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "non-ascii"], cwd=repo, check=True, capture_output=True)
+
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+            # Verify worker worktree is isolated outside store.data_dir so ../../.hmac_key is unreachable
+            wt_sample = store.worktree_path("job-1")
+            self.assertNotEqual((wt_sample / ".." / ".." / ".hmac_key").resolve(), store.hmac_key_path.resolve())
+
+            def isolated_worker(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                (wd / "r\u00e9sum\u00e9.py").write_text("x = 2\n", encoding="utf-8")
+                (wd / "caf\u00e9.py").write_text("c = 3\n", encoding="utf-8")
+                return {"text": "updated non-ascii"}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=isolated_worker)
+            res = jm.delegate_start("non-ascii isolated", project="p", wait=True)
+            self.assertEqual(res["status"], "ok")
+            self.assertIn("r\u00e9sum\u00e9.py", res["files_changed"])
+            self.assertIn("caf\u00e9.py", res["files_changed"])
+            diff_page = jm.get_diff(res["job_id"], file_filter="caf\u00e9.py")
+            self.assertIn("+c = 3", diff_page["diff"])
+            ap = jm.delegate_apply(res["job_id"])
+            self.assertTrue(ap["applied"])
+            self.assertEqual((repo / "r\u00e9sum\u00e9.py").read_text(encoding="utf-8"), "x = 2\n")
+            self.assertEqual((repo / "caf\u00e9.py").read_text(encoding="utf-8"), "c = 3\n")
+            jm.shutdown()
+
+        # Now test in_place mode with shell metacharacters in filename and worker branch switching
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+
+            def inplace_worker(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                subprocess.run(["git", "checkout", "-b", "evil-branch"], cwd=wd, check=True, capture_output=True)
+                (wd / "my notes.py").write_text("a = 1\n", encoding="utf-8")
+                (wd / "$(touch PWNED).py").write_text("b = 2\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=wd, check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "branch commit"], cwd=wd, check=True, capture_output=True)
+                return {"text": "in-place done"}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=inplace_worker)
+            res = jm.delegate_start("in-place branch & metachar", project="p", in_place=True, wait=True)
+            self.assertEqual(res["status"], "ok")
+            cur_branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(cur_branch, "main")
+            branches = subprocess.run(
+                ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(branches, ["main"])
+            # Executing undo_hint must cleanly remove the files without executing $(touch PWNED)
+            self.assertIsNotNone(res.get("undo_hint"))
+            subprocess.run(["bash", "-c", res["undo_hint"]], cwd=repo, check=True, capture_output=True)
+            self.assertFalse((repo / "PWNED").exists())
+            self.assertFalse((repo / "my notes.py").exists())
+            self.assertFalse((repo / "$(touch PWNED).py").exists())
+            jm.shutdown()
+
+    def test_guard_aliasing_sed_ln_glob_and_linter_prefixes(self) -> None:
+        from server.jobs import _matches_file_filter, validate_acceptance
+        from server.receipts import extract_diff_provenance, redact_api_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            _init_git_repo(ws)
+            out_dir = ws / ".cc-agy-data"
+
+            for cmd in (
+                "python3 -c \"import os; os.system('touch pwned')\"",
+                "python3 -c \"import os as o; o.system('touch pwned')\"",
+                "python3 -c \"from os import system; system('touch pwned')\"",
+                "python3 -c \"import importlib; importlib.import_module('os').system('touch pwned')\"",
+                "node -e \"require('child_process').execSync('touch pwned')\"",
+                "sed -E -i \"s/a/b/\" app.py",
+                "sed -e \"s/a/b/\" -i app.py",
+                "python3 -c\"open('app.py','w').write('x')\"",
+                "ln -s /tmp/evil.py",
+            ):
+                verdict = detect_bash_workspace_mutation(cmd, ws, out_dir, cwd=ws)
+                self.assertTrue(verdict["blocked"], f"Expected blocked=True for {cmd!r}")
+                with self.assertRaises(ValueError):
+                    validate_acceptance([cmd], ws)
+
+            env = {"CC_AGY_STRICT_MODE": "true", "CLAUDE_PROJECT_DIR": str(ws), "CC_AGY_OUT_DIR": str(out_dir)}
+            for tool_payload in (
+                {"tool_name": "Glob", "tool_input": {"path": str(ws), "pattern": ".cc-agy-data/.hmac_key"}, "cwd": str(ws)},
+                {"tool_name": "Grep", "tool_input": {"path": str(ws), "pattern": ".*", "glob": ".cc-agy-data/.hmac_key"}, "cwd": str(ws)},
+            ):
+                decision = evaluate_pre_tool_use(tool_payload, env=env)
+                self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+            # Non-dict JSON payloads must not crash hook entrypoints
+            self.assertEqual(evaluate_pre_tool_use([]), {})  # type: ignore[arg-type]
+
+        # Blockquoted and bulleted 10-line code blocks must be caught by lint_delegation_prompt
+        fn_lines = [
+            "def apply_discount(order):",
+            "    total = 0",
+            "    for item in order.items:",
+            "        total += item.price * item.qty",
+            "    if order.coupon:",
+            "        total *= 0.9",
+            "    if total > 100:",
+            "        total -= 5",
+            "    order.total = round(total, 2)",
+            "    return order",
+        ]
+        bq_code = "\n".join(f"> {l}" for l in fn_lines)
+        bullet_code = "\n".join(f"- `{l.strip()}`" for l in bq_code.splitlines())
+        self.assertFalse(lint_delegation_prompt(bq_code)["ok"])
+        self.assertFalse(lint_delegation_prompt(bullet_code)["ok"])
+        prose_parens = "\n".join(f"Ensure helper_{i}(x) returns the right value" for i in range(9))
+        self.assertTrue(lint_delegation_prompt(prose_parens)["ok"])
+
+        # Short API key redaction must not corrupt JSON keys
+        rec = {"status": "ok", "api_key": "st", "model": "gemini-2.5-flash"}
+        redacted = redact_api_keys(rec, api_key="st")
+        self.assertIn("status", redacted)
+        self.assertEqual(redacted["api_key"], "<api-key>")
+
+        # _matches_file_filter must not strip leading dots from dotfiles
+        self.assertFalse(_matches_file_filter(".env", "env"))
+        self.assertFalse(_matches_file_filter("env", ".env"))
+        self.assertFalse(_matches_file_filter(".github/ci.yml", "github/ci.yml"))
+
+        # extract_diff_provenance must hash ++ / -- content lines inside a hunk
+        sample_diff = (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-x = 1\n"
+            "---foo\n"
+            "+++bar\n"
+            "+y = 2\n"
+        )
+        prov = extract_diff_provenance(sample_diff)
+        self.assertEqual(prov["per_file"]["a.py"]["added_count"], 2)
+        self.assertEqual(prov["per_file"]["a.py"]["removed_count"], 2)
+
+    def test_workspace_scoped_status_cancel_continue_and_mcp_boundary(self) -> None:
+        from server.agy_runner import append_progress, build_straitjacket_tools
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo1 = Path(tmp) / "repo1"
+            repo2 = Path(tmp) / "repo2"
+            repo1.mkdir()
+            repo2.mkdir()
+            _init_git_repo(repo1)
+            _init_git_repo(repo2)
+            shared_data = Path(tmp) / "shared_data"
+            s1 = ReceiptStore(shared_data, workspace_root=repo1)
+            s2 = ReceiptStore(shared_data, workspace_root=repo2)
+
+            s1.write_receipt(
+                "j-chk",
+                {"kind": "delegate", "status": "checkpoint", "model": "gemini-2.5-flash", "usage": {"prompt_token_count": 100}},
+                workspace_root=str(repo1),
+            )
+            s2.write_receipt(
+                "j-other",
+                {"kind": "delegate", "status": "ok", "model": "gemini-2.5-flash", "usage": {"prompt_token_count": 9999}},
+                workspace_root=str(repo2),
+            )
+            tot1 = s1.summarize_costs()
+            self.assertEqual(tot1["total_jobs"], 1)
+            self.assertEqual(tot1["in_progress_or_paused_jobs"], 1)
+            self.assertEqual(tot1["prompt_token_count"], 100)
+
+            jm = JobManager(workspace_root=repo1, store=s1, worker_backend=lambda _r: {"text": "ok"})
+            # delegate_continue after delegate_cancel must succeed
+            j = jm.delegate_start("first", project="p", wait=True)
+            jm.delegate_cancel(j["job_id"])
+            resumed = jm.delegate_continue(j["job_id"], "resume after cancel", wait=True)
+            self.assertEqual(resumed["status"], "ok")
+
+            # Missing context_files in ask_gemini raises ValueError; valid context_files are echoed
+            with self.assertRaises(ValueError):
+                ask_gemini(
+                    "review",
+                    context_files=["missing_file.py"],
+                    project="p",
+                    workspace_root=repo1,
+                    store=s1,
+                    backend=lambda _r: {"text": "ok"},
+                )
+
+            # MCP boundary checks: Infinity page, string enabled_tools, string plan, in_place+auto_apply=False, needs_input not is_error
+            def q_worker(req: dict[str, Any]) -> dict[str, Any]:
+                append_progress(req["progress_path"], "question", "clarify?")
+                return {"text": "waiting for answer"}
+
+            jm_q = JobManager(workspace_root=repo1, store=s1, worker_backend=q_worker)
+            srv = MCPServer(job_manager=jm_q, store=s1)
+            for bad_call in (
+                {"name": "get_diff", "arguments": {"job_id": j["job_id"], "page": float("inf")}},
+                {"name": "delegate_start", "arguments": {"prompt": "do", "project": "p", "enabled_tools": "RUN_COMMAND"}},
+                {"name": "delegate_start", "arguments": {"prompt": "do", "project": "p", "plan": "not-a-list"}},
+                {"name": "delegate_to_gemini", "arguments": {"prompt": "do", "project": "p", "in_place": True, "auto_apply": False}},
+            ):
+                resp = srv.handle_Message({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": bad_call})
+                self.assertEqual(resp["error"]["code"], -32602, f"Expected -32602 for {bad_call}")
+
+            d_needs = srv._dispatch_tool("delegate_to_gemini", {"prompt": "ask q", "project": "p"})
+            self.assertEqual(d_needs["status"], "needs_input")
+            self.assertFalse(d_needs.get("is_error", False))
+
+            # Straitjacket tool argument coercion and env scrubbing
+            with unittest.mock.patch.dict(os.environ, {"CC_AGY_DATA_DIR": str(shared_data), "GEMINI_API_KEY": "secret-key-val"}):
+                tools, _ = build_straitjacket_tools(repo1, timeout_seconds=10.0)
+                tmap = {f.__name__: f for f in tools}
+                out_none = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", None, None))
+                self.assertIn("error", out_none)
+                out_str = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", "abc", "5.0"))
+                self.assertIn("error", out_str)
+                out_cmd = json.loads(asyncio.run(tmap["run_command"]('printf "%s|%s" "$CC_AGY_DATA_DIR" "$GEMINI_API_KEY"', None, 0)))
+                self.assertEqual(out_cmd.get("command_exit_code"), 0)
+                self.assertEqual(out_cmd.get("stdout", "").strip(), "|")
+
+            jm.shutdown()
+            jm_q.shutdown()
+
+    def test_round2_gauntlet_regressions(self) -> None:
+        from server.jobs import MAX_TOOL_RESPONSE_TOKENS, validate_acceptance
+        from server.regions import estimate_tokens, resolve_api_key, resolve_auth_config, resolve_vertex_project
+        import stat
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            data_dir = Path(tmp) / "data"
+            store = ReceiptStore(data_dir, workspace_root=repo)
+
+            # 1. Worktrees dir mode is 0o700 and classified as out_dir
+            self.assertEqual(stat.S_IMODE(os.stat(store.worktrees_dir).st_mode), 0o700)
+            wt_file = store.worktrees_dir / "job-x" / "app.py"
+            self.assertEqual(classify_path(str(wt_file), repo, str(data_dir), cwd=repo), "out_dir")
+            self.assertTrue(
+                detect_bash_workspace_mutation(f"cp /tmp/x {wt_file}", repo, str(data_dir), cwd=repo)["blocked"]
+            )
+
+            # 2. One worker turn with 1M accumulated input tokens + 100k output tokens on Argon costs $3.20
+            turn_u = {
+                "prompt_token_count": 1_000_000,
+                "cached_content_token_count": 0,
+                "candidates_token_count": 100_000,
+                "thoughts_token_count": 0,
+                "total_token_count": 1_100_000,
+            }
+            jm_cost = JobManager(
+                workspace_root=repo,
+                store=store,
+                worker_backend=lambda r: (
+                    r["workspace_dir"],
+                    {"text": "ok", "usage": {**turn_u, "max_request_prompt_tokens": 1_000_000, "requests": [dict(turn_u)]}},
+                )[1],
+            )
+            res_cost = jm_cost.delegate_start("argon turn", model="gemini-4-argon", project="p", wait=True)
+            self.assertAlmostEqual(res_cost["cost"]["total_cost_usd"], 3.20, places=4)
+            jm_cost.shutdown()
+
+            # Partial per-call requests must not undercount turn totals, and over-reported per-step sums scale down to turn totals
+            partial_u = {
+                "prompt_token_count": 1_000_000,
+                "candidates_token_count": 100_000,
+                "turns": [{"prompt_token_count": 1_000_000, "candidates_token_count": 100_000}],
+                "requests": [{"prompt_token_count": 50_000, "candidates_token_count": 1_000, "per_call": True}],
+            }
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", partial_u)["total_cost_usd"], 3.20, places=4)
+            over_u1 = {
+                "prompt_token_count": 1_000_000,
+                "candidates_token_count": 100_000,
+                "requests": [
+                    {"prompt_token_count": 1_000_000, "candidates_token_count": 100_000, "per_call": True},
+                    {"prompt_token_count": 1_000_000, "candidates_token_count": 100_000, "per_call": True},
+                ],
+            }
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", over_u1)["total_cost_usd"], 5.80, places=4)
+            over_u2 = {
+                "prompt_token_count": 1_000_000,
+                "candidates_token_count": 100_000,
+                "requests": [{"prompt_token_count": 150_000, "candidates_token_count": 10_000, "per_call": True}] * 10,
+            }
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", over_u2)["total_cost_usd"], 3.20, places=4)
+
+            # 3. AST inline Python check blocks obfuscated mutations and allows benign inline prints
+            for bad_inline in (
+                "python3 -c \"import sys; sys.modules['o'+'s'].__dict__['sys'+'tem']('touch pwned')\"",
+                "python3 -c \"print('x', file=__builtins__.__dict__['op'+'en']('pwned','w'))\"",
+                "node -e \"require('child_pro'+'cess')['exec'+'Sync']('touch pwned')\"",
+            ):
+                self.assertTrue(detect_bash_workspace_mutation(bad_inline, repo, str(data_dir), cwd=repo)["blocked"])
+                with self.assertRaises(ValueError):
+                    validate_acceptance([bad_inline], repo)
+
+            for good_inline in (
+                "python3 -c \"import sys; print(sys.version)\"",
+                "python3 -c \"print('hello os')\"",
+            ):
+                self.assertFalse(detect_bash_workspace_mutation(good_inline, repo, str(data_dir), cwd=repo)["blocked"])
+                validate_acceptance([good_inline], repo)
+
+            # 4. Bulleted `* code` lines are caught by lint_delegation_prompt
+            fn = [
+                "def f(a):",
+                "    b = a + 1",
+                "    c = b * 2",
+                "    if c > 3:",
+                "        c -= 1",
+                "    d = c ** 2",
+                "    e = d % 7",
+                "    print(e)",
+                "    return e",
+            ]
+            self.assertFalse(lint_delegation_prompt("\n".join(f"* {l}" for l in fn))["ok"])
+
+            # 5. Auth precedence and fallback env vars
+            self.assertEqual(resolve_api_key(None, env={"CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY": "k123"}), "k123")
+            self.assertEqual(resolve_vertex_project(None, env={"CLOUD_ML_PROJECT_ID": "p123"}), "p123")
+            self.assertEqual(
+                resolve_auth_config(requested_project="p1", requested_api_key="k1", env={})["auth_mode"],
+                "api_key",
+            )
+
+            # 6. External worktree laundering when worker never touches workspace_dir fails provenance check
+            gate = threading.Event()
+            jm_launder = JobManager(
+                workspace_root=repo,
+                store=store,
+                worker_backend=lambda _r: (gate.wait(5), {"text": "did nothing"})[1],
+            )
+            started = jm_launder.delegate_start("noop", project="p")
+            wt_launder = Path(started["worktree_dir"])
+            (wt_launder / "app.py").write_text("LAUNDERED = True\n", encoding="utf-8")
+            gate.set()
+            jm_launder.delegate_result(started["job_id"], wait=True, timeout=10)
+            jm_launder.delegate_apply(started["job_id"])
+            prov_verdict = verify_workspace_provenance(
+                repo,
+                store,
+                env={"CC_AGY_STRICT_MODE": "true", "CC_AGY_DATA_DIR": str(data_dir), "CLAUDE_PROJECT_DIR": str(repo)},
+                strict=True,
+            )
+            self.assertFalse(prov_verdict["ok"])
+            jm_launder.shutdown()
+
+            # 7. in_place worker committing on a branch and switching back preserves edits, and list status stays under 8k tokens
+            repo_ip = Path(tmp) / "repo_ip"
+            repo_ip.mkdir()
+            _init_git_repo(repo_ip)
+            (repo_ip / "a.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_ip, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add a"], cwd=repo_ip, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "dev"], cwd=repo_ip, check=True, capture_output=True)
+            store_ip = ReceiptStore(Path(tmp) / "data_ip", workspace_root=repo_ip)
+
+            def branch_switch_worker(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                subprocess.run(["git", "checkout", "-b", "worker-feature"], cwd=wd, check=True, capture_output=True)
+                (wd / "a.py").write_text("x = 2\n", encoding="utf-8")
+                subprocess.run(["git", "commit", "-am", "w"], cwd=wd, check=True, capture_output=True)
+                subprocess.run(["git", "checkout", "main"], cwd=wd, check=True, capture_output=True)
+                return {"text": "ok"}
+
+            jm_ip = JobManager(workspace_root=repo_ip, store=store_ip, worker_backend=branch_switch_worker)
+            res_ip = jm_ip.delegate_start("e", project="p", wait=True, in_place=True)
+            self.assertEqual(res_ip["status"], "ok")
+            self.assertEqual((repo_ip / "a.py").read_text(encoding="utf-8").strip(), "x = 2")
+            for idx in range(25):
+                store_ip.write_receipt(
+                    f"job-bulk-{idx}",
+                    {"kind": "delegate", "status": "ok", "model": "gemini-3.5-flash-lite", "usage": {"prompt_token_count": 1000}},
+                    workspace_root=str(repo_ip),
+                )
+            st_list = jm_ip.delegate_status(limit=50)
+            self.assertLessEqual(
+                estimate_tokens(json.dumps(st_list, indent=2, sort_keys=True)),
+                MAX_TOOL_RESPONSE_TOKENS,
+            )
+            jm_ip.shutdown()
 
 
 if __name__ == "__main__":

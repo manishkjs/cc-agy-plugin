@@ -120,6 +120,9 @@ def verify_workspace_provenance(
                     )
 
         if r.get("applied"):
+            if r.get("external_worktree_tamper"):
+                forged_receipts.append(job_id)
+                continue
             diff_file = receipt_store.diff_path(job_id)
             has_valid_diff = diff_file.exists()
             has_hashes = isinstance(r.get("applied_file_hashes"), dict) and bool(
@@ -242,6 +245,8 @@ def evaluate_stop_hook(
     store: ReceiptStore | None = None,
 ) -> dict[str, Any]:
     """Evaluate a Claude Code Stop event and return the structured hook decision."""
+    if not isinstance(payload, dict):
+        payload = {}
     source_env = env if env is not None else os.environ
     if not is_strict_mode_enabled(source_env):
         return {}

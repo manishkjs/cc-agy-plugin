@@ -24,6 +24,8 @@ def main() -> int:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         return 0
+    if not isinstance(payload, dict):
+        return 0
 
     cwd = str(payload.get("cwd") or os.getcwd())
     ws_root = resolve_workspace_root(cwd)
