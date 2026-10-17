@@ -693,6 +693,7 @@ class JobManager:
                         if (
                             not rel_u
                             or rel_u.startswith((".cc-agy-data/", ".worktrees/"))
+                            or _is_ephemeral_build_or_test_artifact(rel_u)
                             or rel_u in existing_prov_files
                             or rel_u in applied_files
                         ):
@@ -735,7 +736,7 @@ class JobManager:
                 if entry
             ]
             for rel in rel_entries:
-                if rel.startswith((".git/", ".cc-agy-data/", ".worktrees/")):
+                if rel.startswith((".git/", ".cc-agy-data/", ".worktrees/", ".venv/", "venv/")) or rel in (".venv", "venv"):
                     continue
                 src_p = self.workspace_root / rel
                 dst_p = wt_dir / rel

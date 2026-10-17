@@ -1960,6 +1960,10 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             repo.mkdir()
             _init_git_repo(repo)
             (repo / "pkg.py").write_text("VAL = 'host'\n", encoding="utf-8")
+            (repo / "test_pkg.py").write_text(
+                "import unittest\nimport pkg\nclass T(unittest.TestCase):\n    def test_v(self):\n        self.assertEqual(pkg.VAL, 'worker_wt')\n",
+                encoding="utf-8",
+            )
             subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             subprocess.run(["git", "commit", "-m", "add pkg"], cwd=repo, check=True, capture_output=True)
 
@@ -1985,12 +1989,22 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 res = jm.delegate_start(
                     "update pkg",
                     wait=True,
-                    acceptance=["python3 -c \"import pkg; assert pkg.VAL == 'worker_wt'\""],
+                    acceptance=["python3 -m unittest test_pkg.py"],
                 )
                 self.assertEqual(res["status"], "ok")
                 self.assertEqual(res["model"], "gemini-4-argon")
                 self.assertEqual(res["files_changed"], ["pkg.py"])
                 self.assertTrue(res["acceptance_passed"])
+                jm.delegate_apply(res["job_id"])
+                (repo / ".pytest_cache").mkdir(exist_ok=True)
+                (repo / ".pytest_cache" / "README.md").write_text("pytest cache\n", encoding="utf-8")
+                prov_res = verify_workspace_provenance(
+                    repo,
+                    store,
+                    env={"CC_AGY_STRICT_MODE": "true", "CC_AGY_DATA_DIR": str(store.data_dir), "CLAUDE_PROJECT_DIR": str(repo)},
+                    strict=True,
+                )
+                self.assertTrue(prov_res["ok"], f"Expected provenance ok even with .pytest_cache, got {prov_res}")
                 jm.shutdown()
             finally:
                 os.environ.clear()

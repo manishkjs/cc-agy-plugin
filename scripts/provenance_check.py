@@ -16,7 +16,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from scripts.pre_tool_guard import is_strict_mode_enabled, lint_delegation_prompt  # noqa: E402
-from server.jobs import capture_live_workspace_diff  # noqa: E402
+from server.jobs import _is_ephemeral_build_or_test_artifact, capture_live_workspace_diff  # noqa: E402
 from server.receipts import (  # noqa: E402
     ReceiptStore,
     extract_diff_provenance,
@@ -150,7 +150,11 @@ def verify_workspace_provenance(
     from server.receipts import sha256_bytes
 
     for fpath in live_prov["files_changed"]:
-        if fpath.startswith(".cc-agy-data/") or fpath.startswith(".worktrees/"):
+        if (
+            fpath.startswith(".cc-agy-data/")
+            or fpath.startswith(".worktrees/")
+            or _is_ephemeral_build_or_test_artifact(fpath)
+        ):
             continue
         if fpath not in applied_files_allowed:
             unverified_files.append(fpath)
