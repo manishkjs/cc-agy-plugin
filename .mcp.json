@@ -13,7 +13,7 @@
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL": "${user_config.default_ask_model}",
         "CC_AGY_USERCFG_STRICT_MODE": "${user_config.strict_delegation_mode}"
       },
-      "timeout": 600000
+      "timeout": 1800000
     }
   }
 }

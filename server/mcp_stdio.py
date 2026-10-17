@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
@@ -154,7 +155,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "timeout_seconds": {
                     "type": "number",
-                    "description": "Per-turn timeout in seconds (default: 300).",
+                    "description": "Per-turn timeout in seconds (default: 1200).",
                 },
                 "wait": {
                     "type": "boolean",
@@ -246,11 +247,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "Completed job_id with status='ok'.",
+                    "description": "Completed job_id.",
                 },
                 "cleanup_worktree": {
                     "type": "boolean",
                     "description": "Remove the temporary worktree after applying (default: true).",
+                },
+                "allow_scope_violations": {
+                    "type": "boolean",
+                    "description": (
+                        "Allow applying files outside allowed_paths if the Lead has reviewed the diff "
+                        "with get_diff and approves the additional modified files (default: false)."
+                    ),
                 },
             },
             "required": ["job_id"],
@@ -270,9 +278,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Follow-up task or test-fix instruction.",
                 },
+                "allowed_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional updated list of allowed relative paths for this job "
+                        "(pass [] to remove path restrictions, or omit to keep existing allowed_paths)."
+                    ),
+                },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional updated list of read-only acceptance check commands.",
+                },
                 "timeout_seconds": {
                     "type": "number",
-                    "description": "Timeout in seconds (default: 300).",
+                    "description": "Timeout in seconds (default: 600).",
                 },
                 "wait": {
                     "type": "boolean",
@@ -401,7 +422,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "timeout_seconds": {
                     "type": "number",
-                    "description": "Timeout in seconds (default: 300).",
+                    "description": "Timeout in seconds (default: 1200).",
                 },
             },
             "required": ["prompt"],
@@ -673,7 +694,7 @@ class MCPServer:
                     "message": f"Invalid params: {exc}",
                 },
             }
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -732,7 +753,7 @@ class MCPServer:
                 in_place_b = parse_bool(args.get("in_place"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
             return self.job_manager.delegate_start(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
@@ -789,11 +810,13 @@ class MCPServer:
             job_id_str = _require_str(args.get("job_id"), "job_id")
             try:
                 cleanup_b = parse_bool(args.get("cleanup_worktree"), True)
+                allow_scope_b = parse_bool(args.get("allow_scope_violations"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.delegate_apply(
                 job_id=job_id_str,
                 cleanup_worktree=cleanup_b,
+                allow_scope_violations=allow_scope_b,
             )
 
         if name == "delegate_continue":
@@ -801,12 +824,24 @@ class MCPServer:
             followup_str = _require_str(args.get("follow_up_prompt"), "follow_up_prompt")
             try:
                 wait_b = parse_bool(args.get("wait"), True)
+                cont_allowed = (
+                    validate_allowed_paths(args.get("allowed_paths"))
+                    if "allowed_paths" in args and args.get("allowed_paths") is not None
+                    else None
+                )
+                cont_acceptance = (
+                    validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
+                    if "acceptance" in args and args.get("acceptance") is not None
+                    else None
+                )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 600.0)
             return self.job_manager.delegate_continue(
                 job_id=job_id_str,
                 follow_up_prompt=followup_str,
+                allowed_paths=cont_allowed,
+                acceptance=cont_acceptance,
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
                 api_key=_optional_str(args.get("api_key"), "api_key"),
@@ -844,7 +879,7 @@ class MCPServer:
                     "in_place=True cannot be combined with auto_apply=False because in_place edits "
                     "are applied directly to the working tree."
                 )
-            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 300.0)
+            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
             digest = self.job_manager.delegate_start(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
@@ -890,7 +925,30 @@ def serve_stdio(
     in_flight_futures: list[Future[None]] = []
 
     def _process_and_write(msg_obj: Any, framed: bool) -> None:
-        resp = active_server.handle_Message(msg_obj)
+        try:
+            resp = active_server.handle_Message(msg_obj)
+        except (Exception, asyncio.CancelledError) as exc:
+            msg_id = msg_obj.get("id") if isinstance(msg_obj, dict) else None
+            resp = (
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+                                    indent=2,
+                                ),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
+                if msg_id is not None
+                else None
+            )
         if resp is not None:
             with write_lock:
                 _write_response(writer, resp, framed)

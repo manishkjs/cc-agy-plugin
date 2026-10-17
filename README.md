@@ -6,43 +6,37 @@
 
 ---
 
-## The Value Proposition: Why Connect Two Harnesses?
+## Architecture & Trade-Offs: Why Connect Two Harnesses?
 
-In multi-step coding tasks, most tokens are consumed by iterative file reads, symbol searches, code edits, and test loops rather than initial architectural planning. Paying flagship model rates ($4/$20 per 1M tokens) for every test retry is expensive, while running a smaller model alone can miss subtle design constraints.
-
-`cc-agy-plugin` splits the work by role:
+`cc-agy-plugin` connects Claude Code to the Google Antigravity SDK so a single workspace can combine Anthropic and Gemini models with strict worktree isolation and cryptographic diff provenance:
 
 1. **Claude Opus 5.5 plans and reviews**:
    - Reads the user prompt, inspects key interfaces, and writes a short outcome-only task brief with ordered `plan` steps and read-only `acceptance` checks (`pytest`, `ruff`, `mypy`).
    - Reviews the token-paginated git diff returned by the worker and decides whether to merge it (`delegate_apply`) or send follow-up instructions (`delegate_continue`).
-2. **Google Antigravity SDK + Gemini executes**:
+2. **Google Antigravity SDK + Gemini executes in an isolated copy**:
    - Spins up a headless Antigravity agent inside a standalone git repository copy (or `in_place` when requested).
-   - Performs the file reads, code edits, and iterative test runs at Gemini rates ($0.10 to $2.00 per 1M input tokens).
    - **Straitjacket (`ctx-harness`) shell containment** intercepts noisy test and build outputs (>240 lines or >4,000 tokens), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite does not flood the worker's context window.
 3. **Your working tree stays clean until verified (Git-Level Isolation)**:
    - In the default isolated mode (`in_place=false`), the worker edits a standalone copy of tracked files under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`), so failed or timed-out runs leave uncommitted files in your checkout untouched. Changes are only merged when `delegate_apply` verifies baseline SHA-256 hashes (using a 3-way merge when needed) and records an HMAC-SHA256 signed receipt.
    - *Security note*: Isolated copies provide git-level checkout isolation, not an OS container or VM sandbox. Worker shell commands run with your local user account's OS permissions; HMAC receipts and child-env scrubbing enforce workflow provenance and prevent accidental secret leakage, not isolation against a hostile local process running as the same OS user. The plugin snapshots and restores host `.git/hooks` and `.git/config` around every run.
 
-### Illustrative Cost Comparison (100k/10k Planning + 1M/100k Execution Tokens)
+### Configured Rate Card & Measured SWE Benchmark Trade-Offs
 
 Configured model rates in `server/regions.py` per 1M tokens (for single model calls exceeding `200,000` prompt tokens on Pro/Argon models, such as `ask_gemini` with `single_request=True` or an individual per-step call, input rates scale by `2.0x` and output rates by `1.5x`; multi-call worker turns accumulate smaller per-step prompts at the standard rate):
 
-| Model | Role | Input / 1M | Output / 1M |
-|---|---|---|---|
-| **Claude Opus 5.5** | Lead Planner & Reviewer | $4.00 | $20.00 |
-| **Gemini 3.1 Pro / Gemini 4 Argon** | Frontier Reasoning Worker (Default) | $2.00 | $12.00 |
-| **Gemini 3.8 Flash** | Fast Daily Coding Worker | $0.50 | $3.00 |
-| **Gemini 3.5 Flash-Lite** | High-Volume Execution Worker | $0.10 | $0.40 |
-| **Gemini 2.5 Flash** | Single-Shot Review (`ask_gemini` Default) | $0.30 | $2.50 |
-
-For an illustrative workload requiring **100k input + 10k output tokens** of planning/review and **1M input + 100k output tokens** of multi-turn worker execution (`1.1M` total input + `110k` total output tokens across turns, each turn `<=200k` prompt tokens):
-
-| Workflow | Lead Cost (Opus) | Worker Cost (Gemini) | Total Cost | Savings vs. All-Opus |
+| Model | Role | Uncached Input / 1M | Cached Input / 1M | Output / 1M |
 |---|---|---|---|---|
-| **All Claude Opus 5.5 (1.1M in + 110k out)** | $4.40 + $2.20 | $0.00 | **$6.60** | Baseline |
-| **Opus Lead + Gemini 3.1 Pro / 4 Argon** | $0.40 + $0.20 | $2.00 + $1.20 | **$3.80** | **42% less** |
-| **Opus Lead + Gemini 3.8 Flash** | $0.40 + $0.20 | $0.50 + $0.30 | **$1.40** | **79% less** |
-| **Opus Lead + Gemini 3.5 Flash-Lite** | $0.40 + $0.20 | $0.10 + $0.04 | **$0.74** | **89% less** |
+| **Claude Opus 5.5** | Lead Planner & Reviewer (Unverified assumed proxy list rate) | $4.00 | $0.40 | $20.00 |
+| **Gemini 3.1 Pro / Gemini 4 Argon** | Frontier Reasoning Worker (Default) | $2.00 | $0.20 | $12.00 |
+| **Gemini 3.8 Flash** | Fast Daily Coding Worker | $0.50 | $0.05 | $3.00 |
+| **Gemini 3.5 Flash-Lite** | High-Volume Execution Worker | $0.10 | $0.01 | $0.40 |
+| **Gemini 2.5 Flash** | Single-Shot Review (`ask_gemini` Default) | $0.30 | $0.03 | $2.50 |
+
+**Empirical Benchmark Findings (2 `httpx` tasks × 3 arms × 2 runs = 12 cells)**:
+Although Gemini per-token rates are lower than Opus, **delegating a self-contained single-repo coding task to a nested multi-turn worker is NOT cheaper or faster than running Claude Opus 5.5 standalone**:
+- When running standalone (`opus_solo`), Claude Opus 5.5 solved the tasks in **17 to 21 turns** (**263.4s to 402.0s**, **0.83M to 1.27M tokens**) with **~87% to 92% prompt cache hits ($0.40/1M)**, costing **96.43¢ to 146.32¢** per run (`3/4` passes).
+- When delegating via `cc-agy-plugin`, the Opus Lead still spent **12 to 25 turns** (**98.73¢ to 202.62¢**) exploring, writing briefs, reviewing `get_diff`, and running post-apply host checks, while the Gemini Worker cold-started a second agent loop (**41 to 70 turns / 148.49¢ to 280.72¢ on `Gemini 4 Argon`**; **125 to 207 turns / 109.68¢ to 224.41¢ on `Gemini 3.8 Flash`**).
+- End-to-end, the delegated arms cost **2.22x to 3.53x more** (**244.81¢ to 422.38¢**) and took **4.6x to 12.7x longer** (**1518.7s to 3529.9s**) than `opus_solo`. Use `cc-agy-plugin` when you want **isolated worktree experimentation (`wait=false`), cross-model second opinions (`ask_gemini`), or cryptographic provenance gating**, not to reduce cost or latency on self-contained tasks that Opus can solve directly in ~20 cached turns.
 
 Every tool call writes a signed receipt with token usage, and `/cc-agy-plugin:cost` reports cumulative workspace spend in USD and cents based on the rate table in `server/regions.py`.
 

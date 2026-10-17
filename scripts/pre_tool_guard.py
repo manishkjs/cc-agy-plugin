@@ -1074,7 +1074,10 @@ def _inspect_segment_tokens(
 
     # Check ruff / npm / npx / make / pytest
     if binary == "ruff":
-        if any(a in ("--fix", "--unsafe-fixes", "format") for a in args):
+        is_mutating_ruff = any(a in ("--fix", "--unsafe-fixes") for a in args) or (
+            "format" in args and not any(a in ("--check", "--diff") for a in args)
+        )
+        if is_mutating_ruff:
             return {
                 "blocked": True,
                 "reason": "Strict orchestrator mode blocked `ruff` mutating/formatting flags.",
@@ -1111,12 +1114,35 @@ def _inspect_segment_tokens(
         return {"blocked": False, "reason": None}, active_cwd
 
     if binary in ("pytest", "py.test"):
-        for parg in args:
-            if parg in ("-p", "--confcutdir", "--rootdir", "-o", "--override-ini") or parg.startswith(("-p", "--confcutdir=", "--rootdir=")):
+        skip_next = False
+        for idx_p, parg in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if parg == "-p":
+                next_val = args[idx_p + 1] if idx_p + 1 < len(args) else ""
+                if next_val.startswith("no:"):
+                    skip_next = True
+                    continue
                 return {
                     "blocked": True,
                     "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
                 }, active_cwd
+            if parg.startswith("-p") and len(parg) > 2:
+                if parg[2:].lstrip("=").startswith("no:"):
+                    continue
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                }, active_cwd
+            if parg in ("--confcutdir", "--rootdir", "-o", "--override-ini") or parg.startswith(("--confcutdir=", "--rootdir=")):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                }, active_cwd
+            if parg in ("-k", "-m", "-W", "-c", "--tb", "--maxfail", "--durations", "--color", "--basetemp"):
+                skip_next = True
+                continue
             if parg.startswith("-"):
                 continue
             target_file = parg.split("::", 1)[0]
@@ -1183,7 +1209,17 @@ def _inspect_segment_tokens(
                 mod_extra_args = args[i + 1 :]
 
             if mod is not None:
-                if mod in ("unittest", "pytest", "json.tool", "py_compile", "compileall"):
+                if mod == "ruff":
+                    is_mutating_ruff = any(a in ("--fix", "--unsafe-fixes") for a in mod_extra_args) or (
+                        "format" in mod_extra_args and not any(a in ("--check", "--diff") for a in mod_extra_args)
+                    )
+                    if is_mutating_ruff:
+                        return {
+                            "blocked": True,
+                            "reason": "Strict orchestrator mode blocked `python -m ruff` mutating/formatting flags.",
+                        }, active_cwd
+                    return {"blocked": False, "reason": None}, active_cwd
+                if mod in ("unittest", "pytest", "mypy", "flake8", "pylint", "json.tool", "py_compile", "compileall"):
                     for mod_arg in mod_extra_args:
                         if mod_arg.startswith("-"):
                             continue

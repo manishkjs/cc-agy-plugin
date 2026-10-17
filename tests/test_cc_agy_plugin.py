@@ -2010,6 +2010,263 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old_env)
 
+    def test_cancelled_error_timeout_recovery_and_sqlite_telemetry_and_readonly_linters(self) -> None:
+        from server.agy_runner import drain_response_streams, extract_sqlite_session_telemetry
+        from server.jobs import validate_acceptance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            (repo / "pkg.py").write_text("VAL = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            # 1. Verify drain_response_streams catches asyncio.CancelledError after buffered items
+            class _CancelledStream:
+                def __aiter__(self):
+                    async def _gen():
+                        yield {"name": "edit_file", "args": {"path": "pkg.py"}}
+                        raise asyncio.CancelledError()
+                    return _gen()
+
+            class _FakeResp:
+                tool_calls = _CancelledStream()
+                thoughts = None
+
+            tc_out: list[dict[str, Any]] = []
+            th_out: list[str] = []
+            asyncio.run(drain_response_streams(_FakeResp(), tc_out, th_out))
+            self.assertEqual(len(tc_out), 1)
+            self.assertEqual(tc_out[0]["name"], "edit_file")
+
+            # 2. Verify JobManager and MCPServer handle asyncio.CancelledError (BaseException) with partial usage & clean edits
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+
+            def cancelled_worker(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                (wd / "pkg.py").write_text("VAL = 2\n", encoding="utf-8")
+                # Simulate Straitjacket creating .ctx-session-reads/engagement.json inside the worktree
+                ctx_dir = wd / ".ctx-session-reads"
+                ctx_dir.mkdir(exist_ok=True)
+                (ctx_dir / "engagement.json").write_text('{"activated_by": "truncation"}\n', encoding="utf-8")
+                exc = asyncio.CancelledError("Simulated SDK wait_for cancellation")
+                setattr(
+                    exc,
+                    "partial_usage",
+                    {
+                        "prompt_token_count": 12000,
+                        "cached_content_token_count": 8000,
+                        "candidates_token_count": 400,
+                        "thoughts_token_count": 200,
+                        "total_token_count": 12600,
+                        "requests": [
+                            {
+                                "prompt_token_count": 12000,
+                                "cached_content_token_count": 8000,
+                                "candidates_token_count": 400,
+                                "thoughts_token_count": 200,
+                                "total_token_count": 12600,
+                                "per_call": True,
+                            }
+                        ],
+                        "max_request_prompt_tokens": 12000,
+                    },
+                )
+                setattr(exc, "partial_tool_calls", [{"name": "replace_file_content", "args": {}}])
+                raise exc
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=cancelled_worker)
+            digest = jm.delegate_start(
+                "edit pkg",
+                model="gemini-3.8-flash",
+                project="p",
+                allowed_paths=["pkg.py"],
+                wait=True,
+            )
+            self.assertEqual(digest["status"], "timeout")
+            self.assertEqual(digest["scope_violations"], [])
+            self.assertEqual(digest["usage"]["total_token_count"], 12600)
+            self.assertEqual(len(digest["usage"]["requests"]), 1)
+            self.assertEqual(digest["tool_call_count"], 1)
+            self.assertEqual(digest["files_changed"], ["pkg.py"])
+            self.assertGreater(digest["cost"]["total_cost_cents"], 0.0)
+
+            # Verify timeout job with clean edits can be applied after diff inspection
+            apply_res = jm.delegate_apply(digest["job_id"])
+            self.assertTrue(apply_res["applied"])
+            self.assertEqual((repo / "pkg.py").read_text(encoding="utf-8"), "VAL = 2\n")
+            self.assertFalse((repo / ".ctx-session-reads").exists())
+            jm.shutdown()
+
+            # 3. Verify validate_acceptance allows python -m mypy / ruff check / ruff format --check / pytest -p no:cacheprovider and blocks ruff --fix / pytest -p evil_mod
+            allowed_cmds = validate_acceptance(
+                [
+                    ".venv/bin/python -m mypy pkg.py",
+                    ".venv/bin/python -m ruff check pkg.py",
+                    "ruff format --check pkg.py",
+                    ".venv/bin/pytest -q -p no:cacheprovider pkg.py",
+                ],
+                repo,
+            )
+            self.assertEqual(len(allowed_cmds), 4)
+            with self.assertRaises(ValueError):
+                validate_acceptance(["ruff format pkg.py"], repo)
+            with self.assertRaises(ValueError):
+                validate_acceptance([".venv/bin/python -m ruff check --fix pkg.py"], repo)
+            with self.assertRaises(ValueError):
+                validate_acceptance([".venv/bin/pytest -p evil_mod pkg.py"], repo)
+
+    def test_bugs_6_7_8_9_tls_keylog_index_reset_digest_cap_and_scope_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@t.local"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), check=True)
+            (repo / "pkg.py").write_text("VAL = 1\n", encoding="utf-8")
+            (repo / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True)
+
+            store = ReceiptStore(repo / ".cc-agy-data", workspace_root=repo)
+
+            # 1. Bug #6 + #7: TLS keylog 'test', .coverage.worker1, and 150 requests in usage
+            def worker_with_tls_and_many_reqs(req: dict) -> dict:
+                wd = Path(req["workspace_dir"])
+                (wd / "pkg.py").write_text("VAL = 2\n", encoding="utf-8")
+                (wd / "test").write_text(
+                    "# TLS secrets log file, generated by OpenSSL / Python\nCLIENT_RANDOM deadbeef 0123\n",
+                    encoding="utf-8",
+                )
+                (wd / ".coverage.worker1").write_text("covdata", encoding="utf-8")
+                reqs = [
+                    {
+                        "prompt_token_count": 1000,
+                        "cached_content_token_count": 800,
+                        "candidates_token_count": 50,
+                        "thoughts_token_count": 20,
+                        "total_token_count": 1070,
+                        "per_call": True,
+                    }
+                    for _ in range(150)
+                ]
+                return {
+                    "text": "updated pkg.py",
+                    "usage": {
+                        "prompt_token_count": 150000,
+                        "cached_content_token_count": 120000,
+                        "candidates_token_count": 7500,
+                        "thoughts_token_count": 3000,
+                        "total_token_count": 160500,
+                        "requests": reqs,
+                    },
+                    "tool_calls": [{"name": "edit_file", "args": {"path": "pkg.py"}}],
+                }
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker_with_tls_and_many_reqs)
+            digest = jm.delegate_start(
+                "update pkg",
+                model="gemini-4-argon",
+                project="p",
+                allowed_paths=["pkg.py"],
+                wait=True,
+            )
+            self.assertEqual(digest["status"], "ok")
+            self.assertEqual(digest["files_changed"], ["pkg.py"])
+            self.assertEqual(digest["scope_violations"], [])
+            # Digest caps usage.requests to 10 while recording requests_count=150
+            self.assertEqual(digest["usage"]["requests_count"], 150)
+            self.assertTrue(digest["usage"]["requests_truncated"])
+            self.assertEqual(len(digest["usage"]["requests"]), 10)
+            # Full on-disk receipt preserves all 150 requests
+            full_rcpt = store.read_receipt(digest["job_id"])
+            self.assertEqual(len(full_rcpt["usage"]["requests"]), 150)
+
+            # Simulate pytest on host creating OpenSSL TLS keylog 'test' before apply
+            (repo / "test").write_text(
+                "# TLS secrets log file, generated by OpenSSL / Python\nCLIENT_RANDOM hostbeef 9999\n",
+                encoding="utf-8",
+            )
+            apply_res = jm.delegate_apply(digest["job_id"])
+            self.assertTrue(apply_res["applied"])
+            prov = verify_workspace_provenance(repo, store, strict=True)
+            self.assertTrue(prov["ok"], f"Expected provenance ok=True, got: {prov}")
+            jm.shutdown()
+
+            # 2. Bug #8: scope_violation override via delegate_apply(allow_scope_violations=True) and delegate_continue(allowed_paths=...)
+            def worker_out_of_scope(req: dict) -> dict:
+                wd = Path(req["workspace_dir"])
+                (wd / "pkg.py").write_text("VAL = 3\n", encoding="utf-8")
+                (wd / "extra.py").write_text("EXTRA = 2\n", encoding="utf-8")
+                return {
+                    "text": "updated both",
+                    "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+                    "tool_calls": [],
+                }
+
+            jm2 = JobManager(workspace_root=repo, store=store, worker_backend=worker_out_of_scope)
+            d2 = jm2.delegate_start(
+                "update both",
+                model="gemini-3.8-flash",
+                project="p",
+                allowed_paths=["pkg.py"],
+                wait=True,
+            )
+            self.assertEqual(d2["status"], "scope_violation")
+            self.assertEqual(d2["scope_violations"], ["extra.py"])
+            with self.assertRaises(ValueError):
+                jm2.delegate_apply(d2["job_id"])
+
+            # Widen allowed_paths via delegate_continue
+            d2_cont = jm2.delegate_continue(
+                d2["job_id"],
+                "verify both files",
+                allowed_paths=["pkg.py", "extra.py"],
+                wait=True,
+            )
+            self.assertEqual(d2_cont["status"], "ok")
+            self.assertEqual(d2_cont["scope_violations"], [])
+            jm2.delegate_apply(d2["job_id"])
+            self.assertEqual((repo / "extra.py").read_text(encoding="utf-8"), "EXTRA = 2\n")
+
+            # Direct allow_scope_violations=True on delegate_apply
+            def worker_out_of_scope_2(req: dict) -> dict:
+                wd = Path(req["workspace_dir"])
+                (wd / "extra.py").write_text("EXTRA = 3\n", encoding="utf-8")
+                return {
+                    "text": "updated extra",
+                    "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+                    "tool_calls": [],
+                }
+
+            jm3 = JobManager(workspace_root=repo, store=store, worker_backend=worker_out_of_scope_2)
+            d3 = jm3.delegate_start(
+                "update extra",
+                model="gemini-3.8-flash",
+                project="p",
+                allowed_paths=["pkg.py"],
+                wait=True,
+            )
+            self.assertEqual(d3["status"], "scope_violation")
+            res3 = jm3.delegate_apply(d3["job_id"], allow_scope_violations=True)
+            self.assertTrue(res3["applied"])
+            self.assertEqual((repo / "extra.py").read_text(encoding="utf-8"), "EXTRA = 3\n")
+            prov3 = verify_workspace_provenance(repo, store, strict=True)
+            self.assertTrue(prov3["ok"], f"Expected provenance ok=True after allow_scope_violations, got: {prov3}")
+            jm2.shutdown()
+            jm3.shutdown()
+
+            # 3. Bug #10: Concurrent ReceiptStore initialization locks .hmac_key and reloads on-disk key
+            race_dir = Path(tmp) / "race_data"
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                stores = list(pool.map(lambda _: ReceiptStore(race_dir, workspace_root=repo), range(8)))
+            keys = {s._active_hmac_key() for s in stores}
+            self.assertEqual(len(keys), 1)
+            rcpt_a = stores[0].write_receipt("job-race-1", {"kind": "delegate", "status": "ok", "model": "gemini-4-argon"})
+            self.assertTrue(stores[-1].verify_receipt_signature(rcpt_a))
+
 
 if __name__ == "__main__":
     unittest.main()

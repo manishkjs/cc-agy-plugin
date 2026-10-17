@@ -153,7 +153,7 @@ def verify_workspace_provenance(
         if (
             fpath.startswith(".cc-agy-data/")
             or fpath.startswith(".worktrees/")
-            or _is_ephemeral_build_or_test_artifact(fpath)
+            or _is_ephemeral_build_or_test_artifact(fpath, root=ws_path)
         ):
             continue
         if fpath not in applied_files_allowed:

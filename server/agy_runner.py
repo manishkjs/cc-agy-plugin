@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import inspect
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -136,6 +138,28 @@ def extract_usage_from_session(agent: Any, resp: Any = None) -> dict[str, int]:
             sub = getattr(agent, attr, None)
             if sub is not None:
                 candidates.append(sub)
+        conv = getattr(agent, "_conversation", None)
+        if conv is None:
+            try:
+                conv = getattr(agent, "conversation", None)
+            except Exception:
+                conv = None
+        if conv is not None:
+            for attr in ("last_turn_usage", "total_usage", "_last_turn_usage"):
+                try:
+                    sub = getattr(conv, attr, None)
+                    if sub is not None:
+                        candidates.append(sub)
+                except Exception:
+                    pass
+            conn = getattr(conv, "_connection", None)
+            if conn is not None:
+                try:
+                    sub = getattr(conn, "cumulative_usage", None)
+                    if sub is not None:
+                        candidates.append(sub)
+                except Exception:
+                    pass
 
     for obj in candidates:
         if isinstance(obj, dict):
@@ -158,6 +182,119 @@ def extract_usage_from_session(agent: Any, resp: Any = None) -> dict[str, int]:
     return usage
 
 
+def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    val = 0
+    shift = 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, pos
+        shift += 7
+    return val, pos
+
+
+def _parse_proto_fields(buf: bytes) -> dict[int, int | bytes]:
+    pos = 0
+    out: dict[int, int | bytes] = {}
+    while pos < len(buf):
+        tag, pos = _read_varint(buf, pos)
+        field_num = tag >> 3
+        wire_type = tag & 7
+        if wire_type == 0:
+            v, pos = _read_varint(buf, pos)
+            out[field_num] = v
+        elif wire_type == 2:
+            ln, pos = _read_varint(buf, pos)
+            out[field_num] = buf[pos : pos + ln]
+            pos += ln
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 5:
+            pos += 4
+        else:
+            break
+    return out
+
+
+def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, Any]:
+    """Extract per-call usage requests and tool calls from localharness SQLite DB in save_dir."""
+    out: dict[str, Any] = {
+        "prompt_token_count": 0,
+        "cached_content_token_count": 0,
+        "candidates_token_count": 0,
+        "thoughts_token_count": 0,
+        "total_token_count": 0,
+        "max_request_prompt_tokens": 0,
+        "requests": [],
+        "tool_calls": [],
+    }
+    if not save_dir or not Path(save_dir).exists():
+        return out
+    for db_path in sorted(glob.glob(os.path.join(str(save_dir), "*.db"))):
+        try:
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                "SELECT idx, step_type, metadata, step_payload FROM steps ORDER BY idx"
+            ).fetchall()
+            conn.close()
+        except Exception:
+            continue
+        for _idx, step_type, meta, payload in rows:
+            if step_type == 15 and isinstance(meta, (bytes, bytearray)) and meta:
+                top = _parse_proto_fields(bytes(meta))
+                u_bytes = top.get(9)
+                if isinstance(u_bytes, bytes) and u_bytes:
+                    u = _parse_proto_fields(u_bytes)
+                    uncached_in = int(u.get(2) or 0) if isinstance(u.get(2), int) else 0
+                    cached_in = int(u.get(5) or 0) if isinstance(u.get(5), int) else 0
+                    thoughts_tok = int(u.get(9) or 0) if isinstance(u.get(9), int) else 0
+                    cand_tok = int(u.get(10) or 0) if isinstance(u.get(10), int) else 0
+                    if cand_tok == 0 and thoughts_tok == 0 and isinstance(u.get(3), int):
+                        cand_tok = int(u.get(3) or 0)
+                    prompt_tok = uncached_in + cached_in
+                    tot_tok = prompt_tok + cand_tok + thoughts_tok
+                    if tot_tok > 0:
+                        req_entry = {
+                            "prompt_token_count": prompt_tok,
+                            "cached_content_token_count": cached_in,
+                            "candidates_token_count": cand_tok,
+                            "thoughts_token_count": thoughts_tok,
+                            "total_token_count": tot_tok,
+                            "per_call": True,
+                        }
+                        out["requests"].append(req_entry)
+                        out["prompt_token_count"] += prompt_tok
+                        out["cached_content_token_count"] += cached_in
+                        out["candidates_token_count"] += cand_tok
+                        out["thoughts_token_count"] += thoughts_tok
+                        out["total_token_count"] += tot_tok
+                        out["max_request_prompt_tokens"] = max(
+                            int(out["max_request_prompt_tokens"]),
+                            prompt_tok,
+                        )
+            elif step_type in (5, 8, 21, 103) and isinstance(payload, (bytes, bytearray)) and payload:
+                try:
+                    top_p = _parse_proto_fields(bytes(payload))
+                    inner_b = top_p.get(5)
+                    if isinstance(inner_b, bytes):
+                        inner_p = _parse_proto_fields(inner_b)
+                        tc_b = inner_p.get(4)
+                        if isinstance(tc_b, bytes):
+                            tc_p = _parse_proto_fields(tc_b)
+                            t_name = tc_p.get(2).decode("utf-8", errors="ignore") if isinstance(tc_p.get(2), bytes) else "tool"
+                            t_args_raw = tc_p.get(3).decode("utf-8", errors="ignore") if isinstance(tc_p.get(3), bytes) else "{}"
+                            try:
+                                t_args = json.loads(t_args_raw)
+                            except Exception:
+                                t_args = {}
+                            out["tool_calls"].append({"name": t_name, "args": t_args})
+                except Exception:
+                    pass
+    return out
+
+
 async def drain_response_streams(
     resp: Any,
     tool_calls_out: list[dict[str, Any]],
@@ -169,21 +306,27 @@ async def drain_response_streams(
 
     tc_stream = getattr(resp, "tool_calls", None)
     if tc_stream is not None:
-        if hasattr(tc_stream, "__aiter__"):
-            async for tc in tc_stream:
-                tool_calls_out.append(_serialize_tool_call(tc))
-        elif hasattr(tc_stream, "__iter__"):
-            for tc in tc_stream:
-                tool_calls_out.append(_serialize_tool_call(tc))
+        try:
+            if hasattr(tc_stream, "__aiter__"):
+                async for tc in tc_stream:
+                    tool_calls_out.append(_serialize_tool_call(tc))
+            elif hasattr(tc_stream, "__iter__"):
+                for tc in tc_stream:
+                    tool_calls_out.append(_serialize_tool_call(tc))
+        except (Exception, asyncio.CancelledError):
+            pass
 
     th_stream = getattr(resp, "thoughts", None)
     if th_stream is not None:
-        if hasattr(th_stream, "__aiter__"):
-            async for th in th_stream:
-                thoughts_out.append(str(getattr(th, "text", th)))
-        elif hasattr(th_stream, "__iter__"):
-            for th in th_stream:
-                thoughts_out.append(str(getattr(th, "text", th)))
+        try:
+            if hasattr(th_stream, "__aiter__"):
+                async for th in th_stream:
+                    thoughts_out.append(str(getattr(th, "text", th)))
+            elif hasattr(th_stream, "__iter__"):
+                for th in th_stream:
+                    thoughts_out.append(str(getattr(th, "text", th)))
+        except (Exception, asyncio.CancelledError):
+            pass
 
 
 def _serialize_tool_call(tc: Any) -> dict[str, Any]:
@@ -560,14 +703,22 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                     except Exception:
                         pass
                 stop_reason = await resolve_stop_reason(resp)
-    except Exception as exc:
+            sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+            if not usage.get("requests") and sqlite_telemetry.get("requests"):
+                usage["requests"] = list(sqlite_telemetry["requests"])
+                usage["max_request_prompt_tokens"] = max(
+                    int(usage.get("max_request_prompt_tokens") or 0),
+                    int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
+                )
+    except (Exception, asyncio.CancelledError) as exc:
         # Attach partial usage and tool calls so the caller's finally block
         # records everything consumed prior to the failure or timeout.
         try:
             await drain_response_streams(resp, tool_calls_log, thoughts_log)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         partial_usage = extract_usage_from_session(agent_ref, resp)
+        sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
         for k in (
             "prompt_token_count",
             "cached_content_token_count",
@@ -575,7 +726,25 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             "thoughts_token_count",
             "total_token_count",
         ):
-            usage[k] = max(int(usage.get(k) or 0), partial_usage[k])
+            usage[k] = max(
+                int(usage.get(k) or 0),
+                int(partial_usage.get(k) or 0),
+                int(sqlite_telemetry.get(k) or 0),
+            )
+        if not usage.get("requests") and sqlite_telemetry.get("requests"):
+            usage["requests"] = list(sqlite_telemetry["requests"])
+            usage["max_request_prompt_tokens"] = max(
+                int(usage.get("max_request_prompt_tokens") or 0),
+                int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
+            )
+        if not tool_calls_log and sqlite_telemetry.get("tool_calls"):
+            tool_calls_log.extend(sqlite_telemetry["tool_calls"])
+        if isinstance(exc, asyncio.CancelledError):
+            timeout_exc = TimeoutError(f"Antigravity worker timed out or was cancelled after {timeout_sec}s")
+            setattr(timeout_exc, "partial_usage", usage)
+            setattr(timeout_exc, "partial_tool_calls", tool_calls_log)
+            setattr(timeout_exc, "partial_thoughts", thoughts_log)
+            raise timeout_exc from exc
         setattr(exc, "partial_usage", usage)
         setattr(exc, "partial_tool_calls", tool_calls_log)
         setattr(exc, "partial_thoughts", thoughts_log)

@@ -120,5 +120,5 @@
 
   <!-- ================= BOTTOM VALUE PROP BAR ================= -->
   <rect class="footer-pill" x="28" y="410" width="1064" height="38"/>
-  <text class="footer-text" x="560" y="434" text-anchor="middle">Result: 42% to 89% lower session cost • Working tree stays clean until verified • Cryptographic HMAC diff provenance</text>
+  <text class="footer-text" x="560" y="434" text-anchor="middle">Isolated worktree execution • Working tree stays clean until verified • Cryptographic HMAC diff provenance</text>
 </svg>

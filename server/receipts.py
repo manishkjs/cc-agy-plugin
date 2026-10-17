@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
 import hashlib
 import hmac
 import json
@@ -455,25 +456,69 @@ class ReceiptStore:
         return (Path.home() / ".cache" / "cc-agy-plugin" / ws_slug).resolve()
 
     def _load_or_create_hmac_key(self) -> bytes:
-        if self.hmac_key_path.exists():
-            try:
-                raw = self.hmac_key_path.read_bytes().strip()
-                if len(raw) >= 32:
-                    return raw
-            except OSError:
-                pass
-        key = secrets.token_hex(32).encode("ascii")
+        lock_path = self.data_dir / ".hmac_key.lock"
+        lock_fd: int | None = None
         try:
-            fd = os.open(
-                str(self.hmac_key_path),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600,
-            )
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(key)
+            lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError:
             pass
-        return key
+        try:
+            if self.hmac_key_path.exists():
+                try:
+                    raw = self.hmac_key_path.read_bytes().strip()
+                    if len(raw) >= 32:
+                        return raw
+                except OSError:
+                    pass
+            key = secrets.token_hex(32).encode("ascii")
+            try:
+                fd, tmp_key_path = tempfile.mkstemp(
+                    prefix=".hmac_key-",
+                    suffix=".tmp",
+                    dir=str(self.data_dir),
+                )
+                try:
+                    os.chmod(tmp_key_path, 0o600)
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(key)
+                    os.replace(tmp_key_path, self.hmac_key_path)
+                finally:
+                    if os.path.exists(tmp_key_path):
+                        try:
+                            os.unlink(tmp_key_path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            if self.hmac_key_path.exists():
+                try:
+                    disk_raw = self.hmac_key_path.read_bytes().strip()
+                    if len(disk_raw) >= 32:
+                        return disk_raw
+                except OSError:
+                    pass
+            return key
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+
+    def _active_hmac_key(self) -> bytes:
+        if self.hmac_key_path.exists():
+            try:
+                disk_key = self.hmac_key_path.read_bytes().strip()
+                if len(disk_key) >= 32 and disk_key != self._hmac_key:
+                    self._hmac_key = disk_key
+            except OSError:
+                pass
+        return self._hmac_key
 
     def _compute_hmac(self, record: dict[str, Any]) -> str:
         canonical_payload = {
@@ -488,7 +533,7 @@ class ReceiptStore:
             "prompts": record.get("prompts", []),
         }
         serialized = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
+        return hmac.new(self._active_hmac_key(), serialized, hashlib.sha256).hexdigest()
 
     def verify_receipt_signature(self, record: dict[str, Any]) -> bool:
         """Verify that a receipt on disk was genuinely written by ReceiptStore (not forged)."""
@@ -553,7 +598,7 @@ class ReceiptStore:
                 "provenance": provenance,
             }
             s_ser = json.dumps(s_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            s_payload["baseline_hmac"] = hmac.new(self._hmac_key, s_ser, hashlib.sha256).hexdigest()
+            s_payload["baseline_hmac"] = hmac.new(self._active_hmac_key(), s_ser, hashlib.sha256).hexdigest()
             s_path.write_text(json.dumps(s_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         self.record_baseline_dirty_state(
@@ -583,7 +628,7 @@ class ReceiptStore:
             "provenance": provenance,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        payload["baseline_hmac"] = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
+        payload["baseline_hmac"] = hmac.new(self._active_hmac_key(), serialized, hashlib.sha256).hexdigest()
         bpath.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._recorded_workspaces.add(str(Path(workspace_root).resolve()))
         try:
@@ -611,10 +656,7 @@ class ReceiptStore:
         if not bpath.exists():
             return None
         try:
-            if self.hmac_key_path.exists():
-                disk_key = self.hmac_key_path.read_bytes().strip()
-                if len(disk_key) >= 32 and disk_key != self._hmac_key:
-                    self._hmac_key = disk_key
+            active_key = self._active_hmac_key()
             data = json.loads(bpath.read_text(encoding="utf-8"))
             sig = data.get("baseline_hmac")
             if not sig or not isinstance(sig, str):
@@ -626,7 +668,7 @@ class ReceiptStore:
                 "provenance": data.get("provenance"),
             }
             serialized = json.dumps(check_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            expected = hmac.new(self._hmac_key, serialized, hashlib.sha256).hexdigest()
+            expected = hmac.new(active_key, serialized, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(sig, expected):
                 return None
             return data

@@ -9,9 +9,35 @@ from pathlib import Path
 import sys
 
 # Ensure plugin root is importable when launched via `python3 ${CLAUDE_PLUGIN_ROOT}/server/main.py`
+# and isolate the MCP server's own imports from workspace/PYTHONPATH shadowing (e.g. target repos
+# named `httpx/` or containing `calendar/`).
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-if str(PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_ROOT))
+SERVER_DIR = Path(__file__).resolve().parent
+
+
+def _sanitize_server_sys_path() -> None:
+    raw_pypath = {
+        os.path.abspath(p)
+        for p in (os.environ.get("PYTHONPATH") or "").split(os.pathsep)
+        if p.strip()
+    }
+    cwd_abs = os.path.abspath(os.getcwd())
+    server_abs = os.path.abspath(str(SERVER_DIR))
+    plugin_abs = os.path.abspath(str(PLUGIN_ROOT))
+    cleaned: list[str] = [str(PLUGIN_ROOT)]
+    deferred: list[str] = []
+    for entry in sys.path:
+        abs_e = os.path.abspath(entry) if entry else cwd_abs
+        if abs_e == plugin_abs:
+            continue
+        if abs_e in (cwd_abs, server_abs) or abs_e in raw_pypath:
+            deferred.append(entry)
+            continue
+        cleaned.append(entry)
+    sys.path[:] = cleaned
+
+
+_sanitize_server_sys_path()
 
 
 def _maybe_reexec_into_sdk_venv() -> None:
