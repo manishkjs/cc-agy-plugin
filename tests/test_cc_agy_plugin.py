@@ -2267,6 +2267,76 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             rcpt_a = stores[0].write_receipt("job-race-1", {"kind": "delegate", "status": "ok", "model": "gemini-4-argon"})
             self.assertTrue(stores[-1].verify_receipt_signature(rcpt_a))
 
+    def test_disable_web_tools_and_timeout_containment_preservation(self) -> None:
+        """Verifies CC_AGY_DISABLE_WEB_TOOLS / CC_AGY_STRICT_MODE blocks outbound network commands
+        in Straitjacket run_command and preserves partial_containment on worker TimeoutError."""
+        from unittest import mock
+        from server.agy_runner import build_straitjacket_tools
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@e.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+            (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            with mock.patch.dict(os.environ, {"CC_AGY_STRICT_MODE": "true"}, clear=False):
+                tools, _ = build_straitjacket_tools(repo, timeout_seconds=60.0)
+                run_cmd_fn = tools[0]
+                blocked_json = asyncio.run(
+                    run_cmd_fn("python -c \"import urllib.request; urllib.request.urlopen('https://huggingface.co')\"")
+                )
+                blocked_obj = json.loads(blocked_json)
+                self.assertEqual(blocked_obj["status"], "error")
+                self.assertEqual(blocked_obj["exit_code"], 126)
+                self.assertIn("Outbound network and web fetching are disabled", blocked_obj["error"])
+
+                host_escape_json = asyncio.run(
+                    run_cmd_fn("find /usr/local/google/home/manishkjs/ -name '*ewald*'")
+                )
+                host_escape_obj = json.loads(host_escape_json)
+                self.assertEqual(host_escape_obj["status"], "error")
+                self.assertEqual(host_escape_obj["exit_code"], 126)
+                self.assertIn("Accessing host filesystem directories outside the isolated workspace", host_escape_obj["error"])
+
+                wd_escape_json = asyncio.run(
+                    run_cmd_fn("ls -la", working_directory="/tmp")
+                )
+                wd_escape_obj = json.loads(wd_escape_json)
+                self.assertEqual(wd_escape_obj["status"], "error")
+                self.assertEqual(wd_escape_obj["exit_code"], 126)
+                self.assertIn("working_directory must stay within the isolated workspace", wd_escape_obj["error"])
+
+                cross_wt_json = asyncio.run(
+                    run_cmd_fn("ls -d /tmp/cc-agy-worktrees-*")
+                )
+                cross_wt_obj = json.loads(cross_wt_json)
+                self.assertEqual(cross_wt_obj["status"], "error")
+                self.assertEqual(cross_wt_obj["exit_code"], 126)
+
+                allowed_json = asyncio.run(run_cmd_fn("echo local_ok"))
+                self.assertIn("local_ok", allowed_json)
+
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+
+            def timeout_worker(req: dict) -> dict:
+                _ = req["workspace_dir"]
+                exc = TimeoutError("worker timed out")
+                setattr(exc, "partial_usage", {"prompt_token_count": 500, "total_token_count": 500})
+                setattr(exc, "partial_tool_calls", [{"name": "view_file", "args": {"path": "a.py"}}])
+                setattr(exc, "partial_containment", "straitjacket")
+                raise exc
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=timeout_worker)
+            digest = jm.delegate_start("test timeout", model="gemini-4-argon", project="p", wait=True)
+            self.assertEqual(digest["status"], "timeout")
+            rcpt = store.read_receipt(digest["job_id"])
+            self.assertEqual(rcpt["containment"], "straitjacket")
+            jm.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

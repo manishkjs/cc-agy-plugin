@@ -382,7 +382,7 @@ def build_straitjacket_tools(
         resolved_profile = "command-output"
 
     session_timeout = max(60.0, float(timeout_seconds or 600.0))
-    default_cmd_timeout = min(600.0, session_timeout)
+    default_cmd_timeout = min(60.0, session_timeout)
     scrubbed_env: dict[str, str] = {
         "CC_AGY_DATA_DIR": "",
         "CC_AGY_OUT_DIR": "",
@@ -420,6 +420,65 @@ def build_straitjacket_tools(
         producer="cc-agy-plugin",
     )
 
+    disable_web_tools = (
+        os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() in ("1", "true", "yes")
+        or (
+            os.environ.get("CC_AGY_STRICT_MODE", "").strip().lower() in ("1", "true", "yes")
+            and os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() not in ("0", "false", "no")
+        )
+    )
+    _network_block_tokens = (
+        "curl ",
+        "wget ",
+        "urllib.request",
+        "urllib.urlopen",
+        "http.client",
+        "requests.get(",
+        "requests.post(",
+        "httpx.get(",
+        "httpx.Client(",
+        "huggingface.co",
+        "githubusercontent.com",
+        "api.github.com",
+    )
+    _host_escape_block_tokens = (
+        "/usr/local",
+        "/google/",
+        "/home/",
+        "/var/tmp/",
+        "/tmp/.brench",
+        "/tmp/bench_3x3",
+        "/tmp/cc-agy-",
+        "/tmp/bench_py_venv",
+        "site-packages",
+        "_shared_deps.pth",
+        "$HOME",
+        "${HOME}",
+    )
+    import re as _re
+    _shell_outside_scan_re = _re.compile(
+        r"\b(?:grep|egrep|fgrep|rg|find|ls|fd|cat|head|tail|stat|du|tree)\b[^;|&\n]*?"
+        r"(?:^|[\s\"'=])(?:/(?:\s|$|[\"'\*])|\.\.(?:/|\s|$|[\"'])|~(?:/|\s|$|[\"'])|"
+        r"/(?:tmp|usr|var|etc|opt|root|proc|sys)(?:/|\s|$|[\"']))"
+    )
+    _py_outside_scan_re = _re.compile(
+        r"\b(?:os\.walk|os\.listdir|os\.scandir|glob\.glob|Path)\s*\(\s*['\"]"
+        r"(?:/(?:\s|$|['\"\*]|tmp|usr|var|etc|home|google)|\.\.|~)"
+    )
+
+    def _is_host_path_escape(raw_cmd: str) -> bool:
+        scrubbed = raw_cmd.replace(str(ws_resolved), "__WS__")
+        scrubbed = scrubbed.replace("/tmp/bench_py_venv/bin", "__VENV_BIN__")
+        for redir in ("2>/dev/null", ">/dev/null", "&>/dev/null", "</dev/null", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"):
+            scrubbed = scrubbed.replace(redir, "")
+        if any(tok in scrubbed for tok in _host_escape_block_tokens):
+            return True
+        if _shell_outside_scan_re.search(scrubbed):
+            return True
+        if _py_outside_scan_re.search(scrubbed):
+            return True
+        return False
+
     async def run_command(
         command: str,
         working_directory: str = "",
@@ -428,13 +487,48 @@ def build_straitjacket_tools(
         """Execute a shell command with typed status and bounded output. Large output (>240 lines or >4,000 tokens)
         is saved to a local evidence store and returns a concise digest with a run address (run:<id>#stdout).
         Use ctx_get or ctx_search to retrieve omitted lines."""
+        cmd_str = str(command or "")
+        if disable_web_tools:
+            if any(tok in cmd_str for tok in _network_block_tokens):
+                return json.dumps({
+                    "status": "error",
+                    "exit_code": 126,
+                    "error": (
+                        "PermissionDenied: Outbound network and web fetching are disabled in strict/offline "
+                        "worker mode (CC_AGY_DISABLE_WEB_TOOLS=true). Solve the task strictly using the local "
+                        "repository and local Python environment."
+                    ),
+                })
+            if _is_host_path_escape(cmd_str):
+                return json.dumps({
+                    "status": "error",
+                    "exit_code": 126,
+                    "error": (
+                        "PermissionDenied: Accessing host filesystem directories outside the isolated workspace "
+                        "is disabled in strict worker mode. All required task specifications are inside the "
+                        "current workspace directory; implement the solution directly."
+                    ),
+                })
+            if working_directory:
+                try:
+                    cand_wd = (ws_resolved / str(working_directory)).resolve()
+                    if not cand_wd.is_relative_to(ws_resolved):
+                        return json.dumps({
+                            "status": "error",
+                            "exit_code": 126,
+                            "error": (
+                                "PermissionDenied: working_directory must stay within the isolated workspace."
+                            ),
+                        })
+                except Exception:
+                    pass
         try:
             raw_timeout = float(timeout_seconds) if timeout_seconds is not None else default_cmd_timeout
         except (TypeError, ValueError, OverflowError):
             raw_timeout = default_cmd_timeout
         eff_timeout = min(max(1.0, raw_timeout if raw_timeout > 0 else default_cmd_timeout), session_timeout)
         result = await session.run(
-            str(command or ""),
+            cmd_str,
             working_directory=str(working_directory or ""),
             timeout_seconds=eff_timeout,
         )
@@ -542,6 +636,37 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     if request.get("disabled_tools") is not None:
         cap_kwargs["disabled_tools"] = list(request["disabled_tools"])
 
+    # Always disable interactive/UI/workflow tools that cannot function in a headless background worker,
+    # and disable SEARCH_WEB / READ_URL_CONTENT when CC_AGY_DISABLE_WEB_TOOLS or CC_AGY_STRICT_MODE is active.
+    disable_web_tools = (
+        os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() in ("1", "true", "yes")
+        or (
+            os.environ.get("CC_AGY_STRICT_MODE", "").strip().lower() in ("1", "true", "yes")
+            and os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() not in ("0", "false", "no")
+        )
+    )
+    headless_disabled_names = ["ASK_QUESTION", "GENERATE_IMAGE", "SCHEDULE", "RUN_WORKFLOW"]
+    if disable_web_tools:
+        headless_disabled_names.extend(["SEARCH_WEB", "READ_URL_CONTENT"])
+    base_disabled = list(cap_kwargs.get("disabled_tools") or [])
+    base_enabled = list(cap_kwargs.get("enabled_tools") or []) if "enabled_tools" in cap_kwargs else None
+    for b_name in headless_disabled_names:
+        b_enum = getattr(types.BuiltinTools, b_name, None)
+        if b_enum is not None:
+            if base_enabled is not None and not disable_web_tools and (b_enum in base_enabled or b_name in base_enabled):
+                continue
+            if b_enum not in base_disabled:
+                base_disabled.append(b_enum)
+            if base_enabled is not None:
+                base_enabled = [
+                    x for x in base_enabled
+                    if x != b_enum and str(x).upper() != b_name
+                ]
+    if base_disabled:
+        cap_kwargs["disabled_tools"] = base_disabled
+    if base_enabled is not None:
+        cap_kwargs["enabled_tools"] = base_enabled
+
     capabilities = types.CapabilitiesConfig(**cap_kwargs)
 
     # Keep the SDK's own session/artifact files outside the repo so they never show up in the diff.
@@ -608,11 +733,22 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
     # For Google AI Studio direct API key: set vertex=False and pass api_key.
     is_api_key = bool(request.get("api_key"))
+    ws_str = str(Path(request["workspace_dir"]).resolve())
+    agent_policies: list[Any] = [policy.allow_all()]
+    if hasattr(policy, "workspace_only"):
+        try:
+            ws_policies = policy.workspace_only([ws_str])
+            if isinstance(ws_policies, list):
+                agent_policies = ws_policies + agent_policies
+            else:
+                agent_policies = [ws_policies] + agent_policies
+        except Exception:
+            pass
     cfg_kwargs: dict[str, Any] = dict(
-        workspaces=[str(Path(request["workspace_dir"]))],
+        workspaces=[ws_str],
         vertex=not is_api_key,
         model=model_cfg,
-        policies=[policy.allow_all()],
+        policies=agent_policies,
         capabilities=capabilities,
         save_dir=save_dir,
     )
@@ -744,10 +880,14 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             setattr(timeout_exc, "partial_usage", usage)
             setattr(timeout_exc, "partial_tool_calls", tool_calls_log)
             setattr(timeout_exc, "partial_thoughts", thoughts_log)
+            setattr(timeout_exc, "partial_containment", containment_mode)
+            setattr(timeout_exc, "partial_containment_warning", containment_warning)
             raise timeout_exc from exc
         setattr(exc, "partial_usage", usage)
         setattr(exc, "partial_tool_calls", tool_calls_log)
         setattr(exc, "partial_thoughts", thoughts_log)
+        setattr(exc, "partial_containment", containment_mode)
+        setattr(exc, "partial_containment_warning", containment_warning)
         raise
     finally:
         shutil.rmtree(save_dir, ignore_errors=True)

@@ -1262,6 +1262,10 @@ class JobManager:
                 status = "timeout"
                 error_msg = f"TimeoutError: {exc}"
             self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
+            if getattr(exc, "partial_containment", None):
+                worker_out["containment"] = getattr(exc, "partial_containment")
+            if getattr(exc, "partial_containment_warning", None):
+                worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
         except Exception as exc:
             with self._lock:
                 is_canc = job_id in self._cancelled
@@ -1272,6 +1276,10 @@ class JobManager:
                 status = "error"
                 error_msg = f"{type(exc).__name__}: {exc}"
             self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
+            if getattr(exc, "partial_containment", None):
+                worker_out["containment"] = getattr(exc, "partial_containment")
+            if getattr(exc, "partial_containment_warning", None):
+                worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
         finally:
             try:
                 hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
