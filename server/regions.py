@@ -205,6 +205,17 @@ def truncate_to_token_budget(
     return pages[0], True, orig_tokens
 
 
+def first_valid_env(source_env: Any, *keys: str, default: str = "") -> str:
+    """Return the first non-empty, non-placeholder (${...}) value from source_env for keys."""
+    for key in keys:
+        val = source_env.get(key)
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if cleaned and not cleaned.startswith("${"):
+                return cleaned
+    return default
+
+
 def resolve_vertex_location(
     model: str,
     requested_location: str | None = None,
@@ -219,16 +230,18 @@ def resolve_vertex_location(
     automatically routes to 'global' and returns an explanatory note.
     """
     source_env = env if env is not None else os.environ
-    raw_loc = (
-        requested_location
-        or source_env.get("GOOGLE_CLOUD_LOCATION")
-        or source_env.get("VERTEX_LOCATION")
-        or "us-central1"
-    ).strip()
-
-    # Handle unsubstituted Claude Code template placeholders gracefully
-    if not raw_loc or raw_loc.startswith("${"):
-        raw_loc = "us-central1"
+    req_clean = (requested_location or "").strip()
+    if req_clean and not req_clean.startswith("${"):
+        raw_loc = req_clean
+    else:
+        raw_loc = first_valid_env(
+            source_env,
+            "GOOGLE_CLOUD_LOCATION",
+            "VERTEX_LOCATION",
+            "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_LOCATION",
+            "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION",
+            default="us-central1",
+        )
     raw_loc = raw_loc.lower()
 
     normalized_model = normalize_model_id(model)
@@ -256,13 +269,24 @@ def sanitize_placeholder_env() -> None:
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
         "CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY",
+        "CC_AGY_USERCFG_GEMINI_API_KEY",
         "GOOGLE_CLOUD_PROJECT",
         "VERTEX_PROJECT",
         "GCLOUD_PROJECT",
         "CLOUD_ML_PROJECT_ID",
         "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT",
+        "CC_AGY_USERCFG_GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_LOCATION",
         "VERTEX_LOCATION",
+        "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_LOCATION",
+        "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION",
+        "CC_AGY_DEFAULT_DELEGATE_MODEL",
+        "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
+        "CC_AGY_DEFAULT_ASK_MODEL",
+        "CC_AGY_USERCFG_DEFAULT_ASK_MODEL",
+        "CC_AGY_STRICT_MODE",
+        "CC_AGY_USERCFG_STRICT_MODE",
+        "CC_AGY_DATA_DIR",
     ):
         val = os.environ.get(var)
         if val is not None and val.strip().startswith("${"):
@@ -283,6 +307,7 @@ def resolve_api_key(
         source_env.get("GEMINI_API_KEY"),
         source_env.get("GOOGLE_API_KEY"),
         source_env.get("CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY"),
+        source_env.get("CC_AGY_USERCFG_GEMINI_API_KEY"),
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
@@ -308,6 +333,7 @@ def resolve_vertex_project(
         source_env.get("GCLOUD_PROJECT"),
         source_env.get("CLOUD_ML_PROJECT_ID"),
         source_env.get("CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT"),
+        source_env.get("CC_AGY_USERCFG_GOOGLE_CLOUD_PROJECT"),
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()

@@ -12,6 +12,7 @@ import uuid
 from server.receipts import ReceiptStore, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
+    first_valid_env,
     resolve_auth_config,
     resolve_vertex_location,
     resolve_vertex_project,
@@ -101,13 +102,17 @@ def ask_gemini(
     ws_root = resolve_workspace_root(workspace_root)
     receipt_store = store or ReceiptStore(workspace_root=ws_root)
 
-    chosen_model = (
-        model
-        or os.environ.get("CC_AGY_DEFAULT_ASK_MODEL")
-        or "gemini-2.5-flash"
-    ).strip()
-    if chosen_model.startswith("${"):
-        chosen_model = "gemini-2.5-flash"
+    req_model_clean = (model or "").strip()
+    if req_model_clean and not req_model_clean.startswith("${"):
+        chosen_model = req_model_clean
+    else:
+        chosen_model = first_valid_env(
+            os.environ,
+            "CC_AGY_DEFAULT_ASK_MODEL",
+            "CLAUDE_PLUGIN_OPTION_DEFAULT_ASK_MODEL",
+            "CC_AGY_USERCFG_DEFAULT_ASK_MODEL",
+            default="gemini-2.5-flash",
+        )
 
     auth = resolve_auth_config(
         requested_project=project,

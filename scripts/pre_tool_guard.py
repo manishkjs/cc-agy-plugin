@@ -20,6 +20,7 @@ def is_strict_mode_enabled(env: dict[str, str] | None = None) -> bool:
     for key in (
         "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
         "CC_AGY_STRICT_MODE",
+        "CC_AGY_USERCFG_STRICT_MODE",
     ):
         val = str(source.get(key) or "").strip().lower()
         if val in ("1", "true", "yes", "on"):

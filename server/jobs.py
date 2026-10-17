@@ -40,6 +40,7 @@ from server.regions import (
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
+    first_valid_env,
     paginate_text_by_tokens,
     resolve_api_key,
     resolve_auth_config,
@@ -464,18 +465,41 @@ def _parse_test_counts(output: str) -> dict[str, int]:
     return counts
 
 
+def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return an environment dict that prepends cwd (and cwd/src) to PYTHONPATH and cwd/.venv/bin to PATH."""
+    env = dict(os.environ if base_env is None else base_env)
+    cwd_resolved = cwd.resolve()
+    py_parts = [str(cwd_resolved)]
+    src_dir = cwd_resolved / "src"
+    if src_dir.is_dir():
+        py_parts.append(str(src_dir))
+    existing_py = (env.get("PYTHONPATH") or "").strip()
+    if existing_py:
+        py_parts.append(existing_py)
+    env["PYTHONPATH"] = ":".join(py_parts)
+    venv_dir = cwd_resolved / ".venv"
+    venv_bin = venv_dir / "bin"
+    if venv_bin.is_dir():
+        existing_path = (env.get("PATH") or "").strip()
+        env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
+        env["VIRTUAL_ENV"] = str(venv_dir)
+    return env
+
+
 def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> list[dict[str, Any]]:
     """Run acceptance checks with a hard timeout (whole process group is killed), then delete any new
     untracked files the checks themselves created (e.g. caches or TLS key logs), so they never land in
     the diff or block later turns."""
     limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(DEFAULT_ACCEPTANCE_TIMEOUT)))
     before = set(_snapshot_untracked_hashes(cwd))
+    exec_env = _build_workdir_exec_env(cwd)
     results: list[dict[str, Any]] = []
     for cmd in cmds:
         started = time.time()
         proc = subprocess.Popen(
             ["bash", "-c", cmd],
             cwd=str(cwd),
+            env=exec_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -739,6 +763,26 @@ class JobManager:
         _run_git(["commit", "--allow-empty", "-m", "cc-agy-baseline"], cwd=wt_dir, check=True)
         sha_res = _run_git(["rev-parse", "HEAD"], cwd=wt_dir, check=True)
         baseline_sha = sha_res.stdout.strip()
+
+        exclude_file = wt_dir / ".git" / "info" / "exclude"
+        try:
+            exclude_file.parent.mkdir(parents=True, exist_ok=True)
+            existing_excl = exclude_file.read_text(encoding="utf-8", errors="replace") if exclude_file.exists() else ""
+            extra_excl = "\n".join([".venv", ".venv/", ".pytest_cache/", "__pycache__/"])
+            exclude_file.write_text(
+                (existing_excl.rstrip("\n") + "\n" + extra_excl + "\n").lstrip("\n"),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        host_venv = self.workspace_root / ".venv"
+        wt_venv = wt_dir / ".venv"
+        if host_venv.exists() and not wt_venv.exists() and not wt_venv.is_symlink():
+            try:
+                os.symlink(str(host_venv.resolve()), str(wt_venv))
+            except OSError:
+                pass
 
         return wt_dir, baseline_sha, {}
 
@@ -1438,13 +1482,17 @@ class JobManager:
                 "allowed_paths cannot be enforced in in_place mode (edits land directly in your "
                 "files). Drop allowed_paths or use the default isolated copy."
             )
-        chosen_model = (
-            model
-            or os.environ.get("CC_AGY_DEFAULT_DELEGATE_MODEL")
-            or "gemini-3.1-pro-preview"
-        ).strip()
-        if chosen_model.startswith("${"):
-            chosen_model = "gemini-3.1-pro-preview"
+        req_model_clean = (model or "").strip()
+        if req_model_clean and not req_model_clean.startswith("${"):
+            chosen_model = req_model_clean
+        else:
+            chosen_model = first_valid_env(
+                os.environ,
+                "CC_AGY_DEFAULT_DELEGATE_MODEL",
+                "CLAUDE_PLUGIN_OPTION_DEFAULT_DELEGATE_MODEL",
+                "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
+                default="gemini-3.1-pro-preview",
+            )
 
         auth = resolve_auth_config(
             requested_project=project,

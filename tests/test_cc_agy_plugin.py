@@ -1936,6 +1936,66 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             )
             jm_ip.shutdown()
 
+    def test_mcp_json_usercfg_separation_and_worktree_venv_symlink(self) -> None:
+        """Verify .mcp.json does not clobber shell env vars and _prepare_worktree symlinks .venv safely."""
+        mcp_cfg = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        mcp_env = mcp_cfg["mcpServers"]["vertex"]["env"]
+        for shell_var in (
+            "GEMINI_API_KEY",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "CC_AGY_DEFAULT_DELEGATE_MODEL",
+            "CC_AGY_DEFAULT_ASK_MODEL",
+            "CC_AGY_STRICT_MODE",
+            "CC_AGY_DATA_DIR",
+        ):
+            self.assertNotIn(
+                shell_var,
+                mcp_env,
+                f".mcp.json must not clobber shell env var {shell_var!r}",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo_venv"
+            repo.mkdir()
+            _init_git_repo(repo)
+            (repo / "pkg.py").write_text("VAL = 'host'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add pkg"], cwd=repo, check=True, capture_output=True)
+
+            # Create a dummy .venv directory in repo
+            venv_bin = repo / ".venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            (venv_bin / "marker").write_text("ok\n", encoding="utf-8")
+
+            store = ReceiptStore(Path(tmp) / "data_venv", workspace_root=repo)
+
+            def edit_pkg_worker(req: dict[str, Any]) -> dict[str, Any]:
+                wd = Path(req["workspace_dir"])
+                assert (wd / ".venv").is_symlink(), "Expected .venv symlink inside worktree"
+                (wd / "pkg.py").write_text("VAL = 'worker_wt'\n", encoding="utf-8")
+                return {"text": "updated pkg"}
+
+            old_env = dict(os.environ)
+            try:
+                os.environ.update(mcp_env)
+                os.environ["CC_AGY_DEFAULT_DELEGATE_MODEL"] = "gemini-4-argon"
+                os.environ["GOOGLE_CLOUD_PROJECT"] = "test-proj-argon"
+                jm = JobManager(workspace_root=repo, store=store, worker_backend=edit_pkg_worker)
+                res = jm.delegate_start(
+                    "update pkg",
+                    wait=True,
+                    acceptance=["python3 -c \"import pkg; assert pkg.VAL == 'worker_wt'\""],
+                )
+                self.assertEqual(res["status"], "ok")
+                self.assertEqual(res["model"], "gemini-4-argon")
+                self.assertEqual(res["files_changed"], ["pkg.py"])
+                self.assertTrue(res["acceptance_passed"])
+                jm.shutdown()
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
 
 if __name__ == "__main__":
     unittest.main()

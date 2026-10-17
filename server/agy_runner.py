@@ -257,8 +257,21 @@ def build_straitjacket_tools(
             "GOOGLE_APPLICATION_CREDENTIALS",
         ):
             scrubbed_env[env_k] = ""
+    ws_resolved = Path(workspace_dir).resolve()
+    py_parts = [str(ws_resolved)]
+    if (ws_resolved / "src").is_dir():
+        py_parts.append(str(ws_resolved / "src"))
+    existing_py = (os.environ.get("PYTHONPATH") or "").strip()
+    if existing_py:
+        py_parts.append(existing_py)
+    scrubbed_env["PYTHONPATH"] = ":".join(py_parts)
+    venv_bin = ws_resolved / ".venv" / "bin"
+    if venv_bin.is_dir():
+        existing_path = (os.environ.get("PATH") or "").strip()
+        scrubbed_env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
+        scrubbed_env["VIRTUAL_ENV"] = str(ws_resolved / ".venv")
     session = ToolSession(
-        Path(workspace_dir),
+        ws_resolved,
         timeout=session_timeout,
         env=scrubbed_env,
         producer="cc-agy-plugin",
