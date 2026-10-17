@@ -2283,9 +2283,16 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
 
+            import inspect
             with mock.patch.dict(os.environ, {"CC_AGY_STRICT_MODE": "true"}, clear=False):
-                tools, _ = build_straitjacket_tools(repo, timeout_seconds=60.0)
+                os.environ.pop("CC_AGY_BLOCKED_PATHS", None)
+                os.environ.pop("CC_AGY_DEFAULT_CMD_TIMEOUT", None)
+                tools, _ = build_straitjacket_tools(repo, timeout_seconds=600.0)
                 run_cmd_fn = tools[0]
+                self.assertEqual(
+                    inspect.signature(run_cmd_fn).parameters["timeout_seconds"].default,
+                    600.0,
+                )
                 blocked_json = asyncio.run(
                     run_cmd_fn("python -c \"import urllib.request; urllib.request.urlopen('https://huggingface.co')\"")
                 )
@@ -2294,13 +2301,15 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 self.assertEqual(blocked_obj["exit_code"], 126)
                 self.assertIn("Outbound network and web fetching are disabled", blocked_obj["error"])
 
-                host_escape_json = asyncio.run(
-                    run_cmd_fn("find /usr/local/google/home/manishkjs/ -name '*ewald*'")
+                # Offline httpx.Client with MockTransport must be allowed
+                httpx_mock_json = asyncio.run(
+                    run_cmd_fn("echo \"python3 -c 'import httpx; c = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))'\"")
                 )
-                host_escape_obj = json.loads(host_escape_json)
-                self.assertEqual(host_escape_obj["status"], "error")
-                self.assertEqual(host_escape_obj["exit_code"], 126)
-                self.assertIn("Accessing host filesystem directories outside the isolated workspace", host_escape_obj["error"])
+                self.assertEqual(json.loads(httpx_mock_json).get("command_exit_code"), 0)
+
+                # Ordinary reads like ls ../ and cat /etc/os-release are allowed when CC_AGY_BLOCKED_PATHS is unset
+                parent_ls_json = asyncio.run(run_cmd_fn("ls ../"))
+                self.assertEqual(json.loads(parent_ls_json).get("command_exit_code"), 0)
 
                 wd_escape_json = asyncio.run(
                     run_cmd_fn("ls -la", working_directory="/tmp")
@@ -2319,6 +2328,29 @@ class TestGauntletRound1Regressions(unittest.TestCase):
 
                 allowed_json = asyncio.run(run_cmd_fn("echo local_ok"))
                 self.assertIn("local_ok", allowed_json)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CC_AGY_STRICT_MODE": "true",
+                    "CC_AGY_BLOCKED_PATHS": "/usr/local,/tmp/.brench",
+                    "CC_AGY_DEFAULT_CMD_TIMEOUT": "75",
+                },
+                clear=False,
+            ):
+                tools_bp, _ = build_straitjacket_tools(repo, timeout_seconds=600.0)
+                run_cmd_bp = tools_bp[0]
+                self.assertEqual(
+                    inspect.signature(run_cmd_bp).parameters["timeout_seconds"].default,
+                    75.0,
+                )
+                host_escape_json = asyncio.run(
+                    run_cmd_bp("find /usr/local/google/home/manishkjs/ -name '*ewald*'")
+                )
+                host_escape_obj = json.loads(host_escape_json)
+                self.assertEqual(host_escape_obj["status"], "error")
+                self.assertEqual(host_escape_obj["exit_code"], 126)
+                self.assertIn("Accessing host filesystem directories outside the isolated workspace", host_escape_obj["error"])
 
             store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
 

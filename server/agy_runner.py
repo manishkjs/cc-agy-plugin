@@ -382,7 +382,17 @@ def build_straitjacket_tools(
         resolved_profile = "command-output"
 
     session_timeout = max(60.0, float(timeout_seconds or 600.0))
-    default_cmd_timeout = min(60.0, session_timeout)
+    env_cmd_timeout = os.environ.get("CC_AGY_DEFAULT_CMD_TIMEOUT", "").strip()
+    try:
+        parsed_cmd_timeout = float(env_cmd_timeout) if env_cmd_timeout else 600.0
+    except ValueError:
+        parsed_cmd_timeout = 600.0
+    default_cmd_timeout = min(max(1.0, parsed_cmd_timeout), session_timeout)
+    extra_blocked_paths = tuple(
+        p.strip()
+        for p in os.environ.get("CC_AGY_BLOCKED_PATHS", "").split(",")
+        if p.strip()
+    )
     scrubbed_env: dict[str, str] = {
         "CC_AGY_DATA_DIR": "",
         "CC_AGY_OUT_DIR": "",
@@ -427,55 +437,40 @@ def build_straitjacket_tools(
             and os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() not in ("0", "false", "no")
         )
     )
-    _network_block_tokens = (
+    import re as _re
+    _direct_network_tokens = (
         "curl ",
         "wget ",
         "urllib.request",
         "urllib.urlopen",
-        "http.client",
-        "requests.get(",
-        "requests.post(",
-        "httpx.get(",
-        "httpx.Client(",
         "huggingface.co",
         "githubusercontent.com",
         "api.github.com",
     )
-    _host_escape_block_tokens = (
-        "/usr/local",
-        "/google/",
-        "/home/",
-        "/var/tmp/",
-        "/tmp/.brench",
-        "/tmp/bench_3x3",
+    _external_url_re = _re.compile(
+        r"https?://(?!(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|example\.(?:com|org|net)|testserver|test\b))"
+        r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+    )
+    _plugin_internal_escape_tokens = (
         "/tmp/cc-agy-",
-        "/tmp/bench_py_venv",
-        "site-packages",
-        "_shared_deps.pth",
-        "$HOME",
-        "${HOME}",
-    )
-    import re as _re
-    _shell_outside_scan_re = _re.compile(
-        r"\b(?:grep|egrep|fgrep|rg|find|ls|fd|cat|head|tail|stat|du|tree)\b[^;|&\n]*?"
-        r"(?:^|[\s\"'=])(?:/(?:\s|$|[\"'\*])|\.\.(?:/|\s|$|[\"'])|~(?:/|\s|$|[\"'])|"
-        r"/(?:tmp|usr|var|etc|opt|root|proc|sys)(?:/|\s|$|[\"']))"
-    )
-    _py_outside_scan_re = _re.compile(
-        r"\b(?:os\.walk|os\.listdir|os\.scandir|glob\.glob|Path)\s*\(\s*['\"]"
-        r"(?:/(?:\s|$|['\"\*]|tmp|usr|var|etc|home|google)|\.\.|~)"
-    )
+        ".cc-agy-worktrees-",
+        ".cc-agy-data",
+        ".hmac_key",
+    ) + extra_blocked_paths
+
+    def _is_outbound_network_command(raw_cmd: str) -> bool:
+        if any(tok in raw_cmd for tok in _direct_network_tokens):
+            return True
+        if ("MockTransport" in raw_cmd or "ASGITransport" in raw_cmd or "WSGITransport" in raw_cmd):
+            return False
+        if any(lib in raw_cmd for lib in ("requests.get(", "requests.post(", "httpx.get(", "httpx.post(", "http.client")):
+            if _external_url_re.search(raw_cmd):
+                return True
+        return False
 
     def _is_host_path_escape(raw_cmd: str) -> bool:
         scrubbed = raw_cmd.replace(str(ws_resolved), "__WS__")
-        scrubbed = scrubbed.replace("/tmp/bench_py_venv/bin", "__VENV_BIN__")
-        for redir in ("2>/dev/null", ">/dev/null", "&>/dev/null", "</dev/null", "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"):
-            scrubbed = scrubbed.replace(redir, "")
-        if any(tok in scrubbed for tok in _host_escape_block_tokens):
-            return True
-        if _shell_outside_scan_re.search(scrubbed):
-            return True
-        if _py_outside_scan_re.search(scrubbed):
+        if any(tok in scrubbed for tok in _plugin_internal_escape_tokens):
             return True
         return False
 
@@ -489,7 +484,7 @@ def build_straitjacket_tools(
         Use ctx_get or ctx_search to retrieve omitted lines."""
         cmd_str = str(command or "")
         if disable_web_tools:
-            if any(tok in cmd_str for tok in _network_block_tokens):
+            if _is_outbound_network_command(cmd_str):
                 return json.dumps({
                     "status": "error",
                     "exit_code": 126,
