@@ -443,12 +443,15 @@ def build_straitjacket_tools(
         "wget ",
         "urllib.request",
         "urllib.urlopen",
+        "socket.create_connection",
+        "git clone ",
+        "git fetch ",
         "huggingface.co",
         "githubusercontent.com",
         "api.github.com",
     )
     _external_url_re = _re.compile(
-        r"https?://(?!(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|example\.(?:com|org|net)|testserver|test\b))"
+        r"https?://(?!(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|testserver|test\b))"
         r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
     )
     _plugin_internal_escape_tokens = (
