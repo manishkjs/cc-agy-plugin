@@ -1,10 +1,78 @@
-# `cc-agy-plugin`: Call Google Antigravity SDK from Claude Code via MCP
+# cc-agy-plugin
 
-![Architecture: Claude Code calling Google Antigravity SDK via MCP](assets/architecture.svg)
+**Let one coding agent hand real work to another, safely, and know exactly what it cost.**
 
-`cc-agy-plugin` connects two coding agent harnesses over the Model Context Protocol (MCP): **Claude Code** acts as the lead engineer, while **Google Antigravity SDK** (defaulting to `gemini-3.1-pro-preview` for worker delegations and `gemini-2.5-flash` for single-shot reviews, with support for `gemini-3.5-flash-lite`, `gemini-3.8-flash`, and `gemini-4-argon`) acts as the execution worker inside an isolated copy of your repository.
+![Architecture: a Lead agent delegating to a Gemini Worker through the plugin](assets/architecture.svg)
+
+## The one-paragraph version
+
+Coding agents such as Claude Code and Google Antigravity are good at understanding a problem but expensive when they do all the typing, testing and retrying themselves. `cc-agy-plugin` sits between the agent you already use (the **Lead**) and a Gemini model that does the hands-on work (the **Worker**). The Worker edits an isolated copy of your repository, runs the tests, and returns a reviewed diff. Nothing touches your real code until the checks pass, every change carries a signed receipt, and the bill is reported per job. Because the plugin speaks the Model Context Protocol (MCP), the same plugin works from Claude Code and from Antigravity without changes.
+
+## Why this matters
+
+| Problem today | What the plugin does about it |
+|---|---|
+| The Lead model re-reads the repository on every task, and most of the cost is this exploration | A cached map of the repository and a short task brief are handed to the Worker, so the Lead reads less and the Worker starts informed |
+| Agents sometimes change the wrong files, or leave a half-finished edit behind | The Worker works in a copy; a 3-way merge applies only the verified diff, and a one-call revert restores the previous state |
+| Nobody can say afterwards which model changed which line, or what it cost | Every job writes an HMAC-signed receipt with files, hashes and token usage; a cost report adds the Lead's own session for the true total |
+| Long runs time out and the work is lost | Finished worker edits are applied automatically, and unapplied edits are saved when the server shuts down |
+| A fix passes the new tests but breaks an old one | The existing tests for every changed module are added to the acceptance run automatically |
+
+## What we measured
+
+On 16 real repository tasks from the DeepSWE v1.1 suite (one run per task, same Gemini model and settings in every arm):
+
+| Setup | Tasks solved | Total cost | Cost per solved task | Model turns |
+|---|:---:|:---:|:---:|:---:|
+| Antigravity alone | 10 / 16 | 3,084¢ | 308¢ | 580 |
+| Antigravity + cc-agy-plugin | 11 / 16 | **2,352¢** | **214¢** | **433** |
+| Claude Code + cc-agy-plugin | **12 / 16** | 2,984¢ | 249¢ | 598 |
+
+Read it as: with the plugin, the same model solved more tasks for 24% less money and 25% fewer turns. Claude Code solved the most tasks because its Lead reviews the Worker's diff and sends it back for a second pass; that review costs about 38¢ per task on top. These are early numbers from a small set and a single run each; the remaining 17 tasks of the suite are still to be run.
+
+## How a task flows
+
+```mermaid
+flowchart LR
+  U["You ask the Lead agent"] --> L["Lead writes a short brief<br/>(goal, plan, acceptance tests)"]
+  L --> W["Gemini Worker edits an<br/>isolated copy of the repo"]
+  W --> T["Plugin runs the tests<br/>(new + existing)"]
+  T -->|fail| W
+  T -->|pass| D["Signed receipt + diff"]
+  D --> A["Apply to your repo<br/>(3-way merge, revertible)"]
+  A --> C["Cost report:<br/>Worker + Lead = true total"]
+```
+
+## What is in the box
+
+- **Delegation tools** (`delegate_start`, `delegate_continue`, `get_diff`, `delegate_apply`, `delegate_revert`, `ask_gemini` and friends): the Lead's interface to the Worker.
+- **Batch file writing**: for changes across many files, the Lead writes a plan once and single-shot writers produce each file, with checks per file and a cheap-first model ladder.
+- **Guardrails**: strict mode blocks the Lead from editing files directly so work goes through the audited path; a hook rejects briefs that dictate code instead of outcomes; outbound network and host-path escapes from the Worker's shell are blocked.
+- **Cost accounting**: per-job receipts in cents, and a true-total report that includes the Lead session.
+- **Works in both harnesses**: Claude Code (as a plugin) and Antigravity (as an MCP server) use the same code and the same tools.
+
+## Getting started in two minutes
+
+```bash
+python3 -m pip install -e ".[antigravity]"      # plugin + Antigravity SDK + Straitjacket
+export GEMINI_API_KEY="your-key"                 # or use Google Cloud ADC, see Quick Start below
+cd /path/to/your/repo
+claude --plugin-dir /path/to/cc-agy-plugin       # then: /mcp to confirm the "vertex" server is connected
+```
+
+Then ask: *"Use `delegate_start` to add input validation to `api/orders.py` with tests, show me the diff, and apply it."*
+
+## Status
+
+- Version 0.2.0, Apache 2.0 licensed, 165 automated tests.
+- Known gap: if an outside process force-kills the plugin server (SIGKILL), unapplied worker edits are not saved.
+- Roadmap: finish the 33-task benchmark, run the same patterns inside Antigravity end to end, and publish per-pattern cost guidance.
 
 ---
+
+# Technical Reference
+
+Everything below is for engineers setting up, operating, or extending the plugin.
 
 ## Architecture & Trade-Offs: Why Connect Two Harnesses?
 
@@ -257,7 +325,7 @@ cc-agy-plugin/
 ## Running Tests
 
 ```bash
-pytest tests/test_cc_agy_plugin.py -v
+pytest tests/ -q   # 165 tests
 ```
 
 ## License
