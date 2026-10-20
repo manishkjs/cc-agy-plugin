@@ -12,17 +12,17 @@
 
 [Why it matters](#why-it-matters) · [Results](#results) · [How it works](#how-it-works) · [Get started](#get-started) · [Technical reference](#technical-reference)
 
-</div>
-
 <br>
 
 <table>
 <tr>
-<td align="center" width="33%"><h3>24% cheaper</h3>same model, same 16 tasks</td>
-<td align="center" width="33%"><h3>25% fewer turns</h3>less back and forth</td>
-<td align="center" width="33%"><h3>+1 to +2 tasks</h3>solved vs. agent alone</td>
+<td align="center" width="260"><h3>24% cheaper</h3>with the plugin, same model</td>
+<td align="center" width="260"><h3>25% fewer turns</h3>with the plugin, same model</td>
+<td align="center" width="260"><h3>12 of 16 solved</h3>best setup, Claude Code + plugin</td>
 </tr>
 </table>
+
+</div>
 
 ## Why it matters
 
