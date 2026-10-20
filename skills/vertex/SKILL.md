@@ -81,6 +81,6 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
    - Call `delegate_status()` to view cumulative prompt, cached, output, and thinking token counts and USD/cents cost across all jobs for the active workspace.
    - Call `cost_report()` for the true total: dispatched Gemini cost from receipts plus your own Claude Code session rebuilt from its transcripts. Report savings on the true total, never on dispatched cost alone.
 7. **When the worker keeps failing**:
-   - If a digest carries `escalation.escalate_to_lead=true` (two failed turns in a row), stop delegating that task. Inspect `get_diff(job_id=...)` and finish it yourself, or `delegate_discard` and re-plan. Only pass `force_retry=true` to `delegate_continue` with a materially different instruction.
+   - If a digest carries `escalation.escalate_to_lead=true` (two failed turns in a row), stop delegating that task. Inspect `get_diff(job_id=...)` and finish it yourself, or `delegate_cancel` and re-plan. Only pass `force_retry=true` to `delegate_continue` with a materially different instruction.
 8. **Undo an applied job**:
    - `delegate_revert(job_id=..., dry_run=true)` shows what would be restored; drop `dry_run` to restore. It refuses if files changed after the apply; `skip_dirty=true` reverts only the clean files.

@@ -1,6 +1,6 @@
 {
   "name": "cc-agy-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Delegate coding, review, and research tasks from Claude Code to Google AI Studio or Vertex AI Gemini models via the Google Antigravity SDK, google-genai, and Straitjacket shell containment.",
   "author": {
     "name": "Manish Kumar"

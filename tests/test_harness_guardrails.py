@@ -1008,3 +1008,21 @@ def test_whole_plugin_strict_mode_defaults(tmp_path: Path, monkeypatch) -> None:
     assert "strict_auto_applied" in (repo / "app.py").read_text(encoding="utf-8")
     jm.shutdown()
 
+
+def test_extract_usage_metadata_handles_dict_model_and_attr_bag() -> None:
+    from server.agy_runner import extract_usage_metadata
+
+    got = extract_usage_metadata({"prompt_token_count": 120, "candidates_token_count": 30, "thoughts_token_count": 5})
+    assert got["prompt_token_count"] == 120
+    assert got["total_token_count"] == 155
+
+    class Bag:
+        prompt_token_count = 7
+        cached_content_token_count = 0
+        candidates_token_count = 1
+        thoughts_token_count = 0
+        total_token_count = 8
+
+    assert extract_usage_metadata(Bag())["total_token_count"] == 8
+    assert extract_usage_metadata(None)["total_token_count"] == 0
+    assert extract_usage_metadata({"prompt_token_count": "bad"})["prompt_token_count"] == 0

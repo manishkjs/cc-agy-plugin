@@ -14,8 +14,6 @@ from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     first_valid_env,
     resolve_auth_config,
-    resolve_vertex_location,
-    resolve_vertex_project,
     sanitize_placeholder_env,
     truncate_to_token_budget,
 )

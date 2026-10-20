@@ -17,8 +17,6 @@ from typing import Any, Callable
 
 from server.regions import (
     resolve_auth_config,
-    resolve_vertex_location,
-    resolve_vertex_project,
     sanitize_placeholder_env,
 )
 
@@ -168,13 +166,28 @@ async def resolve_turn_usage(resp: Any) -> dict[str, int]:
         raw = await maybe_await(getattr(resp, "usage_metadata", None))
     except Exception:
         return usage
+    return extract_usage_metadata(raw)
+
+
+def extract_usage_metadata(raw: Any) -> dict[str, int]:
+    """Normalize one usage_metadata object (pydantic model, dict, or attribute bag) into token counters."""
+    usage = {
+        "prompt_token_count": 0,
+        "cached_content_token_count": 0,
+        "candidates_token_count": 0,
+        "thoughts_token_count": 0,
+        "total_token_count": 0,
+    }
     if raw is None:
         return usage
     data = raw.model_dump() if hasattr(raw, "model_dump") else (dict(raw) if isinstance(raw, dict) else {})
     if not data:
         data = {k: getattr(raw, k, 0) for k in usage}
     for k in usage:
-        usage[k] = int(data.get(k) or 0)
+        try:
+            usage[k] = int(data.get(k) or 0)
+        except (TypeError, ValueError):
+            usage[k] = 0
     if usage["total_token_count"] == 0:
         usage["total_token_count"] = (
             usage["prompt_token_count"] + usage["candidates_token_count"] + usage["thoughts_token_count"]

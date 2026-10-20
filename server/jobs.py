@@ -35,7 +35,6 @@ from server.receipts import (
     parse_unified_header_path,
     resolve_workspace_root,
     sha256_bytes,
-    unquote_git_path,
     validate_job_id,
 )
 from server.regions import (
@@ -46,8 +45,6 @@ from server.regions import (
     paginate_text_by_tokens,
     resolve_api_key,
     resolve_auth_config,
-    resolve_vertex_location,
-    resolve_vertex_project,
     truncate_to_token_budget,
 )
 
@@ -2718,7 +2715,7 @@ class JobManager:
                 "last_acceptance_passed": payload.get("acceptance_passed"),
                 "recommendation": (
                     f"The Gemini worker failed {count} attempts in a row. Stop delegating this task: as the Lead, "
-                    f"inspect get_diff(job_id={job_id!r}), then finish it yourself (or delegate_discard and start over). "
+                    f"inspect get_diff(job_id={job_id!r}), then finish it yourself (or delegate_cancel and start over). "
                     "delegate_continue refuses further Gemini attempts on this job unless force_retry=true."
                 ),
             }
@@ -2786,7 +2783,7 @@ class JobManager:
         if not self.store.verify_receipt_signature(receipt):
             raise ValueError(f"Receipt for job '{safe_id}' failed its HMAC check; refusing to revert from it.")
         if not receipt.get("applied"):
-            raise ValueError(f"Job '{safe_id}' was never applied; nothing to revert (use delegate_discard).")
+            raise ValueError(f"Job '{safe_id}' was never applied; nothing to revert (use delegate_cancel).")
         if receipt.get("reverted"):
             return {"job_id": safe_id, "reverted": True, "already_reverted": True,
                     "reverted_files": receipt.get("reverted_files", [])}
