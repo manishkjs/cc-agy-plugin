@@ -1,80 +1,113 @@
+<div align="center">
+
 # cc-agy-plugin
 
-**Let one coding agent hand real work to another, safely, and know exactly what it cost.**
+**Let your coding agent hand real work to a cheaper Gemini worker, safely, with a receipt for every change.**
 
-![Architecture: a Lead agent delegating to a Gemini Worker through the plugin](assets/architecture.svg)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-1a73e8)](.claude-plugin/plugin.json)
+[![Tests](https://img.shields.io/badge/tests-165%20passing-1e8e3e)](tests/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
+[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Antigravity-f9ab00)](#how-it-works)
 
-## The one-paragraph version
+[Why it matters](#why-it-matters) · [Results](#results) · [How it works](#how-it-works) · [Get started](#get-started) · [Technical reference](#technical-reference)
 
-Coding agents such as Claude Code and Google Antigravity are good at understanding a problem but expensive when they do all the typing, testing and retrying themselves. `cc-agy-plugin` sits between the agent you already use (the **Lead**) and a Gemini model that does the hands-on work (the **Worker**). The Worker edits an isolated copy of your repository, runs the tests, and returns a reviewed diff. Nothing touches your real code until the checks pass, every change carries a signed receipt, and the bill is reported per job. Because the plugin speaks the Model Context Protocol (MCP), the same plugin works from Claude Code and from Antigravity without changes.
+</div>
 
-## Why this matters
+<br>
 
-| Problem today | What the plugin does about it |
-|---|---|
-| The Lead model re-reads the repository on every task, and most of the cost is this exploration | A cached map of the repository and a short task brief are handed to the Worker, so the Lead reads less and the Worker starts informed |
-| Agents sometimes change the wrong files, or leave a half-finished edit behind | The Worker works in a copy; a 3-way merge applies only the verified diff, and a one-call revert restores the previous state |
-| Nobody can say afterwards which model changed which line, or what it cost | Every job writes an HMAC-signed receipt with files, hashes and token usage; a cost report adds the Lead's own session for the true total |
-| Long runs time out and the work is lost | Finished worker edits are applied automatically, and unapplied edits are saved when the server shuts down |
-| A fix passes the new tests but breaks an old one | The existing tests for every changed module are added to the acceptance run automatically |
+<table>
+<tr>
+<td align="center" width="33%"><h3>24% cheaper</h3>same model, same 16 tasks</td>
+<td align="center" width="33%"><h3>25% fewer turns</h3>less back and forth</td>
+<td align="center" width="33%"><h3>+1 to +2 tasks</h3>solved vs. agent alone</td>
+</tr>
+</table>
 
-## What we measured
+## Why it matters
 
-On 16 real repository tasks from the DeepSWE v1.1 suite (one run per task, same Gemini model and settings in every arm):
+Coding agents are good at understanding a problem but expensive when they also do all the typing, testing and retrying. `cc-agy-plugin` lets the agent you already use stay in charge while a Gemini worker does the hands-on work in a safe copy of your code.
+
+| Today | With cc-agy-plugin |
+|:--|:--|
+| The agent re-reads the whole repo for every task | The worker gets a cached map of the repo and a short brief |
+| Edits can land in the wrong place or half-finished | Work happens in a copy and lands only after tests pass |
+| No record of which model changed which line | Every change has a signed receipt and a one-call undo |
+| Cost is a monthly surprise | Cost per job, in cents, including the agent's own session |
+| A timed-out run loses its work | Finished edits are applied and unfinished ones are saved |
+
+## Results
+
+Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, same Gemini model and settings in every setup.
 
 | Setup | Tasks solved | Total cost | Cost per solved task | Model turns |
-|---|:---:|:---:|:---:|:---:|
+|:--|:--:|:--:|:--:|:--:|
 | Antigravity alone | 10 / 16 | 3,084¢ | 308¢ | 580 |
-| Antigravity + cc-agy-plugin | 11 / 16 | **2,352¢** | **214¢** | **433** |
-| Claude Code + cc-agy-plugin | **12 / 16** | 2,984¢ | 249¢ | 598 |
+| **Antigravity + cc-agy-plugin** | 11 / 16 | **2,352¢** | **214¢** | **433** |
+| **Claude Code + cc-agy-plugin** | **12 / 16** | 2,984¢ | 249¢ | 598 |
 
-Read it as: with the plugin, the same model solved more tasks for 24% less money and 25% fewer turns. Claude Code solved the most tasks because its Lead reviews the Worker's diff and sends it back for a second pass; that review costs about 38¢ per task on top. These are early numbers from a small set and a single run each; the remaining 17 tasks of the suite are still to be run.
+- **Cheapest:** Antigravity with the plugin. Same model, one more task solved, 24% lower cost.
+- **Most tasks solved:** Claude Code with the plugin. Its agent reviews the worker's result and sends it back once when something is missed, which costs about 38¢ more per task.
 
-## How a task flows
+> [!NOTE]
+> These are early numbers: 16 of the 33 tasks in the suite, one run each. The remaining tasks are next.
 
-```mermaid
-flowchart LR
-  U["You ask the Lead agent"] --> L["Lead writes a short brief<br/>(goal, plan, acceptance tests)"]
-  L --> W["Gemini Worker edits an<br/>isolated copy of the repo"]
-  W --> T["Plugin runs the tests<br/>(new + existing)"]
-  T -->|fail| W
-  T -->|pass| D["Signed receipt + diff"]
-  D --> A["Apply to your repo<br/>(3-way merge, revertible)"]
-  A --> C["Cost report:<br/>Worker + Lead = true total"]
-```
+## How it works
 
-## What is in the box
+<p align="center">
+  <img src="assets/overview.svg" alt="The Lead agent sends a brief to cc-agy-plugin, which runs a Gemini worker in an isolated copy, tests the result, and returns a signed, costed diff" width="100%">
+</p>
 
-- **Delegation tools** (`delegate_start`, `delegate_continue`, `get_diff`, `delegate_apply`, `delegate_revert`, `ask_gemini` and friends): the Lead's interface to the Worker.
-- **Batch file writing**: for changes across many files, the Lead writes a plan once and single-shot writers produce each file, with checks per file and a cheap-first model ladder.
-- **Guardrails**: strict mode blocks the Lead from editing files directly so work goes through the audited path; a hook rejects briefs that dictate code instead of outcomes; outbound network and host-path escapes from the Worker's shell are blocked.
-- **Cost accounting**: per-job receipts in cents, and a true-total report that includes the Lead session.
-- **Works in both harnesses**: Claude Code (as a plugin) and Antigravity (as an MCP server) use the same code and the same tools.
+1. **You ask your agent** (Claude Code or Antigravity) for a change, as usual.
+2. **The agent writes a short brief**: the goal, a plan and the tests that prove it works.
+3. **The plugin runs a Gemini worker** in an isolated copy of the repository. It edits, runs the new and existing tests, and retries until they pass.
+4. **The agent reviews the diff** and the plugin applies it with a signed receipt and a cost line. One call undoes it.
 
-## Getting started in two minutes
+## What is included
+
+| Capability | What it does |
+|:--|:--|
+| **Delegation** | Start, continue, review and apply worker jobs from any MCP-capable agent |
+| **Batch writing** | Many-file changes from one plan, with per-file checks and a cheap-first model ladder |
+| **Guardrails** | Strict mode routes all edits through the audited path; worker shell is fenced to the copy |
+| **Recovery** | Auto-apply on success, save on shutdown, resume a paused job instead of restarting |
+| **Accounting** | Signed receipts per job and a true-total cost report that includes the agent's session |
+
+## Get started
 
 ```bash
-python3 -m pip install -e ".[antigravity]"      # plugin + Antigravity SDK + Straitjacket
-export GEMINI_API_KEY="your-key"                 # or use Google Cloud ADC, see Quick Start below
+# 1. Install the plugin with the Antigravity SDK and Straitjacket
+python3 -m pip install -e ".[antigravity]"
+
+# 2. Add a Gemini API key (or use Google Cloud credentials, see full setup below)
+export GEMINI_API_KEY="your-key"
+
+# 3. Start Claude Code in your repo with the plugin loaded, then run /mcp to confirm
 cd /path/to/your/repo
-claude --plugin-dir /path/to/cc-agy-plugin       # then: /mcp to confirm the "vertex" server is connected
+claude --plugin-dir /path/to/cc-agy-plugin
 ```
 
-Then ask: *"Use `delegate_start` to add input validation to `api/orders.py` with tests, show me the diff, and apply it."*
+Then ask your agent: *"Use `delegate_start` to add input validation to `api/orders.py` with tests, show me the diff, and apply it."*
 
 ## Status
 
-- Version 0.2.0, Apache 2.0 licensed, 165 automated tests.
-- Known gap: if an outside process force-kills the plugin server (SIGKILL), unapplied worker edits are not saved.
-- Roadmap: finish the 33-task benchmark, run the same patterns inside Antigravity end to end, and publish per-pattern cost guidance.
+| Item | Detail |
+|:--|:--|
+| **Version** | 0.2.0, Apache 2.0 |
+| **Quality** | 165 automated tests |
+| **Known gap** | If another process force-kills the plugin server, unapplied worker edits are not saved |
+| **Next** | Finish the 33-task benchmark, run the full flow inside Antigravity, publish cost guidance per pattern |
 
 ---
 
-# Technical Reference
+## Technical reference
 
-Everything below is for engineers setting up, operating, or extending the plugin.
+Setup, internals and configuration for engineers. Click a section to expand it.
 
-## Architecture & Trade-Offs: Why Connect Two Harnesses?
+<details>
+<summary><b>Architecture and rate card</b></summary>
+
+![Technical architecture](assets/architecture.svg)
 
 `cc-agy-plugin` connects Claude Code to the Google Antigravity SDK so a single workspace can combine Anthropic and Gemini models with strict worktree isolation and cryptographic diff provenance:
 
@@ -104,7 +137,10 @@ Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` 
 
 ---
 
-## Quick Start
+</details>
+
+<details>
+<summary><b>Full setup (API key or Google Cloud)</b></summary>
 
 ### Option A: Google AI Studio API Key (Fastest Setup)
 
@@ -160,7 +196,10 @@ Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, t
 
 ---
 
-## How One Harness Calls the Other (End-to-End Flow)
+</details>
+
+<details>
+<summary><b>End-to-end flow (hooks, MCP, isolation, provenance)</b></summary>
 
 1. **Hook Pre-Flight Check (`scripts/pre_tool_guard.py`)**:
    - A pre-flight linter always rejects delegation prompts (or `plan` steps) containing more than 8 consecutive lines of code so the lead agent writes concise outcome briefs instead of dictating implementation code into the prompt.
@@ -180,7 +219,10 @@ Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, t
 
 ---
 
-## MCP Tools Reference
+</details>
+
+<details>
+<summary><b>MCP tools reference (17 tools)</b></summary>
 
 | Tool | Purpose |
 |---|---|
@@ -209,7 +251,10 @@ Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, t
 
 ---
 
-## Batch file writing
+</details>
+
+<details>
+<summary><b>Batch file writing</b></summary>
 
 Large changes usually cost the most where the Lead types file after file. `delegate_file_batch` moves only the typing: the Lead still explores, plans and reviews, then hands the plan over as one JSON file.
 
@@ -249,7 +294,10 @@ Inspired by the architect/editor split popularized by Aider and by cheap-first m
 
 ---
 
-## Runtime Settings
+</details>
+
+<details>
+<summary><b>Runtime settings (environment variables)</b></summary>
 
 Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT_MODE=true` (or `userConfig.strict_delegation_mode=true`).
 
@@ -266,14 +314,20 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 
 Acceptance runs also add existing tests for each changed module (`tests/test_<module>.py` or `<module>_test.py`), and job results include a `next_action` hint for the Lead.
 
-## Isolated Copy vs. `in_place` Mode
+</details>
+
+<details>
+<summary><b>Isolated copy vs. in-place mode</b></summary>
 
 - **Isolated copy (default, `in_place=false`)**: Every job runs in its own standalone copy of tracked files under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`). Multiple jobs can run in parallel, failed runs leave your working tree untouched, and host `.git/hooks` and `.git/config` are snapshot-verified around every run.
 - **Direct working-tree mode (`in_place=true`)**: Edits your live checkout directly so the worker can use gitignored virtual environments (`.venv/`, `node_modules/`) without copying them. Requires a clean tracked tree, allows one `in_place` job at a time, automatically restores your original branch and unwinds any worker git commits (`git reset --mixed`) while keeping file edits on disk, and returns a shell-quoted `undo_hint` command to revert if needed.
 
 ---
 
-## Repository Layout
+</details>
+
+<details>
+<summary><b>Repository layout</b></summary>
 
 ```text
 cc-agy-plugin/
@@ -322,16 +376,21 @@ cc-agy-plugin/
 └── LICENSE                  # Apache License 2.0
 ```
 
-## Running Tests
+</details>
+
+<details>
+<summary><b>Running tests</b></summary>
 
 ```bash
 pytest tests/ -q   # 165 tests
 ```
 
-## License
+</details>
+
+### License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE).
 
-## Acknowledgments
+### Acknowledgments
 
 Special thanks to Vamsi Ramakrishnan ([github.com/vamsiramakrishnan/straitjacket](https://github.com/vamsiramakrishnan/straitjacket)) for building Straitjacket, whose bounded command execution and addressable evidence retrieval architecture inspired and powers our worker containment pipeline.
