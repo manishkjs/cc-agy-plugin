@@ -310,6 +310,20 @@ _SAFE_NOTE_EXTENSIONS: tuple[str, ...] = (
     ".todo",
 )
 
+# Report files that test runners write at the repo root (pytest-cov, coverage.py, nose). The
+# host and the worker both produce them when they run the same tests, so capturing one turns
+# into a "created on both sides" apply conflict that throws away the worker's real edits.
+# Only matched at the repo root, so fixtures such as tests/fixtures/coverage.xml still apply.
+_GENERATED_REPORT_NAMES: frozenset[str] = frozenset(
+    {
+        "coverage.xml",
+        "coverage.json",
+        "coverage.lcov",
+        "lcov.info",
+        "nosetests.xml",
+    }
+)
+
 
 def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None) -> bool:
     """Return True if `rel_path` is a transient test/compiler cache artifact that should never be captured or applied."""
@@ -323,6 +337,7 @@ def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None
     name = parts[-1]
     if (
         name in (".coverage", ".DS_Store")
+        or (len(parts) == 1 and name in _GENERATED_REPORT_NAMES)
         or name.startswith(".coverage.")
         or name.endswith(_EPHEMERAL_CACHE_SUFFIXES)
     ):
@@ -339,6 +354,21 @@ def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None
             except OSError:
                 pass
     return False
+
+
+def _is_gitignored_on_host(workspace_root: Path, rel_path: str) -> bool:
+    """True if `rel_path` is ignored by the host repo's .gitignore rules (False when not a git repo)."""
+    try:
+        res = subprocess.run(
+            ["git", "check-ignore", "-q", "--", rel_path],
+            cwd=str(workspace_root),
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
 
 
 def _is_ignored_build_artifact(rel_path: str, root: Path | None = None) -> bool:
@@ -2884,6 +2914,7 @@ class JobManager:
         # 2. If host files changed since baseline, attempt in-memory 3-way merge via `git merge-file -p`
         # without ever touching the host repository's git index.
         merged_payloads: dict[str, bytes] = {}
+        skipped_ignored_conflicts: list[str] = []
         if conflicted_files:
             if not wt_dir.exists():
                 raise ValueError(
@@ -2903,6 +2934,11 @@ class JobManager:
                     check=False,
                 )
                 if base_show.returncode != 0:
+                    if _is_gitignored_on_host(self.workspace_root, rel_path):
+                        # Generated output (gitignored) written by both sides, e.g. a test report:
+                        # keep the host copy rather than failing the whole apply.
+                        skipped_ignored_conflicts.append(rel_path)
+                        continue
                     raise ValueError(
                         f"Conflict detected: host file {rel_path!r} was concurrently created on both host and worker."
                     )
@@ -2925,6 +2961,9 @@ class JobManager:
                             f"'{safe_id}' started and could not be cleanly merged."
                         )
                     merged_payloads[rel_path] = merge_res.stdout
+
+        if skipped_ignored_conflicts:
+            files_changed = [f for f in files_changed if f not in skipped_ignored_conflicts]
 
         # Record each target's pre-apply state (bytes backed up under data_dir/backups/<job_id>/) so
         # delegate_revert can restore the workspace exactly, including uncommitted host edits.
@@ -2969,6 +3008,10 @@ class JobManager:
 
         # Compute exact provenance and post-apply SHA-256 hashes of the applied files
         applied_prov = extract_diff_provenance(diff_text)
+        if skipped_ignored_conflicts:
+            applied_prov["files_changed"] = [
+                f for f in applied_prov.get("files_changed", []) if f not in skipped_ignored_conflicts
+            ]
         applied_file_hashes: dict[str, str | None] = {}
         for fpath in applied_files:
             if fpath not in applied_prov["files_changed"]:
@@ -2999,6 +3042,7 @@ class JobManager:
             "job_id": safe_id,
             "applied": True,
             "applied_files": applied_files,
+            **({"kept_host_copy": skipped_ignored_conflicts} if skipped_ignored_conflicts else {}),
             "diff_sha256": applied_prov["diff_sha256"],
             "revert_hint": f"delegate_revert(job_id={safe_id!r}) restores these files to their pre-apply state.",
         }
@@ -3226,6 +3270,8 @@ class JobManager:
             digest["applied"] = True
             digest["applied_files"] = apply_res.get("applied_files", [])
             digest["diff_sha256"] = apply_res.get("diff_sha256")
+            if apply_res.get("kept_host_copy"):
+                digest["kept_host_copy"] = apply_res["kept_host_copy"]
             digest.pop("next_action", None)
         return digest
 

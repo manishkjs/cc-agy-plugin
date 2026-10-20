@@ -691,6 +691,25 @@ _FORBIDDEN_INLINE_PYTHON_ATTRS: frozenset[str] = frozenset(
 )
 
 
+def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
+    """Extra strict-mode Lead reads granted once a worker job started in the current session exists."""
+    try:
+        bonus = int((env.get("CC_AGY_LEAD_REVIEW_READ_LIMIT") or "6").strip() or "6")
+    except ValueError:
+        bonus = 6
+    if bonus <= 0:
+        return 0
+    try:
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime if marker.exists() else 0.0
+        for receipt in (data_root / "receipts").glob("job-*"):
+            if receipt.stat().st_mtime >= since:
+                return bonus
+    except OSError:
+        return 0
+    return 0
+
+
 def _is_safe_python_inline_ast(code_str: str) -> bool:
     """Validate `python -c <code>` using an AST allowlist so dynamic/obfuscated mutations are rejected."""
     try:
@@ -2065,8 +2084,17 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
             except ValueError:
                 read_limit = 0
             if read_limit > 0:
-                data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+                try:
+                    from server.receipts import ReceiptStore
+
+                    data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
+                except Exception:
+                    data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
                 counter_path = data_root / ".lead_read_count"
+                # Once a worker job from this session exists, the Lead gets extra reads to check the
+                # result against the task. Without them a Lead that spent its planning reads has to
+                # accept the worker's result unchecked.
+                read_limit += _lead_review_read_bonus(data_root, source_env)
                 try:
                     current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
                 except Exception:
