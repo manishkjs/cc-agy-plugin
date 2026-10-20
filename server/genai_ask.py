@@ -23,50 +23,100 @@ from server.regions import (
 GenaiBackend = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def _close_genai_client(client: Any) -> None:
+    """Close underlying httpx/requests sessions on a google-genai Client."""
+    if client is None:
+        return
+    api_client = getattr(client, "_api_client", None)
+    for fn_owner in (
+        getattr(api_client, "_authorized_session", None),
+        getattr(getattr(api_client, "_auth", None), "session", None),
+        client,
+        api_client,
+    ):
+        if fn_owner is None:
+            continue
+        close_fn = getattr(fn_owner, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+
 def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
     """Invoke Google AI Studio or Vertex AI via the official google-genai SDK."""
     from google import genai
     from google.genai import types as genai_types
 
     sanitize_placeholder_env()
+    timeout_ms = int(request.get("timeout_ms") or 600_000)
+    vertex_base_url = (
+        request.get("base_url")
+        or os.environ.get("CC_AGY_VERTEX_BASE_URL")
+        or os.environ.get("GOOGLE_VERTEX_BASE_URL")
+        or ""
+    ).strip()
     if request.get("api_key"):
-        client = genai.Client(api_key=request["api_key"])
+        http_opts = genai_types.HttpOptions(timeout=timeout_ms)
+        client = genai.Client(api_key=request["api_key"], http_options=http_opts)
+    elif vertex_base_url:
+        http_opts = genai_types.HttpOptions(
+            timeout=timeout_ms,
+            base_url=vertex_base_url,
+            headers={"Authorization": "Bearer " + os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN", "custom-endpoint")},
+        )
+        client = genai.Client(
+            vertexai=True,
+            project=request.get("project") or "custom-endpoint",
+            location=request.get("location") or "global",
+            http_options=http_opts,
+        )
     else:
+        http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(
             vertexai=True,
             project=request.get("project"),
             location=request.get("location"),
+            http_options=http_opts,
         )
-    cfg_kwargs: dict[str, Any] = {}
-    if request.get("system_instruction"):
-        cfg_kwargs["system_instruction"] = request["system_instruction"]
-    if request.get("temperature") is not None:
-        cfg_kwargs["temperature"] = float(request["temperature"])
+    try:
+        cfg_kwargs: dict[str, Any] = {}
+        if request.get("system_instruction"):
+            cfg_kwargs["system_instruction"] = request["system_instruction"]
+        if request.get("temperature") is not None:
+            cfg_kwargs["temperature"] = float(request["temperature"])
+        if request.get("thinking_level"):
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=str(request["thinking_level"])
+            )
 
-    config = genai_types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
-    response = client.models.generate_content(
-        model=request["model"],
-        contents=request["prompt"],
-        config=config,
-    )
-    usage_meta = getattr(response, "usage_metadata", None)
-    usage = {
-        "prompt_token_count": int(getattr(usage_meta, "prompt_token_count", 0) or 0),
-        "cached_content_token_count": int(
-            getattr(usage_meta, "cached_content_token_count", 0) or 0
-        ),
-        "candidates_token_count": int(
-            getattr(usage_meta, "candidates_token_count", 0) or 0
-        ),
-        "thoughts_token_count": int(
-            getattr(usage_meta, "thoughts_token_count", 0) or 0
-        ),
-        "total_token_count": int(getattr(usage_meta, "total_token_count", 0) or 0),
-    }
-    return {
-        "text": getattr(response, "text", "") or "",
-        "usage": usage,
-    }
+        config = genai_types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
+        response = client.models.generate_content(
+            model=request["model"],
+            contents=request["prompt"],
+            config=config,
+        )
+        usage_meta = getattr(response, "usage_metadata", None)
+        usage = {
+            "prompt_token_count": int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+            "cached_content_token_count": int(
+                getattr(usage_meta, "cached_content_token_count", 0) or 0
+            ),
+            "candidates_token_count": int(
+                getattr(usage_meta, "candidates_token_count", 0) or 0
+            ),
+            "thoughts_token_count": int(
+                getattr(usage_meta, "thoughts_token_count", 0) or 0
+            ),
+            "total_token_count": int(getattr(usage_meta, "total_token_count", 0) or 0),
+        }
+        return {
+            "text": getattr(response, "text", "") or "",
+            "usage": usage,
+        }
+    finally:
+        _close_genai_client(client)
 
 
 def ask_gemini(
@@ -76,6 +126,7 @@ def ask_gemini(
     context_files: list[str] | None = None,
     system_instruction: str | None = None,
     temperature: float | None = None,
+    thinking_level: str | None = None,
     project: str | None = None,
     location: str | None = None,
     api_key: str | None = None,
@@ -159,18 +210,19 @@ def ask_gemini(
 
     active_backend = backend or _default_genai_backend
     try:
-        result = active_backend(
-            {
-                "auth_mode": auth_mode,
-                "api_key": resolved_key,
-                "project": resolved_project,
-                "location": resolved_location,
-                "model": chosen_model,
-                "prompt": full_prompt,
-                "system_instruction": system_instruction,
-                "temperature": temperature,
-            }
-        )
+        req_payload: dict[str, Any] = {
+            "auth_mode": auth_mode,
+            "api_key": resolved_key,
+            "project": resolved_project,
+            "location": resolved_location,
+            "model": chosen_model,
+            "prompt": full_prompt,
+            "system_instruction": system_instruction,
+            "temperature": temperature,
+        }
+        if thinking_level:
+            req_payload["thinking_level"] = thinking_level
+        result = active_backend(req_payload)
         response_text = str(result.get("text") or "")
         if isinstance(result.get("usage"), dict):
             for k in usage:

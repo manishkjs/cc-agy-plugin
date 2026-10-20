@@ -68,11 +68,84 @@ def read_progress(progress_path: str | Path | None, limit: int = 8) -> list[dict
     return entries[-max(1, limit):]
 
 
-def resolve_thinking_level(value: str | None) -> str | None:
-    """Return the worker thinking level (default HIGH); "DEFAULT"/"NONE" leaves it to the model's own default."""
-    raw = (value or os.environ.get("CC_AGY_DELEGATE_THINKING_LEVEL") or "HIGH").strip().upper()
+WORKER_SYSTEM_PROMPT = (
+    "You are a headless software engineering worker inside an isolated repository copy with "
+    "Straitjacket (ctx-harness) tools. Implement or investigate the requested task using "
+    "the cached repository map, candidate files, and Straitjacket tools (run_command, ctx_get, ctx_search, "
+    "view_file, search_dir, list_dir, find_file, ctx_query). When output is bounded to an "
+    "evidence address (e.g. run:<id>#stdout or repo:<path>), inspect spans with ctx_get/ctx_search "
+    "instead of rerunning commands; keep edits within allowed_paths and finish with a summary under 250 words."
+)
+
+
+def build_worker_system_prompt(
+    ws_str: str,
+    *,
+    profile: str | None = None,
+    has_report_to_lead: bool = False,
+) -> str:
+    """Build a workspace-aware system instruction block for the active Straitjacket tool profile."""
+    eff_profile = (profile or os.environ.get("CC_AGY_CONTAINMENT_PROFILE") or "command-output").strip().lower()
+    if eff_profile == "read-only":
+        tool_list = "ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query"
+    elif eff_profile == "full":
+        tool_list = "run_command, ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query, edit_file, create_file"
+    else:
+        tool_list = "run_command, ctx_get, ctx_search, view_file, edit_file, create_file"
+    if has_report_to_lead:
+        tool_list += ", report_to_lead"
+    return (
+        f"{WORKER_SYSTEM_PROMPT}\n"
+        f"- Workspace root (use exact absolute path for file tools): {ws_str}\n"
+        f"- Active tools ({eff_profile}): {tool_list}.\n"
+        "- Read & edit early: batch view_file calls in parallel (1..500 lines, no 50-100 slices or re-reads); edit within <=8 calls.\n"
+        "- Bounded thinking: never draft full code in thinking (<1,500 tokens/turn); emit create_file/edit_file directly.\n"
+        "- Direct verification: skip `python3 -c` / `node -e` probes; edit files, run Acceptance tests, and stop once green.\n"
+        "- Non-interactive: never ask the user; call report_to_lead(kind='question'|'blocker', ...) only if blocked.\n"
+        "- Credential & git hygiene: never read/edit .env*, .mcp.json, .netrc, *.pem, *.key, or .claude/settings*.json; never run git commit/reset/checkout/clean."
+    )
+
+
+def is_read_only_tool_set(
+    enabled_tools: list[str] | None,
+    disabled_tools: list[str] | None,
+) -> bool:
+    """Return True when the caller excluded every file-writing and command-running tool."""
+    mutating_names = {"CREATE_FILE", "EDIT_FILE", "RUN_COMMAND"}
+    if enabled_tools is not None:
+        up = {str(t).strip().upper() for t in enabled_tools if str(t).strip()}
+        if up and not (up & mutating_names):
+            return True
+    if disabled_tools is not None:
+        dis = {str(t).strip().upper() for t in disabled_tools if str(t).strip()}
+        if mutating_names.issubset(dis):
+            return True
+    return False
+
+
+def resolve_thinking_level(
+    value: str | None,
+    *,
+    model: str | None = None,
+    read_only: bool = False,
+) -> str | None:
+    """Return the worker thinking level.
+
+    Defaults to ``LOW`` for mutating coding jobs (`read_only=False`) so multi-turn workers
+    act and run tests empirically without 35k+ token single-turn thinking stalls, and
+    ``HIGH`` for read-only investigation (`read_only=True`). ``"DEFAULT"`` / ``"NONE"``
+    leaves it to the model's own default.
+    """
+    raw_env = (os.environ.get("CC_AGY_DELEGATE_THINKING_LEVEL") or "").strip()
+    if raw_env.startswith("${"):
+        raw_env = ""
+    forced_env = (os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL") or "").strip().upper()
+    if not read_only and forced_env in THINKING_LEVELS:
+        return forced_env
+    default_level = "HIGH" if read_only else "LOW"
+    raw = (value or raw_env or default_level).strip().upper()
     if raw.startswith("${"):
-        raw = "HIGH"
+        raw = default_level
     if raw in ("DEFAULT", "NONE", ""):
         return None
     if raw not in THINKING_LEVELS:
@@ -360,11 +433,32 @@ def _coerce_line_number(value: Any, default: int) -> int:
         return max(1, default)
 
 
+_SECRET_BASENAMES = frozenset({
+    ".env", ".netrc", ".npmrc", ".pypirc", ".mcp.json", ".hmac_key",
+    "id_rsa", "id_ed25519", "id_ecdsa", "credentials.json",
+})
+_EXTRA_CTX_DENY_GLOBS = (
+    ".netrc", "**/.netrc",
+    ".npmrc", "**/.npmrc",
+    ".pypirc", "**/.pypirc",
+    ".mcp.json", "**/.mcp.json",
+    ".hmac_key", "**/.hmac_key",
+    "id_ecdsa*", "**/id_ecdsa*",
+    "credentials.json", "**/credentials.json",
+    "*.p12", "**/*.p12",
+    "*.pfx", "**/*.pfx",
+    ".claude/settings.local.json", "**/.claude/settings.local.json",
+    ".cc-agy-data/**", "**/.cc-agy-data/**",
+)
+
+
 def build_straitjacket_tools(
     workspace_dir: str | Path,
+    timeout_seconds: float | str = 300.0,
     *,
-    timeout_seconds: float = 300.0,
     profile: str | None = None,
+    is_lead_orchestrator: bool = False,
+    lead_read_limit: int = 12,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -373,15 +467,25 @@ def build_straitjacket_tools(
        `ValueError("command timeout exceeds the session timeout")` when `run_command` defaults to 600s.
     2. Coerces `start_line` / `end_line` in `ctx_get` to 1-indexed ints (`1 <= start_line <= end_line`)
        so 0-indexed, None, or float tool arguments from the model do not fail `ToolSession.get` type checks.
-    3. Supports both `command-output` (default) and `full` (`CC_AGY_CONTAINMENT_PROFILE=full`) profiles.
+    3. Supports `command-output` (default), `read-only`, and `full` (`CC_AGY_CONTAINMENT_PROFILE=full`) profiles,
+       while blocking `ws:` alias escapes, `..` traversal, and credential files.
     """
+    import ctx.config as _ctx_cfg
     from ctx.sdk import ToolSession
 
+    merged_globs = tuple(dict.fromkeys(tuple(_ctx_cfg.BUILTIN_DENY_GLOBS) + _EXTRA_CTX_DENY_GLOBS))
+    if _ctx_cfg.BUILTIN_DENY_GLOBS != merged_globs:
+        _ctx_cfg.BUILTIN_DENY_GLOBS = merged_globs
+
     resolved_profile = (profile or os.environ.get("CC_AGY_CONTAINMENT_PROFILE") or "command-output").strip().lower()
-    if resolved_profile not in ("command-output", "full"):
+    if resolved_profile not in ("command-output", "full", "read-only"):
         resolved_profile = "command-output"
 
-    session_timeout = max(60.0, float(timeout_seconds or 600.0))
+    try:
+        numeric_timeout = 300.0 if isinstance(timeout_seconds, str) else float(timeout_seconds or 600.0)
+    except (TypeError, ValueError):
+        numeric_timeout = 300.0
+    session_timeout = max(60.0, numeric_timeout)
     env_cmd_timeout = os.environ.get("CC_AGY_DEFAULT_CMD_TIMEOUT", "").strip()
     try:
         parsed_cmd_timeout = float(env_cmd_timeout) if env_cmd_timeout else 600.0
@@ -423,7 +527,27 @@ def build_straitjacket_tools(
         existing_path = (os.environ.get("PATH") or "").strip()
         scrubbed_env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
         scrubbed_env["VIRTUAL_ENV"] = str(ws_resolved / ".venv")
-    session = ToolSession(
+    from dataclasses import replace as _dc_replace
+
+    class _ExpandedToolSession(ToolSession):
+        def _workspace(self):
+            ws = super()._workspace()
+            b = ws.config.budgets
+            return _dc_replace(
+                ws,
+                config=_dc_replace(
+                    ws.config,
+                    budgets=_dc_replace(
+                        b,
+                        result_tokens=max(b.result_tokens, 6400),
+                        turn_retrieval_tokens=max(b.turn_retrieval_tokens, 16000),
+                        max_inline_lines=max(b.max_inline_lines, 750),
+                        max_inline_bytes=max(b.max_inline_bytes, 40960),
+                    ),
+                ),
+            )
+
+    session = _ExpandedToolSession(
         ws_resolved,
         timeout=session_timeout,
         env=scrubbed_env,
@@ -459,6 +583,8 @@ def build_straitjacket_tools(
         ".cc-agy-worktrees-",
         ".cc-agy-data",
         ".hmac_key",
+        "/google/",
+        "find / ",
     ) + extra_blocked_paths
 
     def _is_outbound_network_command(raw_cmd: str) -> bool:
@@ -476,6 +602,60 @@ def build_straitjacket_tools(
         if any(tok in scrubbed for tok in _plugin_internal_escape_tokens):
             return True
         return False
+
+    import subprocess as _sp
+    _session_started_mono = time.monotonic()
+    _straitjacket_state = {"calls": 0, "last_git_check": 0.0, "has_edits": False}
+
+    def _maybe_append_turn_budget_note(raw_output: str) -> str:
+        if resolved_profile == "read-only":
+            if not is_lead_orchestrator:
+                return raw_output
+            _straitjacket_state["calls"] += 1
+            calls = _straitjacket_state["calls"]
+            if calls >= 3:
+                return (
+                    f"{raw_output}\n"
+                    f"[Lead budget: {calls}/{lead_read_limit} read/search calls used — once you know the target files, "
+                    "call delegate_start with a concise prompt (<500 words, no 'Wait:' self-debate); "
+                    "the worker has full repository and test access.]"
+                )
+            return raw_output
+        _straitjacket_state["calls"] += 1
+        calls = _straitjacket_state["calls"]
+        elapsed = max(0.0, time.monotonic() - _session_started_mono)
+        if calls < 8 and elapsed < session_timeout * 0.35:
+            return raw_output
+        now_m = time.monotonic()
+        if not _straitjacket_state["has_edits"] and (now_m - _straitjacket_state["last_git_check"] >= 4.0):
+            _straitjacket_state["last_git_check"] = now_m
+            try:
+                gs = _sp.run(
+                    ["git", "status", "--porcelain", "--untracked-files=normal"],
+                    cwd=str(ws_resolved),
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                if (gs.stdout or "").strip():
+                    _straitjacket_state["has_edits"] = True
+            except Exception:
+                pass
+        if not _straitjacket_state["has_edits"] and (calls >= 8 or elapsed >= session_timeout * 0.35):
+            return (
+                f"{raw_output}\n"
+                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed, {calls} Straitjacket calls, "
+                "0 files modified in worktree — stop searching/reading and write your implementation with "
+                "edit_file / create_file NOW so your edits are saved on disk before timeout.]"
+            )
+        if _straitjacket_state["has_edits"] and elapsed >= session_timeout * 0.75:
+            return (
+                f"{raw_output}\n"
+                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed — finish your current edit, "
+                "run the targeted acceptance test, and conclude your turn before timeout.]"
+            )
+        return raw_output
 
     async def run_command(
         command: str,
@@ -526,25 +706,88 @@ def build_straitjacket_tools(
             raw_timeout = default_cmd_timeout
         eff_timeout = min(max(1.0, raw_timeout if raw_timeout > 0 else default_cmd_timeout), session_timeout)
         result = await session.run(
-            cmd_str,
+            ["bash", "-c", cmd_str],
             working_directory=str(working_directory or ""),
             timeout_seconds=eff_timeout,
         )
-        return result.to_json()
+        return _maybe_append_turn_budget_note(result.to_json())
+
+    def _normalize_safe_repo_path(rel_path: str) -> tuple[str, str | None]:
+        raw_rel = str(rel_path or "").strip()
+        if raw_rel.lower().startswith("ws:"):
+            return "", "PermissionDenied: External workspace aliases (ws:) are disabled in isolated worker sessions."
+        try:
+            cand = (ws_resolved / raw_rel).resolve()
+            rel_obj = cand.relative_to(ws_resolved)
+        except Exception:
+            return "", "PermissionDenied: Path must remain within the isolated workspace."
+        if rel_obj.parts:
+            bname = rel_obj.name.lower()
+            rel_norm = rel_obj.as_posix().lower()
+            parts_low = [p.lower() for p in rel_obj.parts]
+            if (
+                bname in _SECRET_BASENAMES
+                or bname.startswith(".env.")
+                or bname.endswith((".pem", ".key", ".p12", ".pfx"))
+                or rel_norm == ".claude/settings.local.json"
+                or rel_norm.endswith("/.claude/settings.local.json")
+                or ".cc-agy-data" in parts_low
+            ):
+                return "", f"PermissionDenied: Reading credential or secret file {raw_rel!r} is blocked."
+            return rel_obj.as_posix(), None
+        return "", None
+
+    def _normalize_safe_address(address: str) -> tuple[str, str | None]:
+        addr = str(address or "").strip()
+        if addr.lower().startswith("ws:") or "/ws:" in addr.lower():
+            return addr, "PermissionDenied: External workspace aliases (ws:) are disabled in isolated worker sessions."
+        if addr.lower().startswith("repo:"):
+            rest = addr[5:]
+            repo_rel, sep, frag = rest.partition("#")
+            norm_rel, err = _normalize_safe_repo_path(repo_rel)
+            if err:
+                return addr, err
+            return f"repo:{norm_rel}{sep}{frag}", None
+        return addr, None
+
+    def _check_lead_read_cap() -> str | None:
+        if resolved_profile == "read-only" and is_lead_orchestrator and _straitjacket_state["calls"] >= lead_read_limit:
+            return json.dumps({
+                "error": (
+                    f"LeadReadBudgetExceeded: Lead read/search limit ({lead_read_limit} calls) reached. Do NOT read more files "
+                    "on the Lead orchestrator. Call delegate_start (with a concise prompt <500 words), delegate_continue, "
+                    "get_diff, or delegate_apply immediately — the worker has full repository and test access in its worktree."
+                )
+            })
+        return None
 
     async def ctx_get(address: str, start_line: int = 1, end_line: int = 100) -> str:
         """Retrieve a bounded, inclusive line range from an evidence address (e.g. 'run:<id>#stdout')."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        norm_addr, err = _normalize_safe_address(address)
+        if err:
+            return json.dumps({"error": err, "address": str(address or "")})
         s_line = _coerce_line_number(start_line, 1)
         e_line = max(s_line, _coerce_line_number(end_line, 100))
         try:
-            return await session.get(str(address or ""), start_line=s_line, end_line=e_line)
+            out = await session.get(norm_addr, start_line=s_line, end_line=e_line)
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "address": str(address or "")})
 
     async def ctx_search(address: str, pattern: str) -> str:
         """Search stored evidence (e.g. 'run:<id>#stdout') or repository files for a regex pattern."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        norm_addr, err = _normalize_safe_address(address)
+        if err:
+            return json.dumps({"error": err, "address": str(address or "")})
         try:
-            return await session.search(str(address or ""), str(pattern or ""))
+            out = await session.search(norm_addr, str(pattern or ""))
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "address": str(address or "")})
 
@@ -553,42 +796,90 @@ def build_straitjacket_tools(
 
     import shlex
 
-    async def view_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
-        """Read a bounded, 1-indexed file span; omitted evidence remains addressable."""
+    async def view_file(path: str, start_line: int = 1, end_line: int = 500) -> str:
+        """Read a bounded, 1-indexed file span (minimum 250 lines by default); omitted evidence remains addressable."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        norm_rel, err = _normalize_safe_repo_path(path)
+        if err:
+            return json.dumps({"error": err, "path": str(path or "")})
         s_line = _coerce_line_number(start_line, 1)
-        e_line = max(s_line, _coerce_line_number(end_line, 200))
+        e_line = max(s_line, _coerce_line_number(end_line, 500))
         try:
-            return await session.get(f"repo:{path or ''}", start_line=s_line, end_line=e_line)
+            min_span = max(0, int(os.environ.get("CC_AGY_MIN_VIEW_LINES", "250")))
+        except (TypeError, ValueError):
+            min_span = 250
+        if min_span > 0 and (e_line - s_line + 1) < min_span:
+            s_line = max(1, s_line - 20)
+            e_line = max(e_line, s_line + min_span - 1)
+        try:
+            out = await session.get(f"repo:{norm_rel}", start_line=s_line, end_line=e_line)
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
 
     async def search_dir(pattern: str, path: str = "") -> str:
         """Search repository files with a bounded hit census."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        norm_rel, err = _normalize_safe_repo_path(path)
+        if err:
+            return json.dumps({"error": err, "path": str(path or "")})
         try:
-            return await session.search(f"repo:{path or ''}", str(pattern or ""))
+            out = await session.search(f"repo:{norm_rel}", str(pattern or ""))
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
 
     async def list_dir(path: str = "") -> str:
         """Summarise a directory's file counts, languages and size."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        norm_rel, err = _normalize_safe_repo_path(path)
+        if err:
+            return json.dumps({"error": err, "path": str(path or "")})
         try:
-            return await session.retrieve("stats", ref=f"repo:{path or ''}")
+            out = await session.retrieve("stats", ref=f"repo:{norm_rel}")
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
 
     async def find_file(name: str) -> str:
         """List files matching a path glob, including empty files."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        raw_name = str(name or "")
+        if ".." in raw_name or raw_name.lower().startswith("ws:"):
+            return json.dumps({"error": "PermissionDenied: Invalid file glob.", "name": raw_name})
         try:
-            return await session.query(f"corpus --glob {shlex.quote(str(name or ''))}")
+            out = await session.query(f"corpus --glob {shlex.quote(raw_name)}")
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
-            return json.dumps({"error": f"{type(exc).__name__}: {exc}", "name": str(name or "")})
+            return json.dumps({"error": f"{type(exc).__name__}: {exc}", "name": raw_name})
 
     async def ctx_query(pipeline: str) -> str:
         """Compose observation in one bounded query, e.g. refs Foo | group file | top 3."""
+        cap_err = _check_lead_read_cap()
+        if cap_err:
+            return cap_err
+        raw_pipe = str(pipeline or "")
+        if "ws:" in raw_pipe.lower() or "../" in raw_pipe:
+            return json.dumps({"error": "PermissionDenied: External workspace aliases (ws:) are disabled.", "pipeline": raw_pipe})
         try:
-            return await session.query(str(pipeline or ""))
+            out = await session.query(raw_pipe)
+            return _maybe_append_turn_budget_note(out)
         except Exception as exc:
-            return json.dumps({"error": f"{type(exc).__name__}: {exc}", "pipeline": str(pipeline or "")})
+            return json.dumps({"error": f"{type(exc).__name__}: {exc}", "pipeline": raw_pipe})
+
+    if resolved_profile == "read-only":
+        return (
+            [ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query],
+            ["VIEW_FILE", "SEARCH_DIR", "LIST_DIR", "FIND_FILE"],
+        )
 
     return (
         [run_command, ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query],
@@ -614,11 +905,21 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             options=options,
         )
     else:
-        endpoint = types.VertexEndpoint(
-            project=request["project"],
-            location=request["location"],
-            options=options,
-        )
+        vertex_base_url = (
+            request.get("base_url")
+            or os.environ.get("CC_AGY_VERTEX_BASE_URL")
+            or os.environ.get("GOOGLE_VERTEX_BASE_URL")
+            or ""
+        ).strip()
+        ep_kwargs: dict[str, Any] = {
+            "project": request["project"],
+            "location": request["location"],
+            "options": options,
+        }
+        if vertex_base_url:
+            ep_kwargs["base_url"] = vertex_base_url
+            ep_kwargs["api_key"] = os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN", "custom-endpoint")
+        endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     model_cfg = types.ModelTarget(
         name=request["model"],
@@ -629,10 +930,20 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     cap_kwargs: dict[str, Any] = {
         "enable_subagents": bool(request.get("enable_subagents", False)),
     }
+    def _coerce_builtin_tools(items: list[Any]) -> list[Any]:
+        coerced: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                b_enum = getattr(types.BuiltinTools, item.strip().upper(), None)
+                coerced.append(b_enum if b_enum is not None else item.strip().lower())
+            else:
+                coerced.append(item)
+        return coerced
+
     if request.get("enabled_tools") is not None:
-        cap_kwargs["enabled_tools"] = list(request["enabled_tools"])
+        cap_kwargs["enabled_tools"] = _coerce_builtin_tools(list(request["enabled_tools"]))
     if request.get("disabled_tools") is not None:
-        cap_kwargs["disabled_tools"] = list(request["disabled_tools"])
+        cap_kwargs["disabled_tools"] = _coerce_builtin_tools(list(request["disabled_tools"]))
 
     # Always disable interactive/UI/workflow tools that cannot function in a headless background worker,
     # and disable SEARCH_WEB / READ_URL_CONTENT when CC_AGY_DISABLE_WEB_TOOLS or CC_AGY_STRICT_MODE is active.
@@ -692,15 +1003,32 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     custom_tools: list[Any] = []
     if progress_path:
         custom_tools.append(report_to_lead)
+    extra_tools = request.get("extra_tools")
+    if extra_tools:
+        custom_tools.extend(extra_tools)
 
     containment_mode = "none"
     containment_warning: str | None = None
+    inferred_profile = (
+        "read-only"
+        if (
+            not os.environ.get("CC_AGY_CONTAINMENT_PROFILE", "").strip()
+            and is_read_only_tool_set(request.get("enabled_tools"), request.get("disabled_tools"))
+        )
+        else None
+    )
     use_containment = os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
     if use_containment:
         try:
+            is_lead_orch = any(
+                getattr(fn, "__name__", "") in ("delegate_start", "delegate_to_gemini")
+                for fn in (extra_tools or [])
+            )
             sj_tools, replaced_names = build_straitjacket_tools(
                 Path(request["workspace_dir"]),
                 timeout_seconds=float(request.get("timeout_seconds") or 300.0),
+                profile=inferred_profile,
+                is_lead_orchestrator=is_lead_orch,
             )
             custom_tools.extend(sj_tools)
             disabled_list = list(cap_kwargs.get("disabled_tools") or [])
@@ -759,6 +1087,27 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         cfg_kwargs["budget_config"] = budget_cfg
     if custom_tools:
         cfg_kwargs["tools"] = custom_tools
+    use_short_preamble = os.environ.get("CC_AGY_FULL_SDK_PREAMBLE", "").strip().lower() not in ("1", "true", "yes")
+    force_custom = bool(request.get("system_prompt")) or (
+        os.environ.get("CC_AGY_CUSTOM_SYSTEM_PROMPT", "").strip().lower() in ("1", "true", "yes")
+    )
+    if use_short_preamble:
+        sys_text = str(
+            request.get("system_prompt")
+            or build_worker_system_prompt(
+                ws_str,
+                profile=inferred_profile,
+                has_report_to_lead=bool(progress_path),
+            )
+        )
+        if force_custom and hasattr(types, "CustomSystemInstructions"):
+            cfg_kwargs["system_instructions"] = types.CustomSystemInstructions(text=sys_text)
+        elif hasattr(types, "TemplatedSystemInstructions") and hasattr(types, "SystemInstructionSection"):
+            cfg_kwargs["system_instructions"] = types.TemplatedSystemInstructions(
+                sections=[types.SystemInstructionSection(title="straitjacket_worker_rules", content=sys_text)]
+            )
+        elif hasattr(types, "CustomSystemInstructions"):
+            cfg_kwargs["system_instructions"] = types.CustomSystemInstructions(text=sys_text)
     cfg = ag.LocalAgentConfig(**cfg_kwargs)
 
     tool_calls_log: list[dict[str, Any]] = []
@@ -779,76 +1128,84 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     timeout_sec = float(request.get("timeout_seconds") or 300.0)
     stop_reason: str | None = None
 
+    agent = ag.Agent(cfg)
+    entered = False
     try:
-        async with ag.Agent(cfg) as agent:
-            agent_ref = agent
-            for idx, prompt_turn in enumerate(request["prompts"]):
-                if idx == 0 or not hasattr(agent, "continue_session"):
-                    resp = await maybe_await(agent.chat(prompt_turn))
-                else:
-                    resp = await maybe_await(agent.continue_session(prompt_turn))
-                await asyncio.wait_for(
-                    maybe_await(resp.resolve()),
-                    timeout=timeout_sec,
-                )
-                await drain_response_streams(resp, tool_calls_log, thoughts_log)
-                text_fn = getattr(resp, "text", None)
-                if callable(text_fn):
-                    text_out = str((await maybe_await(text_fn())) or "")
-                elif isinstance(text_fn, str):
-                    text_out = text_fn
-                # Turn.usage_metadata is accumulated across all model invocations in the turn.
-                turn_usage = await resolve_turn_usage(resp)
-                if not any(turn_usage.values()):
-                    turn_usage = extract_usage_from_session(agent, resp)
-                for k in (
-                    "prompt_token_count",
-                    "cached_content_token_count",
-                    "candidates_token_count",
-                    "thoughts_token_count",
-                    "total_token_count",
-                ):
-                    usage[k] += turn_usage[k]
-                usage["turns"].append(dict(turn_usage))
+        agent_ref = await agent.__aenter__()
+        entered = True
+        for idx, prompt_turn in enumerate(request["prompts"]):
+            if idx == 0 or not hasattr(agent_ref, "continue_session"):
+                resp = await maybe_await(agent_ref.chat(prompt_turn))
+            else:
+                resp = await maybe_await(agent_ref.continue_session(prompt_turn))
+            await asyncio.wait_for(
+                maybe_await(resp.resolve()),
+                timeout=timeout_sec,
+            )
+            await asyncio.wait_for(
+                drain_response_streams(resp, tool_calls_log, thoughts_log),
+                timeout=3.0,
+            )
+            text_fn = getattr(resp, "text", None)
+            if callable(text_fn):
+                text_out = str((await maybe_await(text_fn())) or "")
+            elif isinstance(text_fn, str):
+                text_out = text_fn
+            # Turn.usage_metadata is accumulated across all model invocations in the turn.
+            turn_usage = await resolve_turn_usage(resp)
+            if not any(turn_usage.values()):
+                turn_usage = extract_usage_from_session(agent_ref, resp)
+            for k in (
+                "prompt_token_count",
+                "cached_content_token_count",
+                "candidates_token_count",
+                "thoughts_token_count",
+                "total_token_count",
+            ):
+                usage[k] += turn_usage[k]
+            usage["turns"].append(dict(turn_usage))
 
-                # Extract per-invocation usage from resp.steps when available so >200k long-context
-                # pricing is evaluated on single model calls rather than accumulated multi-step turns.
-                steps_stream = getattr(resp, "steps", None)
-                if steps_stream is not None:
-                    try:
-                        if hasattr(steps_stream, "__aiter__"):
-                            async for st in steps_stream:
-                                st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
-                                if any(st_u.values()):
-                                    usage["requests"].append({**st_u, "per_call": True})
-                                    usage["max_request_prompt_tokens"] = max(
-                                        int(usage.get("max_request_prompt_tokens") or 0),
-                                        int(st_u.get("prompt_token_count") or 0),
-                                    )
-                        elif hasattr(steps_stream, "__iter__"):
-                            for st in steps_stream:
-                                st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
-                                if any(st_u.values()):
-                                    usage["requests"].append({**st_u, "per_call": True})
-                                    usage["max_request_prompt_tokens"] = max(
-                                        int(usage.get("max_request_prompt_tokens") or 0),
-                                        int(st_u.get("prompt_token_count") or 0),
-                                    )
-                    except Exception:
-                        pass
-                stop_reason = await resolve_stop_reason(resp)
-            sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
-            if not usage.get("requests") and sqlite_telemetry.get("requests"):
-                usage["requests"] = list(sqlite_telemetry["requests"])
-                usage["max_request_prompt_tokens"] = max(
-                    int(usage.get("max_request_prompt_tokens") or 0),
-                    int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
-                )
+            # Extract per-invocation usage from resp.steps when available so >200k long-context
+            # pricing is evaluated on single model calls rather than accumulated multi-step turns.
+            steps_stream = getattr(resp, "steps", None)
+            if steps_stream is not None:
+                try:
+                    if hasattr(steps_stream, "__aiter__"):
+                        async for st in steps_stream:
+                            st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
+                            if any(st_u.values()):
+                                usage["requests"].append({**st_u, "per_call": True})
+                                usage["max_request_prompt_tokens"] = max(
+                                    int(usage.get("max_request_prompt_tokens") or 0),
+                                    int(st_u.get("prompt_token_count") or 0),
+                                )
+                    elif hasattr(steps_stream, "__iter__"):
+                        for st in steps_stream:
+                            st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
+                            if any(st_u.values()):
+                                usage["requests"].append({**st_u, "per_call": True})
+                                usage["max_request_prompt_tokens"] = max(
+                                    int(usage.get("max_request_prompt_tokens") or 0),
+                                    int(st_u.get("prompt_token_count") or 0),
+                                )
+                except Exception:
+                    pass
+            stop_reason = await resolve_stop_reason(resp)
+        sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+        if not usage.get("requests") and sqlite_telemetry.get("requests"):
+            usage["requests"] = list(sqlite_telemetry["requests"])
+            usage["max_request_prompt_tokens"] = max(
+                int(usage.get("max_request_prompt_tokens") or 0),
+                int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
+            )
     except (Exception, asyncio.CancelledError) as exc:
-        # Attach partial usage and tool calls so the caller's finally block
-        # records everything consumed prior to the failure or timeout.
+        # Attach partial usage and tool calls before closing the agent so the caller's finally
+        # block records everything consumed prior to the failure or timeout without blocking.
         try:
-            await drain_response_streams(resp, tool_calls_log, thoughts_log)
+            await asyncio.wait_for(
+                drain_response_streams(resp, tool_calls_log, thoughts_log),
+                timeout=2.0,
+            )
         except (Exception, asyncio.CancelledError):
             pass
         partial_usage = extract_usage_from_session(agent_ref, resp)
@@ -888,7 +1245,13 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         setattr(exc, "partial_containment_warning", containment_warning)
         raise
     finally:
+        if entered:
+            try:
+                await asyncio.wait_for(agent.__aexit__(None, None, None), timeout=5.0)
+            except (Exception, asyncio.CancelledError):
+                pass
         shutil.rmtree(save_dir, ignore_errors=True)
+        shutil.rmtree(Path(ws_str) / ".ctx-session-reads", ignore_errors=True)
 
     return {
         "text": text_out,
@@ -916,6 +1279,31 @@ async def resolve_stop_reason(resp: Any) -> str | None:
     return name
 
 
+def _run_coro_with_bounded_shutdown(coro: Any) -> Any:
+    """Run `coro` in an isolated event loop with bounded executor/task shutdown on timeout."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.wait(pending, timeout=2.0))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            try:
+                loop.run_until_complete(loop.shutdown_default_executor(timeout=2.0))
+            except TypeError:
+                pass
+        except Exception:
+            pass
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
 def run_antigravity_worker(
     *,
     prompts: list[str],
@@ -933,6 +1321,8 @@ def run_antigravity_worker(
     max_tool_calls: int | None = None,
     max_total_tokens: int | None = None,
     progress_path: str | Path | None = None,
+    extra_tools: list[Any] | None = None,
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     auth = resolve_auth_config(
@@ -946,7 +1336,11 @@ def run_antigravity_worker(
     resolved_project = auth.get("project")
     resolved_location = auth.get("location")
     reroute_note = auth.get("reroute_note")
-    resolved_thinking = resolve_thinking_level(thinking_level)
+    resolved_thinking = resolve_thinking_level(
+        thinking_level,
+        model=model,
+        read_only=is_read_only_tool_set(enabled_tools, disabled_tools),
+    )
 
     req = {
         "prompts": list(prompts),
@@ -965,13 +1359,15 @@ def run_antigravity_worker(
         "max_tool_calls": max_tool_calls,
         "max_total_tokens": max_total_tokens,
         "progress_path": str(progress_path) if progress_path else None,
+        "extra_tools": list(extra_tools) if extra_tools else None,
+        "system_prompt": system_prompt,
     }
 
     active_backend = backend or _default_antigravity_backend
     started = time.time()
     result = active_backend(req)
     if inspect.isawaitable(result):
-        result = asyncio.run(result)
+        result = _run_coro_with_bounded_shutdown(result)
     elapsed = round(max(0.0, time.time() - started), 3)
 
     containment_val = result.get("containment", "none")

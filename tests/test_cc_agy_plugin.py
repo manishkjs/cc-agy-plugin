@@ -2345,7 +2345,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                     75.0,
                 )
                 host_escape_json = asyncio.run(
-                    run_cmd_bp("find /usr/local/google/home/manishkjs/ -name '*ewald*'")
+                    run_cmd_bp("find /usr/local/share/ -name '*ewald*'")
                 )
                 host_escape_obj = json.loads(host_escape_json)
                 self.assertEqual(host_escape_obj["status"], "error")
@@ -2367,6 +2367,582 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             self.assertEqual(digest["status"], "timeout")
             rcpt = store.read_receipt(digest["job_id"])
             self.assertEqual(rcpt["containment"], "straitjacket")
+            jm.shutdown()
+
+    def test_preload_files_and_qa_review_pipeline_in_delegate_to_gemini(self) -> None:
+        from server.genai_ask import _close_genai_client
+        from server.jobs import parse_qa_audit_verdict, select_candidate_files
+
+        class DummyClient:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        dc = DummyClient()
+        _close_genai_client(dc)
+        self.assertTrue(dc.closed)
+
+        self.assertTrue(parse_qa_audit_verdict("VERDICT: PASS\nLooks great.")["passed"])
+        nf = parse_qa_audit_verdict("VERDICT: NEEDS_FIXES\n- ISSUE: app.py:1: missing exclamation")
+        self.assertFalse(nf["passed"])
+        self.assertEqual(len(nf["issues"]), 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+
+            cands = select_candidate_files(repo, "Update greet in app.py")
+            self.assertEqual([rel for rel, _ in cands], ["app.py"])
+
+            worker_calls: list[dict] = []
+
+            def fake_worker(req: dict) -> dict:
+                worker_calls.append(req)
+                wt = Path(req["workspace_dir"])
+                if len(worker_calls) == 1:
+                    (wt / "app.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+                else:
+                    (wt / "app.py").write_text("def greet():\n    return 'hi!'\n", encoding="utf-8")
+                return {
+                    "text": "updated app.py",
+                    "usage": {"prompt_token_count": 200, "candidates_token_count": 50, "total_token_count": 250},
+                    "tool_calls": [],
+                    "thoughts": [],
+                }
+
+            ask_calls: list[dict] = []
+
+            def fake_ask(req: dict) -> dict:
+                ask_calls.append(req)
+                return {
+                    "text": "VERDICT: NEEDS_FIXES\n- ISSUE: app.py:2: return 'hi!' with exclamation",
+                    "usage": {"prompt_token_count": 300, "candidates_token_count": 40, "thoughts_token_count": 60, "total_token_count": 400},
+                }
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=fake_worker)
+            srv = MCPServer(job_manager=jm, store=store, ask_backend=fake_ask)
+            resp = srv.handle_Message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delegate_to_gemini",
+                        "arguments": {
+                            "prompt": "Update greet in app.py to return 'hi!'",
+                            "model": "gemini-3.8-flash",
+                            "project": "test-proj",
+                            "preload_files": True,
+                            "qa_review_model": "gemini-4-argon",
+                            "auto_apply": True,
+                        },
+                    },
+                }
+            )
+            payload = json.loads(resp["result"]["content"][0]["text"])
+            self.assertEqual(payload["status"], "ok")
+            self.assertTrue(payload["applied"])
+            self.assertEqual(payload.get("preloaded_files"), ["app.py"])
+            self.assertIn("## Candidate Repository Files", worker_calls[0]["prompts"][0])
+            self.assertIn("- `app.py`", worker_calls[0]["prompts"][0])
+            # Path hints only: file contents must not be pasted into turn 1.
+            self.assertNotIn("def greet():", worker_calls[0]["prompts"][0])
+            # Fix pass is a fresh worker session with a compact context note, not a replay of turn 1.
+            self.assertEqual(len(worker_calls[1]["prompts"]), 1)
+            self.assertIn("[Prior turn context", worker_calls[1]["prompts"][0])
+            self.assertNotIn("## Candidate Repository Files", worker_calls[1]["prompts"][0])
+            self.assertEqual(len(worker_calls), 2)
+            self.assertEqual(len(ask_calls), 1)
+            self.assertEqual(ask_calls[0].get("thinking_level"), "HIGH")
+            self.assertTrue(payload["qa_review"]["resumed"])
+            self.assertFalse(payload["qa_review"]["passed"])
+            self.assertEqual((repo / "app.py").read_text(encoding="utf-8"), "def greet():\n    return 'hi!'\n")
+
+            # Also verify checkpoint status on Turn 1 triggers qa_review_model + delegate_continue
+            checkpoint_calls: list[dict] = []
+
+            def fake_checkpoint_worker(req: dict) -> dict:
+                checkpoint_calls.append(req)
+                wt = Path(req["workspace_dir"])
+                if len(checkpoint_calls) == 1:
+                    (wt / "app.py").write_text("def greet():\n    return 'partial'\n", encoding="utf-8")
+                    return {
+                        "text": "hit cap",
+                        "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                        "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+                        "tool_calls": [{"name": "view_file", "args": {"path": "app.py"}}],
+                        "thoughts": [],
+                    }
+                (wt / "app.py").write_text("def greet():\n    return 'completed!'\n", encoding="utf-8")
+                return {
+                    "text": "completed",
+                    "status": "ok",
+                    "usage": {"prompt_token_count": 120, "candidates_token_count": 30, "total_token_count": 150},
+                    "tool_calls": [],
+                    "thoughts": [],
+                }
+
+            jm_cp = JobManager(workspace_root=repo, store=store, worker_backend=fake_checkpoint_worker)
+            srv_cp = MCPServer(
+                job_manager=jm_cp,
+                store=store,
+                ask_backend=lambda _r: {
+                    "text": "VERDICT: PASS\nNo spec defects in partial diff.",
+                    "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "thoughts_token_count": 10, "total_token_count": 120},
+                },
+            )
+            resp_cp = srv_cp.handle_Message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 100,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delegate_to_gemini",
+                        "arguments": {
+                            "prompt": "Finish greet in app.py",
+                            "model": "gemini-3.8-flash",
+                            "project": "test-proj",
+                            "qa_review_model": "gemini-4-argon",
+                            "auto_apply": True,
+                        },
+                    },
+                }
+            )
+            payload_cp = json.loads(resp_cp["result"]["content"][0]["text"])
+            self.assertEqual(payload_cp["status"], "ok")
+            self.assertTrue(payload_cp["applied"])
+            self.assertTrue(payload_cp["qa_review"]["resumed"])
+            self.assertEqual(len(checkpoint_calls), 2)
+            self.assertEqual((repo / "app.py").read_text(encoding="utf-8"), "def greet():\n    return 'completed!'\n")
+            jm_cp.shutdown()
+            jm.shutdown()
+
+    def test_qa_review_diff_is_capped_at_25k_tokens(self) -> None:
+        """Reviewer context is truncated to QA_REVIEW_MAX_TOKENS with HIGH thinking."""
+        from server.jobs import QA_REVIEW_MAX_TOKENS
+        from server.regions import estimate_tokens
+
+        self.assertEqual(QA_REVIEW_MAX_TOKENS, 25_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_git_repo(repo)
+            store = ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+            big_line = "x = '" + ("abcdefgh " * 20) + "'\n"
+
+            def fake_worker(req: dict) -> dict:
+                wt = Path(req["workspace_dir"])
+                (wt / "big.py").write_text(big_line * 6000, encoding="utf-8")
+                return {"text": "done", "usage": {"prompt_token_count": 10, "candidates_token_count": 5, "total_token_count": 15},
+                        "tool_calls": [], "thoughts": []}
+
+            ask_calls: list[dict] = []
+
+            def fake_ask(req: dict) -> dict:
+                ask_calls.append(req)
+                return {"text": "VERDICT: PASS", "usage": {"prompt_token_count": 1, "candidates_token_count": 1, "total_token_count": 2}}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=fake_worker)
+            srv = MCPServer(job_manager=jm, store=store, ask_backend=fake_ask)
+            resp = srv.handle_Message({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+                "name": "delegate_to_gemini",
+                "arguments": {"prompt": "Add big.py", "model": "gemini-3.8-flash", "project": "test-proj",
+                              "qa_review_model": "gemini-4-argon", "auto_apply": False}}})
+            payload = json.loads(resp["result"]["content"][0]["text"])
+            self.assertEqual(len(ask_calls), 1)
+            self.assertEqual(ask_calls[0].get("thinking_level"), "HIGH")
+            sent = str(ask_calls[0].get("prompt") or "")
+            self.assertIn("(truncated)", sent)
+            self.assertLessEqual(estimate_tokens(sent), QA_REVIEW_MAX_TOKENS + 200)
+            self.assertTrue(payload["qa_review"]["passed"])
+            jm.shutdown()
+
+
+class TestEscalationRevertAndTrueCost(unittest.TestCase):
+    """Dispatched vs true total cost, escalation after repeated failures, and revert from provenance."""
+
+    def _repo(self, tmp: str) -> tuple[Path, ReceiptStore]:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        _init_git_repo(repo)
+        return repo, ReceiptStore(Path(tmp) / "data", workspace_root=repo)
+
+    @staticmethod
+    def _ok_usage() -> dict:
+        return {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120}
+
+    def test_true_cost_report_splits_dispatched_and_lead(self) -> None:
+        from server.true_cost import collect_lead_usage, project_hash, true_total_report
+
+        self.assertEqual(project_hash("/Users/you/repro-v0.6.0"), "-Users-you-repro-v0-6-0")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            now = time.time()
+            store.write_receipt(
+                "job-1-aaaaaaaa",
+                {"kind": "delegate", "status": "ok", "model": "gemini-3.8-flash",
+                 "usage": {"prompt_token_count": 1_000_000, "candidates_token_count": 0, "total_token_count": 1_000_000},
+                 "started_at_epoch": now - 60, "prompts": ["x"]},
+                workspace_root=str(repo),
+            )
+            dispatched = float(store.read_receipt("job-1-aaaaaaaa")["cost"]["total_cost_cents"])
+            self.assertGreater(dispatched, 0.0)
+
+            tdir = Path(tmp) / "transcripts"
+            tdir.mkdir()
+
+            def iso(t: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".000Z"
+
+            lines = [
+                # Opus message written twice (two content blocks, same id): counted once.
+                {"type": "assistant", "timestamp": iso(now - 30), "message": {"id": "m1", "model": "claude-opus-5-5",
+                 "usage": {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000, "output_tokens": 100_000,
+                           "cache_creation_input_tokens": 300_000,
+                           "cache_creation": {"ephemeral_5m_input_tokens": 100_000, "ephemeral_1h_input_tokens": 200_000}}}},
+                {"type": "assistant", "timestamp": iso(now - 30), "message": {"id": "m1", "model": "claude-opus-5-5",
+                 "usage": {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000, "output_tokens": 100_000}}},
+                {"type": "assistant", "timestamp": iso(now - 20), "message": {"id": "m2", "model": "claude-haiku-4",
+                 "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}},
+                {"type": "assistant", "timestamp": iso(now - 20), "message": {"id": "m3", "model": "mystery-model",
+                 "usage": {"input_tokens": 5, "output_tokens": 5}}},
+                # Outside the window (before the first receipt): ignored.
+                {"type": "assistant", "timestamp": iso(now - 3600), "message": {"id": "m0", "model": "claude-opus-5-5",
+                 "usage": {"input_tokens": 9_000_000, "output_tokens": 0}}},
+                {"type": "user", "timestamp": iso(now - 25), "message": {"content": "hi"}},
+            ]
+            (tdir / "session.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+
+            lead = collect_lead_usage(repo, since_epoch=now - 60, transcripts_dir=tdir)
+            # Opus: 1M*5 + 1M*0.5 + 100k*6.25 + 200k*10 + 100k*25 = 5 + 0.5 + 0.625 + 2 + 2.5 = 10.625 USD
+            self.assertAlmostEqual(lead["per_model"]["claude-opus-5-5"]["cost_cents"], 1062.5, places=3)
+            self.assertEqual(lead["per_model"]["claude-opus-5-5"]["messages"], 1)
+            self.assertAlmostEqual(lead["per_model"]["claude-haiku-4"]["cost_cents"], 100.0, places=3)
+            self.assertFalse(lead["per_model"]["mystery-model"]["priced"])
+            self.assertFalse(lead["all_lead_pricing_known"])
+            self.assertAlmostEqual(lead["lead_cost_cents"], 1162.5, places=3)
+
+            # Default window: whole sessions overlapping the jobs, so session.jsonl's early 9M-token
+            # planning message (before the first receipt) counts; another session that ended before
+            # the first job does not.
+            old_session = [{"type": "assistant", "timestamp": iso(now - 7200), "message": {"id": "z1",
+                            "model": "claude-opus-5-5", "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}}]
+            (tdir / "old.jsonl").write_text(json.dumps(old_session[0]) + "\n", encoding="utf-8")
+            rep = true_total_report(store, repo, transcripts_dir=tdir)
+            self.assertAlmostEqual(rep["dispatched"]["cost_cents"], dispatched, places=3)
+            self.assertAlmostEqual(rep["lead"]["lead_cost_cents"], 1162.5 + 4500.0, places=3)
+            self.assertEqual(rep["lead"]["transcript_files"], 1)
+            self.assertAlmostEqual(rep["true_total_cost_cents"], dispatched + 5662.5, places=3)
+            rep_explicit = true_total_report(store, repo, transcripts_dir=tdir, since_epoch=now - 60)
+            self.assertAlmostEqual(rep_explicit["true_total_cost_cents"], dispatched + 1162.5, places=3)
+            self.assertGreater(rep["lead_share_of_true_total"], 0.5)
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=lambda _r: {"text": "ok"})
+            srv = MCPServer(job_manager=jm, store=store)
+            names = [t["name"] for t in srv.handle_Message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]]
+            self.assertIn("cost_report", names)
+            self.assertIn("delegate_revert", names)
+            resp = srv.handle_Message({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "cost_report", "arguments": {"transcripts_dir": str(tdir)}}})
+            payload = json.loads(resp["result"]["content"][0]["text"])
+            self.assertAlmostEqual(payload["true_total_cost_cents"], dispatched + 5662.5, places=3)
+            jm.shutdown()
+
+    def test_escalates_to_lead_after_two_failed_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            calls: list[dict] = []
+
+            def worker(req: dict) -> dict:
+                calls.append(req)
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text(f"def greet():\n    return 'try {len(calls)}'\n", encoding="utf-8")
+                return {"text": "done", "usage": self._ok_usage(), "tool_calls": [], "thoughts": []}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+            failing = ["grep -q NEVER_PRESENT_TOKEN app.py"]
+            d1 = jm.delegate_start(prompt="Make greet say hi", model="gemini-3.8-flash", project="p",
+                                   acceptance=failing, wait=True)
+            self.assertIs(d1["acceptance_passed"], False)
+            self.assertEqual(d1.get("failed_attempts"), 1)
+            self.assertNotIn("escalation", d1)
+
+            d2 = jm.delegate_continue(job_id=d1["job_id"], follow_up_prompt="Fix it", project="p")
+            self.assertEqual(d2.get("failed_attempts"), 2)
+            self.assertTrue(d2["escalation"]["escalate_to_lead"])
+            self.assertEqual(len(calls), 2)
+
+            d3 = jm.delegate_continue(job_id=d1["job_id"], follow_up_prompt="Try again", project="p")
+            self.assertEqual(d3["status"], "escalated")
+            self.assertEqual(len(calls), 2, "an escalated job must not spend another Gemini attempt")
+
+            d4 = jm.delegate_continue(job_id=d1["job_id"], follow_up_prompt="Try again", project="p", force_retry=True)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(d4.get("failed_attempts"), 3)
+
+            # A passing turn resets the streak.
+            d5 = jm.delegate_continue(job_id=d1["job_id"], follow_up_prompt="Finish", project="p",
+                                      acceptance=["grep -q greet app.py"], force_retry=True)
+            self.assertIs(d5["acceptance_passed"], True)
+            self.assertNotIn("failed_attempts", d5)
+            self.assertNotIn("escalation", d5)
+            jm.shutdown()
+
+    def test_revert_restores_pre_apply_state_and_refuses_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            original = (repo / "app.py").read_bytes()
+
+            def worker(req: dict) -> dict:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("def greet():\n    return 'hi!'\n", encoding="utf-8")
+                (wt / "new_mod.py").write_text("X = 1\n", encoding="utf-8")
+                return {"text": "done", "usage": self._ok_usage(), "tool_calls": [], "thoughts": []}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+            srv = MCPServer(job_manager=jm, store=store)
+            d = jm.delegate_start(prompt="Change greet and add new_mod", model="gemini-3.8-flash", project="p", wait=True)
+            applied = jm.delegate_apply(d["job_id"])
+            self.assertIn("revert_hint", applied)
+            self.assertTrue((repo / "new_mod.py").exists())
+            rec = store.read_receipt(d["job_id"])
+            self.assertEqual(rec["pre_apply"]["new_mod.py"]["state"], "absent")
+            self.assertEqual(rec["pre_apply"]["app.py"]["state"], "file")
+            self.assertTrue(store.verify_receipt_signature(rec))
+
+            dry = jm.delegate_revert(d["job_id"], dry_run=True)
+            self.assertEqual(sorted(x["file"] for x in dry["would_restore"]), ["app.py", "new_mod.py"])
+            self.assertTrue((repo / "new_mod.py").exists(), "dry_run must not write")
+
+            # A later edit makes new_mod.py dirty: revert refuses and writes nothing.
+            (repo / "new_mod.py").write_text("X = 2  # human edit\n", encoding="utf-8")
+            refused = jm.delegate_revert(d["job_id"])
+            self.assertTrue(refused["refused"])
+            self.assertEqual([x["file"] for x in refused["dirty_files"]], ["new_mod.py"])
+            self.assertNotEqual((repo / "app.py").read_bytes(), original)
+
+            # skip_dirty reverts only the clean file, through the MCP tool.
+            resp = srv.handle_Message({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "delegate_revert", "arguments": {"job_id": d["job_id"], "skip_dirty": True}}})
+            out = json.loads(resp["result"]["content"][0]["text"])
+            self.assertTrue(out["reverted"])
+            self.assertEqual(out["reverted_files"], ["app.py"])
+            self.assertEqual((repo / "app.py").read_bytes(), original)
+            self.assertEqual((repo / "new_mod.py").read_text(encoding="utf-8"), "X = 2  # human edit\n")
+            again = jm.delegate_revert(d["job_id"])
+            self.assertTrue(again["already_reverted"])
+            self.assertTrue(store.verify_receipt_signature(store.read_receipt(d["job_id"])))
+            jm.shutdown()
+
+    def test_full_revert_deletes_created_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            original = (repo / "app.py").read_bytes()
+
+            def worker(req: dict) -> dict:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("def greet():\n    return 'yo'\n", encoding="utf-8")
+                (wt / "pkg").mkdir(exist_ok=True)
+                (wt / "pkg" / "extra.py").write_text("Y = 1\n", encoding="utf-8")
+                return {"text": "done", "usage": self._ok_usage(), "tool_calls": [], "thoughts": []}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+            d = jm.delegate_start(prompt="edit", model="gemini-3.8-flash", project="p", wait=True)
+            jm.delegate_apply(d["job_id"])
+            out = jm.delegate_revert(d["job_id"])
+            self.assertEqual(sorted(out["reverted_files"]), ["app.py", "pkg/extra.py"])
+            self.assertFalse((repo / "pkg" / "extra.py").exists())
+            self.assertEqual((repo / "app.py").read_bytes(), original)
+            jm.shutdown()
+
+    def test_revert_in_place_job_restores_from_git_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            original = (repo / "app.py").read_bytes()
+
+            def worker(req: dict) -> dict:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("def greet():\n    return 'inplace'\n", encoding="utf-8")
+                (wt / "added.py").write_text("Z = 3\n", encoding="utf-8")
+                return {"text": "done", "usage": self._ok_usage(), "tool_calls": [], "thoughts": []}
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+            d = jm.delegate_start(prompt="edit in place", model="gemini-3.8-flash", project="p", wait=True, in_place=True)
+            self.assertTrue(store.read_receipt(d["job_id"]).get("in_place"))
+            out = jm.delegate_revert(d["job_id"])
+            self.assertTrue(out["reverted"], out)
+            self.assertEqual(sorted(out["reverted_files"]), ["added.py", "app.py"])
+            self.assertEqual((repo / "app.py").read_bytes(), original)
+            self.assertFalse((repo / "added.py").exists())
+            jm.shutdown()
+
+    def test_scout_repo_map_low_thinking_and_straitjacket_read_only(self) -> None:
+        from server.agy_runner import build_straitjacket_tools, is_straitjacket_available, resolve_thinking_level
+        from server.model_routes import resolve_batch_settings
+        from server.regions import estimate_tokens
+        from server.repo_map import build_repo_map
+        from server.verify import is_behavioral_check
+
+        self.assertEqual(resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False), "LOW")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-3.8-flash", read_only=True), "HIGH")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=False), "LOW")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=True), "HIGH")
+        self.assertEqual(resolve_batch_settings({"model": "mechanical"}).model, "gemini-3.8-flash")
+        self.assertEqual(resolve_batch_settings({"read_budget": 6}).writer, "agent")
+        self.assertFalse(is_behavioral_check("python3 -m py_compile pkg/a.py"))
+        self.assertTrue(is_behavioral_check("python3 -m pytest -q tests/test_a.py"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            rmap = build_repo_map(repo, cache_dir=store.data_dir)
+            self.assertIn("`app.py`", rmap)
+            if is_straitjacket_available():
+                sj_tools, replaced = build_straitjacket_tools(repo, profile="read-only")
+                tool_names = [t.__name__ for t in sj_tools]
+                self.assertIn("view_file", tool_names)
+                self.assertNotIn("run_command", tool_names)
+                self.assertEqual(replaced, ["VIEW_FILE", "SEARCH_DIR", "LIST_DIR", "FIND_FILE"])
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=lambda _r: {
+                "text": "word " * 1200, "usage": self._ok_usage(), "tool_calls": [], "thoughts": []
+            })
+            d = jm.delegate_start(prompt="edit", model="gemini-3.8-flash", project="p", wait=True)
+            self.assertEqual(d["thinking_level"], "LOW")
+            self.assertTrue(d["summary_truncated"])
+            self.assertLessEqual(estimate_tokens(d["summary"]), 300)
+            jm.shutdown()
+
+    def test_read_only_detection_uses_sdk_tool_names_and_budget_rules(self) -> None:
+        from server.agy_runner import (
+            build_straitjacket_tools,
+            build_worker_system_prompt,
+            is_read_only_tool_set,
+            is_straitjacket_available,
+            resolve_thinking_level,
+        )
+        from server.model_routes import resolve_batch_settings
+        from server.repo_map import build_repo_map, repo_map_cache_key
+        from server.verify import is_behavioral_check
+
+        # google-antigravity names its mutating tools CREATE_FILE, EDIT_FILE, and RUN_COMMAND.
+        self.assertTrue(is_read_only_tool_set(None, ["CREATE_FILE", "EDIT_FILE", "RUN_COMMAND"]))
+        self.assertFalse(is_read_only_tool_set(None, ["CREATE_FILE", "EDIT_FILE"]))
+        self.assertFalse(is_read_only_tool_set(None, ["EDIT_FILE"]))
+        self.assertTrue(is_read_only_tool_set(["VIEW_FILE", "SEARCH_DIR"], None))
+        self.assertFalse(is_read_only_tool_set(["VIEW_FILE", "CREATE_FILE"], None))
+        self.assertEqual(
+            resolve_thinking_level(
+                None,
+                model="gemini-3.8-flash",
+                read_only=is_read_only_tool_set(None, ["CREATE_FILE", "EDIT_FILE", "RUN_COMMAND"]),
+            ),
+            "HIGH",
+        )
+        self.assertEqual(resolve_thinking_level("MEDIUM", model="gemini-3.8-flash"), "MEDIUM")
+        with self.assertRaises(ValueError):
+            resolve_batch_settings({"read_budget": 6, "writer": "genai"})
+
+        # Behavioral check classification must reject non-test commands and collection-only flags.
+        self.assertFalse(is_behavioral_check("true"))
+        self.assertFalse(is_behavioral_check("echo ok"))
+        self.assertFalse(is_behavioral_check("pytest --collect-only"))
+        self.assertFalse(is_behavioral_check("pytest --co"))
+        self.assertFalse(is_behavioral_check("cargo test --no-run"))
+        self.assertFalse(is_behavioral_check("go test -c ./..."))
+        self.assertTrue(is_behavioral_check("pytest -q"))
+
+        sys_ro = build_worker_system_prompt("/tmp/ws", profile="read-only", has_report_to_lead=True)
+        self.assertIn("/tmp/ws", sys_ro)
+        self.assertIn("ctx_query", sys_ro)
+        self.assertIn("report_to_lead", sys_ro)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            key1 = repo_map_cache_key(repo)
+            os.utime(repo / "app.py", None)  # touching a file must not bust the cache
+            self.assertEqual(repo_map_cache_key(repo), key1)
+            (repo / "app.py").write_text("def greet(token='sk-secret-123'):\n    return 'changed'\n", encoding="utf-8")
+            key2 = repo_map_cache_key(repo)
+            self.assertNotEqual(key2, key1)  # 1st edit busts cache
+            (repo / "app.py").write_text("def greet(token='sk-secret-456'):\n    return 'changed-v2'\n", encoding="utf-8")
+            key3 = repo_map_cache_key(repo)
+            self.assertNotEqual(key3, key2)  # 2nd edit to already-dirty file also busts cache
+            (repo / "untracked_mod.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+            rmap = build_repo_map(repo, cache_dir=store.data_dir)
+            self.assertIn("`untracked_mod.py`", rmap)
+            self.assertNotIn("sk-secret", rmap)
+            self.assertEqual(len(list(Path(store.data_dir).glob("repo_map_*.txt"))), 1)
+
+            if is_straitjacket_available():
+                (repo / ".mcp.json").write_text('{"secret": "top-secret-mcp"}\n', encoding="utf-8")
+                ro_tools, _ = build_straitjacket_tools(repo, profile="read-only")
+                ro_map = {t.__name__: t for t in ro_tools}
+                ws_esc = asyncio.run(ro_map["ctx_get"]("ws:host/repo:secret.txt"))
+                self.assertIn("PermissionDenied", ws_esc)
+                sec_read = asyncio.run(ro_map["view_file"](".mcp.json"))
+                self.assertIn("PermissionDenied", sec_read)
+                self.assertNotIn("top-secret-mcp", sec_read)
+
+            # Without git, node_modules is never walked.
+            plain = Path(tmp) / "plain"
+            (plain / "node_modules" / "dep").mkdir(parents=True)
+            (plain / "node_modules" / "dep" / "index.js").write_text("x", encoding="utf-8")
+            (plain / "main.py").write_text("def main():\n    pass\n", encoding="utf-8")
+            rmap = build_repo_map(plain)
+            self.assertIn("`main.py`", rmap)
+            self.assertNotIn("node_modules", rmap)
+
+    def test_line_numbered_repo_map_focused_outline_and_diff_preview(self) -> None:
+        from server.repo_map import build_focused_file_outline, build_repo_map
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, store = self._repo(tmp)
+            # Create a file with 7 private helpers at top followed by a public class
+            helper_lines = "\n".join(f"def _priv_{i}(x: int) -> int:\n    return x + {i}\n" for i in range(7))
+            class_body = (
+                "\nclass CoreEngine:\n"
+                "    def __init__(self, cfg: str) -> None:\n"
+                "        self.cfg = cfg\n\n"
+                "    def execute(self, item: str) -> str:\n"
+                "        return item.upper()\n"
+            )
+            (repo / "engine.py").write_text(helper_lines + class_body, encoding="utf-8")
+            rmap = build_repo_map(repo, cache_dir=store.data_dir, refresh=True)
+            # Class definition must appear first in repo_map with line span despite 7 _priv_* helpers above it
+            self.assertIn("class CoreEngine (L", rmap)
+            outline = build_focused_file_outline(repo, ["engine.py"])
+            self.assertIn("`engine.py`", outline)
+            self.assertIn("execute@L", outline)
+
+            def worker_edit(req: dict[str, Any]) -> dict[str, Any]:
+                wt = Path(req["workspace_dir"])
+                (wt / "app.py").write_text("def greet(name: str = 'world') -> str:\n    return f'hi {name}'\n", encoding="utf-8")
+                return {
+                    "text": "updated greet",
+                    "usage": self._ok_usage(),
+                    "tool_calls": [{"name": "edit_file"}],
+                    "thoughts": [],
+                }
+
+            jm = JobManager(workspace_root=repo, store=store, worker_backend=worker_edit)
+            d = jm.delegate_start(
+                prompt="update greet in app.py",
+                model="gemini-3.8-flash",
+                project="p",
+                allowed_paths=["app.py"],
+                acceptance=["python3 -m py_compile app.py"],
+                wait=True,
+            )
+            self.assertEqual(d["status"], "ok")
+            self.assertTrue(d["acceptance_passed"])
+            self.assertIn("diff_preview", d)
+            self.assertIn("+    return f'hi {name}'", d["diff_preview"])
+            self.assertTrue(d["diff_preview_complete"])
+            self.assertIn("delegate_apply", d.get("next_action", ""))
             jm.shutdown()
 
 

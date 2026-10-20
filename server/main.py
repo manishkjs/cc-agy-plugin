@@ -92,6 +92,9 @@ def main() -> int:
     atexit.register(_record_unfinished)
     signal.signal(signal.SIGTERM, _on_sigterm)
     serve_stdio(server)
+    # Record unfinished jobs right when stdin closes. The atexit hook alone is too late: Python joins
+    # ThreadPoolExecutor worker threads before atexit handlers run, so no future is still live by then.
+    _record_unfinished()
     return 0
 
 

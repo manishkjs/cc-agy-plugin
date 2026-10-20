@@ -131,6 +131,16 @@ def verify_workspace_provenance(
             if not (has_valid_diff and has_hashes):
                 forged_receipts.append(job_id)
                 continue
+            if r.get("reverted"):
+                # A reverted job's lines no longer count as provenance; its files are expected back
+                # at their pre-apply content (recorded and HMAC-signed at apply time).
+                pre_apply = r.get("pre_apply") or {}
+                base_hashes = r.get("baseline_file_hashes") or {}
+                if float(r.get("updated_at_epoch") or 0.0) >= baseline_recorded_at:
+                    for fpath in r.get("reverted_files") or []:
+                        pre = pre_apply.get(fpath) or {}
+                        latest_applied_file_hash[fpath] = pre.get("sha256") if pre else base_hashes.get(fpath)
+                continue
             prov = r.get("provenance") or {}
             _accumulate_provenance(prov, list(r.get("applied_files") or []))
             if float(r.get("updated_at_epoch") or 0.0) >= baseline_recorded_at:

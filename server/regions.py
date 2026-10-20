@@ -289,7 +289,10 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_DATA_DIR",
     ):
         val = os.environ.get(var)
-        if val is not None and val.strip().startswith("${"):
+        if val is not None and (
+            val.strip().startswith("${")
+            or val.strip().lower() in ("<api-key>", "dummy-key", "dummy", "none", "null")
+        ):
             os.environ.pop(var, None)
 
 
@@ -311,7 +314,30 @@ def resolve_api_key(
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
-            if cleaned and not cleaned.startswith("${") and cleaned != "<api-key>":
+            if (
+                cleaned
+                and not cleaned.startswith("${")
+                and cleaned.lower() not in ("<api-key>", "dummy-key", "dummy", "none", "null")
+            ):
+                return cleaned
+    return None
+
+
+def resolve_vertex_base_url(
+    requested_base_url: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve an optional custom Vertex AI / proxy base URL from arguments or environment."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_base_url,
+        source_env.get("CC_AGY_VERTEX_BASE_URL"),
+        source_env.get("GOOGLE_VERTEX_BASE_URL"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            cleaned = candidate.strip()
+            if cleaned and not cleaned.startswith("${"):
                 return cleaned
     return None
 
@@ -339,6 +365,8 @@ def resolve_vertex_project(
             cleaned = candidate.strip()
             if cleaned and not cleaned.startswith("${") and cleaned != "<paying-project>":
                 return cleaned
+    if resolve_vertex_base_url(env=source_env):
+        return "custom-endpoint"
     if allow_missing:
         return None
     raise ValueError(

@@ -5,14 +5,32 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
+from pathlib import Path
 import math
+import os
 import sys
 import threading
 from typing import Any, BinaryIO
 
 from server.genai_ask import ask_gemini
-from server.jobs import JobManager, validate_acceptance, validate_allowed_paths, validate_plan
+from server.jobs import (
+    QA_DIFF_AUDIT_SYSTEM,
+    QA_REVIEW_MAX_TOKENS,
+    JobManager,
+    parse_qa_audit_verdict,
+    validate_acceptance,
+    validate_allowed_paths,
+    validate_plan,
+)
 from server.receipts import ReceiptStore
+from server.regions import truncate_to_token_budget
+from server.true_cost import true_total_report
+from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_plan
+from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
+from server.assist_tools import AssistRequestError, prepare_document, prepare_replication, prepare_tests
+from server.model_routes import resolve_batch_settings
+from server.regions import resolve_auth_config
+from server.review_bundle import build_review_evidence_dir
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_MCP_VERSIONS = frozenset({"2024-11-05", "2025-03-26"})
@@ -49,6 +67,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "number",
                     "description": "Optional sampling temperature.",
                 },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH"],
+                    "description": "Optional reasoning depth for thinking-capable Gemini models.",
+                },
                 "api_key": {
                     "type": "string",
                     "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
@@ -81,7 +104,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Outcome-oriented task specification (avoid pasting >8 consecutive code lines).",
+                    "description": (
+                        "Concise, outcome-oriented task specification (keep under 500 words / 3,500 characters; "
+                        "state the behavioral requirements, edge cases, and target file paths directly without "
+                        "'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines of "
+                        "implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
+                    ),
                 },
                 "model": {
                     "type": "string",
@@ -114,7 +142,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "acceptance": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Up to 5 read-only check commands (e.g. focused pytest runs). The plugin runs them after the worker finishes and returns pass/fail with output tails, so you do not need to re-run them.",
+                    "description": (
+                        "Up to 5 targeted, read-only check commands (prefer focused test files such as "
+                        "`pytest -q tests/test_target.py` rather than slow full-repo suites). The plugin runs "
+                        "them after the worker finishes and returns pass/fail with output tails and diff_preview, "
+                        "so you can call delegate_apply directly without re-running get_diff or Bash tests."
+                    ),
                 },
                 "max_tool_calls": {
                     "type": "integer",
@@ -160,6 +193,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "wait": {
                     "type": "boolean",
                     "description": "If true, block until the worker finishes and return the digest.",
+                },
+                "preload_files": {
+                    "type": "boolean",
+                    "description": "If true, list the top keyword-matched repository file paths (paths only, not contents) in the initial worker prompt so the worker opens the right files first (default: true).",
+                },
+                "auto_apply": {
+                    "type": "boolean",
+                    "description": "If true (default in strict orchestrator mode or when CC_AGY_AUTO_APPLY_ON_PASS=1) and wait=true, automatically apply the diff when status='ok', acceptance checks pass, and scope_violations=[].",
+                },
+                "qa_review_model": {
+                    "type": "string",
+                    "description": "Optional stronger Vertex Gemini model ID (or env CC_AGY_QA_REVIEW_MODEL) to run an automated QA diff audit when wait=true.",
                 },
             },
             "required": ["prompt"],
@@ -311,8 +356,57 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional Vertex AI region override.",
                 },
+                "force_retry": {
+                    "type": "boolean",
+                    "description": (
+                        "Run another Gemini attempt even though the job was escalated to the Lead after "
+                        "repeated failures (default: false)."
+                    ),
+                },
+                "auto_apply": {
+                    "type": "boolean",
+                    "description": "If true (or env CC_AGY_AUTO_APPLY_ON_PASS=1) and wait=true, automatically apply the diff when status='ok', acceptance checks pass, and scope_violations=[].",
+                },
             },
             "required": ["job_id", "follow_up_prompt"],
+        },
+    },
+    {
+        "name": "delegate_revert",
+        "description": (
+            "Undo an applied job: restore every file it touched to its pre-apply state from the backups "
+            "recorded at apply time. Refuses if any of those files changed after the apply, unless skip_dirty."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Applied job_id (the receipt id)."},
+                "receipt_id": {"type": "string", "description": "Alias of job_id."},
+                "dry_run": {"type": "boolean", "description": "Report what would be restored without writing (default: false)."},
+                "skip_dirty": {
+                    "type": "boolean",
+                    "description": "Revert only the files that still match what the job applied (default: false).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "cost_report",
+        "description": (
+            "Dispatched cost (Gemini calls the plugin sent, from receipts) vs true total cost (dispatched plus "
+            "the Claude Code lead session, rebuilt from its transcripts) for this workspace and time window."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_epoch": {"type": "number", "description": "Window start, epoch seconds (default: first job in this workspace)."},
+                "until_epoch": {"type": "number", "description": "Window end, epoch seconds (default: now)."},
+                "transcripts_dir": {
+                    "type": "string",
+                    "description": "Claude Code transcript folder (default: $CLAUDE_CONFIG_DIR or ~/.claude, projects/<workspace hash>).",
+                },
+            },
         },
     },
     {
@@ -424,13 +518,181 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "number",
                     "description": "Timeout in seconds (default: 1200).",
                 },
+                "preload_files": {
+                    "type": "boolean",
+                    "description": "If true, list the top keyword-matched repository file paths (paths only, not contents) in the initial worker prompt so the worker opens the right files first (default: true).",
+                },
+                "qa_review_model": {
+                    "type": "string",
+                    "description": (
+                        "Optional 1-shot QA reviewer model (e.g. 'gemini-4-argon'). When set, audits the worker's "
+                        "git diff (capped at 25,000 tokens, HIGH thinking) against the task prompt after Turn 1 and, "
+                        "if concrete bugs are found, runs delegate_continue as a fresh worker session on the edited "
+                        "worktree before auto_apply. Experimental: not yet shown to raise solve rate."
+                    ),
+                },
             },
             "required": ["prompt"],
         },
     },
 ]
 
+_AUTH_PROPS: dict[str, Any] = {
+    "api_key": {"type": "string", "description": "Optional Google AI Studio Gemini API key override."},
+    "project": {"type": "string", "description": "Optional Google Cloud project ID override for Vertex AI."},
+    "location": {"type": "string", "description": "Optional Vertex AI region override."},
+}
+
+_WRITER_PROPS: dict[str, Any] = {
+    "writer": {"type": "string", "enum": ["genai", "agent"],
+               "description": "Low-cost writer: 'genai' (one generate_content call, default) or 'agent' (Antigravity, writer-only or bounded reader)."},
+    "model": {"type": "string", "description": "Writer model (default gemini-3.8-flash, 'gemini-4-argon', or CC_AGY_BATCH_MODEL)."},
+    "thinking_level": {"type": "string", "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH"], "description": "Writer thinking (default LOW)."},
+    "read_budget": {"type": "integer", "description": "Bounded read-only lookups per task on the agent writer (default 0 = blind writer, max 12; e.g. 6 on messy brownfield repos)."},
+    "claude_writer": {"type": "boolean", "description": "Use Claude (claude -p, no tools) as the third attempt (default true)."},
+    "claude_model": {"type": "string", "description": "Claude model for the third attempt (default opus)."},
+    "max_parallel": {"type": "integer", "description": "Writer calls in flight at once (default 4, max 16); checks run one task at a time."},
+    "max_cost_cents": {"type": "number", "description": "Stop starting new work once the batch has spent this much (cents)."},
+    "max_claude_escalations": {"type": "integer", "description": "Cap on Claude third attempts per batch (default 10)."},
+    "check_timeout_seconds": {"type": "number", "description": "Per-check timeout, clamped to 5-3600 s (default 300)."},
+}
+
+TOOL_DEFINITIONS.extend([
+    {
+        "name": "delegate_file_batch",
+        "description": (
+            "Write many files from one plan in a single call. Each task is answered by a single-shot writer "
+            "(no exploration), checked in an isolated job copy, retried with the failing output, and escalated "
+            "to Claude on the third attempt. Returns a compact per-task digest; land the job with get_diff + "
+            "delegate_apply. Use for 6+ file changes with a clear per-file plan."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "plan_path": {"type": "string", "description": "Batch plan JSON written by the Lead (outside the repo, e.g. /tmp/plan.json, or inside it)."},
+                "tasks": {"type": "array", "items": {"type": "object"}, "description": "Inline tasks instead of plan_path."},
+                "shared_context": {"type": "array", "items": {"type": "string"}, "description": "Inline plans only: files every task sees."},
+                "acceptance": {"type": "array", "items": {"type": "string"}, "description": "Read-only commands run once after all tasks."},
+                "formatter": {"type": "string", "description": "Inline plans only: allowlisted formatter, e.g. 'ruff format {path}'."},
+                "allowed_paths": {"type": "array", "items": {"type": "string"}, "description": "Restrict which paths tasks may write."},
+                "resume_job_id": {"type": "string", "description": "Continue an unapplied batch job; identical re-sent plans resume automatically."},
+                **_WRITER_PROPS,
+                **_AUTH_PROPS,
+            },
+        },
+    },
+    {
+        "name": "draft_document",
+        "description": (
+            "Draft one new doc or spec from purpose, audience, sections and facts. Each fact's quote must exist "
+            "verbatim in its source file; the draft must contain every section and only link to real paths. "
+            "Verified in an isolated job copy; land with delegate_apply."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "purpose": {"type": "string"},
+                "audience": {"type": "string"},
+                "sections": {"type": "array", "items": {"type": "string"}},
+                "facts": {"type": "array", "items": {"type": "object", "properties": {
+                    "claim": {"type": "string"}, "source": {"type": "string"}, "quote": {"type": "string"}}}},
+                "context_files": {"type": "array", "items": {"type": "string"}},
+                **_WRITER_PROPS,
+                **_AUTH_PROPS,
+            },
+            "required": ["path", "purpose", "audience", "sections"],
+        },
+    },
+    {
+        "name": "write_tests_from_cases",
+        "description": (
+            "Write one new test file for a target file from named cases (name, given, expect). Every case and every "
+            "expected value must appear verbatim and test_command must pass in an isolated job copy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "test_path": {"type": "string"},
+                "target_path": {"type": "string"},
+                "cases": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "given": {"type": "string"}, "expect": {"type": "string"}}}},
+                "test_command": {"type": "string", "description": "Read-only test command, e.g. python -m pytest -q tests/test_x.py"},
+                **_WRITER_PROPS,
+                **_AUTH_PROPS,
+            },
+            "required": ["test_path", "target_path", "cases", "test_command"],
+        },
+    },
+    {
+        "name": "replicate_edit",
+        "description": (
+            "Repeat a change you already made by hand in example_path (uncommitted) across target files as exact "
+            "find/replace edits, then run check_command once in an isolated job copy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "example_path": {"type": "string"},
+                "targets": {"type": "array", "items": {"type": "string"}},
+                "note": {"type": "string", "description": "Optional one-line guidance, e.g. what not to touch."},
+                "check_command": {"type": "string"},
+                **_WRITER_PROPS,
+                **_AUTH_PROPS,
+            },
+            "required": ["example_path", "targets"],
+        },
+    },
+    {
+        "name": "batch_task_log",
+        "description": "Attempt history, last failure and recent check log paths for one task of a batch job.",
+        "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}, "task_id": {"type": "string"}},
+                        "required": ["job_id", "task_id"]},
+    },
+    {
+        "name": "probe_writers",
+        "description": (
+            "Preflight: send one tiny request through each configured batch writer (a fraction of a cent each). "
+            "Fails fast with the exact fix when one cannot answer (auth, missing CLI); warns on 429/5xx."
+        ),
+        "inputSchema": {"type": "object", "properties": {**_WRITER_PROPS, **_AUTH_PROPS}},
+    },
+])
+
 KNOWN_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in TOOL_DEFINITIONS)
+
+CORE_TOOL_NAMES: tuple[str, ...] = (
+    "ask_gemini",
+    "delegate_start",
+    "delegate_continue",
+    "delegate_apply",
+    "delegate_result",
+    "delegate_status",
+    "delegate_cancel",
+    "get_diff",
+)
+
+
+def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Return MCP tool definitions filtered by `CC_AGY_TOOL_PROFILE` (`core` default in strict mode, else `full`)."""
+    active_env = os.environ if env is None else env
+    raw_profile = (active_env.get("CC_AGY_TOOL_PROFILE") or "").strip().lower()
+    if not raw_profile:
+        strict_active = any(
+            str(active_env.get(k) or "").strip().lower() in ("1", "true", "yes", "on")
+            for k in (
+                "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
+                "CC_AGY_STRICT_MODE",
+                "CC_AGY_USERCFG_STRICT_MODE",
+            )
+        )
+        profile = "core" if strict_active else "full"
+    else:
+        profile = raw_profile
+    if profile == "core":
+        core_set = set(CORE_TOOL_NAMES)
+        return [t for t in TOOL_DEFINITIONS if t["name"] in core_set]
+    return TOOL_DEFINITIONS
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -541,10 +803,48 @@ class MCPServer:
         job_manager: JobManager | None = None,
         store: ReceiptStore | None = None,
         ask_backend: Any = None,
+        batch_writer_factory: Any = None,
     ) -> None:
         self.store = store or (job_manager.store if job_manager else ReceiptStore())
         self.job_manager = job_manager or JobManager(store=self.store)
         self.ask_backend = ask_backend
+        self.batch_writer_factory = batch_writer_factory
+        # Set by serve_stdio: writes a JSON-RPC notification (e.g. notifications/progress) to the client.
+        self.notify: Any = None
+        # notifications/cancelled flips the stop event of the matching in-flight batch request.
+        self._active_stops: dict[Any, threading.Event] = {}
+        self._cancel_lock = threading.Lock()
+
+    def _progress_reporter(self, progress_token: Any, heartbeat_seconds: float = 30.0):
+        """Return (report, stop) for MCP progress: report(done, total, msg) plus a heartbeat thread."""
+        if progress_token is None or self.notify is None:
+            return None, (lambda: None)
+        state = {"done": 0, "total": None, "message": "starting"}
+        lock = threading.Lock()
+        halt = threading.Event()
+
+        def send() -> None:
+            params: dict[str, Any] = {"progressToken": progress_token, "progress": state["done"], "message": state["message"]}
+            if state["total"] is not None:
+                params["total"] = state["total"]
+            try:
+                self.notify({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
+            except Exception:  # noqa: BLE001 - progress is best effort
+                pass
+
+        def report(done: int, total: int, message: str) -> None:
+            with lock:
+                state.update(done=done, total=total, message=message)
+                send()
+
+        def beat() -> None:
+            while not halt.wait(heartbeat_seconds):
+                with lock:
+                    state["message"] = f"working ({state['done']} settled)"
+                    send()
+
+        threading.Thread(target=beat, name="cc-agy-progress", daemon=True).start()
+        return report, halt.set
 
     def handle_Message(self, message: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
         """Process a JSON-RPC 2.0 message (or batch) and return a response dict (or None for notifications)."""
@@ -605,6 +905,11 @@ class MCPServer:
 
         # Notifications have no id and expect no response
         if not has_id:
+            if method == "notifications/cancelled":
+                with self._cancel_lock:
+                    stop = self._active_stops.get(params.get("requestId"))
+                if stop is not None:
+                    stop.set()
             return None
 
         try:
@@ -637,7 +942,7 @@ class MCPServer:
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "result": {"tools": TOOL_DEFINITIONS},
+                    "result": {"tools": get_tool_definitions()},
                 }
 
             if method == "tools/call":
@@ -662,7 +967,9 @@ class MCPServer:
                         },
                     }
                 arguments = dict(raw_args or {})
-                payload = self._dispatch_tool(tool_name, arguments)
+                meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+                payload = self._dispatch_tool(tool_name, arguments, progress_token=meta.get("progressToken"),
+                                              request_id=msg_id)
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
@@ -715,7 +1022,110 @@ class MCPServer:
                 },
             }
 
-    def _dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _batch_auth(self, args: dict[str, Any], model: str) -> dict[str, Any]:
+        return resolve_auth_config(
+            requested_project=_optional_str(args.get("project"), "project"),
+            requested_location=_optional_str(args.get("location"), "location"),
+            requested_api_key=_optional_str(args.get("api_key"), "api_key"),
+            model=model,
+        )
+
+    def _run_file_batch(self, plan: Any, args: dict[str, Any], progress_token: Any, *, request_id: Any = None,
+                        **runner_kwargs: Any) -> dict[str, Any]:
+        try:
+            settings = resolve_batch_settings(args)
+        except ValueError as exc:
+            raise InvalidParamsError(str(exc)) from exc
+        auth = self._batch_auth(args, settings.model)
+        report, stop_beat = self._progress_reporter(progress_token)
+        stop = threading.Event()
+        if request_id is not None:
+            with self._cancel_lock:
+                self._active_stops[request_id] = stop
+        try:
+            runner = FileBatchRunner(self.job_manager, writer_factory=self.batch_writer_factory, progress=report, stop=stop)
+            return runner.run(plan, settings, auth, **runner_kwargs)
+        finally:
+            stop_beat()
+            if request_id is not None:
+                with self._cancel_lock:
+                    self._active_stops.pop(request_id, None)
+
+    def _dispatch_tool(self, name: str, args: dict[str, Any], *, progress_token: Any = None,
+                       request_id: Any = None) -> dict[str, Any]:
+        if name == "delegate_file_batch":
+            if parse_bool(args.get("in_place"), False):
+                raise InvalidParamsError(
+                    "delegate_file_batch always writes into an isolated job copy; land it with delegate_apply."
+                )
+            allowed = validate_allowed_paths(args.get("allowed_paths")) if args.get("allowed_paths") else None
+            ws = self.job_manager.workspace_root
+            extra = _validate_optional_str_list(args.get("acceptance"), "acceptance") or []
+            try:
+                if args.get("plan_path"):
+                    plan = load_batch_plan(_require_str(args.get("plan_path"), "plan_path"), ws,
+                                           allowed_paths=allowed, extra_acceptance=extra)
+                elif isinstance(args.get("tasks"), list):
+                    plan = validate_batch_plan(
+                        {"tasks": args["tasks"], "shared_context": args.get("shared_context") or [],
+                         "acceptance": extra, "formatter": args.get("formatter") or ""},
+                        ws, allowed_paths=allowed,
+                    )
+                else:
+                    raise InvalidParamsError("Pass plan_path (preferred) or tasks.")
+            except BatchPlanError as exc:
+                return {"status": "invalid_plan", **exc.as_dict(), "is_error": True}
+            return self._run_file_batch(
+                plan, args, progress_token, allowed_paths=allowed, request_id=request_id,
+                resume_job_id=_optional_str(args.get("resume_job_id"), "resume_job_id"),
+            )
+
+        if name == "batch_task_log":
+            return batch_task_log(self.store, _require_str(args.get("job_id"), "job_id"),
+                                  _require_str(args.get("task_id"), "task_id"))
+
+        if name in ("draft_document", "write_tests_from_cases", "replicate_edit"):
+            ws = Path(self.job_manager.workspace_root)
+            try:
+                if name == "draft_document":
+                    plan, note, gate = prepare_document(
+                        ws, path=_require_str(args.get("path"), "path"), purpose=str(args.get("purpose") or ""),
+                        audience=str(args.get("audience") or ""), sections=args.get("sections") or [],
+                        facts=args.get("facts") or [], context_files=args.get("context_files") or [],
+                    )
+                    edits_only = False
+                elif name == "write_tests_from_cases":
+                    plan, note, gate = prepare_tests(
+                        ws, test_path=_require_str(args.get("test_path"), "test_path"),
+                        target_path=_require_str(args.get("target_path"), "target_path"),
+                        cases=args.get("cases") or [], test_command=str(args.get("test_command") or ""),
+                    )
+                    edits_only = False
+                else:
+                    plan, note, gate = prepare_replication(
+                        ws, example_path=_require_str(args.get("example_path"), "example_path"),
+                        targets=args.get("targets") or [], note=str(args.get("note") or ""),
+                        check_command=str(args.get("check_command") or ""),
+                    )
+                    edits_only = True
+            except AssistRequestError as exc:
+                return exc.as_dict()
+            return self._run_file_batch(
+                plan, args, progress_token, request_id=request_id, kind=name, content_gate=gate, shared_note=note,
+                edits_only=edits_only,
+            )
+
+        if name == "probe_writers":
+            try:
+                settings = resolve_batch_settings(args)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
+            try:
+                auth = self._batch_auth(args, settings.model)
+            except ValueError as exc:
+                return {"status": "error", "is_error": True, "writers": [], "error": str(exc)}
+            return probe_writers(settings, auth, writer_factory=self.batch_writer_factory)
+
         if name == "ask_gemini":
             prompt_str = _require_str(args.get("prompt"), "prompt")
             ctx_files = _validate_optional_str_list(args.get("context_files"), "context_files")
@@ -730,6 +1140,7 @@ class MCPServer:
                 context_files=ctx_files,
                 system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
                 temperature=temp_val,
+                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
                 api_key=_optional_str(args.get("api_key"), "api_key"),
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
@@ -743,6 +1154,9 @@ class MCPServer:
             prompt_str = _require_str(args.get("prompt"), "prompt")
             enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
             disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
+            qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
+                os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
+            )
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
                 plan_steps = validate_plan(args.get("plan"))
@@ -751,10 +1165,25 @@ class MCPServer:
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 wait_b = parse_bool(args.get("wait"), False)
                 in_place_b = parse_bool(args.get("in_place"), False)
+                preload_b = parse_bool(args.get("preload_files"), True)
+                auto_apply_arg = (
+                    parse_bool(args.get("auto_apply"), False)
+                    if "auto_apply" in args and args.get("auto_apply") is not None
+                    else None
+                )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            if in_place_b and auto_apply_arg is False:
+                raise InvalidParamsError(
+                    "in_place=True cannot be combined with auto_apply=False because in_place edits "
+                    "are applied directly to the working tree."
+                )
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
-            return self.job_manager.delegate_start(
+            req_api_key = _optional_str(args.get("api_key"), "api_key")
+            req_project = _optional_str(args.get("project"), "project")
+            req_location = _optional_str(args.get("location"), "location")
+            will_run_qa = bool(wait_b and qa_review_model and qa_review_model.strip())
+            digest = self.job_manager.delegate_start(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
                 allowed_paths=allowed,
@@ -765,15 +1194,36 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=wait_b,
                 in_place=in_place_b,
-                api_key=_optional_str(args.get("api_key"), "api_key"),
-                project=_optional_str(args.get("project"), "project"),
-                location=_optional_str(args.get("location"), "location"),
+                api_key=req_api_key,
+                project=req_project,
+                location=req_location,
                 thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
                 plan=plan_steps,
                 acceptance=acceptance_cmds,
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
+                preload_files=preload_b,
+                auto_apply=False if will_run_qa else auto_apply_arg,
             )
+            if will_run_qa and qa_review_model:
+                digest = self._maybe_run_qa_review(
+                    digest,
+                    prompt_str=prompt_str,
+                    qa_review_model=qa_review_model,
+                    in_place_b=in_place_b,
+                    timeout_sec=timeout_sec,
+                    req_api_key=req_api_key,
+                    req_project=req_project,
+                    req_location=req_location,
+                    scrub_b=scrub_b,
+                )
+                digest = self.job_manager._maybe_auto_apply_digest(
+                    str(digest["job_id"]),
+                    digest,
+                    auto_apply=auto_apply_arg,
+                    in_place=in_place_b,
+                )
+            return digest
 
         if name == "delegate_status":
             limit_val = _parse_positive_int(args.get("limit"), "limit", 20)
@@ -824,6 +1274,12 @@ class MCPServer:
             followup_str = _require_str(args.get("follow_up_prompt"), "follow_up_prompt")
             try:
                 wait_b = parse_bool(args.get("wait"), True)
+                force_b = parse_bool(args.get("force_retry"), False)
+                cont_auto_apply = (
+                    parse_bool(args.get("auto_apply"), False)
+                    if "auto_apply" in args and args.get("auto_apply") is not None
+                    else None
+                )
                 cont_allowed = (
                     validate_allowed_paths(args.get("allowed_paths"))
                     if "allowed_paths" in args and args.get("allowed_paths") is not None
@@ -847,6 +1303,35 @@ class MCPServer:
                 api_key=_optional_str(args.get("api_key"), "api_key"),
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
+                force_retry=force_b,
+                auto_apply=cont_auto_apply,
+            )
+
+        if name == "delegate_revert":
+            job_id_str = _require_str(args.get("job_id") or args.get("receipt_id"), "job_id")
+            try:
+                dry_b = parse_bool(args.get("dry_run"), False)
+                skip_b = parse_bool(args.get("skip_dirty"), False)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
+            return self.job_manager.delegate_revert(job_id=job_id_str, dry_run=dry_b, skip_dirty=skip_b)
+
+        if name == "cost_report":
+            def _opt_epoch(key: str) -> float | None:
+                val = args.get(key)
+                if val is None:
+                    return None
+                try:
+                    return float(val)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidParamsError(f"{key} must be a number") from exc
+
+            return true_total_report(
+                self.store,
+                self.job_manager.workspace_root,
+                since_epoch=_opt_epoch("since_epoch"),
+                until_epoch=_opt_epoch("until_epoch"),
+                transcripts_dir=_optional_str(args.get("transcripts_dir"), "transcripts_dir"),
             )
 
         if name == "delegate_cancel":
@@ -864,6 +1349,9 @@ class MCPServer:
             prompt_str = _require_str(args.get("prompt"), "prompt")
             enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
             disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
+            qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
+                os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
+            )
             try:
                 allowed = validate_allowed_paths(args.get("allowed_paths"))
                 plan_steps = validate_plan(args.get("plan"))
@@ -872,6 +1360,7 @@ class MCPServer:
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
                 auto_apply = parse_bool(args.get("auto_apply"), True)
                 in_place_b = parse_bool(args.get("in_place"), False)
+                preload_b = parse_bool(args.get("preload_files"), True)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             if in_place_b and not auto_apply:
@@ -880,6 +1369,9 @@ class MCPServer:
                     "are applied directly to the working tree."
                 )
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
+            req_api_key = _optional_str(args.get("api_key"), "api_key")
+            req_project = _optional_str(args.get("project"), "project")
+            req_location = _optional_str(args.get("location"), "location")
             digest = self.job_manager.delegate_start(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
@@ -891,25 +1383,169 @@ class MCPServer:
                 timeout_seconds=timeout_sec,
                 wait=True,
                 in_place=in_place_b,
-                api_key=_optional_str(args.get("api_key"), "api_key"),
-                project=_optional_str(args.get("project"), "project"),
-                location=_optional_str(args.get("location"), "location"),
+                api_key=req_api_key,
+                project=req_project,
+                location=req_location,
                 thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
                 plan=plan_steps,
                 acceptance=acceptance_cmds,
                 max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
+                preload_files=preload_b,
+                auto_apply=False,
             )
-            if auto_apply and digest.get("status") == "ok" and not in_place_b:
-                apply_res = self.job_manager.delegate_apply(str(digest["job_id"]))
-                digest["applied"] = True
-                digest["applied_files"] = apply_res.get("applied_files", [])
-                digest["diff_sha256"] = apply_res.get("diff_sha256")
-            elif digest.get("status") not in ("ok", "checkpoint", "needs_input"):
+            if qa_review_model and qa_review_model.strip():
+                digest = self._maybe_run_qa_review(
+                    digest,
+                    prompt_str=prompt_str,
+                    qa_review_model=qa_review_model,
+                    in_place_b=in_place_b,
+                    timeout_sec=timeout_sec,
+                    req_api_key=req_api_key,
+                    req_project=req_project,
+                    req_location=req_location,
+                    scrub_b=scrub_b,
+                )
+            digest = self.job_manager._maybe_auto_apply_digest(
+                str(digest["job_id"]),
+                digest,
+                auto_apply=auto_apply,
+                in_place=in_place_b,
+            )
+            if digest.get("status") not in ("ok", "checkpoint", "needs_input"):
                 digest["is_error"] = True
             return digest
 
         raise InvalidParamsError(f"Unknown tool: {name!r}")
+
+    def _maybe_run_qa_review(
+        self,
+        digest: dict[str, Any],
+        *,
+        prompt_str: str,
+        qa_review_model: str,
+        in_place_b: bool,
+        timeout_sec: float,
+        req_api_key: str | None,
+        req_project: str | None,
+        req_location: str | None,
+        scrub_b: bool,
+    ) -> dict[str, Any]:
+        if not (
+            qa_review_model
+            and qa_review_model.strip()
+            and digest.get("status") in ("ok", "checkpoint")
+            and digest.get("files_changed")
+        ):
+            return digest
+        was_checkpoint = digest.get("status") == "checkpoint"
+        job_id_str = str(digest["job_id"])
+        diff_path = self.store.diff_path(job_id_str)
+        diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
+        if not diff_text.strip():
+            return digest
+        wt_candidate = (
+            self.job_manager.workspace_root
+            if in_place_b
+            else self.store.worktree_path(job_id_str)
+        )
+        target_wt = wt_candidate if wt_candidate.exists() else self.job_manager.workspace_root
+        acc_results = digest.get("acceptance_results") or []
+        test_out_lines = [
+            f"$ {r.get('command', '')} (exit {r.get('exit_code', 0)})\n{r.get('output_tail', '')}".strip()
+            for r in acc_results
+            if isinstance(r, dict)
+        ]
+        review_bundle = build_review_evidence_dir(
+            target_wt,
+            task_prompt=prompt_str,
+            diff_text=diff_text,
+            test_output="\n\n".join(test_out_lines),
+            files_changed=digest.get("files_changed") or [],
+        )
+        qa_diff, qa_truncated, _qa_orig = truncate_to_token_budget(diff_text, QA_REVIEW_MAX_TOKENS)
+        slices_text = str(review_bundle.get("enclosing_slices") or "")
+        slices_tok = int(review_bundle.get("enclosing_slices_tokens") or 0)
+        slices_block = (
+            f"\n\n## Enclosing Modified Functions & Classes\n{slices_text}"
+            if (slices_text and not qa_truncated and (_qa_orig + slices_tok) <= QA_REVIEW_MAX_TOKENS)
+            else ""
+        )
+        qa_prompt = (
+            f"## Task Specification\n{prompt_str}\n\n"
+            f"## Candidate Git Diff{' (truncated)' if qa_truncated else ''}\n```diff\n{qa_diff}\n```"
+            f"{slices_block}"
+        )
+        qa_error: str | None = None
+        try:
+            qa_res = ask_gemini(
+                prompt=qa_prompt,
+                model=qa_review_model.strip(),
+                system_instruction=QA_DIFF_AUDIT_SYSTEM,
+                thinking_level="HIGH",
+                api_key=req_api_key,
+                project=req_project,
+                location=req_location,
+                workspace_root=self.job_manager.workspace_root,
+                store=self.store,
+                scrub_receipt=scrub_b,
+                backend=self.ask_backend,
+            )
+            parsed_qa = parse_qa_audit_verdict(str(qa_res.get("text") or ""))
+        except Exception as qa_exc:
+            qa_error = f"{type(qa_exc).__name__}: {qa_exc}"
+            qa_res = {}
+            parsed_qa = {"verdict": "ERROR", "passed": None, "issues": []}
+        resumed = False
+        if (parsed_qa["passed"] is False) or was_checkpoint:
+            if parsed_qa["issues"]:
+                issues_block = "\n".join(parsed_qa["issues"])
+                followup = (
+                    "A QA diff audit identified the following issues against the task specification:\n"
+                    f"{issues_block}\n\n"
+                    f"{review_bundle['pointer_prompt']}\n\n"
+                    "Fix each issue above cleanly and verify tests pass."
+                )
+            elif parsed_qa["passed"] is False:
+                followup = (
+                    "A QA diff audit returned VERDICT: NEEDS_FIXES against the task specification.\n\n"
+                    f"{review_bundle['pointer_prompt']}\n\n"
+                    "Verify every requirement and edge case in the task specification and ensure all tests pass."
+                )
+            else:
+                followup = (
+                    "You reached the tool-call checkpoint before completing the turn. "
+                    f"{review_bundle['pointer_prompt']}\n\n"
+                    "Finish any remaining implementation steps and verify tests pass."
+                )
+            cont_digest = self.job_manager.delegate_continue(
+                job_id=job_id_str,
+                follow_up_prompt=followup,
+                timeout_seconds=min(timeout_sec, 600.0),
+                wait=True,
+                api_key=req_api_key,
+                project=req_project,
+                location=req_location,
+                auto_apply=False,
+            )
+            resumed = cont_digest.get("continued", True) is not False
+            digest = cont_digest
+        qa_meta: dict[str, Any] = {
+            "model": qa_review_model.strip(),
+            "job_id": qa_res.get("job_id"),
+            "verdict": parsed_qa["verdict"],
+            "passed": parsed_qa["passed"],
+            "issues": parsed_qa["issues"],
+            "resumed": resumed,
+            "review_dir": review_bundle["review_dir"],
+            "pointer_prompt_tokens": review_bundle["pointer_prompt_tokens"],
+            "usage": qa_res.get("usage"),
+            "cost": qa_res.get("cost"),
+        }
+        if qa_error:
+            qa_meta["error"] = qa_error
+        digest["qa_review"] = qa_meta
+        return digest
 
 
 def serve_stdio(
@@ -923,8 +1559,16 @@ def serve_stdio(
     writer = out_stream or sys.stdout.buffer
     write_lock = threading.Lock()
     in_flight_futures: list[Future[None]] = []
+    last_framing = {"content_length": False}
+
+    def _notify(message: dict[str, Any]) -> None:
+        with write_lock:
+            _write_response(writer, message, last_framing["content_length"])
+
+    active_server.notify = _notify
 
     def _process_and_write(msg_obj: Any, framed: bool) -> None:
+        last_framing["content_length"] = framed
         try:
             resp = active_server.handle_Message(msg_obj)
         except (Exception, asyncio.CancelledError) as exc:

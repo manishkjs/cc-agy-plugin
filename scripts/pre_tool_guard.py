@@ -1520,7 +1520,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
     if not is_strict_mode_enabled(source_env):
         return {}
 
-    # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts)
+    # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts) and enforce 6-call Lead read cap in strict mode
     if tool_name in ("Read", "Grep", "Glob"):
         for field in ("file_path", "path", "pattern", "glob"):
             target_val = tool_input.get(field)
@@ -1543,6 +1543,42 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         ),
                     }
                 }
+        raw_limit = (
+            source_env.get("CC_AGY_LEAD_READ_LIMIT")
+            or source_env.get("CC_AGY_MAX_LEAD_READS")
+            or "2"
+        ).strip()
+        if raw_limit:
+            try:
+                read_limit = int(raw_limit)
+            except ValueError:
+                read_limit = 0
+            if read_limit > 0:
+                data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+                counter_path = data_root / ".lead_read_count"
+                try:
+                    current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
+                except Exception:
+                    current_reads = 0
+                if current_reads >= read_limit:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": (
+                                f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
+                                "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
+                                "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
+                                "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
+                                "immediately — the worker has full repository and test access in its worktree."
+                            ),
+                        }
+                    }
+                try:
+                    data_root.mkdir(parents=True, exist_ok=True)
+                    counter_path.write_text(str(current_reads + 1), encoding="utf-8")
+                except Exception:
+                    pass
 
     # 2b. Block direct Edit / Write / MultiEdit / NotebookEdit on both workspace and out_dir (receipts)
     if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):

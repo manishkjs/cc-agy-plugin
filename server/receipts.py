@@ -532,6 +532,10 @@ class ReceiptStore:
             "applied_history": record.get("applied_history", []),
             "prompts": record.get("prompts", []),
         }
+        # Revert metadata is signed only when present, so receipts written before it existed still verify.
+        for opt_key in ("pre_apply", "reverted_files", "tasks", "plan_fingerprint", "precomputed_cost", "writer_route"):
+            if opt_key in record:
+                canonical_payload[opt_key] = record.get(opt_key)
         serialized = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hmac.new(self._active_hmac_key(), serialized, hashlib.sha256).hexdigest()
 
@@ -716,11 +720,16 @@ class ReceiptStore:
 
         usage = record.get("usage") or {}
         model = str(record.get("model") or "gemini-3.1-pro-preview")
-        record["cost"] = estimate_cost_usd(
-            model,
-            usage,
-            single_request=(record.get("kind") == "ask"),
-        )
+        precomputed = record.get("precomputed_cost")
+        if isinstance(precomputed, dict) and "total_cost_cents" in precomputed:
+            # Jobs that mix models (e.g. Gemini writers plus a Claude fallback) price each call themselves.
+            record["cost"] = dict(precomputed)
+        else:
+            record["cost"] = estimate_cost_usd(
+                model,
+                usage,
+                single_request=(record.get("kind") == "ask"),
+            )
 
         # Always redact secret API keys even when scrub=False
         record = redact_api_keys(record, api_key=api_key)
