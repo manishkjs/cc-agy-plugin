@@ -46,8 +46,10 @@ def verify_mcp_server_health() -> dict[str, Any]:
 
 
 _CHECKLIST_STEP_1 = (
-    "1. Before delegating, write every behavioral requirement from the task as a numbered list "
-    "(names, signatures, defaults, error cases, edge cases). Put the whole list in the delegate prompt. "
+    "1. Before delegating, include the user's verbatim task specification in the delegate prompt "
+    "(do not paraphrase away exact sentences, formulas, or examples), and also write every behavioral "
+    "requirement from the task as a numbered list (names, signatures, defaults, error cases, edge cases). "
+    "Put the whole list in the delegate prompt. "
     "Ask the worker to add one test per item, and to search for every caller and consumer of each API it "
     "changes and update them too.\n"
 )

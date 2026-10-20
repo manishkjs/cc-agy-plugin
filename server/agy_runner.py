@@ -1238,6 +1238,23 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                     pass
             stop_reason = await resolve_stop_reason(resp)
         sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+        for k in (
+            "prompt_token_count",
+            "cached_content_token_count",
+            "candidates_token_count",
+            "thoughts_token_count",
+            "total_token_count",
+        ):
+            usage[k] = max(
+                int(usage.get(k) or 0),
+                int(sqlite_telemetry.get(k) or 0),
+            )
+        usage["total_token_count"] = max(
+            int(usage.get("total_token_count") or 0),
+            int(usage.get("prompt_token_count") or 0)
+            + int(usage.get("candidates_token_count") or 0)
+            + int(usage.get("thoughts_token_count") or 0),
+        )
         if not usage.get("requests") and sqlite_telemetry.get("requests"):
             usage["requests"] = list(sqlite_telemetry["requests"])
             usage["max_request_prompt_tokens"] = max(

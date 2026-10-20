@@ -1309,6 +1309,35 @@ class JobManager:
             return False
         return self.worker_backend is None
 
+    def _resolve_escalation_target_model(self, current_model: str) -> str | None:
+        """Return the escalated worker model (e.g. 'gemini-4-argon') when escalating from Flash, or None."""
+        if "flash" not in (current_model or "").lower():
+            return None
+        raw_esc = os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip()
+        if raw_esc.lower() in ("0", "false", "no", "off"):
+            return None
+        if raw_esc:
+            target = (
+                "gemini-4-argon"
+                if raw_esc.lower() in ("1", "true", "yes", "on")
+                else raw_esc
+            )
+        elif self._is_bounded_lead_session() or self.worker_backend is None:
+            target = "gemini-4-argon"
+        else:
+            return None
+        return target if target != current_model else None
+
+    def _session_has_completed_delegate_job(self) -> bool:
+        """Return True if this workspace already has a finished prior delegate job (so a new delegate_start is a follow-up/retry)."""
+        for r in self.store.list_receipts(workspace_root=self.workspace_root):
+            if r.get("kind", "delegate") != "delegate":
+                continue
+            st = str(r.get("status") or "")
+            if st and st not in ("running", "cancelled"):
+                return True
+        return False
+
     def _clamp_worker_timeout(self, timeout_seconds: float) -> float:
         """Clamp worker turn timeout against the session deadline (reserving headroom for review & apply)."""
         t_val = max(0.1, float(timeout_seconds))
@@ -2390,6 +2419,11 @@ class JobManager:
                 "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
                 default="gemini-3.1-pro-preview",
             )
+        escalated_from_model: str | None = None
+        target_esc_model = self._resolve_escalation_target_model(chosen_model)
+        if target_esc_model and self._session_has_completed_delegate_job():
+            escalated_from_model = chosen_model
+            chosen_model = target_esc_model
         resolved_thinking = resolve_thinking_level(
             thinking_level,
             model=chosen_model,
@@ -2498,6 +2532,8 @@ class JobManager:
             "preloaded_files": preloaded_rel_paths,
             "error": None,
         }
+        if escalated_from_model:
+            initial_receipt["escalated_from_model"] = escalated_from_model
         self.store.write_receipt(
             job_id,
             initial_receipt,
@@ -2542,6 +2578,44 @@ class JobManager:
         if wait:
             self._wait_for_future_or_cancel(job_id, fut, timeout=max(0.5, float(timeout_seconds) + 30.0))
             receipt = self.store.read_receipt(job_id)
+            if (
+                self._is_bounded_lead_session()
+                and not in_place
+                and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is not None
+                and (
+                    worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+                    or receipt.get("status") in ("checkpoint", "needs_input")
+                )
+                and receipt.get("status") not in ("cancelled", "interrupted")
+            ):
+                acc_failures = [
+                    f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
+                    for r in (receipt.get("acceptance_results") or [])
+                    if isinstance(r, dict) and not r.get("passed")
+                ]
+                fail_detail = (
+                    "\n\nFailing acceptance commands from the Flash attempt:\n" + "\n\n".join(acc_failures)
+                    if acc_failures
+                    else f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
+                )
+                return self.delegate_continue(
+                    job_id=job_id,
+                    follow_up_prompt=(
+                        "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
+                        "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
+                        "complete all requirements from the original task specification, and ensure all acceptance "
+                        "and unit tests pass." + fail_detail
+                    ),
+                    allowed_paths=allowed_paths,
+                    acceptance=acceptance,
+                    timeout_seconds=timeout_seconds,
+                    wait=True,
+                    project=project,
+                    location=location,
+                    api_key=api_key,
+                    scrub_receipt=scrub_receipt,
+                    auto_apply=auto_apply,
+                )
             digest = self._digest_with_progress(receipt)
             return self._maybe_auto_apply_digest(
                 job_id,
@@ -2555,6 +2629,7 @@ class JobManager:
             "status": "running",
             "auth_mode": auth_mode,
             "model": chosen_model,
+            **({"escalated_from_model": escalated_from_model} if escalated_from_model else {}),
             "vertex_location": resolved_location,
             "reroute_note": reroute_note,
             "allowed_paths": validated_paths,
@@ -3310,7 +3385,10 @@ class JobManager:
                 prior_receipt = self.store.read_receipt(safe_id)
             except FileNotFoundError:
                 prior_receipt = {}
-            if (prior_receipt.get("escalation") or {}).get("escalate_to_lead"):
+            if (
+                (prior_receipt.get("escalation") or {}).get("escalate_to_lead")
+                and self._resolve_escalation_target_model(str(prior_receipt.get("model") or "")) is None
+            ):
                 digest = self._compact_digest(prior_receipt, include_summary=False)
                 digest["status"] = "escalated"
                 digest["continued"] = False
@@ -3455,21 +3533,10 @@ class JobManager:
 
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
         escalated_from: str | None = None
-        raw_esc_model = os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip()
-        if (
-            raw_esc_model
-            and raw_esc_model.lower() not in ("0", "false", "no", "off")
-            and "flash" in model.lower()
-            and worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
-        ):
-            target_esc_model = (
-                "gemini-4-argon"
-                if raw_esc_model.lower() in ("1", "true", "yes", "on")
-                else raw_esc_model
-            )
-            if target_esc_model != model:
-                escalated_from = str(receipt.get("escalated_from_model") or model)
-                model = target_esc_model
+        target_esc_model = self._resolve_escalation_target_model(model)
+        if target_esc_model:
+            escalated_from = str(receipt.get("escalated_from_model") or model)
+            model = target_esc_model
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
@@ -3511,6 +3578,8 @@ class JobManager:
         if escalated_from is not None:
             receipt["escalated_from_model"] = escalated_from
             receipt["model"] = model
+            receipt["failed_attempts"] = 0
+            receipt.pop("escalation", None)
             try:
                 self.store.write_receipt(
                     safe_id,

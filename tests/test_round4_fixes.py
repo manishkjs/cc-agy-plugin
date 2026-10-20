@@ -202,3 +202,117 @@ def test_session_start_resets_read_counter(tmp_path: Path) -> None:
     assert (store.data_dir / ".lead_read_count").read_text(encoding="utf-8") == "0"
     assert (store.data_dir / ".lead_session_started").exists()
     assert out["hookSpecificOutput"]["additionalContext"] == REVIEW_AFTER_APPLY_GUIDANCE
+    assert "verbatim task specification" in REVIEW_AFTER_APPLY_GUIDANCE
+
+
+def test_flash_to_argon_escalation_on_followup_delegate_start_and_continue(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo_esc"
+    _init_repo(repo)
+    (repo / "app.py").write_text("def f(x: int) -> int:\n    return x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
+
+    seen_models: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen_models.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text(f"def f(x: int) -> int:\n    return x + {len(seen_models)}\n", encoding="utf-8")
+        return {
+            "text": "updated app.py",
+            "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+        }
+
+    store = ReceiptStore(tmp_path / "data_esc", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        # Job 1 runs on gemini-3.8-flash and auto-applies when its initial acceptance command passes.
+        d1 = jm.delegate_start(
+            "Initial implementation",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["grep -q def app.py"],
+            wait=True,
+        )
+        assert d1["model"] == "gemini-3.8-flash"
+        assert d1["applied"] is True
+        assert "escalated_from_model" not in d1
+
+        # Job 2 is a follow-up delegate_start after post-apply review found an edge case:
+        # it must automatically escalate from gemini-3.8-flash to gemini-4-argon.
+        d2 = jm.delegate_start(
+            "Fix edge case found during post-apply review",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["grep -q def app.py"],
+            wait=True,
+        )
+        assert d2["model"] == "gemini-4-argon"
+        assert d2["escalated_from_model"] == "gemini-3.8-flash"
+        assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
+    finally:
+        jm.shutdown()
+
+
+def test_bounded_lead_delegate_start_auto_escalates_in_place_on_turn1_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When Job 1 on Flash fails acceptance or hits checkpoint in a bounded Lead session, delegate_start(wait=True) auto-escalates in-place to Argon."""
+    repo = tmp_path / "repo_esc_inplace"
+    _init_repo(repo)
+    (repo / "app.py").write_text("broken\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
+
+    seen_models: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        model = str(req["model"])
+        seen_models.append(model)
+        wt = Path(str(req["workspace_dir"]))
+        if model == "gemini-3.8-flash":
+            # Turn 1 on Flash hits the 100-tool-call checkpoint even though the initial acceptance command passes
+            (wt / "app.py").write_text("def partial():\n    return 1\n", encoding="utf-8")
+            return {
+                "text": "hit 100 tool calls checkpoint",
+                "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+            }
+        # Turn 2 on Argon fixes the code
+        (wt / "app.py").write_text("def x():\n    return 2\n", encoding="utf-8")
+        return {
+            "text": "fixed on argon",
+            "usage": {"prompt_token_count": 150, "candidates_token_count": 30, "total_token_count": 180},
+        }
+
+    store = ReceiptStore(tmp_path / "data_esc_inplace", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d1 = jm.delegate_start(
+            "Implement feature with Turn 1 failure on flash",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["grep -q def app.py"],
+            wait=True,
+        )
+        assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
+        assert d1["model"] == "gemini-4-argon"
+        assert d1["escalated_from_model"] == "gemini-3.8-flash"
+        assert d1["acceptance_passed"] is True
+        assert d1["applied"] is True
+        raw_rec = store.read_receipt(d1["job_id"])
+        assert len(raw_rec.get("prompts") or []) == 2
+        assert raw_rec["model"] == "gemini-4-argon"
+        assert raw_rec["escalated_from_model"] == "gemini-3.8-flash"
+    finally:
+        jm.shutdown()
+
+
+
