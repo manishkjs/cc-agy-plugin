@@ -900,6 +900,33 @@ def build_straitjacket_tools(
     )
 
 
+def resolve_worker_sdk_limits(
+    request: dict[str, Any] | None = None,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[int, int]:
+    """Return `(compaction_threshold_tokens, tool_output_max_tokens)` for `LocalAgentConfig` (`0` disables)."""
+    req = request or {}
+    source_env = os.environ if env is None else env
+    raw_compaction = req.get("compaction_threshold")
+    if raw_compaction is None:
+        raw_compaction = source_env.get("CC_AGY_COMPACTION_THRESHOLD", "120000")
+    try:
+        compaction_threshold = max(0, int(float(str(raw_compaction).strip())))
+    except (TypeError, ValueError):
+        compaction_threshold = 120000
+
+    raw_tool_max = req.get("tool_output_max_tokens")
+    if raw_tool_max is None:
+        raw_tool_max = source_env.get("CC_AGY_TOOL_OUTPUT_MAX_TOKENS", "4000")
+    try:
+        tool_max_tokens = max(0, int(float(str(raw_tool_max).strip())))
+    except (TypeError, ValueError):
+        tool_max_tokens = 4000
+
+    return compaction_threshold, tool_max_tokens
+
+
 async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any]:
     """Execute an agentic task inside `workspace_dir` using `google.antigravity`."""
     from google import antigravity as ag
@@ -988,6 +1015,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         cap_kwargs["disabled_tools"] = base_disabled
     if base_enabled is not None:
         cap_kwargs["enabled_tools"] = base_enabled
+
+    compaction_threshold, tool_max_tokens = resolve_worker_sdk_limits(request)
+    if tool_max_tokens > 0 and hasattr(types, "ToolOutputTruncationConfig"):
+        cap_kwargs["tool_output_truncation_config"] = types.ToolOutputTruncationConfig(max_tokens=tool_max_tokens)
 
     capabilities = types.CapabilitiesConfig(**cap_kwargs)
 
@@ -1098,6 +1129,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         cfg_kwargs["location"] = request.get("location")
     if budget_cfg is not None:
         cfg_kwargs["budget_config"] = budget_cfg
+    if compaction_threshold > 0 and hasattr(types, "CompactionConfig"):
+        cfg_kwargs["compaction_config"] = types.CompactionConfig(token_threshold=compaction_threshold)
     if custom_tools:
         cfg_kwargs["tools"] = custom_tools
     use_short_preamble = os.environ.get("CC_AGY_FULL_SDK_PREAMBLE", "").strip().lower() not in ("1", "true", "yes")

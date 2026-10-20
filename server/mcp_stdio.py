@@ -105,7 +105,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "Concise, outcome-oriented task specification (keep under 500 words / 3,500 characters; "
+                        "Concise, outcome-oriented task specification (keep under 500 words / 1,000 tokens; "
                         "state the behavioral requirements, edge cases, and target file paths directly without "
                         "'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines of "
                         "implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
@@ -276,6 +276,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "page_tokens": {
                     "type": "integer",
                     "description": "Token budget per page (default: 4000, max: 8000).",
+                },
+                "summary_only": {
+                    "type": "boolean",
+                    "description": "If true, return only per-file added/removed line stats (`file_stats`) and token estimates without diff hunks (default: false).",
+                },
+                "focus_symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of symbol names; filters diff output to only hunks touching at least one symbol.",
                 },
             },
             "required": ["job_id"],
@@ -1173,6 +1182,7 @@ class MCPServer:
                 )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(prompt_str, plan_steps)
             if in_place_b and auto_apply_arg is False:
                 raise InvalidParamsError(
                     "in_place=True cannot be combined with auto_apply=False because in_place edits "
@@ -1223,6 +1233,10 @@ class MCPServer:
                     auto_apply=auto_apply_arg,
                     in_place=in_place_b,
                 )
+            if repair_meta.get("repaired") and isinstance(digest, dict):
+                digest["dictation_repaired"] = True
+                if repair_meta.get("snippet_paths"):
+                    digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
             return digest
 
         if name == "delegate_status":
@@ -1249,11 +1263,18 @@ class MCPServer:
             job_id_str = _require_str(args.get("job_id"), "job_id")
             page_val = _parse_positive_int(args.get("page"), "page", 1)
             page_tok_val = _parse_positive_int(args.get("page_tokens"), "page_tokens", 4000)
+            focus_syms = _validate_optional_str_list(args.get("focus_symbols"), "focus_symbols")
+            try:
+                summary_only_b = parse_bool(args.get("summary_only"), False)
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.get_diff(
                 job_id=job_id_str,
                 file_filter=_optional_str(args.get("file_filter"), "file_filter"),
                 page=page_val,
                 page_tokens=page_tok_val,
+                summary_only=summary_only_b,
+                focus_symbols=focus_syms,
             )
 
         if name == "delegate_apply":
@@ -1292,8 +1313,9 @@ class MCPServer:
                 )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            followup_str, _, repair_meta = self._maybe_repair_dictation(followup_str, None)
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 600.0)
-            return self.job_manager.delegate_continue(
+            digest = self.job_manager.delegate_continue(
                 job_id=job_id_str,
                 follow_up_prompt=followup_str,
                 allowed_paths=cont_allowed,
@@ -1306,6 +1328,11 @@ class MCPServer:
                 force_retry=force_b,
                 auto_apply=cont_auto_apply,
             )
+            if repair_meta.get("repaired") and isinstance(digest, dict):
+                digest["dictation_repaired"] = True
+                if repair_meta.get("snippet_paths"):
+                    digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
+            return digest
 
         if name == "delegate_revert":
             job_id_str = _require_str(args.get("job_id") or args.get("receipt_id"), "job_id")
@@ -1363,6 +1390,7 @@ class MCPServer:
                 preload_b = parse_bool(args.get("preload_files"), True)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
+            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(prompt_str, plan_steps)
             if in_place_b and not auto_apply:
                 raise InvalidParamsError(
                     "in_place=True cannot be combined with auto_apply=False because in_place edits "
@@ -1414,9 +1442,57 @@ class MCPServer:
             )
             if digest.get("status") not in ("ok", "checkpoint", "needs_input"):
                 digest["is_error"] = True
+            if repair_meta.get("repaired") and isinstance(digest, dict):
+                digest["dictation_repaired"] = True
+                if repair_meta.get("snippet_paths"):
+                    digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
             return digest
 
         raise InvalidParamsError(f"Unknown tool: {name!r}")
+
+    def _maybe_repair_dictation(
+        self,
+        prompt_str: str,
+        plan_steps: list[str] | None,
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        """Auto-repair dictated code blocks when CC_AGY_REPAIR_CODE_DICTATION is enabled."""
+        resolved_plan = list(plan_steps or [])
+        auto_repair = os.environ.get("CC_AGY_REPAIR_CODE_DICTATION", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not auto_repair:
+            return prompt_str, resolved_plan, {"repaired": False, "snippet_paths": []}
+        from scripts.pre_tool_guard import lint_delegation_prompt, repair_dictated_prompt
+
+        snippet_dir = self.store.data_dir / "dictated_snippets"
+        rep_prompt = repair_dictated_prompt(prompt_str, snippet_dir=snippet_dir)
+        repaired_any = bool(rep_prompt.get("repaired"))
+        snippet_paths = list(rep_prompt.get("snippet_paths") or [])
+        new_prompt = str(rep_prompt.get("prompt") or prompt_str)
+        new_plan: list[str] = []
+        for step in resolved_plan:
+            rep_step = repair_dictated_prompt(step, snippet_dir=snippet_dir)
+            if rep_step.get("repaired"):
+                repaired_any = True
+                for sp in rep_step.get("snippet_paths") or []:
+                    if sp not in snippet_paths:
+                        snippet_paths.append(sp)
+            new_plan.append(str(rep_step.get("prompt") or step))
+        if new_plan and not lint_delegation_prompt("\n".join([new_prompt, *new_plan]))["ok"]:
+            new_prompt = new_prompt.rstrip() + "\n[... behavioral specification boundary ...]"
+            new_plan = [
+                s.rstrip() + "\n[... behavioral specification boundary ...]"
+                for s in new_plan
+            ]
+            repaired_any = True
+        return (
+            new_prompt,
+            new_plan,
+            {"repaired": repaired_any, "snippet_paths": snippet_paths},
+        )
 
     def _maybe_run_qa_review(
         self,

@@ -1026,3 +1026,499 @@ def test_extract_usage_metadata_handles_dict_model_and_attr_bag() -> None:
     assert extract_usage_metadata(Bag())["total_token_count"] == 8
     assert extract_usage_metadata(None)["total_token_count"] == 0
     assert extract_usage_metadata({"prompt_token_count": "bad"})["prompt_token_count"] == 0
+
+
+def test_worker_sdk_limits_and_test_count_parsers() -> None:
+    from server.agy_runner import resolve_worker_sdk_limits
+    from server.jobs import _parse_test_counts
+
+    # Default limits: 120000 compaction threshold, 4000 tool output tokens
+    defaults = resolve_worker_sdk_limits({}, env={})
+    assert defaults == (120_000, 4000)
+
+    # Custom env overrides and 0-disable
+    custom = resolve_worker_sdk_limits(
+        {},
+        env={"CC_AGY_TOOL_OUTPUT_MAX_TOKENS": "2500", "CC_AGY_COMPACTION_THRESHOLD": "0"},
+    )
+    assert custom == (0, 2500)
+
+    # stestr / subunit parser (e.g. bandit)
+    stestr_out = (
+        "======\nTotals\n======\nRan: 163 tests in 1.4200 sec.\n"
+        " - Passed: 161\n - Skipped: 0\n - Expected Fail: 0\n - Unexpected Success: 1\n - Failed: 1\n"
+    )
+    assert _parse_test_counts(stestr_out) == {"passed": 161, "failed": 1, "errors": 1}
+
+    # unittest OK and FAILED parser (subtracts skipped from passed)
+    ut_ok = "...............\n----------------------------------------------------------------------\nRan 15 tests in 0.042s\n\nOK (skipped=1)\n"
+    assert _parse_test_counts(ut_ok) == {"passed": 14, "failed": 0, "errors": 0}
+    ut_fail = "Ran 10 tests in 0.05s\n\nFAILED (failures=2, errors=1)\n"
+    assert _parse_test_counts(ut_fail) == {"passed": 7, "failed": 2, "errors": 1}
+
+
+def test_default_acceptance_import_smoke_and_model_escalation(tmp_path: Path, monkeypatch) -> None:
+    from server.jobs import JobManager, build_import_smoke_command, discover_related_test_commands
+    from server.receipts import ReceiptStore
+
+    repo = tmp_path / "repo_acc"
+    repo.mkdir()
+    _init_temp_git_repo(repo)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "pkg" / "calc.py").write_text("def double(x: int) -> int:\n    return x * 2\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_calc.py").write_text(
+        "from pkg.calc import double\ndef test_double():\n    assert double(3) == 6\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "add pkg.calc"], cwd=str(repo), check=True)
+
+    # 1. Default test discovery when caller passes existing_cmds=[]
+    default_cmds = discover_related_test_commands(repo, ["pkg/calc.py"], [])
+    assert len(default_cmds) == 1
+    assert "pytest -q tests/test_calc.py" in default_cmds[0]
+
+    # 2. Import smoke command generation for changed package module
+    imp_cmds = build_import_smoke_command(repo, ["pkg/calc.py", "tests/test_calc.py"])
+    assert len(imp_cmds) == 1
+    assert "pkg.calc" in imp_cmds[0]
+    assert "test_calc" not in imp_cmds[0]
+
+    # 3. Auto default acceptance + Flash -> Argon model escalation on delegate_continue
+    monkeypatch.setenv("CC_AGY_AUTO_DEFAULT_ACCEPTANCE", "1")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_SESSION_DEADLINE_SECONDS", "600")
+    monkeypatch.setenv("CC_AGY_DEADLINE_RESERVE_SECONDS", "100")
+
+    seen_models: list[str] = []
+    seen_timeouts: list[float] = []
+
+    def broken_then_fixed_worker(req: dict[str, object]) -> dict[str, object]:
+        seen_models.append(str(req["model"]))
+        seen_timeouts.append(float(req["timeout_seconds"]))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen_models) == 1:
+            # Break pkg/calc.py so auto-discovered default acceptance fails
+            (wt / "pkg" / "calc.py").write_text("def double(x: int) -> int:\n    return x * 999\n", encoding="utf-8")
+        else:
+            (wt / "pkg" / "calc.py").write_text("def double(x: int) -> int:\n    return int(x) * 2\n", encoding="utf-8")
+        return {
+            "text": "updated calc",
+            "usage": {
+                "prompt_token_count": 250_000,
+                "candidates_token_count": 100,
+                "total_token_count": 250_100,
+                "requests": [
+                    {"prompt_token_count": 180_000},
+                    {"prompt_token_count": 220_000},
+                ],
+            },
+        }
+
+    store = ReceiptStore(tmp_path / "data_acc", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=broken_then_fixed_worker)
+
+    d1 = jm.delegate_start(
+        "Update double in pkg/calc.py",
+        model="gemini-3.8-flash",
+        project="test-proj",
+        timeout_seconds=1200.0,
+        wait=True,
+    )
+    # Timeout was clamped below (600 - 100) = 500s
+    assert seen_timeouts[0] <= 500.0
+    assert d1["acceptance_passed"] is False
+    assert any(r.get("auto_discovered_default") for r in d1.get("acceptance_results", []))
+    assert d1["usage"]["over_200k_requests_count"] == 1
+
+    d2 = jm.delegate_continue(
+        d1["job_id"],
+        "Fix double in pkg/calc.py so tests pass",
+        project="test-proj",
+        timeout_seconds=1200.0,
+        wait=True,
+    )
+    assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
+    assert seen_timeouts[1] <= 500.0
+    assert d2["model"] == "gemini-4-argon"
+    assert d2.get("escalated_from_model") == "gemini-3.8-flash"
+    assert d2["acceptance_passed"] is True
+    jm.shutdown()
+
+
+def test_guard_pytest_ini_plugin_fence_dictation_repair_and_diff_summary(tmp_path: Path, monkeypatch) -> None:
+    from scripts.pre_tool_guard import (
+        PLUGIN_ROOT,
+        detect_bash_workspace_mutation,
+        evaluate_pre_tool_use,
+        lint_delegation_prompt,
+        repair_dictated_prompt,
+    )
+    from scripts.session_start import verify_mcp_server_health
+    from server.jobs import JobManager
+    from server.mcp_stdio import MCPServer
+    from server.receipts import ReceiptStore
+
+    # 1. SessionStart MCP health self-check
+    health = verify_mcp_server_health()
+    assert health["healthy"] is True
+    assert health["tool_count"] >= 8
+
+    # 2. pytest -o addopts=... is allowed while unsafe -o cache_dir=... or -p plugin is blocked
+    v_safe = detect_bash_workspace_mutation('pytest -q -o addopts="" tests/', tmp_path)
+    assert v_safe["blocked"] is False
+    v_safe2 = detect_bash_workspace_mutation("pytest --override-ini=xfail_strict=true tests/", tmp_path)
+    assert v_safe2["blocked"] is False
+    v_unsafe = detect_bash_workspace_mutation("pytest -o cache_dir=/tmp/outside tests/", tmp_path)
+    assert v_unsafe["blocked"] is True
+    v_unsafe_plug = detect_bash_workspace_mutation('pytest -o "addopts=-p evil_plugin" tests/', tmp_path)
+    assert v_unsafe_plug["blocked"] is True
+
+    # 3. Direct Python import of plugin internals in Bash or reading PLUGIN_ROOT is blocked in strict mode
+    v_imp = detect_bash_workspace_mutation(
+        'python3 -c "from server.mcp_stdio import MCPServer; print(MCPServer)"',
+        tmp_path,
+    )
+    assert v_imp["blocked"] is True
+    assert "plugin internals" in str(v_imp["reason"])
+
+    strict_env = {
+        "CC_AGY_STRICT_MODE": "true",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "CC_AGY_DATA_DIR": str(tmp_path / ".cc-agy-data"),
+    }
+    dec_plugin_read = evaluate_pre_tool_use(
+        {
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(PLUGIN_ROOT / "server" / "mcp_stdio.py")},
+            "cwd": str(tmp_path),
+        },
+        env=strict_env,
+    )
+    assert dec_plugin_read["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # 4. LeadReadBudgetExceeded auto-attaches Focused File Outline for the requested workspace file
+    (tmp_path / "service.py").write_text(
+        "class OrderProcessor:\n    def process_order(self, order_id: str) -> bool:\n        return True\n",
+        encoding="utf-8",
+    )
+    strict_env_cap1 = {**strict_env, "CC_AGY_LEAD_READ_LIMIT": "1"}
+    assert (
+        evaluate_pre_tool_use(
+            {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "service.py")}, "cwd": str(tmp_path)},
+            env=strict_env_cap1,
+        )
+        == {}
+    )
+    dec_exceed = evaluate_pre_tool_use(
+        {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "service.py")}, "cwd": str(tmp_path)},
+        env=strict_env_cap1,
+    )
+    reason_exceed = dec_exceed["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "LeadReadBudgetExceeded" in reason_exceed
+    assert "Focused File Outline" in reason_exceed
+    assert "OrderProcessor" in reason_exceed
+
+    # 5. Dictated code block auto-repair (repair_dictated_prompt + CC_AGY_REPAIR_CODE_DICTATION=1)
+    dictated = (
+        "Please update app.py with this implementation:\n"
+        "```python\n"
+        "def a1(x):\n"
+        "    y = x + 1\n"
+        "    y = y + 2\n"
+        "    y = y + 3\n"
+        "    y = y + 4\n"
+        "    y = y + 5\n"
+        "    y = y + 6\n"
+        "    y = y + 7\n"
+        "    y = y + 8\n"
+        "    return y\n"
+        "```\n"
+    )
+    assert lint_delegation_prompt(dictated)["ok"] is False
+    rep = repair_dictated_prompt(dictated, snippet_dir=tmp_path / "snippets")
+    assert rep["repaired"] is True
+    assert lint_delegation_prompt(rep["prompt"])["ok"] is True
+    assert len(rep["snippet_paths"]) == 1
+    assert Path(rep["snippet_paths"][0]).is_file()
+
+    # With CC_AGY_REPAIR_CODE_DICTATION=1, PreToolUse allows the call through and MCPServer repairs it
+    env_repair = {**strict_env, "CC_AGY_REPAIR_CODE_DICTATION": "1"}
+    assert (
+        evaluate_pre_tool_use(
+            {"tool_name": "mcp__plugin_agy_agy__delegate_start", "tool_input": {"prompt": dictated}, "cwd": str(tmp_path)},
+            env=env_repair,
+        )
+        == {}
+    )
+
+    # 6. get_diff with file_stats, summary_only=True, and focus_symbols
+    repo = tmp_path / "repo_diff"
+    repo.mkdir()
+    _init_temp_git_repo(repo)
+    (repo / "extra.py").write_text("def helper_one() -> int:\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "add extra.py"], cwd=str(repo), check=True)
+
+    def multi_file_worker(req: dict[str, object]) -> dict[str, object]:
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text("def greet() -> str:\n    return 'updated_greet'\n", encoding="utf-8")
+        (wt / "extra.py").write_text("def helper_one() -> int:\n    return 42\n", encoding="utf-8")
+        return {"text": "edited both"}
+
+    monkeypatch.setenv("CC_AGY_REPAIR_CODE_DICTATION", "1")
+    store = ReceiptStore(tmp_path / "data_diff", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=multi_file_worker)
+    srv = MCPServer(job_manager=jm, store=store)
+
+    d_rep = srv._dispatch_tool(
+        "delegate_start",
+        {"prompt": dictated, "project": "p", "wait": True, "auto_apply": False},
+    )
+    assert d_rep.get("dictation_repaired") is True
+
+    diff_summary = srv._dispatch_tool(
+        "get_diff",
+        {"job_id": d_rep["job_id"], "summary_only": True},
+    )
+    assert diff_summary["summary_only"] is True
+    assert diff_summary["diff"] == ""
+    assert set(diff_summary["file_stats"].keys()) == {"app.py", "extra.py"}
+    assert diff_summary["file_stats"]["app.py"]["added"] >= 1
+
+    diff_focused = srv._dispatch_tool(
+        "get_diff",
+        {"job_id": d_rep["job_id"], "focus_symbols": ["helper_one"]},
+    )
+    assert "helper_one" in diff_focused["diff"]
+    assert "updated_greet" not in diff_focused["diff"]
+    assert list(diff_focused["file_stats"].keys()) == ["extra.py"]
+    assert diff_focused["files_changed"] == ["extra.py"]
+    jm.shutdown()
+
+
+def test_gauntlet_round1_regressions(tmp_path: Path, monkeypatch) -> None:
+    """Regression suite for all Round 1 Gauntlet findings across Opus 5.5, Fable 5.1, and Argon."""
+    from scripts.pre_tool_guard import (
+        PLUGIN_ROOT,
+        detect_bash_workspace_mutation,
+        evaluate_pre_tool_use,
+        lint_delegation_prompt,
+        repair_dictated_prompt,
+    )
+    from server.agy_runner import resolve_worker_sdk_limits
+    from server.jobs import JobManager, _parse_test_counts, build_import_smoke_command
+    from server.mcp_stdio import MCPServer
+    from server.receipts import ReceiptStore
+
+    # 1. Pytest addopts bypasses, clustered short flags (-qo, -qp, -qc), testpaths, and python -m pytest
+    for blocked_cmd in (
+        'pytest -o "addopts=-c /tmp/evil.ini" tests/',
+        'pytest -o "addopts=--noconftest" tests/',
+        'pytest -o "addopts=--cov=pkg --cov-report=html:/tmp/cov" tests/',
+        'pytest -o "addopts=--log-file=/tmp/pwn.log" tests/',
+        'pytest -o "addopts=/tmp/evil_test.py" tests/',
+        "pytest -o testpaths=/tmp tests/",
+        "pytest -c /tmp/evil.ini tests/",
+        "pytest -qc /tmp/evil.ini tests/",
+        "pytest -qp evil_plugin tests/",
+        "pytest -qo cache_dir=/tmp/outside tests/",
+        "python3 -m pytest -p evil_plugin tests/",
+        "python3 -m pytest --confcutdir=/tmp tests/",
+        "python3 -m pytest -o cache_dir=/tmp/outside tests/",
+        'PYTEST_ADDOPTS="-o cache_dir=/tmp/outside" pytest tests/',
+        'env PYTEST_ADDOPTS="-o cache_dir=/tmp/outside" pytest tests/',
+        'export PYTEST_ADDOPTS="-o cache_dir=/tmp/outside" && pytest tests/',
+        "PYTEST_PLUGINS=evil_plugin pytest tests/",
+        "pytest-3 -o cache_dir=/tmp/outside tests/",
+    ):
+        res_b = detect_bash_workspace_mutation(blocked_cmd, tmp_path)
+        assert res_b["blocked"] is True, f"Expected blocked for: {blocked_cmd}"
+
+    for allowed_cmd in (
+        "pytest -q -p no:cacheprovider tests/",
+        "pytest -qp no:cacheprovider tests/",
+        'pytest -qo "addopts=-q -p no:cacheprovider" tests/',
+        'python3 -m pytest -q -o "addopts=-q" tests/',
+        'SAFE_VAR="a b" pytest -q tests/',
+    ):
+        res_a = detect_bash_workspace_mutation(allowed_cmd, tmp_path)
+        assert res_a["blocked"] is False, f"Expected allowed for: {allowed_cmd} ({res_a.get('reason')})"
+
+    # 2. Scoped MCPServer / JobManager / PLUGIN_ROOT fence: grep in user repo allowed, python import or cat PLUGIN_ROOT blocked
+    assert detect_bash_workspace_mutation("grep -rn 'JobManager(' server/", tmp_path)["blocked"] is False
+    assert (
+        detect_bash_workspace_mutation(
+            'python3 -c "from server import jobs; print(jobs.JobManager)"',
+            tmp_path,
+        )["blocked"]
+        is True
+    )
+    assert (
+        detect_bash_workspace_mutation(
+            f"cat {PLUGIN_ROOT / 'server' / 'mcp_stdio.py'}",
+            tmp_path,
+        )["blocked"]
+        is True
+    )
+
+    strict_env = {
+        "CC_AGY_STRICT_MODE": "true",
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+        "CC_AGY_DATA_DIR": str(tmp_path / ".cc-agy-data"),
+    }
+    # Grep with regex pattern is allowed even when pattern has slashes
+    assert (
+        evaluate_pre_tool_use(
+            {"tool_name": "Grep", "tool_input": {"pattern": "server/jobs"}, "cwd": str(tmp_path)},
+            env=strict_env,
+        )
+        == {}
+    )
+    # Grep with cwd inside PLUGIN_ROOT and no path is denied when workspace is tmp_path
+    dec_grep_plugin = evaluate_pre_tool_use(
+        {"tool_name": "Grep", "tool_input": {"pattern": "MCPServer"}, "cwd": str(PLUGIN_ROOT)},
+        env=strict_env,
+    )
+    assert dec_grep_plugin["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # 3. Dictation repair: mismatched inner fence (~~~ inside ```), unfenced across short fence, no host path leak
+    mismatched_fence_prompt = (
+        "Update parser:\n"
+        "```python\n"
+        "x1 = 1\n"
+        "x2 = 2\n"
+        "x3 = 3\n"
+        "x4 = 4\n"
+        "~~~\n"
+        "x5 = 5\n"
+        "x6 = 6\n"
+        "x7 = 7\n"
+        "x8 = 8\n"
+        "x9 = 9\n"
+        "```\n"
+    )
+    assert lint_delegation_prompt(mismatched_fence_prompt)["ok"] is False
+    rep_m = repair_dictated_prompt(mismatched_fence_prompt, snippet_dir=tmp_path / "snip_m")
+    assert rep_m["repaired"] is True
+    assert lint_delegation_prompt(rep_m["prompt"])["ok"] is True
+    assert str(tmp_path / "snip_m") not in rep_m["prompt"]
+
+    split_unfenced_prompt = (
+        "x1 = 1\n"
+        "x2 = 2\n"
+        "x3 = 3\n"
+        "x4 = 4\n"
+        "x5 = 5\n"
+        "```\n"
+        "note\n"
+        "```\n"
+        "x6 = 6\n"
+        "x7 = 7\n"
+        "x8 = 8\n"
+        "x9 = 9\n"
+    )
+    assert lint_delegation_prompt(split_unfenced_prompt)["ok"] is False
+    rep_s = repair_dictated_prompt(split_unfenced_prompt, snippet_dir=tmp_path / "snip_s")
+    assert rep_s["repaired"] is True
+    assert lint_delegation_prompt(rep_s["prompt"])["ok"] is True
+
+    # Cross-boundary prompt + plan dictation repair in MCPServer._maybe_repair_dictation
+    monkeypatch.setenv("CC_AGY_REPAIR_CODE_DICTATION", "1")
+    repo = tmp_path / "repo_r1"
+    repo.mkdir()
+    _init_temp_git_repo(repo)
+    (repo / "extra.py").write_text("def check() -> bool:\n    valid = True\n    return valid\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init r1"], cwd=str(repo), check=True)
+    store = ReceiptStore(tmp_path / "data_r1", workspace_root=repo)
+    jm = JobManager(
+        workspace_root=repo,
+        store=store,
+        worker_backend=lambda req: (
+            (Path(str(req["workspace_dir"])) / "app.py").write_text("def by_id(id):\n    return id\n", encoding="utf-8"),
+            (Path(str(req["workspace_dir"])) / "extra.py").write_text("def check() -> bool:\n    valid = False\n    return valid\n", encoding="utf-8"),
+            {"text": "ok"},
+        )[-1],
+    )
+    srv = MCPServer(job_manager=jm, store=store)
+    p_tail = "a1 = 1\na2 = 2\na3 = 3\na4 = 4\na5 = 5"
+    plan_head = ["b1 = 1\nb2 = 2\nb3 = 3\nb4 = 4"]
+    assert lint_delegation_prompt("\n".join([p_tail, *plan_head]))["ok"] is False
+    new_p, new_pl, rmeta = srv._maybe_repair_dictation(p_tail, plan_head)
+    assert rmeta["repaired"] is True
+    assert lint_delegation_prompt("\n".join([new_p, *new_pl]))["ok"] is True
+
+    # 4. get_diff focus_symbols word-boundary matching ("id" matches `by_id(id)` in app.py, not `valid` in extra.py)
+    d_job = jm.delegate_start("Update app and extra", project="p", wait=True)
+    diff_id = jm.get_diff(d_job["job_id"], focus_symbols=["id"])
+    assert diff_id["files_changed"] == ["app.py"]
+    assert list(diff_id["file_stats"].keys()) == ["app.py"]
+    assert "by_id" in diff_id["diff"]
+    assert "valid" not in diff_id["diff"]
+
+    # 5. _parse_test_counts with prose "2 errors" inside unittest output + trailing teardown + multi-suite
+    ut_with_prose_and_teardown = (
+        "test_validation (tests.TestParser) ... expected 2 errors in malformed input\n"
+        "ok\n"
+        "----------------------------------------------------------------------\n"
+        "Ran 12 tests in 0.031s\n\n"
+        "OK (skipped=2)\n"
+        "Destroying test database for alias 'default'...\n"
+    )
+    assert _parse_test_counts(ut_with_prose_and_teardown) == {"passed": 10, "failed": 0, "errors": 0}
+    ut_multi = (
+        "Ran 5 tests in 0.01s\n\nOK\n"
+        "Ran 4 tests in 0.02s\n\nFAILED (failures=1, errors=1, skipped=1)\n"
+    )
+    assert _parse_test_counts(ut_multi) == {"passed": 6, "failed": 1, "errors": 1}
+
+    # 6. build_import_smoke_command skips top-level scripts like run.py
+    (repo / "run.py").write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "pkg" / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    smoke_cmds = build_import_smoke_command(repo, ["run.py", "pkg/mod.py"])
+    assert len(smoke_cmds) == 1
+    assert "pkg.mod" in smoke_cmds[0]
+    assert "run" not in smoke_cmds[0]
+
+    # 7. _clamp_worker_timeout floor when elapsed >= deadline, and CC_AGY_SESSION_DEADLINE_SECONDS=0
+    monkeypatch.setenv("CC_AGY_SESSION_DEADLINE_SECONDS", "100")
+    monkeypatch.setenv("CC_AGY_DEADLINE_RESERVE_SECONDS", "30")
+    jm._created_at = jm._created_at - 500.0
+    assert jm._clamp_worker_timeout(600.0) == 45.0
+    monkeypatch.setenv("CC_AGY_SESSION_DEADLINE_SECONDS", "0")
+    assert jm._clamp_worker_timeout(600.0) == 600.0
+    assert jm._is_bounded_lead_session() is False
+
+    # 8. resolve_worker_sdk_limits float coercion & _compact_digest malformed prompt_token_count resilience
+    limits = resolve_worker_sdk_limits({"compaction_threshold": 150000.0, "tool_output_max_tokens": 3500.0})
+    assert limits == (150000, 3500)
+    rec = store.read_receipt(d_job["job_id"])
+    rec["usage"] = {"requests": [{"prompt_token_count": "n/a"}, {"prompt_token_count": 250000}]}
+    store.write_receipt(d_job["job_id"], rec, workspace_root=str(repo))
+    st_digest = jm.delegate_status(d_job["job_id"])
+    assert st_digest["usage"]["over_200k_requests_count"] == 1
+
+    # 9. Round 2: new broken module (`SyntaxError` in `pkg/new_broken.py`) fails import smoke (acceptance_passed=False)
+    # and never touches untracked files in workspace_root
+    monkeypatch.setenv("CC_AGY_AUTO_DEFAULT_ACCEPTANCE", "1")
+    (repo / "MY_NOTES.md").write_text("keep me\n", encoding="utf-8")
+    jm_broken = JobManager(
+        workspace_root=repo,
+        store=store,
+        worker_backend=lambda req: (
+            (Path(str(req["workspace_dir"])) / "pkg").mkdir(exist_ok=True),
+            (Path(str(req["workspace_dir"])) / "pkg" / "__init__.py").write_text("", encoding="utf-8"),
+            (Path(str(req["workspace_dir"])) / "pkg" / "new_broken.py").write_text("def broken(:\n", encoding="utf-8"),
+            {"text": "created broken module"},
+        )[-1],
+    )
+    d_broken = jm_broken.delegate_start("Create pkg/new_broken.py", project="p", wait=True)
+    assert d_broken["acceptance_passed"] is False
+    assert (repo / "MY_NOTES.md").is_file()
+    jm_broken.shutdown()
+    jm.shutdown()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,10 @@ import shlex
 import subprocess
 import sys
 from typing import Any
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
 
 
 def is_strict_mode_enabled(env: dict[str, str] | None = None) -> bool:
@@ -217,11 +222,12 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
                 fence_run = 0
                 in_fence = False
                 fence_marker = ""
+                continue
             elif not in_fence:
                 in_fence = True
                 fence_marker = marker
                 fence_run = 0
-            continue
+                continue
 
         if in_fence:
             if unwrapped_fence_check:
@@ -265,6 +271,224 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
             if violated
             else None
         ),
+    }
+
+
+def _collapse_code_lines_run(
+    block_lines: list[str],
+    *,
+    max_consecutive_code_lines: int,
+    snippet_dir: Path | None,
+    snippet_paths: list[str],
+) -> list[str]:
+    """Collapse a single run of code lines exceeding `max_consecutive_code_lines` into signature lines + note."""
+    keep_head = max(0, min(3, max_consecutive_code_lines - 1))
+    full_block = "\n".join(block_lines)
+    omitted_count = max(1, len(block_lines) - keep_head)
+    if snippet_dir is not None:
+        try:
+            snippet_dir.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha256(full_block.encode("utf-8", errors="replace")).hexdigest()[:10]
+            target_file = snippet_dir / f"dictated_snippet_{digest}.txt"
+            target_file.write_text(full_block + "\n", encoding="utf-8")
+            snippet_str = str(target_file)
+            if snippet_str not in snippet_paths:
+                snippet_paths.append(snippet_str)
+        except OSError:
+            pass
+    note = (
+        f"[... {omitted_count} dictated code lines omitted; "
+        "implement from behavioral requirements ...]"
+    )
+    return [*block_lines[:keep_head], note]
+
+
+def repair_dictated_prompt(
+    prompt_text: str,
+    *,
+    max_consecutive_code_lines: int = 8,
+    snippet_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Repair a delegation prompt that violates the consecutive-code-line dictation limit.
+
+    Extracts over-limit fenced or unfenced code blocks into optional reference files under
+    `snippet_dir` and collapses them in-place to their leading signature lines plus an omission
+    marker, preventing empty-patch PreToolUse deadlocks while keeping the prompt within linting limits.
+    """
+    lint = lint_delegation_prompt(prompt_text, max_consecutive_code_lines=max_consecutive_code_lines)
+    if lint["ok"]:
+        return {
+            "repaired": False,
+            "prompt": prompt_text,
+            "original_max_code_lines": lint["max_consecutive_code_lines"],
+            "snippet_paths": [],
+        }
+
+    lines = prompt_text.splitlines()
+    out_lines: list[str] = []
+    snippet_paths: list[str] = []
+
+    in_fence = False
+    fence_marker = ""
+    fence_open_line = ""
+    fence_body: list[str] = []
+    fence_nonempty = 0
+
+    unfenced_buf: list[str] = []
+    unfenced_code_count = 0
+
+    def _flush_unfenced() -> None:
+        nonlocal unfenced_buf, unfenced_code_count
+        if not unfenced_buf:
+            return
+        if unfenced_code_count > max_consecutive_code_lines:
+            out_lines.extend(
+                _collapse_code_lines_run(
+                    unfenced_buf,
+                    max_consecutive_code_lines=max_consecutive_code_lines,
+                    snippet_dir=snippet_dir,
+                    snippet_paths=snippet_paths,
+                )
+            )
+        else:
+            out_lines.extend(unfenced_buf)
+        unfenced_buf = []
+        unfenced_code_count = 0
+
+    for line in lines:
+        stripped = line.strip()
+        unwrapped_fence_check = _BLOCKQUOTE_PREFIX_RE.sub("", stripped, count=1).strip()
+        if unwrapped_fence_check.startswith("```") or unwrapped_fence_check.startswith("~~~"):
+            marker = unwrapped_fence_check[:3]
+            if in_fence and marker == fence_marker:
+                if fence_nonempty > max_consecutive_code_lines:
+                    collapsed = _collapse_code_lines_run(
+                        fence_body,
+                        max_consecutive_code_lines=max_consecutive_code_lines,
+                        snippet_dir=snippet_dir,
+                        snippet_paths=snippet_paths,
+                    )
+                    out_lines.append(fence_open_line)
+                    out_lines.extend(collapsed)
+                    out_lines.append(line)
+                else:
+                    out_lines.append(fence_open_line)
+                    out_lines.extend(fence_body)
+                    out_lines.append(line)
+                in_fence = False
+                fence_marker = ""
+                fence_open_line = ""
+                fence_body = []
+                fence_nonempty = 0
+                continue
+            elif not in_fence:
+                _flush_unfenced()
+                in_fence = True
+                fence_marker = marker
+                fence_open_line = line
+                fence_body = []
+                fence_nonempty = 0
+                continue
+
+        if in_fence:
+            fence_body.append(line)
+            if unwrapped_fence_check:
+                fence_nonempty += 1
+            continue
+
+        if stripped == "" or unwrapped_fence_check == "":
+            if unfenced_buf:
+                unfenced_buf.append(line)
+            else:
+                out_lines.append(line)
+            continue
+
+        unwrapped, had_blockquote = _unwrap_markdown_code_line(line)
+        if _COMMENT_LINE_RE.match(unwrapped):
+            if unfenced_buf:
+                unfenced_buf.append(line)
+            else:
+                out_lines.append(line)
+            continue
+
+        is_indented_code = (
+            ((line.startswith("    ") or line.startswith("\t")) and not _PROSE_LIST_RE.match(line))
+            or (had_blockquote and (unwrapped.startswith("    ") or unwrapped.startswith("\t")))
+        )
+        if _CODE_LINE_RE.match(line) or _CODE_LINE_RE.match(unwrapped) or is_indented_code:
+            unfenced_buf.append(line)
+            unfenced_code_count += 1
+        else:
+            _flush_unfenced()
+            out_lines.append(line)
+
+    if in_fence:
+        out_lines.append(fence_open_line)
+        if fence_nonempty > max_consecutive_code_lines:
+            out_lines.extend(
+                _collapse_code_lines_run(
+                    fence_body,
+                    max_consecutive_code_lines=max_consecutive_code_lines,
+                    snippet_dir=snippet_dir,
+                    snippet_paths=snippet_paths,
+                )
+            )
+        else:
+            out_lines.extend(fence_body)
+    _flush_unfenced()
+
+    repaired_prompt = "\n".join(out_lines)
+    if not lint_delegation_prompt(repaired_prompt, max_consecutive_code_lines=max_consecutive_code_lines)["ok"]:
+        pass2_lines: list[str] = []
+        p2_in_fence = False
+        p2_marker = ""
+        p2_code_run = 0
+        keep_limit = max(0, min(3, max_consecutive_code_lines - 1))
+        for ln in repaired_prompt.splitlines():
+            st = ln.strip()
+            ufc = _BLOCKQUOTE_PREFIX_RE.sub("", st, count=1).strip()
+            if ufc.startswith("```") or ufc.startswith("~~~"):
+                mk = ufc[:3]
+                if p2_in_fence and mk == p2_marker:
+                    p2_in_fence = False
+                    p2_marker = ""
+                    pass2_lines.append(ln)
+                    continue
+                elif not p2_in_fence:
+                    p2_in_fence = True
+                    p2_marker = mk
+                    pass2_lines.append(ln)
+                    continue
+            if p2_in_fence or st == "" or ufc == "":
+                pass2_lines.append(ln)
+                continue
+            unw, had_bq = _unwrap_markdown_code_line(ln)
+            if _COMMENT_LINE_RE.match(unw):
+                if p2_code_run <= keep_limit:
+                    pass2_lines.append(ln)
+                continue
+            is_ind = (
+                ((ln.startswith("    ") or ln.startswith("\t")) and not _PROSE_LIST_RE.match(ln))
+                or (had_bq and (unw.startswith("    ") or unw.startswith("\t")))
+            )
+            if _CODE_LINE_RE.match(ln) or _CODE_LINE_RE.match(unw) or is_ind:
+                p2_code_run += 1
+                if p2_code_run <= keep_limit:
+                    pass2_lines.append(ln)
+                elif p2_code_run == keep_limit + 1:
+                    pass2_lines.append(
+                        "[... dictated code lines omitted; implement from behavioral requirements ...]"
+                    )
+            else:
+                p2_code_run = 0
+                pass2_lines.append(ln)
+        repaired_prompt = "\n".join(pass2_lines)
+
+    return {
+        "repaired": repaired_prompt != prompt_text,
+        "prompt": repaired_prompt,
+        "original_max_code_lines": lint["max_consecutive_code_lines"],
+        "snippet_paths": snippet_paths,
     }
 
 
@@ -320,6 +544,9 @@ _BLOCKED_ENV_VARS: frozenset[str] = frozenset(
         "PYTHONPATH",
         "PYTHONSTARTUP",
         "PYTHONHOME",
+        "PYTEST_ADDOPTS",
+        "PYTEST_PLUGINS",
+        "PYTEST_DEBUG_TEMPROOT",
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
         "NODE_OPTIONS",
@@ -632,6 +859,223 @@ def _extract_git_subcommand_and_workdir(
     return None, [], eff_cwd, None
 
 
+_SAFE_PYTEST_INI_KEYS: frozenset[str] = frozenset({
+    "addopts",
+    "xfail_strict",
+    "filterwarnings",
+    "log_cli",
+    "log_cli_level",
+    "log_level",
+    "asyncio_mode",
+    "python_files",
+    "python_classes",
+    "python_functions",
+    "markers",
+    "console_output_style",
+    "junit_family",
+})
+
+_BLOCKED_PYTEST_FLAG_PREFIXES: tuple[str, ...] = (
+    "--confcutdir",
+    "--rootdir",
+    "--noconftest",
+    "--basetemp",
+    "--junitxml",
+    "--junit-xml",
+    "--result-log",
+    "--resultlog",
+    "--log-file",
+    "--cov",
+    "--html",
+    "--self-contained-html",
+    "--import-mode",
+    "--pastebin",
+)
+
+
+def _is_safe_pytest_ini_override(
+    ini_expr: str,
+    *,
+    ws_root: Path | None = None,
+    out_dir: str | Path | None = None,
+    active_cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Return True if a `pytest -o key=val` expression only sets a read-only ini key without unsafe flags."""
+    key, sep, val = (ini_expr or "").strip().partition("=")
+    clean_key = key.strip()
+    if not sep or clean_key not in _SAFE_PYTEST_INI_KEYS:
+        return False
+    if clean_key == "addopts":
+        try:
+            sub_args = shlex.split(val)
+        except ValueError:
+            return False
+        eff_ws = ws_root or Path.cwd().resolve()
+        eff_cwd = active_cwd or eff_ws
+        sub_v = _validate_pytest_args(
+            sub_args,
+            ws_root=eff_ws,
+            out_dir=out_dir,
+            active_cwd=eff_cwd,
+            env=env,
+            allow_nested_ini=False,
+        )
+        return not sub_v["blocked"]
+    if any(
+        tok in val
+        for tok in (
+            "--confcutdir",
+            "--rootdir",
+            "--override-ini",
+            "--basetemp",
+            "--junitxml",
+            "--result-log",
+            "--log-file",
+        )
+    ):
+        return False
+    return True
+
+
+def _validate_pytest_args(
+    args: list[str],
+    *,
+    ws_root: Path,
+    out_dir: str | Path | None,
+    active_cwd: Path,
+    env: dict[str, str] | None,
+    allow_nested_ini: bool = True,
+) -> dict[str, Any]:
+    """Validate pytest CLI arguments (used for both `pytest` and `python -m pytest` and `-o addopts=...`)."""
+    skip_next = False
+    for idx_p, parg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if parg == "--":
+            continue
+        if parg == "-c" or parg.startswith("-c="):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if any(parg == pref or parg.startswith(pref + "=") for pref in _BLOCKED_PYTEST_FLAG_PREFIXES):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if parg == "-p":
+            next_val = args[idx_p + 1] if idx_p + 1 < len(args) else ""
+            if next_val.startswith("no:"):
+                skip_next = True
+                continue
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if parg.startswith("-p") and len(parg) > 2 and not parg.startswith("--"):
+            if parg[2:].lstrip("=").startswith("no:"):
+                continue
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if parg in ("-o", "--override-ini"):
+            if not allow_nested_ini:
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked nested `pytest {parg}` override.",
+                }
+            next_val = args[idx_p + 1] if idx_p + 1 < len(args) else ""
+            if _is_safe_pytest_ini_override(
+                next_val, ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+            ):
+                skip_next = True
+                continue
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if parg.startswith("--override-ini=") or (parg.startswith("-o") and len(parg) > 2 and not parg.startswith("--")):
+            if not allow_nested_ini:
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked nested `pytest {parg}` override.",
+                }
+            ini_val = parg.split("=", 1)[1] if parg.startswith("--override-ini=") else parg[2:].lstrip("=")
+            if _is_safe_pytest_ini_override(
+                ini_val, ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+            ):
+                continue
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+            }
+        if parg in ("-k", "-m", "-W", "-r", "--tb", "--maxfail", "--durations", "--durations-min", "--color", "--capture"):
+            skip_next = True
+            continue
+        if parg.startswith("-") and not parg.startswith("--") and len(parg) > 2:
+            # Inspect clustered short flags (e.g. -qo, -qp, -qc)
+            short_chars = parg[1:]
+            for idx_ch, ch in enumerate(short_chars):
+                if ch in ("k", "m", "W", "r"):
+                    if idx_ch == len(short_chars) - 1:
+                        skip_next = True
+                    break
+                if ch == "c":
+                    return {
+                        "blocked": True,
+                        "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                    }
+                if ch == "p":
+                    tail = short_chars[idx_ch + 1 :].lstrip("=")
+                    if tail:
+                        if tail.startswith("no:"):
+                            break
+                    elif idx_p + 1 < len(args) and args[idx_p + 1].startswith("no:"):
+                        skip_next = True
+                        break
+                    return {
+                        "blocked": True,
+                        "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                    }
+                if ch == "o":
+                    if not allow_nested_ini:
+                        return {
+                            "blocked": True,
+                            "reason": f"Strict orchestrator mode blocked nested `pytest {parg}` override.",
+                        }
+                    tail = short_chars[idx_ch + 1 :].lstrip("=")
+                    if tail:
+                        if _is_safe_pytest_ini_override(
+                            tail, ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+                        ):
+                            break
+                    elif idx_p + 1 < len(args) and _is_safe_pytest_ini_override(
+                        args[idx_p + 1], ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+                    ):
+                        skip_next = True
+                        break
+                    return {
+                        "blocked": True,
+                        "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
+                    }
+            continue
+        if parg.startswith("-"):
+            continue
+        target_file = parg.split("::", 1)[0]
+        cls = classify_path(target_file, ws_root, out_dir, cwd=active_cwd, env=env)
+        if cls != "workspace":
+            return {
+                "blocked": True,
+                "reason": (
+                    f"Strict orchestrator mode blocked `pytest` on non-workspace path {parg!r} ({cls})."
+                ),
+            }
+    return {"blocked": False, "reason": None}
+
+
 def detect_bash_workspace_mutation(
     command: str,
     workdir: str | Path,
@@ -655,11 +1099,20 @@ def detect_bash_workspace_mutation(
     ws_root = resolve_project_root(workdir, env=env)
     active_cwd = Path(cwd).resolve() if cwd is not None else Path(workdir).resolve()
 
-    # 0. Block direct access to .hmac_key, ${IFS} / $'...' obfuscation, and process substitution <( / >(
+    # 0. Block direct access to .hmac_key, PLUGIN_ROOT, ${IFS} / $'...' obfuscation, and process substitution <( / >(
     if ".hmac_key" in cmd:
         return {
             "blocked": True,
             "reason": "Strict orchestrator mode blocked reading or modifying the internal `.hmac_key`.",
+        }
+    if ws_root != PLUGIN_ROOT and str(PLUGIN_ROOT) in cmd:
+        return {
+            "blocked": True,
+            "reason": (
+                "Strict orchestrator mode blocked accessing or modifying the cc-agy-plugin installation "
+                "directory. Use the MCP tools (`delegate_start`, `delegate_continue`, `delegate_apply`, "
+                "`get_diff`) directly."
+            ),
         }
     if "${IFS}" in cmd or "$IFS" in cmd or "$'" in cmd:
         return {
@@ -762,7 +1215,18 @@ def detect_bash_workspace_mutation(
 
         # Detect obfuscated or dynamic command heads before shlex strips quotes/escapes
         # e.g. `$(echo cp) ...`, `c\p ...`, `'c'p ...`
-        raw_words = seg.split()
+        seg_mask = _unquoted_mask(seg)
+        raw_words: list[str] = []
+        w_start: int | None = None
+        for idx_ch, ch in enumerate(seg):
+            if seg_mask[idx_ch] and ch.isspace():
+                if w_start is not None:
+                    raw_words.append(seg[w_start:idx_ch])
+                    w_start = None
+            elif w_start is None:
+                w_start = idx_ch
+        if w_start is not None:
+            raw_words.append(seg[w_start:])
         raw_head_idx = 0
         while (
             raw_head_idx < len(raw_words)
@@ -943,13 +1407,26 @@ def _inspect_segment_tokens(
     binary = Path(raw_cmd_tok).name
     raw_args = tokens[idx + 1 :]
 
-    # Block any non-`ls` command from reading, searching, or archiving `out_dir` (.hmac_key / receipts)
+    # Block any non-`ls` command from reading, searching, or archiving `out_dir` (.hmac_key / receipts) or `PLUGIN_ROOT`
     if binary != "ls":
         for arg in raw_args:
             if arg.startswith("-"):
                 continue
             clean_arg = arg.split("=", 1)[-1] if "=" in arg else arg
             if "/" in clean_arg or clean_arg.startswith("."):
+                try:
+                    cand_p = Path(clean_arg).expanduser()
+                    res_p = (active_cwd / cand_p).resolve() if not cand_p.is_absolute() else cand_p.resolve()
+                    if ws_root != PLUGIN_ROOT and res_p.is_relative_to(PLUGIN_ROOT):
+                        return {
+                            "blocked": True,
+                            "reason": (
+                                f"Strict orchestrator mode blocked `{binary}` on cc-agy-plugin internal source {clean_arg!r}. "
+                                "Use the MCP tools (`delegate_start`, `delegate_continue`, `delegate_apply`, `get_diff`) directly."
+                            ),
+                        }, active_cwd
+                except OSError:
+                    pass
                 if classify_path(clean_arg, ws_root, out_dir, cwd=active_cwd, env=env) == "out_dir":
                     return {
                         "blocked": True,
@@ -966,6 +1443,18 @@ def _inspect_segment_tokens(
         non_flags = [a for a in args if not a.startswith("-")]
         if non_flags:
             active_cwd = (active_cwd / non_flags[0]).resolve()
+        return {"blocked": False, "reason": None}, active_cwd
+
+    if binary in ("export", "declare", "typeset"):
+        for earg in args:
+            if earg.startswith("-"):
+                continue
+            var_name = earg.split("=", 1)[0]
+            if var_name in _BLOCKED_ENV_VARS:
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `{binary} {var_name}`.",
+                }, active_cwd
         return {"blocked": False, "reason": None}, active_cwd
 
     # Unwrap nested shells (`sh -c`, `bash -c`, `zsh -c`, `eval`)
@@ -1113,48 +1602,11 @@ def _inspect_segment_tokens(
             }, active_cwd
         return {"blocked": False, "reason": None}, active_cwd
 
-    if binary in ("pytest", "py.test"):
-        skip_next = False
-        for idx_p, parg in enumerate(args):
-            if skip_next:
-                skip_next = False
-                continue
-            if parg == "-p":
-                next_val = args[idx_p + 1] if idx_p + 1 < len(args) else ""
-                if next_val.startswith("no:"):
-                    skip_next = True
-                    continue
-                return {
-                    "blocked": True,
-                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
-                }, active_cwd
-            if parg.startswith("-p") and len(parg) > 2:
-                if parg[2:].lstrip("=").startswith("no:"):
-                    continue
-                return {
-                    "blocked": True,
-                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
-                }, active_cwd
-            if parg in ("--confcutdir", "--rootdir", "-o", "--override-ini") or parg.startswith(("--confcutdir=", "--rootdir=")):
-                return {
-                    "blocked": True,
-                    "reason": f"Strict orchestrator mode blocked `pytest {parg}` plugin/config override.",
-                }, active_cwd
-            if parg in ("-k", "-m", "-W", "-c", "--tb", "--maxfail", "--durations", "--color", "--basetemp"):
-                skip_next = True
-                continue
-            if parg.startswith("-"):
-                continue
-            target_file = parg.split("::", 1)[0]
-            cls = classify_path(target_file, ws_root, out_dir, cwd=active_cwd, env=env)
-            if cls != "workspace":
-                return {
-                    "blocked": True,
-                    "reason": (
-                        f"Strict orchestrator mode blocked `pytest` on non-workspace path {parg!r} ({cls})."
-                    ),
-                }, active_cwd
-        return {"blocked": False, "reason": None}, active_cwd
+    if binary in ("pytest", "py.test") or bool(re.match(r"^(?:pytest|py\.test)(?:-\d+(?:\.\d+)?)?$", binary)):
+        v_pytest = _validate_pytest_args(
+            args, ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+        )
+        return v_pytest, active_cwd
 
     # Check dd output file `of=<path>`
     if binary == "dd":
@@ -1189,6 +1641,18 @@ def _inspect_segment_tokens(
                 inline_code = arg.split("=", 1)[1]
 
             if inline_code is not None:
+                if re.search(
+                    r"\b(?:from\s+server\.(?:mcp_stdio|jobs|agy_runner|receipts)\s+import|import\s+server\.(?:mcp_stdio|jobs|agy_runner|receipts)|from\s+server\s+import\s+(?:mcp_stdio|jobs|agy_runner|receipts)|MCPServer\s*\(|JobManager\s*\()",
+                    inline_code,
+                ):
+                    return {
+                        "blocked": True,
+                        "reason": (
+                            "Strict orchestrator mode blocked direct Python import/invocation of plugin internals "
+                            "(`MCPServer` / `JobManager`). Use the MCP tools (`delegate_start`, `delegate_continue`, "
+                            "`delegate_apply`, `get_diff`) directly."
+                        ),
+                    }, active_cwd
                 if binary in ("node", "ruby", "perl", "php", "lua") or not _is_safe_python_inline_ast(inline_code):
                     return {
                         "blocked": True,
@@ -1219,7 +1683,12 @@ def _inspect_segment_tokens(
                             "reason": "Strict orchestrator mode blocked `python -m ruff` mutating/formatting flags.",
                         }, active_cwd
                     return {"blocked": False, "reason": None}, active_cwd
-                if mod in ("unittest", "pytest", "mypy", "flake8", "pylint", "json.tool", "py_compile", "compileall"):
+                if mod in ("pytest", "py.test"):
+                    v_py = _validate_pytest_args(
+                        mod_extra_args, ws_root=ws_root, out_dir=out_dir, active_cwd=active_cwd, env=env
+                    )
+                    return v_py, active_cwd
+                if mod in ("unittest", "mypy", "flake8", "pylint", "json.tool", "py_compile", "compileall"):
                     for mod_arg in mod_extra_args:
                         if mod_arg.startswith("-"):
                             continue
@@ -1509,24 +1978,66 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
         )
         lint = lint_delegation_prompt(prompt_text)
         if not lint["ok"]:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": lint["reason"],
+            auto_repair = str(source_env.get("CC_AGY_REPAIR_CODE_DICTATION") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if not auto_repair:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": lint["reason"],
+                    }
                 }
-            }
 
     if not is_strict_mode_enabled(source_env):
         return {}
 
-    # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts) and enforce 6-call Lead read cap in strict mode
+    # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts) or PLUGIN_ROOT and enforce Lead read cap in strict mode
     if tool_name in ("Read", "Grep", "Glob"):
+        if (
+            ws_root != PLUGIN_ROOT
+            and tool_name in ("Grep", "Glob")
+            and not tool_input.get("path")
+            and Path(cwd).resolve().is_relative_to(PLUGIN_ROOT)
+        ):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Strict orchestrator mode is active: {tool_name} on cc-agy-plugin internal source "
+                        "is disabled. Use the MCP tools (`delegate_start`, `delegate_continue`, "
+                        "`get_diff`, `delegate_apply`) directly."
+                    ),
+                }
+            }
         for field in ("file_path", "path", "pattern", "glob"):
             target_val = tool_input.get(field)
             if not target_val:
                 continue
             raw_t = str(target_val)
+            if field in ("file_path", "path"):
+                try:
+                    cand_p = Path(raw_t).expanduser()
+                    resolved_t = (Path(cwd).resolve() / cand_p).resolve() if not cand_p.is_absolute() else cand_p.resolve()
+                    if ws_root != PLUGIN_ROOT and resolved_t.is_relative_to(PLUGIN_ROOT):
+                        return {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": (
+                                    f"Strict orchestrator mode is active: {tool_name} on cc-agy-plugin internal source "
+                                    f"{raw_t!r} is disabled. Use the MCP tools (`delegate_start`, `delegate_continue`, "
+                                    "`get_diff`, `delegate_apply`) directly."
+                                ),
+                            }
+                        }
+                except OSError:
+                    pass
             classification = classify_path(raw_t, ws_root, out_dir, cwd=cwd, env=source_env)
             if (
                 classification == "out_dir"
@@ -1561,17 +2072,34 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 except Exception:
                     current_reads = 0
                 if current_reads >= read_limit:
+                    reason_msg = (
+                        f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
+                        "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
+                        "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
+                        "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
+                        "immediately — the worker has full repository and test access in its worktree."
+                    )
+                    if tool_name == "Read" and tool_input.get("file_path"):
+                        try:
+                            from server.repo_map import build_focused_file_outline
+
+                            req_p = Path(str(tool_input["file_path"]))
+                            res_p = (Path(cwd).resolve() / req_p).resolve() if not req_p.is_absolute() else req_p.resolve()
+                            if res_p.is_relative_to(ws_root) and res_p.is_file():
+                                rel_p = str(res_p.relative_to(ws_root))
+                                outline = build_focused_file_outline(ws_root, [rel_p], max_tokens=450)
+                                if outline:
+                                    reason_msg += (
+                                        "\n\nFocused File Outline (auto-attached so you can call delegate_start immediately):\n"
+                                        + outline
+                                    )
+                        except Exception:
+                            pass
                     return {
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
                             "permissionDecision": "deny",
-                            "permissionDecisionReason": (
-                                f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
-                                "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
-                                "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
-                                "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
-                                "immediately — the worker has full repository and test access in its worktree."
-                            ),
+                            "permissionDecisionReason": reason_msg,
                         }
                     }
                 try:
@@ -1580,7 +2108,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 except Exception:
                     pass
 
-    # 2b. Block direct Edit / Write / MultiEdit / NotebookEdit on both workspace and out_dir (receipts)
+    # 2b. Block direct Edit / Write / MultiEdit / NotebookEdit on workspace, out_dir (receipts), and PLUGIN_ROOT
     if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         file_path = (
             tool_input.get("file_path")
@@ -1589,6 +2117,19 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
             or ""
         )
         if file_path:
+            cand_edit = Path(str(file_path))
+            res_edit = (Path(cwd).resolve() / cand_edit).resolve() if not cand_edit.is_absolute() else cand_edit.resolve()
+            if ws_root != PLUGIN_ROOT and res_edit.is_relative_to(PLUGIN_ROOT):
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Strict orchestrator mode is active: direct {tool_name} on cc-agy-plugin source "
+                            f"{file_path!r} is disabled."
+                        ),
+                    }
+                }
             classification = classify_path(
                 str(file_path), ws_root, out_dir, cwd=cwd, env=source_env
             )

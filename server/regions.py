@@ -427,16 +427,23 @@ def resolve_auth_config(
     )
 
 
+def _safe_tok_int(val: Any) -> int:
+    try:
+        return max(0, int(float(val or 0)))
+    except (ValueError, TypeError):
+        return 0
+
+
 def _cost_for_turn(
     rates: dict[str, float],
     turn_usage: dict[str, Any],
     *,
     apply_long_context: bool,
 ) -> tuple[float, float, float]:
-    prompt_tokens = int(turn_usage.get("prompt_token_count") or 0)
-    cached_tokens = int(turn_usage.get("cached_content_token_count") or 0)
-    candidates_tokens = int(turn_usage.get("candidates_token_count") or 0)
-    thoughts_tokens = int(turn_usage.get("thoughts_token_count") or 0)
+    prompt_tokens = _safe_tok_int(turn_usage.get("prompt_token_count"))
+    cached_tokens = _safe_tok_int(turn_usage.get("cached_content_token_count"))
+    candidates_tokens = _safe_tok_int(turn_usage.get("candidates_token_count"))
+    thoughts_tokens = _safe_tok_int(turn_usage.get("thoughts_token_count"))
 
     in_mult = 1.0
     out_mult = 1.0
@@ -485,10 +492,10 @@ def estimate_cost_usd(
     if rates is None:
         rates = MODEL_PRICING_PER_1M_USD["gemini-2.5-flash"]
 
-    prompt_tokens = int(usage.get("prompt_token_count") or 0)
-    cached_tokens = int(usage.get("cached_content_token_count") or 0)
-    cand_tokens = int(usage.get("candidates_token_count") or 0)
-    think_tokens = int(usage.get("thoughts_token_count") or 0)
+    prompt_tokens = _safe_tok_int(usage.get("prompt_token_count"))
+    cached_tokens = _safe_tok_int(usage.get("cached_content_token_count"))
+    cand_tokens = _safe_tok_int(usage.get("candidates_token_count"))
+    think_tokens = _safe_tok_int(usage.get("thoughts_token_count"))
     requests_list = usage.get("requests")
     long_context_applied = False
 
@@ -502,9 +509,9 @@ def estimate_cost_usd(
         for req_u in requests_list:
             if not isinstance(req_u, dict):
                 continue
-            req_prompt = int(req_u.get("prompt_token_count") or 0)
-            req_cached = int(req_u.get("cached_content_token_count") or 0)
-            req_out = int(req_u.get("candidates_token_count") or 0) + int(req_u.get("thoughts_token_count") or 0)
+            req_prompt = _safe_tok_int(req_u.get("prompt_token_count"))
+            req_cached = _safe_tok_int(req_u.get("cached_content_token_count"))
+            req_out = _safe_tok_int(req_u.get("candidates_token_count")) + _safe_tok_int(req_u.get("thoughts_token_count"))
             sum_req_prompt += req_prompt
             sum_req_cached += req_cached
             sum_req_out += req_out

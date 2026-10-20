@@ -24,14 +24,41 @@ from server.jobs import capture_live_workspace_diff
 from server.receipts import ReceiptStore, extract_diff_provenance, resolve_workspace_root
 
 
+def verify_mcp_server_health() -> dict[str, Any]:
+    """Perform a fast self-check verifying that the cc-agy-plugin MCP stdio tool catalog loads cleanly."""
+    try:
+        from server.mcp_stdio import get_tool_definitions
+
+        tools = get_tool_definitions()
+        tool_names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
+        required = {"delegate_start", "delegate_continue", "delegate_apply", "get_diff"}
+        missing = sorted(required - set(tool_names))
+        if missing:
+            return {
+                "healthy": False,
+                "tool_count": len(tool_names),
+                "error": f"Missing required MCP tools: {', '.join(missing)}",
+            }
+        return {"healthy": True, "tool_count": len(tool_names), "tools": tool_names}
+    except Exception as exc:
+        return {"healthy": False, "tool_count": 0, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def handle_session_start(
     payload: dict[str, Any],
     *,
     env: dict[str, str] | None = None,
     store: ReceiptStore | None = None,
 ) -> dict[str, Any]:
-    """Record the workspace baseline for a new Claude Code session_id."""
+    """Record the workspace baseline for a new Claude Code session_id and verify MCP server health."""
     source_env = env if env is not None else os.environ
+    health = verify_mcp_server_health()
+    out: dict[str, Any] = {}
+    if not health.get("healthy"):
+        out["systemMessage"] = (
+            f"cc-agy-plugin MCP self-check failed ({health.get('error')}). "
+            "Check plugin installation and Python environment before delegating."
+        )
     cwd = str(payload.get("cwd") or os.getcwd())
     session_id = str(payload.get("session_id") or "").strip() or None
     ws_path = resolve_workspace_root(cwd, env=source_env)
@@ -46,7 +73,7 @@ def handle_session_start(
         check=False,
     )
     if git_check.returncode != 0 or git_check.stdout.strip().lower() != "true":
-        return {}
+        return out
 
     head_res = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -67,7 +94,7 @@ def handle_session_start(
         baseline_head_sha=head_sha,
         session_id=session_id,
     )
-    return {}
+    return out
 
 
 def main() -> int:
@@ -76,7 +103,9 @@ def main() -> int:
         payload: dict[str, Any] = json.loads(raw) if raw else {}
         if not isinstance(payload, dict):
             payload = {}
-        handle_session_start(payload)
+        res = handle_session_start(payload)
+        if res:
+            sys.stdout.write(json.dumps(res) + "\n")
     except Exception:
         pass
     return 0

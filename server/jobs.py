@@ -643,8 +643,79 @@ def render_worker_prompt(
 
 def _parse_test_counts(output: str) -> dict[str, int]:
     counts = {"passed": 0, "failed": 0, "errors": 0}
-    for key, pat in (("passed", r"(\d+) passed"), ("failed", r"(\d+) failed"), ("errors", r"(\d+) errors?\b")):
-        found = re.findall(pat, output)
+    text = output or ""
+
+    # 1. Check anchored pytest summary lines first so prose like "expected 2 errors" in a unittest/stestr
+    # log never hijacks the count parser.
+    pytest_summary_lines = [
+        ln
+        for ln in text.splitlines()
+        if re.search(r"=+.*\bin\s+\d+(?:\.\d+)?s\b.*=+", ln)
+        or re.search(
+            r"^\s*\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|warnings?)\b.*\bin\s+\d+(?:\.\d+)?s\b",
+            ln,
+        )
+    ]
+    if pytest_summary_lines:
+        for ln in pytest_summary_lines:
+            for key, pat in (
+                ("passed", r"(\d+)\s+passed\b"),
+                ("failed", r"(\d+)\s+failed\b"),
+                ("errors", r"(\d+)\s+errors?\b"),
+            ):
+                for m in re.finditer(pat, ln):
+                    counts[key] += int(m.group(1))
+        return counts
+
+    # 2. stestr / subunit summary blocks (e.g. "- Passed: 162", "- Failed: 1")
+    st_passed = re.findall(r"-\s*Passed:\s*(\d+)", text)
+    st_failed = re.findall(r"-\s*Failed:\s*(\d+)", text)
+    st_errors = re.findall(r"-\s*(?:Errors?|Unexpected Success(?:es)?):\s*(\d+)", text)
+    if st_passed or st_failed or st_errors:
+        if st_passed:
+            counts["passed"] = int(st_passed[-1])
+        if st_failed:
+            counts["failed"] = int(st_failed[-1])
+        if st_errors:
+            counts["errors"] = sum(int(x) for x in st_errors)
+        return counts
+
+    # 3. Standard library unittest summary ("Ran N tests in 0.123s" + "OK" / "FAILED (...)")
+    # Sum across multiple unittest suite invocations in the same output and tolerate trailing teardown lines.
+    ran_iter = list(re.finditer(r"Ran (\d+) tests? in [\d.]+s", text))
+    if ran_iter:
+        matched_any_suite = False
+        for idx_r, m_ran in enumerate(ran_iter):
+            suite_total = int(m_ran.group(1))
+            block_start = m_ran.end()
+            block_end = ran_iter[idx_r + 1].start() if idx_r + 1 < len(ran_iter) else len(text)
+            suite_tail = text[block_start:block_end]
+            m_fail = re.search(r"(?m)^\s*FAILED\s*\(([^)]+)\)", suite_tail)
+            m_ok = re.search(r"(?m)^\s*OK(?:\s*\(([^)]*)\))?\s*$", suite_tail)
+            if m_fail:
+                matched_any_suite = True
+                fail_meta = m_fail.group(1)
+                f_m = re.search(r"failures=(\d+)", fail_meta)
+                e_m = re.search(r"errors=(\d+)", fail_meta)
+                s_m = re.search(r"skipped=(\d+)", fail_meta)
+                f_cnt = int(f_m.group(1)) if f_m else 0
+                e_cnt = int(e_m.group(1)) if e_m else 0
+                s_cnt = int(s_m.group(1)) if s_m else 0
+                counts["failed"] += f_cnt
+                counts["errors"] += e_cnt
+                counts["passed"] += max(0, suite_total - f_cnt - e_cnt - s_cnt)
+            elif m_ok:
+                matched_any_suite = True
+                ok_meta = m_ok.group(1) or ""
+                s_m = re.search(r"skipped=(\d+)", ok_meta)
+                s_cnt = int(s_m.group(1)) if s_m else 0
+                counts["passed"] += max(0, suite_total - s_cnt)
+        if matched_any_suite:
+            return counts
+
+    # 4. Fallback for minimal/custom pytest output without a duration footer
+    for key, pat in (("passed", r"(\d+) passed\b"), ("failed", r"(\d+) failed\b"), ("errors", r"(\d+) errors?\b")):
+        found = re.findall(pat, text)
         if found:
             counts[key] = int(found[-1])
     return counts
@@ -741,6 +812,38 @@ _PROMPT_SYMBOL_STOPLIST = frozenset({
 })
 
 
+def _detect_default_pytest_runner(cwd: Path) -> str:
+    """Detect the best pytest command prefix for `cwd` when the caller supplied no acceptance commands.
+    Returns `""` if pytest is not installed in `cwd`'s environment."""
+    for rel_cand in (".venv/bin/pytest", "venv/bin/pytest"):
+        if (cwd / rel_cand).is_file():
+            return rel_cand
+    exec_env = _build_workdir_exec_env(cwd)
+    if shutil.which("pytest", path=exec_env.get("PATH")):
+        return "pytest"
+    for py_cand in (".venv/bin/python", "venv/bin/python"):
+        if (cwd / py_cand).is_file():
+            probe = subprocess.run(
+                [str(cwd / py_cand), "-c", "import pytest"],
+                cwd=str(cwd),
+                env=exec_env,
+                capture_output=True,
+                check=False,
+            )
+            if probe.returncode == 0:
+                return f"{py_cand} -m pytest"
+    probe_sys = subprocess.run(
+        ["python3", "-c", "import pytest"],
+        cwd=str(cwd),
+        env=exec_env,
+        capture_output=True,
+        check=False,
+    )
+    if probe_sys.returncode == 0:
+        return "python3 -m pytest"
+    return ""
+
+
 def discover_related_test_commands(
     cwd: Path,
     files_changed: list[str],
@@ -749,25 +852,33 @@ def discover_related_test_commands(
     max_files: int = 4,
 ) -> list[str]:
     """Discover existing tracked unit test files (`tests/test_<stem>.py`) for modified Python source
-    modules that are not already covered by `existing_cmds`."""
-    if not files_changed or not existing_cmds:
+    modules that are not already covered by `existing_cmds`. When `existing_cmds` is empty, also
+    discovers modified test files and synthesizes a default pytest command."""
+    if not files_changed:
         return []
-    pytest_cmds = [c for c in existing_cmds if re.search(r"\bpytest\b", c)]
-    if not pytest_cmds:
-        return []
-    # If any existing pytest command runs the full suite or a directory without targeting specific .py files
-    # and without filtering to a subset via -k, no supplemental regression command is needed.
-    for pcmd in pytest_cmds:
-        if not re.search(r"[\w./-]+\.py\b", pcmd) and not re.search(r"(?:^|\s)-k(?:\s|=|$)", pcmd):
+    pytest_cmds: list[str] = []
+    if existing_cmds:
+        pytest_cmds = [c for c in existing_cmds if re.search(r"\bpytest\b", c)]
+        if not pytest_cmds:
             return []
+        # If any existing pytest command runs the full suite or a directory without targeting specific .py files
+        # and without filtering to a subset via -k, no supplemental regression command is needed.
+        for pcmd in pytest_cmds:
+            if not re.search(r"[\w./-]+\.py\b", pcmd) and not re.search(r"(?:^|\s)-k(?:\s|=|$)", pcmd):
+                return []
 
+    discovered: list[str] = []
     stems_to_check: list[str] = []
     for rel in files_changed:
         norm = rel.replace("\\", "/").strip("/")
         if not norm.endswith(".py"):
             continue
         bname = Path(norm).name
-        if bname in ("__init__.py", "conftest.py", "setup.py") or bname.startswith("test_") or bname.endswith("_test.py"):
+        if bname.startswith("test_") or bname.endswith("_test.py"):
+            if not existing_cmds and (cwd / norm).is_file() and norm not in discovered:
+                discovered.append(norm)
+            continue
+        if bname in ("__init__.py", "conftest.py", "setup.py"):
             continue
         parts = Path(norm).parts
         if any(p in ("tests", "test", "docs", "examples", "benchmarks") for p in parts[:-1]):
@@ -775,48 +886,119 @@ def discover_related_test_commands(
         stem = Path(norm).stem
         if stem and stem not in stems_to_check:
             stems_to_check.append(stem)
-    if not stems_to_check:
-        return []
 
-    tracked_res = subprocess.run(
-        ["git", "ls-files"],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    tracked_files = [line.strip() for line in (tracked_res.stdout or "").splitlines() if line.strip()]
-    if not tracked_files:
-        return []
-
-    discovered: list[str] = []
-    for stem in stems_to_check:
-        target_names = {f"test_{stem}.py", f"{stem}_test.py"}
-        for tf in tracked_files:
-            tf_name = Path(tf).name
-            if tf_name in target_names and tf not in discovered:
-                already_covered = any(
-                    re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
-                    for c in pytest_cmds
-                )
-                if not already_covered and (cwd / tf).is_file():
-                    discovered.append(tf)
-                    if len(discovered) >= max_files:
-                        break
-        if len(discovered) >= max_files:
-            break
+    if stems_to_check and len(discovered) < max_files:
+        tracked_res = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        tracked_files = [line.strip() for line in (tracked_res.stdout or "").splitlines() if line.strip()]
+        for stem in stems_to_check:
+            target_names = {f"test_{stem}.py", f"{stem}_test.py"}
+            for tf in tracked_files:
+                tf_name = Path(tf).name
+                if tf_name in target_names and tf not in discovered:
+                    already_covered = any(
+                        re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
+                        for c in pytest_cmds
+                    )
+                    if not already_covered and (cwd / tf).is_file():
+                        discovered.append(tf)
+                        if len(discovered) >= max_files:
+                            break
+            if len(discovered) >= max_files:
+                break
 
     if not discovered:
         return []
 
-    # Preserve the full pytest invocation prefix (including env vars, `uv run`, `poetry run`, `python3 -m pytest`, etc.)
-    first_pytest = pytest_cmds[0].strip()
-    m_pref = re.match(r"^(.*?\bpytest)\b", first_pytest)
-    runner_prefix = m_pref.group(1).strip() if m_pref else "pytest"
+    discovered = discovered[:max_files]
+    if pytest_cmds:
+        # Preserve the full pytest invocation prefix (including env vars, `uv run`, `poetry run`, `python3 -m pytest`, etc.)
+        first_pytest = pytest_cmds[0].strip()
+        m_pref = re.match(r"^(.*?\bpytest)\b", first_pytest)
+        runner_prefix = m_pref.group(1).strip() if m_pref else "pytest"
+    else:
+        runner_prefix = _detect_default_pytest_runner(cwd)
+        if not runner_prefix:
+            return []
     quoted_files = " ".join(shlex.quote(f) for f in discovered)
     return [f"{runner_prefix} -q {quoted_files}"]
+
+
+_IMPORT_SKIP_DIRS = frozenset({
+    "tests", "test", "docs", "examples", "benchmarks", "scripts", "migrations", "tools", "bin",
+})
+_IMPORT_SKIP_FILES = frozenset({
+    "setup.py", "conftest.py", "__main__.py", "manage.py", "noxfile.py", "tasks.py", "fabfile.py",
+    "wsgi.py", "asgi.py", "sitecustomize.py", "usercustomize.py",
+})
+
+
+def build_import_smoke_command(
+    cwd: Path,
+    files_changed: list[str],
+    *,
+    max_modules: int = 8,
+) -> list[str]:
+    """Build a fast Python import smoke-check command for modified or created Python modules."""
+    if not files_changed:
+        return []
+    modules: list[str] = []
+    for rel in files_changed:
+        norm = rel.replace("\\", "/").strip("/")
+        if not norm.endswith(".py") or not (cwd / norm).is_file():
+            continue
+        bname = Path(norm).name
+        if bname in _IMPORT_SKIP_FILES or bname.startswith("test_") or bname.endswith("_test.py"):
+            continue
+        parts = list(Path(norm).parts)
+        if any(p in _IMPORT_SKIP_DIRS or p.startswith(".") for p in parts[:-1]):
+            continue
+        base_dir = cwd
+        if parts[0] == "src" and len(parts) > 1:
+            base_dir = cwd / "src"
+            parts = parts[1:]
+        if len(parts) <= 1:
+            # Never import top-level non-package .py scripts (e.g. run.py), which can execute CLI/server side effects.
+            continue
+        # Verify every parent directory is a valid Python package with __init__.py
+        cur = base_dir
+        valid_pkg = True
+        for pkg_part in parts[:-1]:
+            cur = cur / pkg_part
+            if not (cur / "__init__.py").is_file() or not pkg_part.isidentifier():
+                valid_pkg = False
+                break
+        if not valid_pkg:
+            continue
+        if bname == "__init__.py":
+            mod_name = ".".join(parts[:-1])
+        else:
+            stem = Path(bname).stem
+            if not stem.isidentifier():
+                continue
+            mod_name = ".".join((*parts[:-1], stem))
+        if mod_name and mod_name not in modules:
+            modules.append(mod_name)
+            if len(modules) >= max_modules:
+                break
+    if not modules:
+        return []
+    py_bin = "python3"
+    for cand in (".venv/bin/python", "venv/bin/python"):
+        if (cwd / cand).is_file():
+            py_bin = cand
+            break
+    quoted_mods = " ".join(shlex.quote(m) for m in modules)
+    return [
+        f"{py_bin} -c 'import importlib, sys; [importlib.import_module(m) for m in sys.argv[1:]]' {quoted_mods}"
+    ]
 
 
 def find_missing_prompt_symbols(
@@ -1087,16 +1269,39 @@ class JobManager:
             or bool(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "").strip())
         )
 
+    def _should_run_default_acceptance(self) -> bool:
+        if os.environ.get("CC_AGY_AUTO_REGRESSION_TESTS", "1").strip().lower() in ("0", "false", "no"):
+            return False
+        raw = os.environ.get("CC_AGY_AUTO_DEFAULT_ACCEPTANCE", "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return self.worker_backend is None
+
     def _clamp_worker_timeout(self, timeout_seconds: float) -> float:
-        """Clamp worker turn timeout when running inside a bounded strict-mode Lead session."""
+        """Clamp worker turn timeout against the session deadline (reserving headroom for review & apply)."""
         t_val = max(0.1, float(timeout_seconds))
-        if not self._is_bounded_lead_session():
+        raw_deadline = os.environ.get("CC_AGY_SESSION_DEADLINE_SECONDS", "").strip()
+        if raw_deadline:
+            try:
+                session_deadline = float(raw_deadline)
+            except ValueError:
+                session_deadline = 1500.0
+            if session_deadline <= 0:
+                return t_val
+        elif self._is_bounded_lead_session():
+            session_deadline = 1500.0
+        else:
             return t_val
+        raw_reserve = os.environ.get("CC_AGY_DEADLINE_RESERVE_SECONDS", "").strip()
+        try:
+            reserve_sec = max(15.0, float(raw_reserve)) if raw_reserve else 120.0
+        except ValueError:
+            reserve_sec = 120.0
         elapsed = max(0.0, time.monotonic() - self._created_at)
-        if elapsed < 1500.0:
-            remaining = max(45.0, 1380.0 - elapsed)
-            return min(t_val, remaining)
-        return t_val
+        worker_budget = max(45.0, (session_deadline - reserve_sec) - elapsed)
+        return min(t_val, worker_budget)
 
     def _ensure_baseline_recorded(self) -> None:
         if self.store.is_baseline_tampered(self.workspace_root):
@@ -1766,14 +1971,30 @@ class JobManager:
                 if status in ("running", "ok"):
                     status = "error"
                     error_msg = f"Failed to collect worktree diff: {type(fin_exc).__name__}: {fin_exc}"
-            if acceptance and (
+            runnable_acc_status = (
                 status in ("ok", "checkpoint", "needs_input")
-                or (status == "timeout" and files_changed)
-            ):
-                target_acc_cwd = self.workspace_root if in_place else wt_dir
+                or (status == "timeout" and bool(files_changed))
+            )
+            effective_acceptance = list(acceptance or [])
+            auto_default_acceptance = False
+            target_acc_cwd = self.workspace_root if in_place else wt_dir
+            if not effective_acceptance and runnable_acc_status and files_changed and self._should_run_default_acceptance():
+                effective_acceptance = discover_related_test_commands(target_acc_cwd, files_changed, [])
+                if os.environ.get("CC_AGY_AUTO_IMPORT_CHECK", "1").strip().lower() not in ("0", "false", "no", "off"):
+                    for icmd in build_import_smoke_command(target_acc_cwd, files_changed):
+                        if icmd not in effective_acceptance:
+                            effective_acceptance.append(icmd)
+                auto_default_acceptance = bool(effective_acceptance)
+            if effective_acceptance and runnable_acc_status:
                 try:
-                    acceptance_results = run_acceptance(acceptance, target_acc_cwd)
-                    if (
+                    acceptance_results = run_acceptance(effective_acceptance, target_acc_cwd)
+                    if auto_default_acceptance:
+                        for dr in acceptance_results:
+                            dr["auto_discovered_default"] = True
+                            if dr.get("exit_code") == 5:
+                                dr["passed"] = True
+                                dr["no_tests_collected"] = True
+                    elif (
                         files_changed
                         and os.environ.get("CC_AGY_AUTO_REGRESSION_TESTS", "1").strip().lower()
                         not in ("0", "false", "no")
@@ -1781,13 +2002,25 @@ class JobManager:
                         extra_reg_cmds = discover_related_test_commands(
                             target_acc_cwd,
                             files_changed,
-                            acceptance,
+                            effective_acceptance,
                         )
                         if extra_reg_cmds:
                             extra_res = run_acceptance(extra_reg_cmds, target_acc_cwd)
                             for er in extra_res:
                                 er["auto_discovered_regression"] = True
                             acceptance_results.extend(extra_res)
+                    if (
+                        not auto_default_acceptance
+                        and files_changed
+                        and os.environ.get("CC_AGY_AUTO_IMPORT_CHECK", "").strip().lower()
+                        in ("1", "true", "yes", "on", "always")
+                    ):
+                        import_cmds = build_import_smoke_command(target_acc_cwd, files_changed)
+                        if import_cmds:
+                            imp_res = run_acceptance(import_cmds, target_acc_cwd)
+                            for ir in imp_res:
+                                ir["auto_import_smoke"] = True
+                            acceptance_results.extend(imp_res)
                 except Exception as acc_exc:
                     acceptance_results = [
                         {"command": "<acceptance>", "passed": False, "error": f"{type(acc_exc).__name__}: {acc_exc}"}
@@ -1962,6 +2195,8 @@ class JobManager:
                 receipt_payload["status"] = "interrupted"
                 if not receipt_payload.get("error"):
                     receipt_payload["error"] = prior_disk_rec.get("error")
+            if prior_disk_rec.get("escalated_from_model") and not receipt_payload.get("escalated_from_model"):
+                receipt_payload["escalated_from_model"] = prior_disk_rec["escalated_from_model"]
             if prior_disk_rec.get("applied") and not in_place:
                 for preserve_key in (
                     "applied",
@@ -2380,6 +2615,53 @@ class JobManager:
         receipt = self.store.read_receipt(safe_id)
         return self._digest_with_progress(receipt)
 
+    @staticmethod
+    def _filter_diff_by_symbols(diff_text: str, focus_symbols: list[str]) -> str:
+        clean_syms = [str(s).strip() for s in focus_symbols if isinstance(s, str) and str(s).strip()]
+        if not clean_syms or not diff_text:
+            return diff_text
+        sym_patterns = [
+            re.compile(rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])")
+            for sym in clean_syms
+        ]
+        matched_files: list[str] = []
+        file_chunks: list[list[str]] = []
+        cur_file_lines: list[str] = []
+        for line in diff_text.splitlines(keepends=True):
+            if line.startswith("diff --git "):
+                if cur_file_lines:
+                    file_chunks.append(cur_file_lines)
+                cur_file_lines = [line]
+            else:
+                cur_file_lines.append(line)
+        if cur_file_lines:
+            file_chunks.append(cur_file_lines)
+        for chunk in file_chunks:
+            header_lines: list[str] = []
+            hunks: list[list[str]] = []
+            cur_hunk: list[str] = []
+            for ln in chunk:
+                if ln.startswith("@@ "):
+                    if cur_hunk:
+                        hunks.append(cur_hunk)
+                    cur_hunk = [ln]
+                elif cur_hunk:
+                    cur_hunk.append(ln)
+                else:
+                    header_lines.append(ln)
+            if cur_hunk:
+                hunks.append(cur_hunk)
+            kept_hunks = [
+                "".join(h)
+                for h in hunks
+                if any(pat.search("".join(h[1:]) if len(h) > 1 else "".join(h)) for pat in sym_patterns)
+            ]
+            if kept_hunks:
+                matched_files.append("".join(header_lines) + "".join(kept_hunks))
+            elif not hunks and any(pat.search("".join(header_lines)) for pat in sym_patterns):
+                matched_files.append("".join(header_lines))
+        return "".join(matched_files)
+
     def get_diff(
         self,
         job_id: str,
@@ -2387,8 +2669,11 @@ class JobManager:
         file_filter: str | None = None,
         page: int = 1,
         page_tokens: int = DEFAULT_DIFF_PAGE_TOKENS,
+        summary_only: bool = False,
+        focus_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Return paginated unified git diff for job_id measured in tokens."""
+        """Return paginated unified git diff for job_id measured in tokens, with per-file line stats
+        and optional summary-only or symbol-focused hunk filtering."""
         safe_id = validate_job_id(job_id)
         receipt = self.store.read_receipt(safe_id)
         diff_path = self.store.diff_path(safe_id)
@@ -2424,12 +2709,29 @@ class JobManager:
                 filtered_chunks.append("".join(current_chunk))
             full_diff = "".join(filtered_chunks)
 
+        if focus_symbols and full_diff:
+            full_diff = self._filter_diff_by_symbols(full_diff, focus_symbols)
+
+        prov_per_file = (extract_diff_provenance(full_diff).get("per_file") or {}) if full_diff else {}
+        file_stats = {
+            fpath: {
+                "added": int(meta.get("added_count") or 0),
+                "removed": int(meta.get("removed_count") or 0),
+            }
+            for fpath, meta in prov_per_file.items()
+        }
+
         pages = paginate_text_by_tokens(full_diff, page_tokens=page_tokens)
         total_pages = len(pages)
         clamped_page = max(1, min(int(page), total_pages))
-        page_slice = pages[clamped_page - 1]
+        page_slice = "" if summary_only else pages[clamped_page - 1]
+        effective_files = (
+            list(file_stats.keys())
+            if (file_filter or focus_symbols)
+            else receipt.get("files_changed", [])
+        )
 
-        return {
+        out: dict[str, Any] = {
             "job_id": safe_id,
             "status": receipt.get("status"),
             "file_filter": file_filter,
@@ -2437,9 +2739,15 @@ class JobManager:
             "total_pages": total_pages,
             "page_tokens_estimated": estimate_tokens(page_slice),
             "total_diff_tokens_estimated": estimate_tokens(full_diff),
-            "files_changed": receipt.get("files_changed", []),
+            "files_changed": effective_files,
+            "file_stats": file_stats,
             "diff": page_slice,
         }
+        if summary_only:
+            out["summary_only"] = True
+        if focus_symbols:
+            out["focus_symbols"] = list(focus_symbols)
+        return out
 
     def delegate_apply(
         self,
@@ -3100,6 +3408,22 @@ class JobManager:
         ]
 
         model = str(receipt.get("model") or "gemini-3.1-pro-preview")
+        escalated_from: str | None = None
+        raw_esc_model = os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip()
+        if (
+            raw_esc_model
+            and raw_esc_model.lower() not in ("0", "false", "no", "off")
+            and "flash" in model.lower()
+            and worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+        ):
+            target_esc_model = (
+                "gemini-4-argon"
+                if raw_esc_model.lower() in ("1", "true", "yes", "on")
+                else raw_esc_model
+            )
+            if target_esc_model != model:
+                escalated_from = str(receipt.get("escalated_from_model") or model)
+                model = target_esc_model
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
@@ -3138,6 +3462,18 @@ class JobManager:
         else:
             resolved_allowed_paths = validate_allowed_paths(receipt.get("allowed_paths") or [])
         allowed_paths = resolved_allowed_paths
+        if escalated_from is not None:
+            receipt["escalated_from_model"] = escalated_from
+            receipt["model"] = model
+            try:
+                self.store.write_receipt(
+                    safe_id,
+                    receipt,
+                    scrub=bool(receipt.get("scrub_receipt", False)),
+                    workspace_root=str(self.workspace_root),
+                )
+            except Exception:
+                pass
         enabled_tools = receipt.get("enabled_tools")
         disabled_tools = receipt.get("disabled_tools")
         enable_subagents = bool(receipt.get("enable_subagents", False))
@@ -3575,12 +3911,27 @@ class JobManager:
                 slim["error"] = receipt.get("error")
             if receipt.get("stop_reason"):
                 slim["stop_reason"] = receipt.get("stop_reason")
+            if receipt.get("escalated_from_model"):
+                slim["escalated_from_model"] = receipt.get("escalated_from_model")
             return slim
 
         digest_usage = dict(receipt.get("usage") or {})
         raw_reqs = digest_usage.get("requests")
         if isinstance(raw_reqs, list):
+            def _safe_req_tokens(req_obj: Any) -> int:
+                if not isinstance(req_obj, dict):
+                    return 0
+                try:
+                    return int(float(req_obj.get("prompt_token_count") or 0))
+                except (ValueError, TypeError):
+                    return 0
+
             digest_usage["requests_count"] = len(raw_reqs)
+            digest_usage["over_200k_requests_count"] = sum(
+                1
+                for r in raw_reqs
+                if _safe_req_tokens(r) > 200_000
+            )
             if len(raw_reqs) > 10:
                 digest_usage["requests"] = raw_reqs[-10:]
                 digest_usage["requests_truncated"] = True
@@ -3614,6 +3965,8 @@ class JobManager:
         }
         if receipt.get("preloaded_files"):
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
+        if receipt.get("escalated_from_model"):
+            digest["escalated_from_model"] = receipt.get("escalated_from_model")
         if receipt.get("missing_prompt_symbols"):
             digest["missing_prompt_symbols"] = list(receipt.get("missing_prompt_symbols") or [])
         if receipt.get("applied"):
