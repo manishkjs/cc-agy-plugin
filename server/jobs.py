@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import fcntl
@@ -26,6 +27,7 @@ from server.agy_runner import (
     read_progress,
     resolve_thinking_level,
     run_antigravity_worker,
+    verify_worker_run_record,
 )
 from server.repo_map import build_focused_file_outline, build_repo_map
 from server.receipts import (
@@ -41,10 +43,13 @@ from server.regions import (
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
-    first_valid_env,
+    env_flag,
+    is_strict_mode_enabled,
     paginate_text_by_tokens,
     resolve_api_key,
     resolve_auth_config,
+    resolve_cost_profile,
+    resolve_default_delegate_model,
     truncate_to_token_budget,
 )
 
@@ -372,20 +377,25 @@ def _is_gitignored_on_host(workspace_root: Path, rel_path: str) -> bool:
 
 
 def _is_ignored_build_artifact(rel_path: str, root: Path | None = None) -> bool:
-    """Return True if an already-.gitignored path is inside a build/output/cache directory."""
+    """Return True if an already-.gitignored path is inside a build/output/cache directory or a setuptools-scm _version.py."""
     if _is_ephemeral_build_or_test_artifact(rel_path, root=root):
         return True
     norm = rel_path.strip("/")
     if not norm:
         return False
-    for part in norm.split("/"):
+    parts = norm.split("/")
+    for part in parts:
         if part in _IGNORED_BUILD_OUTPUT_DIRS:
             return True
+    if parts[-1] in ("_version.py", "__version__.py"):
+        return True
     return False
 
 
 DEFAULT_MAX_TOOL_CALLS = 100
+DEFAULT_FLASH_MAX_TOOL_CALLS = 40
 DEFAULT_MAX_TOTAL_TOKENS = 5_000_000
+DEFAULT_MAX_WAIT_SLICE_SECONDS = 240.0
 DEFAULT_ACCEPTANCE_TIMEOUT = 300.0
 MAX_ACCEPTANCE_COMMANDS = 5
 MAX_PLAN_STEPS = 15
@@ -410,10 +420,18 @@ def _env_int(name: str, default: int) -> int:
 
 
 def resolve_budget(
-    max_tool_calls: int | None, max_total_tokens: int | None
+    max_tool_calls: int | None,
+    max_total_tokens: int | None,
+    *,
+    model: str | None = None,
 ) -> tuple[int | None, int | None]:
-    """Per-turn worker caps (defaults 100 tool calls / 5M tokens; env overrides; 0 disables a cap)."""
-    calls = max_tool_calls if max_tool_calls is not None else _env_int("CC_AGY_MAX_TOOL_CALLS", DEFAULT_MAX_TOOL_CALLS)
+    """Per-turn worker caps (defaults 40 tool calls on Flash / 100 on Pro/Argon, 5M tokens; env overrides; 0 disables)."""
+    if max_tool_calls is not None:
+        calls = max_tool_calls
+    elif "flash" in (model or "").lower() and not str(os.environ.get("CC_AGY_MAX_TOOL_CALLS") or "").strip():
+        calls = _env_int("CC_AGY_FLASH_MAX_TOOL_CALLS", DEFAULT_FLASH_MAX_TOOL_CALLS)
+    else:
+        calls = _env_int("CC_AGY_MAX_TOOL_CALLS", DEFAULT_MAX_TOOL_CALLS)
     tokens = (
         max_total_tokens
         if max_total_tokens is not None
@@ -450,7 +468,9 @@ def validate_acceptance(acceptance: Any, workdir: Path) -> list[str]:
     from scripts.pre_tool_guard import detect_bash_workspace_mutation
 
     for cmd in cmds:
-        verdict = detect_bash_workspace_mutation(cmd, workdir, cwd=workdir)
+        verdict = detect_bash_workspace_mutation(
+            cmd, workdir, cwd=workdir, allow_workspace_inline_imports=True
+        )
         if verdict.get("blocked"):
             raise ValueError(
                 f"acceptance command {cmd!r} is refused because it can modify the workspace: "
@@ -595,6 +615,105 @@ def select_candidate_files(
     return chosen
 
 
+def _load_safe_workspace_files(
+    workspace_root: Path,
+    rel_paths: list[str] | None,
+    *,
+    max_total_tokens: int = 8000,
+    line_windows: dict[str, tuple[int, int]] | None = None,
+) -> list[tuple[str, str]]:
+    """Safely load workspace-relative text files up to `max_total_tokens` without escaping `workspace_root`."""
+    if not rel_paths:
+        return []
+    ws_resolved = workspace_root.resolve()
+    secret_basenames = {
+        ".env", ".netrc", ".npmrc", ".pypirc", ".mcp.json", ".hmac_key",
+        "id_rsa", "id_ed25519", "id_ecdsa", "credentials.json",
+    }
+    candidates: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    for raw_p in rel_paths:
+        clean_p = str(raw_p or "").strip()
+        if not clean_p or ".." in Path(clean_p).parts:
+            continue
+        try:
+            cand = (ws_resolved / clean_p).resolve()
+            rel_obj = cand.relative_to(ws_resolved)
+        except Exception:
+            continue
+        rel_str = rel_obj.as_posix()
+        if not rel_str or rel_str in seen:
+            continue
+        bname = rel_obj.name.lower()
+        parts_low = [p.lower() for p in rel_obj.parts]
+        if (
+            bname in secret_basenames
+            or bname.startswith(".env.")
+            or bname.endswith((".pem", ".key", ".p12", ".pfx"))
+            or ".git" in parts_low
+            or ".claude" in parts_low
+            or ".ssh" in parts_low
+            or ".cc-agy-data" in parts_low
+            or ".worktrees" in parts_low
+            or not cand.is_file()
+        ):
+            continue
+        try:
+            raw_bytes = cand.read_bytes()
+            if b"\x00" in raw_bytes[:4096]:
+                continue
+            text = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        seen.add(rel_str)
+        candidates.append((rel_str, text, estimate_tokens(text)))
+
+    if not candidates:
+        return []
+
+    # Reserve token budget for smaller files so an oversized first file never starves subsequent small files.
+    small_cutoff = max(250, max_total_tokens // 2)
+    remaining_small_tokens = sum(est for _, _, est in candidates if est <= small_cutoff)
+    loaded: list[tuple[str, str]] = []
+    used_tokens = 0
+    for rel_str, text, est in candidates:
+        is_small = est <= small_cutoff
+        if is_small:
+            remaining_small_tokens = max(0, remaining_small_tokens - est)
+        avail_for_this = max_total_tokens - used_tokens - (0 if is_small else min(remaining_small_tokens, max_total_tokens // 2))
+        if avail_for_this <= 0:
+            continue
+        if est > avail_for_this:
+            if avail_for_this < 200 and loaded:
+                continue
+            all_lines = text.splitlines()
+            total_lines = max(1, len(all_lines))
+            win = (line_windows or {}).get(rel_str)
+            if win and total_lines > 1:
+                w_start = max(1, min(int(win[0]), total_lines))
+                w_limit = max(50, int(win[1]) if int(win[1]) > 0 else 250)
+                w_end = min(total_lines, w_start + w_limit - 1)
+                window_text = "\n".join(all_lines[w_start - 1 : w_end])
+                trunc_text, _was_tr, _orig_t = truncate_to_token_budget(window_text, max(100, avail_for_this - 30))
+                shown_count = max(1, len(trunc_text.splitlines()))
+                actual_end = min(total_lines, w_start + shown_count - 1)
+                text = (
+                    trunc_text.rstrip("\n")
+                    + f"\n... [truncated: showing lines {w_start}-{actual_end} of {total_lines}; use view_file for remaining lines]"
+                )
+            else:
+                trunc_text, _was_tr, _orig_t = truncate_to_token_budget(text, max(100, avail_for_this - 30))
+                shown_lines = max(1, len(trunc_text.splitlines()))
+                text = (
+                    trunc_text.rstrip("\n")
+                    + f"\n... [truncated: showing lines 1-{shown_lines} of {total_lines}; use view_file for remaining lines]"
+                )
+            est = estimate_tokens(text)
+        loaded.append((rel_str, text))
+        used_tokens += est
+    return loaded
+
+
 def render_worker_prompt(
     brief: str,
     *,
@@ -606,25 +725,106 @@ def render_worker_prompt(
     preloaded_files: list[tuple[str, str]] | None = None,
     repo_map: str = "",
     focused_outline: str = "",
+    spec_files_inlined: list[tuple[str, str]] | None = None,
+    context_files_inlined: list[tuple[str, str]] | None = None,
+    checklist: list[str] | None = None,
+    raw_user_prompt: str = "",
 ) -> str:
-    """Wrap the lead's brief with its plan, acceptance checks, budget, and reporting rules."""
-    parts = [brief.strip()]
+    """Wrap the lead's brief with repository map, budget/reporting rules, inlined context, plan, and acceptance."""
+    static_parts: list[str] = []
     if repo_map and repo_map.strip():
-        parts.append("## Repository Map (Cached)\n" + repo_map.strip())
+        static_parts.append("## Repository Map (Cached)\n" + repo_map.strip())
+    budget_bits = []
+    if max_tool_calls:
+        budget_bits.append(f"{max_tool_calls} tool calls")
+    if max_total_tokens:
+        budget_bits.append(f"{max_total_tokens:,} total tokens")
+    if budget_bits:
+        static_parts.append(
+            "## Budget\nThis turn stops automatically after " + " or ".join(budget_bits) + ". Work efficiently: "
+            "make your first file edit within 8-10 tool calls and implement changes incrementally file-by-file "
+            "so your edits are saved on disk early (never read more than 6-8 files before editing, and NEVER draft "
+            "full file implementations or long code blocks inside internal thinking; emit create_file/edit_file "
+            "tool calls directly and iterate against test output), read files <=260 lines in a single view_file "
+            "call (start_line=1, end_line=260) or use the Focused File Outline line numbers to read 200-260 line "
+            "spans on larger files instead of paging in small slices, avoid interactive one-liner REPL probes, "
+            "run only the focused test file(s) needed for your changes, do not re-read files you have already seen, "
+            "and remove any temporary scratch scripts before finishing."
+        )
+    if progress_channel:
+        static_parts.append(
+            "## Reporting\nUse the report_to_lead tool only when blocked (kind=\"question\" if a requirement is "
+            "ambiguous; kind=\"blocker\" if you cannot proceed — questions and blockers end your turn) or "
+            "kind=\"milestone\" between distinct plan steps on multi-step plans. Once your implementation and "
+            "tests pass, finish your turn directly with a short summary instead of calling report_to_lead."
+        )
+    if (
+        os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
+        and is_straitjacket_available()
+    ):
+        static_parts.append(
+            "## Shell Commands & Evidence\n"
+            "Commands and file reads execute with bounded output via Straitjacket (`run_command`, `view_file`, "
+            "`search_dir`, `list_dir`, `find_file`, `ctx_query`, `ctx_get`, `ctx_search`). If a test or build "
+            "produces large output, it returns a concise digest and an address (e.g. `run:<id>#stdout`). Use "
+            "`ctx_get(address, start_line, end_line)` or `ctx_search(address, pattern)` to retrieve specific "
+            "omitted lines or tracebacks instead of rerunning commands."
+        )
+
+    dynamic_parts: list[str] = []
+    if raw_user_prompt and raw_user_prompt.strip():
+        dynamic_parts.append(
+            "## Original User Request (Verbatim — Do Not Omit Any Requirement)\n"
+            + raw_user_prompt.strip()
+        )
+    if spec_files_inlined:
+        full_specs = [(r, c) for r, c in spec_files_inlined if "[truncated:" not in c]
+        trunc_specs = [(r, c) for r, c in spec_files_inlined if "[truncated:" in c]
+        if full_specs:
+            spec_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in full_specs]
+            dynamic_parts.append(
+                "## Task Specification Files (Verbatim — Do Not Re-Read)\n" + "\n\n".join(spec_blocks)
+            )
+        if trunc_specs:
+            tspec_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in trunc_specs]
+            dynamic_parts.append(
+                "## Partially Inlined Specification Files (Truncated to Token Budget — Use view_file for Omitted Lines)\n"
+                + "\n\n".join(tspec_blocks)
+            )
+    if checklist:
+        dynamic_parts.append(
+            "## Behavioral Checklist\n"
+            + "\n".join(f"{i}. {item}" for i, item in enumerate(checklist, 1))
+        )
     if focused_outline and focused_outline.strip():
-        parts.append("## Focused File Outline (Line-Numbered)\n" + focused_outline.strip())
+        dynamic_parts.append("## Focused File Outline (Line-Numbered)\n" + focused_outline.strip())
     if preloaded_files:
         # Path hints only: full file contents pasted into turn 1 get re-read on every later turn.
         path_lines = [f"- `{rel}`" for rel, _content in preloaded_files]
-        parts.append(
+        dynamic_parts.append(
             "## Candidate Repository Files\n"
             "These files matched the task's identifiers. Open only the relevant sections:\n"
             + "\n".join(path_lines)
         )
+    if context_files_inlined:
+        full_ctx = [(r, c) for r, c in context_files_inlined if "[truncated:" not in c]
+        trunc_ctx = [(r, c) for r, c in context_files_inlined if "[truncated:" in c]
+        if full_ctx:
+            ctx_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in full_ctx]
+            dynamic_parts.append(
+                "## Pre-Read Context Files (Already Inlined — Do Not Call view_file on These Again; Edit Directly)\n"
+                + "\n\n".join(ctx_blocks)
+            )
+        if trunc_ctx:
+            tctx_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in trunc_ctx]
+            dynamic_parts.append(
+                "## Partially Inlined Context Files (Truncated to Token Budget — Use view_file with start_line/end_line for Omitted Lines)\n"
+                + "\n\n".join(tctx_blocks)
+            )
     if plan:
-        parts.append("## Plan from the lead\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1)))
+        dynamic_parts.append("## Plan from the lead\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1)))
     if acceptance:
-        parts.append(
+        dynamic_parts.append(
             "## Acceptance\nWhen you finish, the plugin runs these commands and reports the results to the lead. "
             "Make them pass:\n"
             + "\n".join(f"- `{c}`" for c in acceptance)
@@ -634,46 +834,15 @@ def render_worker_prompt(
             "linters (e.g. ruff, mypy, flake8, eslint) that are not listed above. Never modify unrelated files to "
             "fix pre-existing test failures outside your task scope or allowed_paths."
         )
-    budget_bits = []
-    if max_tool_calls:
-        budget_bits.append(f"{max_tool_calls} tool calls")
-    if max_total_tokens:
-        budget_bits.append(f"{max_total_tokens:,} total tokens")
-    if budget_bits:
-        parts.append(
-            "## Budget\nThis turn stops automatically after " + " or ".join(budget_bits) + ". Work efficiently: "
-            "make your first file edit within 8-10 tool calls and implement changes incrementally file-by-file "
-            "so your edits are saved on disk early (never read more than 6-8 files before editing, and NEVER draft "
-            "full file implementations or long code blocks inside internal thinking; emit create_file/edit_file "
-            "tool calls directly and iterate against test output), read files <=500 lines in a single view_file "
-            "call (start_line=1, end_line=500) or use the Focused File Outline line numbers to read 250-500 line "
-            "spans on larger files instead of paging in small slices, avoid interactive one-liner REPL probes, "
-            "run only the focused test file(s) needed for your changes, do not re-read files you have already seen, "
-            "and remove any temporary scratch scripts before finishing."
-        )
-    if progress_channel:
-        parts.append(
-            "## Reporting\nUse the report_to_lead tool: kind=\"milestone\" after each plan step or when tests "
-            "pass; kind=\"question\" if a requirement is ambiguous; kind=\"blocker\" if you cannot proceed "
-            "(questions and blockers end your turn). Finish with a short summary that marks each plan step "
-            "DONE or BLOCKED."
-        )
-    if (
-        os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
-        and is_straitjacket_available()
-    ):
-        parts.append(
-            "## Shell Commands & Evidence\n"
-            "Commands execute with bounded output. If a test or build produces large output, it returns a concise "
-            "digest and an address (e.g. `run:<id>#stdout`). Use `ctx_get(address, start_line, end_line)` or "
-            "`ctx_search(address, pattern)` to retrieve specific omitted lines or tracebacks instead of rerunning commands."
-        )
-    return "\n\n".join(parts)
+    return "\n\n".join([brief.strip(), *static_parts, *dynamic_parts])
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _parse_test_counts(output: str) -> dict[str, int]:
     counts = {"passed": 0, "failed": 0, "errors": 0}
-    text = output or ""
+    text = _ANSI_ESCAPE_RE.sub("", output or "")
 
     # 1. Check anchored pytest summary lines first so prose like "expected 2 errors" in a unittest/stestr
     # log never hijacks the count parser.
@@ -743,7 +912,85 @@ def _parse_test_counts(output: str) -> dict[str, int]:
         if matched_any_suite:
             return counts
 
-    # 4. Fallback for minimal/custom pytest output without a duration footer
+    # 4. Rust cargo test ("test result: ok. 12 passed; 0 failed; 0 ignored; ...")
+    cargo_matches = list(
+        re.finditer(r"test result:\s*(?:ok|FAILED)\.\s*(\d+)\s+passed;\s*(\d+)\s+failed;", text)
+    )
+    if cargo_matches:
+        for cm in cargo_matches:
+            counts["passed"] += int(cm.group(1))
+            counts["failed"] += int(cm.group(2))
+        return counts
+
+    # 5. Jest / Vitest ("Tests: 1 failed, 14 passed, 15 total" or "Tests  14 passed (14)")
+    jest_lines = [
+        ln for ln in text.splitlines() if re.match(r"^\s*Tests:?\s+", ln) and re.search(r"\b(?:passed|failed)\b", ln)
+    ]
+    if jest_lines:
+        last_jest = jest_lines[-1]
+        m_jp = re.search(r"(\d+)\s+passed\b", last_jest)
+        m_jf = re.search(r"(\d+)\s+failed\b", last_jest)
+        if m_jp:
+            counts["passed"] = int(m_jp.group(1))
+        if m_jf:
+            counts["failed"] = int(m_jf.group(1))
+        return counts
+
+    # 6. Go `go test` ("--- PASS: TestX", "--- FAIL: TestY", or package-level "ok  pkg  0.012s" / "FAIL pkg 0.012s")
+    go_case_pass = len(re.findall(r"(?m)^---\s+PASS:\s+\S+", text))
+    go_case_fail = len(re.findall(r"(?m)^---\s+FAIL:\s+\S+", text))
+    if go_case_pass or go_case_fail:
+        counts["passed"] = go_case_pass
+        counts["failed"] = go_case_fail
+        return counts
+    go_pkg_ok = len(re.findall(r"(?m)^ok\s+\S+\s+(?:\d+(?:\.\d+)?s|\(cached\))", text))
+    go_pkg_fail = len(re.findall(r"(?m)^FAIL\s+\S+\s+\d+(?:\.\d+)?s", text))
+    if go_pkg_ok or go_pkg_fail:
+        counts["passed"] = go_pkg_ok
+        counts["failed"] = go_pkg_fail
+        return counts
+
+    # 7. Node.js `node --test` TAP/spec footer ("ℹ pass 5" / "# pass 5", "ℹ fail 1" / "# fail 1")
+    node_pass = re.findall(r"(?m)^[\sℹ#]*pass\s+(\d+)\s*$", text)
+    node_fail = re.findall(r"(?m)^[\sℹ#]*fail\s+(\d+)\s*$", text)
+    if node_pass or node_fail:
+        if node_pass:
+            counts["passed"] = int(node_pass[-1])
+        if node_fail:
+            counts["failed"] = int(node_fail[-1])
+        return counts
+
+    # 8. Maven Surefire ("Tests run: 10, Failures: 1, Errors: 0, Skipped: 0")
+    mvn_matches = list(
+        re.finditer(
+            r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)",
+            text,
+        )
+    )
+    if mvn_matches:
+        last_m = mvn_matches[-1]
+        total_m, fail_m, err_m, skip_m = (int(last_m.group(i)) for i in range(1, 5))
+        counts["failed"] = fail_m
+        counts["errors"] = err_m
+        counts["passed"] = max(0, total_m - fail_m - err_m - skip_m)
+        return counts
+
+    # 9. Gradle ("5 tests completed, 1 failed, 1 skipped")
+    gradle_matches = list(
+        re.finditer(
+            r"(\d+)\s+tests?\s+completed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+skipped)?",
+            text,
+        )
+    )
+    if gradle_matches:
+        total_g = sum(int(m.group(1)) for m in gradle_matches)
+        fail_g = sum(int(m.group(2) or 0) for m in gradle_matches)
+        skip_g = sum(int(m.group(3) or 0) for m in gradle_matches)
+        counts["failed"] = fail_g
+        counts["passed"] = max(0, total_g - fail_g - skip_g)
+        return counts
+
+    # 10. Fallback for minimal/custom pytest output without a duration footer
     for key, pat in (("passed", r"(\d+) passed\b"), ("failed", r"(\d+) failed\b"), ("errors", r"(\d+) errors?\b")):
         found = re.findall(pat, text)
         if found:
@@ -825,6 +1072,8 @@ def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> 
     return results
 
 
+import builtins as _py_builtins
+
 _PROMPT_SYMBOL_STOPLIST = frozenset({
     "True", "False", "None", "self", "cls", "args", "kwargs", "dict", "list", "tuple", "set",
     "str", "int", "float", "bool", "bytes", "object", "type", "super", "Path", "Any", "Optional",
@@ -839,12 +1088,58 @@ _PROMPT_SYMBOL_STOPLIST = frozenset({
     "ctx_get", "ctx_search", "ctx_query", "report_to_lead", "delegate_start", "delegate_continue",
     "delegate_apply", "delegate_result", "delegate_status", "delegate_cancel", "delegate_revert",
     "delegate_to_gemini", "ask_gemini", "get_diff", "cost_report", "probe_writers",
-})
+    "delegate_file_batch", "draft_document", "write_tests_from_cases", "replicate_edit", "list_jobs",
+    "allowed_paths", "files_changed", "acceptance", "acceptance_passed", "acceptance_results",
+    "scope_violations", "scope_violation", "missing_prompt_symbols", "auto_apply", "in_place",
+    "follow_up_prompt", "job_id", "timeout_seconds", "max_tool_calls", "max_total_tokens",
+    "thinking_level", "allow_scope_violations", "force_retry", "resume_job_id",
+} | {name for name in dir(_py_builtins) if not name.startswith("_")})
+
+
+def _repo_has_explicit_pytest_config(cwd: Path) -> bool:
+    """Return True when `cwd` declares explicit pytest configuration."""
+    if (cwd / "pytest.ini").is_file() or (cwd / "conftest.py").is_file():
+        return True
+    for cfg_name, marker in (("pyproject.toml", "[tool.pytest"), ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+        cfg_p = cwd / cfg_name
+        if cfg_p.is_file():
+            try:
+                if marker in cfg_p.read_text(encoding="utf-8", errors="replace"):
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def _has_python_bin_test_runner(cwd: Path) -> bool:
+    """Return True if `cwd/bin/test` is a Python test runner script."""
+    bin_test = cwd / "bin" / "test"
+    if not bin_test.is_file():
+        return False
+    try:
+        head = bin_test.read_bytes()[:256].decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    first_line = head.splitlines()[0] if head else ""
+    return "python" in first_line.lower()
 
 
 def _detect_default_pytest_runner(cwd: Path) -> str:
-    """Detect the best pytest command prefix for `cwd` when the caller supplied no acceptance commands.
-    Returns `""` if pytest is not installed in `cwd`'s environment."""
+    """Detect the best Python test runner prefix for `cwd` when the caller supplied no acceptance commands.
+    Returns `""` if no compatible Python test runner is installed in `cwd`'s environment."""
+    # Repositories with a dedicated Python `bin/test` runner and legacy `utilities/pytest.py` shims
+    # (without modern pytest config) fail under modern pytest (`module 'py' has no attribute 'test'`).
+    has_bin_test = _has_python_bin_test_runner(cwd)
+    has_legacy_pytest_shim = (
+        has_bin_test
+        and not _repo_has_explicit_pytest_config(cwd)
+        and next(cwd.glob("*/utilities/pytest.py"), None) is not None
+    )
+    if has_legacy_pytest_shim:
+        for py_cand in (".venv/bin/python", "venv/bin/python"):
+            if (cwd / py_cand).is_file():
+                return f"{py_cand} bin/test"
+        return "python3 bin/test"
     for rel_cand in (".venv/bin/pytest", "venv/bin/pytest"):
         if (cwd / rel_cand).is_file():
             return rel_cand
@@ -871,53 +1166,238 @@ def _detect_default_pytest_runner(cwd: Path) -> str:
     )
     if probe_sys.returncode == 0:
         return "python3 -m pytest"
+    if has_bin_test:
+        for py_cand in (".venv/bin/python", "venv/bin/python"):
+            if (cwd / py_cand).is_file():
+                return f"{py_cand} bin/test"
+        return "python3 bin/test"
     return ""
 
 
-def discover_related_test_commands(
-    cwd: Path,
-    files_changed: list[str],
-    existing_cmds: list[str],
-    *,
-    max_files: int = 4,
-) -> list[str]:
-    """Discover existing tracked unit test files (`tests/test_<stem>.py`) for modified Python source
-    modules that are not already covered by `existing_cmds`. When `existing_cmds` is empty, also
-    discovers modified test files and synthesizes a default pytest command."""
-    if not files_changed:
-        return []
-    pytest_cmds: list[str] = []
-    if existing_cmds:
-        pytest_cmds = [c for c in existing_cmds if re.search(r"\bpytest\b", c)]
-        if not pytest_cmds:
-            return []
-        # If any existing pytest command runs the full suite or a directory without targeting specific .py files
-        # and without filtering to a subset via -k, no supplemental regression command is needed.
-        for pcmd in pytest_cmds:
-            if not re.search(r"[\w./-]+\.py\b", pcmd) and not re.search(r"(?:^|\s)-k(?:\s|=|$)", pcmd):
-                return []
+_JS_TS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_JS_TS_TEST_RE = re.compile(r"\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)$", re.I)
 
-    discovered: list[str] = []
-    stems_to_check: list[str] = []
-    for rel in files_changed:
-        norm = rel.replace("\\", "/").strip("/")
-        if not norm.endswith(".py"):
-            continue
-        bname = Path(norm).name
-        if bname.startswith("test_") or bname.endswith("_test.py"):
-            if not existing_cmds and (cwd / norm).is_file() and norm not in discovered:
-                discovered.append(norm)
-            continue
-        if bname in ("__init__.py", "conftest.py", "setup.py"):
-            continue
-        parts = Path(norm).parts
-        if any(p in ("tests", "test", "docs", "examples", "benchmarks") for p in parts[:-1]):
-            continue
-        stem = Path(norm).stem
-        if stem and stem not in stems_to_check:
-            stems_to_check.append(stem)
 
-    if stems_to_check and len(discovered) < max_files:
+def _detect_node_runner_info(cwd: Path, exec_env: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """Inspect `package.json` and lockfiles to detect the Node/TypeScript test runner for `cwd`."""
+    pkg_json = cwd / "package.json"
+    if not pkg_json.is_file():
+        return None
+    env_map = exec_env if exec_env is not None else _build_workdir_exec_env(cwd)
+    path_str = env_map.get("PATH")
+    try:
+        pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        pkg = {}
+    if not isinstance(pkg, dict):
+        pkg = {}
+    scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
+    test_script = str((scripts or {}).get("test") or "").strip()
+    is_placeholder = "no test specified" in test_script.lower()
+    deps: dict[str, Any] = {}
+    for dep_key in ("dependencies", "devDependencies"):
+        sub = pkg.get(dep_key)
+        if isinstance(sub, dict):
+            deps.update(sub)
+    pm_field = str(pkg.get("packageManager") or "").lower()
+    if (cwd / "pnpm-lock.yaml").is_file() or pm_field.startswith("pnpm@"):
+        pm = "pnpm"
+    elif (cwd / "yarn.lock").is_file() or pm_field.startswith("yarn@"):
+        pm = "yarn"
+    elif (cwd / "bun.lockb").is_file() or (cwd / "bun.lock").is_file() or pm_field.startswith("bun@"):
+        pm = "bun"
+    else:
+        pm = "npm"
+
+    framework = ""
+    if "vitest" in test_script or "vitest" in deps:
+        framework = "vitest"
+    elif "jest" in test_script or "jest" in deps:
+        framework = "jest"
+    elif "mocha" in test_script or "mocha" in deps:
+        framework = "mocha"
+    elif "node --test" in test_script:
+        framework = "node-test"
+    elif pm == "bun" and (not test_script or "bun test" in test_script):
+        framework = "bun-test"
+
+    node_bin_dir = cwd / "node_modules" / ".bin"
+    pm_available = bool(shutil.which(pm, path=path_str))
+    node_available = bool(shutil.which("node", path=path_str))
+    if framework in ("vitest", "jest", "mocha"):
+        local_bin = node_bin_dir / framework
+        available = local_bin.is_file() or ((cwd / "node_modules").is_dir() and pm_available)
+    elif framework == "node-test":
+        available = node_available
+    elif framework == "bun-test":
+        available = bool(shutil.which("bun", path=path_str))
+    else:
+        available = bool(test_script and not is_placeholder and pm_available and (cwd / "node_modules").is_dir())
+
+    primary_cmd = ""
+    if framework == "bun-test":
+        primary_cmd = "bun test"
+    elif framework == "node-test":
+        primary_cmd = "node --test"
+    elif framework == "vitest" and test_script.strip() == "vitest":
+        primary_cmd = "./node_modules/.bin/vitest run" if (node_bin_dir / "vitest").is_file() else "npx vitest run"
+    elif test_script and not is_placeholder:
+        primary_cmd = f"{pm} test"
+    elif framework == "vitest":
+        primary_cmd = "./node_modules/.bin/vitest run" if (node_bin_dir / "vitest").is_file() else "npx vitest run"
+    elif framework == "jest":
+        primary_cmd = (
+            "./node_modules/.bin/jest --watchAll=false"
+            if (node_bin_dir / "jest").is_file()
+            else "npx jest --watchAll=false"
+        )
+
+    return {
+        "ecosystem": "node",
+        "package_manager": pm,
+        "framework": framework or ("npm-script" if (test_script and not is_placeholder) else "none"),
+        "primary_command": primary_cmd,
+        "available": available,
+    }
+
+
+def detect_project_test_runner(cwd: Path) -> dict[str, Any]:
+    """Detect repository language ecosystems and the best read-only test command for `cwd`."""
+    root = Path(cwd).resolve()
+    exec_env = _build_workdir_exec_env(root)
+    path_str = exec_env.get("PATH")
+    ecosystems: list[str] = []
+    runners: list[dict[str, Any]] = []
+
+    py_markers = ("pyproject.toml", "pytest.ini", "setup.py", "setup.cfg", "manage.py", "requirements.txt")
+    has_py = (
+        any((root / m).is_file() for m in py_markers)
+        or _has_python_bin_test_runner(root)
+        or next(root.glob("tests/test_*.py"), None) is not None
+        or next(root.glob("*/tests/test_*.py"), None) is not None
+    )
+    if has_py:
+        ecosystems.append("python")
+        if (root / "manage.py").is_file() and not _repo_has_explicit_pytest_config(root):
+            py_bin = ".venv/bin/python" if (root / ".venv/bin/python").is_file() else "python3"
+            runners.append(
+                {
+                    "ecosystem": "python",
+                    "framework": "django",
+                    "primary_command": f"{py_bin} manage.py test",
+                    "available": bool(shutil.which(py_bin, path=path_str) or (root / py_bin).is_file()),
+                }
+            )
+        else:
+            py_runner = _detect_default_pytest_runner(root)
+            if py_runner:
+                runners.append(
+                    {
+                        "ecosystem": "python",
+                        "framework": "bin/test" if py_runner.endswith("bin/test") else "pytest",
+                        "primary_command": py_runner if py_runner.endswith("bin/test") else f"{py_runner} -q",
+                        "available": True,
+                    }
+                )
+            else:
+                runners.append(
+                    {
+                        "ecosystem": "python",
+                        "framework": "unittest",
+                        "primary_command": "python3 -m unittest discover",
+                        "available": bool(shutil.which("python3", path=path_str)),
+                    }
+                )
+
+    node_info = _detect_node_runner_info(root, exec_env)
+    if node_info is not None:
+        ecosystems.append("node")
+        if node_info.get("primary_command"):
+            runners.append(node_info)
+
+    if (root / "go.mod").is_file():
+        ecosystems.append("go")
+        runners.append(
+            {
+                "ecosystem": "go",
+                "framework": "go-test",
+                "primary_command": "go test ./...",
+                "available": bool(shutil.which("go", path=path_str)),
+            }
+        )
+
+    if (root / "Cargo.toml").is_file():
+        ecosystems.append("rust")
+        runners.append(
+            {
+                "ecosystem": "rust",
+                "framework": "cargo-test",
+                "primary_command": "cargo test --quiet",
+                "available": bool(shutil.which("cargo", path=path_str)),
+            }
+        )
+
+    if (root / "gradlew").is_file() or (root / "build.gradle").is_file() or (root / "build.gradle.kts").is_file():
+        ecosystems.append("jvm")
+        use_wrapper = (root / "gradlew").is_file() and os.access(root / "gradlew", os.X_OK)
+        cmd_jvm = "./gradlew test" if use_wrapper else "gradle test"
+        avail_jvm = (use_wrapper and bool(shutil.which("java", path=path_str))) or bool(
+            shutil.which("gradle", path=path_str)
+        )
+        runners.append(
+            {
+                "ecosystem": "jvm",
+                "framework": "gradle",
+                "primary_command": cmd_jvm,
+                "available": avail_jvm,
+            }
+        )
+    elif (root / "pom.xml").is_file():
+        ecosystems.append("jvm")
+        use_mvnw = (root / "mvnw").is_file() and os.access(root / "mvnw", os.X_OK)
+        cmd_mvn = "./mvnw -q test" if use_mvnw else "mvn -q test"
+        avail_mvn = (use_mvnw and bool(shutil.which("java", path=path_str))) or bool(
+            shutil.which("mvn", path=path_str)
+        )
+        runners.append(
+            {
+                "ecosystem": "jvm",
+                "framework": "maven",
+                "primary_command": cmd_mvn,
+                "available": avail_mvn,
+            }
+        )
+
+    makefile_p = root / "Makefile"
+    if makefile_p.is_file():
+        try:
+            mk_txt = makefile_p.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"(?m)^test\s*:", mk_txt):
+                if "make" not in ecosystems:
+                    ecosystems.append("make")
+                runners.append(
+                    {
+                        "ecosystem": "make",
+                        "framework": "make",
+                        "primary_command": "make test",
+                        "available": bool(shutil.which("make", path=path_str)),
+                    }
+                )
+        except OSError:
+            pass
+
+    primary = next((r for r in runners if r.get("available")), runners[0] if runners else None)
+    return {
+        "ecosystems": ecosystems,
+        "primary_command": str(primary.get("primary_command") or "") if primary else "",
+        "framework": str(primary.get("framework") or "") if primary else "",
+        "available": bool(primary.get("available")) if primary else False,
+        "runners": runners,
+    }
+
+
+def _list_tracked_repo_files(cwd: Path) -> list[str]:
+    try:
         tracked_res = subprocess.run(
             ["git", "ls-files"],
             cwd=str(cwd),
@@ -927,38 +1407,319 @@ def discover_related_test_commands(
             errors="replace",
             check=False,
         )
-        tracked_files = [line.strip() for line in (tracked_res.stdout or "").splitlines() if line.strip()]
-        for stem in stems_to_check:
-            target_names = {f"test_{stem}.py", f"{stem}_test.py"}
-            for tf in tracked_files:
-                tf_name = Path(tf).name
-                if tf_name in target_names and tf not in discovered:
-                    already_covered = any(
-                        re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
-                        for c in pytest_cmds
-                    )
-                    if not already_covered and (cwd / tf).is_file():
-                        discovered.append(tf)
-                        if len(discovered) >= max_files:
-                            break
-            if len(discovered) >= max_files:
-                break
-
-    if not discovered:
+        if tracked_res.returncode == 0 and tracked_res.stdout.strip():
+            return [line.strip() for line in tracked_res.stdout.splitlines() if line.strip()]
+    except OSError:
+        pass
+    skip_dirs = {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "target",
+        "dist",
+        "build",
+        "__pycache__",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+    }
+    fallback: list[str] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(cwd):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".agy")]
+            rel_dir = Path(dirpath).relative_to(cwd)
+            for fname in sorted(filenames):
+                rel_p = (rel_dir / fname).as_posix() if rel_dir != Path(".") else fname
+                fallback.append(rel_p)
+                if len(fallback) >= 5000:
+                    return fallback
+    except OSError:
         return []
+    return fallback
 
-    discovered = discovered[:max_files]
-    if pytest_cmds:
-        # Preserve the full pytest invocation prefix (including env vars, `uv run`, `poetry run`, `python3 -m pytest`, etc.)
-        first_pytest = pytest_cmds[0].strip()
-        m_pref = re.match(r"^(.*?\bpytest)\b", first_pytest)
-        runner_prefix = m_pref.group(1).strip() if m_pref else "pytest"
-    else:
-        runner_prefix = _detect_default_pytest_runner(cwd)
-        if not runner_prefix:
-            return []
-    quoted_files = " ".join(shlex.quote(f) for f in discovered)
-    return [f"{runner_prefix} -q {quoted_files}"]
+
+def discover_related_test_commands(
+    cwd: Path,
+    files_changed: list[str],
+    existing_cmds: list[str],
+    *,
+    max_files: int = 4,
+) -> list[str]:
+    """Discover targeted unit/regression test commands across Python, Node/TS, Go, Rust, and JVM
+    for modified source or test files that are not already covered by `existing_cmds`."""
+    if not files_changed:
+        return []
+    exec_env = _build_workdir_exec_env(cwd)
+    path_str = exec_env.get("PATH")
+    tracked_cache: list[str] | None = None
+
+    def _get_tracked() -> list[str]:
+        nonlocal tracked_cache
+        if tracked_cache is None:
+            tracked_cache = _list_tracked_repo_files(cwd)
+        return tracked_cache
+
+    out_cmds: list[str] = []
+
+    # --- 1. Python (.py) ---
+    py_changed = [
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if rel.replace("\\", "/").strip("/").endswith(".py")
+    ]
+    if py_changed:
+        pytest_cmds: list[str] = []
+        skip_py = False
+        if existing_cmds:
+            pytest_cmds = [c for c in existing_cmds if re.search(r"\bpytest\b", c)]
+            if not pytest_cmds:
+                skip_py = True
+            else:
+                for pcmd in pytest_cmds:
+                    if not re.search(r"[\w./-]+\.py\b", pcmd) and not re.search(r"(?:^|\s)-k(?:\s|=|$)", pcmd):
+                        skip_py = True
+                        break
+        if not skip_py:
+            discovered_py: list[str] = []
+            stems_to_check: list[str] = []
+            for norm in py_changed:
+                bname = Path(norm).name
+                if bname.startswith("test_") or bname.endswith("_test.py"):
+                    if not existing_cmds and (cwd / norm).is_file() and norm not in discovered_py:
+                        discovered_py.append(norm)
+                    continue
+                if bname in ("__init__.py", "conftest.py", "setup.py"):
+                    continue
+                parts = Path(norm).parts
+                if any(p in ("tests", "test", "docs", "examples", "benchmarks") for p in parts[:-1]):
+                    continue
+                stem = Path(norm).stem
+                if stem and stem not in stems_to_check:
+                    stems_to_check.append(stem)
+
+            if stems_to_check and len(discovered_py) < max_files:
+                for stem in stems_to_check:
+                    target_names = {f"test_{stem}.py", f"{stem}_test.py"}
+                    for tf in _get_tracked():
+                        tf_name = Path(tf).name
+                        if tf_name in target_names and tf not in discovered_py:
+                            already_covered = any(
+                                re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
+                                for c in pytest_cmds
+                            )
+                            if not already_covered and (cwd / tf).is_file():
+                                discovered_py.append(tf)
+                                if len(discovered_py) >= max_files:
+                                    break
+                    if len(discovered_py) >= max_files:
+                        break
+
+            if discovered_py:
+                discovered_py = discovered_py[:max_files]
+                if pytest_cmds:
+                    first_pytest = pytest_cmds[0].strip()
+                    m_pref = re.match(r"^(.*?\bpytest)\b", first_pytest)
+                    runner_prefix = m_pref.group(1).strip() if m_pref else "pytest"
+                else:
+                    runner_prefix = _detect_default_pytest_runner(cwd)
+                quoted_files = " ".join(shlex.quote(f) for f in discovered_py)
+                if runner_prefix:
+                    if runner_prefix.endswith("bin/test"):
+                        out_cmds.append(f"{runner_prefix} {quoted_files}")
+                    else:
+                        out_cmds.append(f"{runner_prefix} -q {quoted_files}")
+                elif not existing_cmds and shutil.which("python3", path=path_str):
+                    out_cmds.append(f"python3 -m unittest {quoted_files}")
+
+    # --- 2. Node.js / TypeScript (.ts, .tsx, .js, .jsx, .mjs, .cjs) ---
+    js_changed = [
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if rel.replace("\\", "/").strip("/").lower().endswith(_JS_TS_EXTS)
+    ]
+    if js_changed and (cwd / "package.json").is_file():
+        node_info = _detect_node_runner_info(cwd, exec_env)
+        if node_info and node_info.get("available"):
+            fw = str(node_info.get("framework") or "")
+            pm = str(node_info.get("package_manager") or "npm")
+            has_existing_node_cmd = any(
+                re.search(r"\b(?:npm|pnpm|yarn|bun|npx|vitest|jest|mocha|node\s+--test)\b", c)
+                for c in existing_cmds
+            )
+            # Only synthesize a Node test command when caller passed none, or when caller ran targeted
+            # vitest/jest test files and missed a sibling `<stem>.test.*` / `<stem>.spec.*`.
+            specific_js_cmds = [
+                c
+                for c in existing_cmds
+                if re.search(r"\b(?:vitest|jest)\b", c) and _JS_TS_TEST_RE.search(c)
+            ]
+            if not existing_cmds or (has_existing_node_cmd and specific_js_cmds and len(specific_js_cmds) == len(existing_cmds)):
+                discovered_js: list[str] = []
+                js_stems: list[str] = []
+                for norm in js_changed:
+                    if _JS_TS_TEST_RE.search(norm):
+                        if not existing_cmds and (cwd / norm).is_file() and norm not in discovered_js:
+                            discovered_js.append(norm)
+                        continue
+                    bname = Path(norm).name
+                    if bname.startswith(("index.", "vite.config.", "vitest.config.", "jest.config.", "eslint.config.")):
+                        continue
+                    stem = Path(norm).stem
+                    if stem and stem not in js_stems:
+                        js_stems.append(stem)
+                if js_stems and len(discovered_js) < max_files:
+                    for stem in js_stems:
+                        cand_names = {
+                            f"{stem}.test{ext}" for ext in _JS_TS_EXTS
+                        } | {
+                            f"{stem}.spec{ext}" for ext in _JS_TS_EXTS
+                        }
+                        for tf in _get_tracked():
+                            tf_name = Path(tf).name
+                            if tf_name in cand_names and tf not in discovered_js:
+                                already_cov = any(
+                                    re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
+                                    for c in existing_cmds
+                                )
+                                if not already_cov and (cwd / tf).is_file():
+                                    discovered_js.append(tf)
+                                    if len(discovered_js) >= max_files:
+                                        break
+                        if len(discovered_js) >= max_files:
+                            break
+                if discovered_js:
+                    q_js = " ".join(shlex.quote(f) for f in discovered_js[:max_files])
+                    if fw == "vitest":
+                        bin_v = "./node_modules/.bin/vitest" if (cwd / "node_modules/.bin/vitest").is_file() else "npx vitest"
+                        out_cmds.append(f"{bin_v} run {q_js}")
+                    elif fw == "jest":
+                        bin_j = "./node_modules/.bin/jest" if (cwd / "node_modules/.bin/jest").is_file() else "npx jest"
+                        out_cmds.append(f"{bin_j} --watchAll=false {q_js}")
+                    elif fw == "bun-test":
+                        out_cmds.append(f"bun test {q_js}")
+                    elif fw == "node-test":
+                        out_cmds.append(f"node --test {q_js}")
+                    elif not existing_cmds and node_info.get("primary_command"):
+                        out_cmds.append(str(node_info["primary_command"]))
+                elif not existing_cmds and node_info.get("primary_command") and pm in ("npm", "pnpm", "yarn", "bun"):
+                    out_cmds.append(str(node_info["primary_command"]))
+
+    # --- 3. Go (.go) ---
+    go_changed = [
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if rel.replace("\\", "/").strip("/").endswith(".go")
+    ]
+    if go_changed and (cwd / "go.mod").is_file() and shutil.which("go", path=path_str):
+        go_cmds = [c for c in existing_cmds if re.search(r"\bgo\s+test\b", c)]
+        full_go_suite = any("./..." in c for c in go_cmds)
+        if (not existing_cmds) or (go_cmds and not full_go_suite):
+            pkg_dirs: list[str] = []
+            for norm in go_changed:
+                parent_rel = Path(norm).parent.as_posix()
+                pkg_dir = cwd if parent_rel in ("", ".") else (cwd / parent_rel)
+                if not pkg_dir.is_dir() or next(pkg_dir.glob("*_test.go"), None) is None:
+                    continue
+                pkg_spec = "." if parent_rel in ("", ".") else f"./{parent_rel}"
+                already_cov = any(
+                    re.search(rf"(?:^|\s){re.escape(pkg_spec)}(?:$|/|\s)", c) for c in go_cmds
+                )
+                if not already_cov and pkg_spec not in pkg_dirs:
+                    pkg_dirs.append(pkg_spec)
+                    if len(pkg_dirs) >= max_files:
+                        break
+            if pkg_dirs:
+                out_cmds.append("go test " + " ".join(shlex.quote(p) for p in pkg_dirs))
+
+    # --- 4. Rust (.rs) ---
+    rs_changed = [
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if rel.replace("\\", "/").strip("/").endswith(".rs")
+    ]
+    if not existing_cmds and rs_changed and (cwd / "Cargo.toml").is_file() and shutil.which("cargo", path=path_str):
+        crate_names: list[str] = []
+        for norm in rs_changed:
+            cur_dir = (cwd / norm).parent
+            while cur_dir != cwd and cur_dir.is_relative_to(cwd):
+                sub_toml = cur_dir / "Cargo.toml"
+                if sub_toml.is_file():
+                    try:
+                        toml_txt = sub_toml.read_text(encoding="utf-8", errors="replace")
+                        m_pkg = re.search(r'(?ms)^\[package\].*?^\s*name\s*=\s*["\']([A-Za-z0-9_-]+)["\']', toml_txt)
+                        if m_pkg and m_pkg.group(1) not in crate_names:
+                            crate_names.append(m_pkg.group(1))
+                    except OSError:
+                        pass
+                    break
+                cur_dir = cur_dir.parent
+        if crate_names:
+            pkg_flags = " ".join(f"-p {shlex.quote(cn)}" for cn in crate_names[:max_files])
+            out_cmds.append(f"cargo test --quiet {pkg_flags}")
+        else:
+            out_cmds.append("cargo test --quiet")
+
+    # --- 5. Java / Kotlin (.java, .kt) ---
+    jvm_changed = [
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if rel.replace("\\", "/").strip("/").lower().endswith((".java", ".kt"))
+    ]
+    if not existing_cmds and jvm_changed:
+        jvm_test_classes: list[str] = []
+        for norm in jvm_changed:
+            stem = Path(norm).stem
+            if not stem:
+                continue
+            if stem.endswith(("Test", "Tests", "IT")):
+                if stem not in jvm_test_classes:
+                    jvm_test_classes.append(stem)
+                continue
+            cand_jvm = {f"{stem}Test.java", f"{stem}Tests.java", f"{stem}Test.kt", f"{stem}Tests.kt"}
+            for tf in _get_tracked():
+                tf_bname = Path(tf).name
+                if tf_bname in cand_jvm and (cwd / tf).is_file():
+                    cls_name = Path(tf_bname).stem
+                    if cls_name not in jvm_test_classes:
+                        jvm_test_classes.append(cls_name)
+                        break
+        jvm_test_classes = jvm_test_classes[:max_files]
+        is_multi_gradle = False
+        for sg_name in ("settings.gradle", "settings.gradle.kts"):
+            sg_p = cwd / sg_name
+            if sg_p.is_file():
+                try:
+                    if re.search(r"\binclude\s*[\(\"'']", sg_p.read_text(encoding="utf-8", errors="replace")):
+                        is_multi_gradle = True
+                        break
+                except OSError:
+                    pass
+        if (cwd / "gradlew").is_file() and os.access(cwd / "gradlew", os.X_OK) and shutil.which("java", path=path_str):
+            if jvm_test_classes and not is_multi_gradle:
+                flags = " ".join(f"--tests {shlex.quote('*' + c)}" for c in jvm_test_classes)
+                out_cmds.append(f"./gradlew test {flags}")
+            else:
+                out_cmds.append("./gradlew test")
+        elif ((cwd / "build.gradle").is_file() or (cwd / "build.gradle.kts").is_file()) and shutil.which("gradle", path=path_str):
+            if jvm_test_classes and not is_multi_gradle:
+                flags = " ".join(f"--tests {shlex.quote('*' + c)}" for c in jvm_test_classes)
+                out_cmds.append(f"gradle test {flags}")
+            else:
+                out_cmds.append("gradle test")
+        elif (cwd / "pom.xml").is_file():
+            use_mvnw = (cwd / "mvnw").is_file() and os.access(cwd / "mvnw", os.X_OK) and bool(shutil.which("java", path=path_str))
+            mvn_bin = "./mvnw" if use_mvnw else ("mvn" if shutil.which("mvn", path=path_str) else "")
+            if mvn_bin:
+                if jvm_test_classes:
+                    out_cmds.append(
+                        f"{mvn_bin} -q test -Dtest={','.join(jvm_test_classes)} "
+                        f"-Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false"
+                    )
+                else:
+                    out_cmds.append(f"{mvn_bin} -q test")
+
+    return out_cmds[:MAX_ACCEPTANCE_COMMANDS]
 
 
 _IMPORT_SKIP_DIRS = frozenset({
@@ -1025,9 +1786,8 @@ def build_import_smoke_command(
         if (cwd / cand).is_file():
             py_bin = cand
             break
-    quoted_mods = " ".join(shlex.quote(m) for m in modules)
     return [
-        f"{py_bin} -c 'import importlib, sys; [importlib.import_module(m) for m in sys.argv[1:]]' {quoted_mods}"
+        f"{py_bin} -c 'import {', '.join(modules)}'"
     ]
 
 
@@ -1285,19 +2045,44 @@ class JobManager:
         self._cancelled: set[str] = set()
         self._raw_projects: dict[str, str] = {}
         self._raw_api_keys: dict[str, str] = {}
+        self._wait_sliced_auto_apply: dict[str, bool | None] = {}
+        self._sparse_worktrees: dict[str, int] = {}
         self._in_place_job: str | None = None
         self._created_at = time.monotonic()
+        self._created_at_epoch = time.time()
         self._ensure_baseline_recorded()
 
+    def _resolve_wait_slice_seconds(
+        self,
+        timeout_seconds: float,
+        *,
+        elapsed_seconds: float = 0.0,
+    ) -> float:
+        """Clamp synchronous blocking wait slices (default <=240s) so the host prompt cache never expires."""
+        full_wait = max(0.5, float(timeout_seconds) + 30.0)
+        raw_slice = os.environ.get("CC_AGY_MAX_WAIT_SLICE_SECONDS", "").strip()
+        if raw_slice:
+            try:
+                max_slice = float(raw_slice)
+            except ValueError:
+                max_slice = DEFAULT_MAX_WAIT_SLICE_SECONDS
+            if max_slice <= 0:
+                return full_wait
+        elif self._is_bounded_lead_session() and self.worker_backend is None:
+            max_slice = DEFAULT_MAX_WAIT_SLICE_SECONDS
+        else:
+            return full_wait
+        remaining_slice = max(0.05, max_slice - max(0.0, float(elapsed_seconds)))
+        return min(full_wait, remaining_slice)
+
     def _is_bounded_lead_session(self) -> bool:
-        if os.environ.get("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "").strip().lower() in ("1", "true", "yes"):
+        if env_flag("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE") is True:
             return True
         if self.worker_backend is not None:
             return False
-        return (
-            os.environ.get("CC_AGY_STRICT_MODE", "").strip().lower() in ("1", "true", "yes")
-            or bool(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "").strip())
-        )
+        if is_strict_mode_enabled():
+            return True
+        return bool(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "").strip())
 
     def _should_run_default_acceptance(self) -> bool:
         if os.environ.get("CC_AGY_AUTO_REGRESSION_TESTS", "1").strip().lower() in ("0", "false", "no"):
@@ -1322,36 +2107,181 @@ class JobManager:
                 if raw_esc.lower() in ("1", "true", "yes", "on")
                 else raw_esc
             )
+        elif resolve_cost_profile() == "economy":
+            return None
         elif self._is_bounded_lead_session() or self.worker_backend is None:
             target = "gemini-4-argon"
         else:
             return None
         return target if target != current_model else None
 
+    def _session_since_epoch(self) -> float:
+        session_since = self._created_at_epoch - 1.0
+        try:
+            marker = self.store.data_dir / ".lead_session_started"
+            if marker.exists():
+                session_since = marker.stat().st_mtime
+                try:
+                    m_obj = json.loads(marker.read_text(encoding="utf-8"))
+                    if isinstance(m_obj, dict) and m_obj.get("ts"):
+                        session_since = float(m_obj["ts"])
+                except Exception:
+                    pass
+        except OSError:
+            pass
+        return session_since
+
     def _session_has_completed_delegate_job(self) -> bool:
-        """Return True if this workspace already has a finished prior delegate job (so a new delegate_start is a follow-up/retry)."""
+        """Return True if this active session already has a finished prior delegate job."""
+        session_since = self._session_since_epoch()
         for r in self.store.list_receipts(workspace_root=self.workspace_root):
             if r.get("kind", "delegate") != "delegate":
+                continue
+            r_started = float(r.get("started_at_epoch") or 0.0)
+            if r_started > 0.0 and r_started < session_since:
                 continue
             st = str(r.get("status") or "")
             if st and st not in ("running", "cancelled"):
                 return True
         return False
 
+    def _should_escalate_new_delegate_start(
+        self,
+        prompt: str,
+        *,
+        allowed_paths: list[str] | None = None,
+        context_files: list[str] | None = None,
+        spec_files: list[str] | None = None,
+        acceptance: list[str] | None = None,
+    ) -> bool:
+        """Return True when a new `delegate_start` is a retry or follow-up fix on a prior session job,
+        and False when it is an independent task after cleanly applied work."""
+        session_since = self._session_since_epoch()
+        session_jobs: list[dict[str, Any]] = []
+        for r in self.store.list_receipts(workspace_root=self.workspace_root):
+            if r.get("kind", "delegate") != "delegate":
+                continue
+            r_started = float(r.get("started_at_epoch") or 0.0)
+            if r_started > 0.0 and r_started < session_since:
+                continue
+            st = str(r.get("status") or "")
+            if st and st not in ("running", "cancelled"):
+                session_jobs.append(r)
+
+        if not session_jobs:
+            return False
+
+        def _job_failed_or_unapplied(r: dict[str, Any]) -> bool:
+            st = str(r.get("status") or "")
+            return (
+                st != "ok"
+                or r.get("acceptance_passed") is False
+                or bool(r.get("reverted"))
+                or not bool(r.get("applied"))
+            )
+
+        prior_paths: list[str] = []
+        for r in session_jobs:
+            for key in ("files_changed", "applied_files", "allowed_paths"):
+                for p in r.get(key) or []:
+                    norm_p = str(p or "").replace("\\", "/").strip("/")
+                    if norm_p and norm_p not in prior_paths:
+                        prior_paths.append(norm_p)
+
+        explicit_targets: list[str] = []
+        for seq in (allowed_paths, context_files, spec_files):
+            for p in seq or []:
+                norm_p = str(p or "").replace("\\", "/").strip("/")
+                if norm_p and norm_p not in explicit_targets:
+                    explicit_targets.append(norm_p)
+
+        mentioned_targets: list[str] = list(explicit_targets)
+        runner_names = {"pytest.py", "manage.py", "runtests.py", "run_tests.py", "setup.py"}
+        scan_text = "\n".join([prompt or "", *(acceptance or [])])
+        for tok in re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8}", scan_text):
+            norm_tok = tok.strip(".,:;()[]{}'\"").replace("\\", "/").strip("/")
+            if not norm_tok or Path(norm_tok).name in runner_names or ".." in Path(norm_tok).parts:
+                continue
+            if norm_tok in prior_paths or (self.workspace_root / norm_tok).exists():
+                if norm_tok not in mentioned_targets:
+                    mentioned_targets.append(norm_tok)
+
+        if mentioned_targets and prior_paths:
+            overlaps_prior = any(
+                _matches_allowed_paths(nt, prior_paths) or _matches_allowed_paths(pp, mentioned_targets)
+                for nt in mentioned_targets
+                for pp in prior_paths
+            )
+            if overlaps_prior:
+                return True
+
+        followup_intent_re = re.compile(
+            r"\b(?:fix\s+edge\s+case|post-apply\s+review|regression|still\s+(?:fails?|broken)|"
+            r"missed\s+(?:item|requirement|case)|follow[- ]?up\s+fix|previous\s+job|prior\s+attempt)\b",
+            re.I,
+        )
+        if followup_intent_re.search(prompt or ""):
+            return True
+
+        norm_new_acc = {c.strip() for c in (acceptance or []) if c.strip()}
+        acc_overlaps_prior = False
+        if norm_new_acc:
+            for r in session_jobs:
+                norm_old_acc = {str(c).strip() for c in (r.get("acceptance") or []) if str(c).strip()}
+                if norm_new_acc & norm_old_acc:
+                    acc_overlaps_prior = True
+                    break
+        if acc_overlaps_prior:
+            return True
+
+        # Check whether a new human user prompt arrived after prior session jobs finished.
+        up_path = self.store.data_dir / ".last_user_prompt.json"
+        if up_path.is_file():
+            try:
+                up_obj = json.loads(up_path.read_text(encoding="utf-8"))
+                if isinstance(up_obj, dict):
+                    up_ts = float(up_obj.get("ts") or 0.0)
+                    if up_ts >= session_since:
+                        active_turn_jobs = [
+                            r
+                            for r in session_jobs
+                            if max(
+                                float(r.get("applied_at_epoch") or 0.0),
+                                float(r.get("finished_at_epoch") or 0.0),
+                                float(r.get("started_at_epoch") or 0.0),
+                            )
+                            >= up_ts - 0.02
+                        ]
+                        if not active_turn_jobs:
+                            # Brand-new user prompt after all prior jobs, with disjoint targets & no fix intent -> stay on Flash!
+                            return False
+                        if mentioned_targets and prior_paths:
+                            return False
+                        return True
+            except Exception:
+                pass
+
+        # When called directly without hook state: disjoint explicit/mentioned targets stay on Flash even if an unrelated job failed.
+        if mentioned_targets and prior_paths:
+            return False
+
+        return any(_job_failed_or_unapplied(r) for r in session_jobs)
+
     def _clamp_worker_timeout(self, timeout_seconds: float) -> float:
-        """Clamp worker turn timeout against the session deadline (reserving headroom for review & apply)."""
+        """Clamp worker turn timeout against an explicit session deadline (reserving headroom for review & apply).
+
+        Only `CC_AGY_SESSION_DEADLINE_SECONDS` enables the clamp. Session deadlines belong to the
+        harness that owns the wall clock, not to strict mode, so interactive sessions are never clamped.
+        """
         t_val = max(0.1, float(timeout_seconds))
         raw_deadline = os.environ.get("CC_AGY_SESSION_DEADLINE_SECONDS", "").strip()
-        if raw_deadline:
-            try:
-                session_deadline = float(raw_deadline)
-            except ValueError:
-                session_deadline = 1500.0
-            if session_deadline <= 0:
-                return t_val
-        elif self._is_bounded_lead_session():
+        if not raw_deadline:
+            return t_val
+        try:
+            session_deadline = float(raw_deadline)
+        except ValueError:
             session_deadline = 1500.0
-        else:
+        if session_deadline <= 0:
             return t_val
         raw_reserve = os.environ.get("CC_AGY_DEADLINE_RESERVE_SECONDS", "").strip()
         try:
@@ -1451,12 +2381,225 @@ class JobManager:
             overwrite=True,
         )
 
-    def _prepare_worktree(self, job_id: str) -> tuple[Path, str, dict[str, str | None]]:
+    def _select_sparse_worktree_entries(
+        self,
+        rel_entries: list[str],
+        *,
+        allowed_paths: list[str],
+        context_files: list[str] | None = None,
+        spec_files: list[str] | None = None,
+    ) -> list[str]:
+        """Select a self-contained subset of repository files for large monorepos when `allowed_paths` is scoped.
+
+        Includes:
+        1. All top-level manifest/configuration files (e.g. `pyproject.toml`, `package.json`, `go.mod`, `Cargo.toml`, `.gitignore`).
+        2. All files matching `allowed_paths`, `context_files`, or `spec_files`, plus sibling files in their immediate directories.
+        3. Ancestor package markers (`__init__.py`, `conftest.py`, `package.json`, `tsconfig*.json`, `Cargo.toml`, `BUILD*`).
+        4. Matching unit test files (`test_<stem>.*`, `<stem>_test.*`, `<stem>.test.*`, `<stem>.spec.*`).
+        """
+        seed_scopes = [
+            p.replace("\\", "/").strip("/")
+            for p in [*(allowed_paths or []), *(context_files or []), *(spec_files or [])]
+            if str(p or "").strip()
+        ]
+        target_dirs: set[str] = set()
+        ancestor_dirs: set[str] = {""}
+        stems: set[str] = set()
+        for sp in seed_scopes:
+            sp_path = self.workspace_root / sp
+            if sp_path.is_dir():
+                target_dirs.add(sp)
+                cur_parts = Path(sp).parts
+            else:
+                parent_str = Path(sp).parent.as_posix()
+                if parent_str and parent_str != ".":
+                    target_dirs.add(parent_str)
+                cur_parts = Path(sp).parts[:-1]
+                stem_s = Path(sp).stem
+                if stem_s and stem_s not in ("__init__", "index", "mod", "main"):
+                    stems.add(stem_s)
+            acc = []
+            for part in cur_parts:
+                acc.append(part)
+                ancestor_dirs.add("/".join(acc))
+
+        test_names: set[str] = set()
+        for st in stems:
+            test_names.update(
+                {
+                    f"test_{st}.py",
+                    f"{st}_test.py",
+                    f"{st}_test.go",
+                    f"{st}_test.rs",
+                    *(f"{st}.test{ext}" for ext in _JS_TS_EXTS),
+                    *(f"{st}.spec{ext}" for ext in _JS_TS_EXTS),
+                }
+            )
+        anc_marker_names = {
+            "__init__.py",
+            "conftest.py",
+            "pytest.ini",
+            "pyproject.toml",
+            "setup.cfg",
+            "package.json",
+            "tsconfig.json",
+            "tsconfig.base.json",
+            "Cargo.toml",
+            "go.mod",
+            "go.sum",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "Makefile",
+            "BUILD",
+            "BUILD.bazel",
+            ".gitignore",
+        }
+        selected: list[str] = []
+        dir_siblings_cap: dict[str, int] = {}
+        for rel in rel_entries:
+            norm = rel.replace("\\", "/").strip("/")
+            if not norm:
+                continue
+            if "/" not in norm:
+                # Top-level config/manifest files
+                selected.append(rel)
+                continue
+            if _matches_allowed_paths(norm, seed_scopes):
+                selected.append(rel)
+                st_m = Path(norm).stem
+                if len(stems) < 24 and st_m and st_m not in ("__init__", "index"):
+                    stems.add(st_m)
+                    test_names.update({f"test_{st_m}.py", f"{st_m}_test.py", f"{st_m}_test.go"})
+                continue
+            parent_rel = Path(norm).parent.as_posix()
+            bname = Path(norm).name
+            if parent_rel in ancestor_dirs and (bname in anc_marker_names or bname.startswith("BUILD.")):
+                selected.append(rel)
+                continue
+            if parent_rel in target_dirs and dir_siblings_cap.get(parent_rel, 0) < 200:
+                dir_siblings_cap[parent_rel] = dir_siblings_cap.get(parent_rel, 0) + 1
+                selected.append(rel)
+                continue
+            if bname in test_names or norm.startswith(("bin/test",)):
+                selected.append(rel)
+
+        # 5. Bounded 2-hop workspace import tracing so cross-package local imports are materialized.
+        rel_entry_map: dict[str, str] = {}
+        for r_item in rel_entries:
+            n_item = r_item.replace("\\", "/").strip("/")
+            if n_item and n_item not in rel_entry_map:
+                rel_entry_map[n_item] = r_item
+        selected_norms: set[str] = {r_sel.replace("\\", "/").strip("/") for r_sel in selected}
+
+        def _add_dep_norm(dep_norm: str, next_frontier: list[str]) -> bool:
+            if dep_norm not in rel_entry_map or dep_norm in selected_norms:
+                return False
+            selected_norms.add(dep_norm)
+            selected.append(rel_entry_map[dep_norm])
+            next_frontier.append(dep_norm)
+            # Ensure ancestor package markers (__init__.py, package.json, BUILD*) are included for imported modules
+            acc_p: list[str] = []
+            for pt in Path(dep_norm).parts[:-1]:
+                acc_p.append(pt)
+                anc_dir = "/".join(acc_p)
+                for mk in ("__init__.py", "conftest.py", "package.json", "tsconfig.json", "BUILD", "BUILD.bazel"):
+                    mk_norm = f"{anc_dir}/{mk}"
+                    if mk_norm in rel_entry_map and mk_norm not in selected_norms:
+                        selected_norms.add(mk_norm)
+                        selected.append(rel_entry_map[mk_norm])
+            return True
+
+        frontier = [
+            n_s
+            for n_s in selected_norms
+            if n_s.endswith((".py", *_JS_TS_EXTS))
+        ][:80]
+        added_deps = 0
+        js_rel_re = re.compile(r"""(?:from|import|require\s*\()\s*['"](\.[^'"]+)['"]""")
+        for _hop in range(2):
+            if not frontier or added_deps >= 200:
+                break
+            next_frontier: list[str] = []
+            for src_norm in frontier[:80]:
+                if added_deps >= 200:
+                    break
+                src_file = self.workspace_root / src_norm
+                try:
+                    if not src_file.is_file() or src_file.stat().st_size > 256_000:
+                        continue
+                    src_txt = src_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if src_norm.endswith(".py"):
+                    try:
+                        tree = ast.parse(src_txt)
+                    except SyntaxError:
+                        continue
+                    src_parts = Path(src_norm).parts
+                    for node in ast.walk(tree):
+                        cand_mod_paths: list[str] = []
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                mod_slash = alias.name.replace(".", "/").strip("/")
+                                if mod_slash:
+                                    cand_mod_paths.extend([mod_slash, f"src/{mod_slash}"])
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.level and node.level > 0:
+                                if node.level <= len(src_parts):
+                                    base_parts = list(src_parts[: len(src_parts) - node.level])
+                                    if node.module:
+                                        base_parts.extend(p for p in node.module.split(".") if p)
+                                    base_slash = "/".join(base_parts)
+                                    if base_slash:
+                                        cand_mod_paths.append(base_slash)
+                                    for alias in node.names:
+                                        if alias.name != "*":
+                                            sub_slash = "/".join([*base_parts, alias.name])
+                                            if sub_slash:
+                                                cand_mod_paths.append(sub_slash)
+                            elif node.module:
+                                mod_slash = node.module.replace(".", "/").strip("/")
+                                if mod_slash:
+                                    for pref in ("", "src/"):
+                                        cand_mod_paths.append(f"{pref}{mod_slash}")
+                                        for alias in node.names:
+                                            if alias.name != "*":
+                                                cand_mod_paths.append(f"{pref}{mod_slash}/{alias.name}")
+                        for cm in cand_mod_paths:
+                            for cand_file in (f"{cm}.py", f"{cm}/__init__.py"):
+                                if _add_dep_norm(cand_file, next_frontier):
+                                    added_deps += 1
+                else:
+                    parent_posix = Path(src_norm).parent.as_posix()
+                    for m_js in js_rel_re.finditer(src_txt):
+                        raw_spec = m_js.group(1)
+                        joined = os.path.normpath(
+                            f"{parent_posix}/{raw_spec}" if parent_posix and parent_posix != "." else raw_spec
+                        ).replace("\\", "/")
+                        if joined.startswith("..") or joined == ".":
+                            continue
+                        for sfx in ("", *_JS_TS_EXTS, *(f"/index{ext}" for ext in _JS_TS_EXTS)):
+                            if _add_dep_norm(f"{joined}{sfx}", next_frontier):
+                                added_deps += 1
+                                break
+            frontier = next_frontier
+        return selected
+
+    def _prepare_worktree(
+        self,
+        job_id: str,
+        *,
+        allowed_paths: list[str] | None = None,
+        context_files: list[str] | None = None,
+        spec_files: list[str] | None = None,
+    ) -> tuple[Path, str, dict[str, str | None]]:
         """Create a standalone isolated git repository copy for `job_id`.
 
         Uses `git ls-files -co --exclude-standard -z` so gitignored directories (like
-        `node_modules/` or `.venv/`) are never copied into the worker tree, and computes
-        baseline file hashes on demand for changed files rather than bloating the receipt JSON.
+        `node_modules/` or `.venv/`) are never copied into the worker tree, supports opt-in
+        scoped sparse materialization on large monorepos when `allowed_paths` is set, and
+        computes baseline file hashes on demand for changed files.
         """
         safe_id = validate_job_id(job_id)
         wt_dir = self.store.worktree_path(safe_id).resolve()
@@ -1470,24 +2613,101 @@ class JobManager:
             capture_output=True,
             check=False,
         )
+        sparse_used = False
         if ls_res.returncode == 0:
             rel_entries = [
                 entry.decode("utf-8", errors="surrogateescape")
                 for entry in ls_res.stdout.split(b"\x00")
                 if entry
             ]
+            sparse_flag = env_flag("CC_AGY_SPARSE_WORKTREE")
+            sparse_threshold = _env_int("CC_AGY_SPARSE_THRESHOLD_FILES", 0)
+            if (
+                allowed_paths
+                and sparse_flag is not False
+                and (sparse_flag is True or (sparse_threshold > 0 and len(rel_entries) > sparse_threshold))
+            ):
+                rel_entries = self._select_sparse_worktree_entries(
+                    rel_entries,
+                    allowed_paths=allowed_paths,
+                    context_files=context_files,
+                    spec_files=spec_files,
+                )
+                sparse_used = True
+
+            created_dirs: set[Path] = {wt_dir}
+            copied_count = 0
             for rel in rel_entries:
                 if rel.startswith((".git/", ".cc-agy-data/", ".worktrees/", ".ctx-session-reads/", ".cc-agy-review/", ".venv/", "venv/")) or rel in (".venv", "venv", ".ctx-session-reads", ".cc-agy-review"):
                     continue
                 src_p = self.workspace_root / rel
                 dst_p = wt_dir / rel
+                dst_parent = dst_p.parent
                 if src_p.is_symlink():
-                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_parent not in created_dirs:
+                        dst_parent.mkdir(parents=True, exist_ok=True)
+                        created_dirs.add(dst_parent)
                     os.symlink(os.readlink(src_p), dst_p)
+                    copied_count += 1
                 elif src_p.is_file():
-                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_parent not in created_dirs:
+                        dst_parent.mkdir(parents=True, exist_ok=True)
+                        created_dirs.add(dst_parent)
                     shutil.copy2(src_p, dst_p)
+                    copied_count += 1
+            with self._lock:
+                if sparse_used:
+                    self._sparse_worktrees[safe_id] = copied_count
+                else:
+                    self._sparse_worktrees.pop(safe_id, None)
+            # Also copy any pre-existing gitignored `_version.py` / `__version__.py` / `*_version*.py`
+            # or compiled Cython/C extension (`*.so`, `*.pyd`) files generated during editable install
+            # so they are present in baseline_sha and importable inside the worktree.
+            copied_ignored_rels: list[str] = []
+            ign_ver_res = subprocess.run(
+                [
+                    "git",
+                    "ls-files",
+                    "-o",
+                    "-i",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    ":(glob)**/_version.py",
+                    ":(glob)**/__version__.py",
+                    ":(glob)**/*_version*.py",
+                    ":(glob)**/*.so",
+                    ":(glob)**/*.pyd",
+                    "_version.py",
+                    "__version__.py",
+                ],
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                check=False,
+            )
+            if ign_ver_res.returncode == 0:
+                for entry in ign_ver_res.stdout.split(b"\x00"):
+                    if not entry:
+                        continue
+                    rel_v = entry.decode("utf-8", errors="surrogateescape")
+                    if rel_v.startswith((".git/", ".cc-agy-data/", ".worktrees/", ".venv/", "venv/", "node_modules/", "build/", "dist/")):
+                        continue
+                    if sparse_used and allowed_paths and not _matches_allowed_paths(rel_v, allowed_paths) and "/" in rel_v:
+                        continue
+                    v_name = Path(rel_v).name
+                    if (
+                        v_name in ("_version.py", "__version__.py")
+                        or ("_version" in v_name and v_name.endswith(".py"))
+                        or v_name.endswith((".so", ".pyd"))
+                    ):
+                        src_v = self.workspace_root / rel_v
+                        dst_v = wt_dir / rel_v
+                        if src_v.is_file() and not src_v.is_symlink() and not dst_v.exists():
+                            dst_v.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src_v, dst_v)
+                            copied_ignored_rels.append(rel_v)
         else:
+            copied_ignored_rels = []
             shutil.rmtree(wt_dir, ignore_errors=True)
             shutil.copytree(
                 self.workspace_root,
@@ -1501,10 +2721,122 @@ class JobManager:
         _run_git(["init", "-b", "main"], cwd=wt_dir, check=True)
         _run_git(["config", "user.email", "worker@cc-agy-plugin.local"], cwd=wt_dir, check=True)
         _run_git(["config", "user.name", "CC-AGY Worker"], cwd=wt_dir, check=True)
-        _run_git(["add", "-A"], cwd=wt_dir, check=True)
-        _run_git(["commit", "--allow-empty", "-m", "cc-agy-baseline"], cwd=wt_dir, check=True)
-        sha_res = _run_git(["rev-parse", "HEAD"], cwd=wt_dir, check=True)
-        baseline_sha = sha_res.stdout.strip()
+        host_objects_dir = self.workspace_root / ".git" / "objects"
+        fast_seeded = False
+        if ls_res.returncode == 0 and host_objects_dir.is_dir():
+            try:
+                alt_file = wt_dir / ".git" / "objects" / "info" / "alternates"
+                alt_file.parent.mkdir(parents=True, exist_ok=True)
+                alt_file.write_text(str(host_objects_dir.resolve()) + "\n", encoding="utf-8")
+                # In sparse mode, NEVER read-tree the full host HEAD (which would mark omitted files as deleted!).
+                if not sparse_used:
+                    lsv_res = subprocess.run(
+                        ["git", "ls-files", "-v", "-z"],
+                        cwd=str(self.workspace_root),
+                        capture_output=True,
+                        check=False,
+                    )
+                    has_special_index_flags = (
+                        lsv_res.returncode != 0
+                        or any(e and not e.startswith(b"H ") for e in lsv_res.stdout.split(b"\x00"))
+                    )
+                    host_head_res = _run_git(["rev-parse", "--verify", "HEAD"], cwd=self.workspace_root, check=False)
+                    host_head_sha = host_head_res.stdout.strip() if host_head_res.returncode == 0 else ""
+                    if host_head_sha and not has_special_index_flags:
+                        rt_res = _run_git(["read-tree", host_head_sha], cwd=wt_dir, check=False)
+                        if rt_res.returncode == 0:
+                            # Remove index entries that were excluded from worktree copy or are submodule gitlinks (160000).
+                            wt_ls = subprocess.run(
+                                ["git", "ls-files", "-s", "-z"],
+                                cwd=str(wt_dir),
+                                capture_output=True,
+                                check=False,
+                            )
+                            if wt_ls.returncode == 0:
+                                idx_remove: list[str] = []
+                                for raw_s in wt_ls.stdout.split(b"\x00"):
+                                    if not raw_s:
+                                        continue
+                                    s_line = raw_s.decode("utf-8", errors="surrogateescape")
+                                    meta, sep, idx_path = s_line.partition("\t")
+                                    if not sep or not idx_path:
+                                        continue
+                                    mode_str = meta.split(" ", 1)[0]
+                                    path_parts = Path(idx_path).parts
+                                    if (
+                                        mode_str == "160000"
+                                        or idx_path.startswith(
+                                            (
+                                                ".git/",
+                                                ".cc-agy-data/",
+                                                ".worktrees/",
+                                                ".ctx-session-reads/",
+                                                ".cc-agy-review/",
+                                                ".venv/",
+                                                "venv/",
+                                            )
+                                        )
+                                        or idx_path in (".venv", "venv", ".ctx-session-reads", ".cc-agy-review")
+                                        or "__pycache__" in path_parts
+                                        or "node_modules" in path_parts
+                                    ):
+                                        idx_remove.append(idx_path)
+                                if idx_remove:
+                                    _run_git(
+                                        ["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", *idx_remove],
+                                        cwd=wt_dir,
+                                        check=False,
+                                    )
+                            delta_res = subprocess.run(
+                                ["git", "status", "--porcelain", "-z"],
+                                cwd=str(self.workspace_root),
+                                capture_output=True,
+                                check=False,
+                            )
+                            if delta_res.returncode == 0:
+                                raw_entries = [
+                                    e.decode("utf-8", errors="surrogateescape")
+                                    for e in delta_res.stdout.split(b"\x00")
+                                    if e
+                                ]
+                                delta_paths: list[str] = []
+                                for entry in raw_entries:
+                                    if len(entry) > 3 and entry[2] == " ":
+                                        delta_paths.append(entry[3:])
+                                    elif entry and not entry.startswith(" "):
+                                        delta_paths.append(entry)
+                                delta_paths = [
+                                    p for p in dict.fromkeys([*delta_paths, *copied_ignored_rels])
+                                    if not p.startswith((".git/", ".cc-agy-data/", ".worktrees/", ".ctx-session-reads/", ".cc-agy-review/", ".venv/", "venv/"))
+                                    and p not in (".venv", "venv", ".ctx-session-reads", ".cc-agy-review")
+                                ]
+                                if delta_paths:
+                                    _run_git(["add", "-f", "-A", "--", *delta_paths], cwd=wt_dir, check=True)
+                                fast_seeded = True
+            except Exception:
+                fast_seeded = False
+        if not fast_seeded:
+            # When populated from `git ls-files`, force-add (`-f`) so tracked files that also match `.gitignore`
+            # patterns (e.g. `tests/test_apps/.env` in Flask) are committed to `baseline_sha`.
+            _run_git(["add", "-f", "-A"] if ls_res.returncode == 0 else ["add", "-A"], cwd=wt_dir, check=True)
+        baseline_sha = ""
+        if fast_seeded:
+            wt_tree = _run_git(["write-tree"], cwd=wt_dir, check=False)
+            if wt_tree.returncode == 0 and wt_tree.stdout.strip():
+                wt_commit = _run_git(
+                    ["commit-tree", wt_tree.stdout.strip(), "-m", "cc-agy-baseline"],
+                    cwd=wt_dir,
+                    check=False,
+                )
+                if wt_commit.returncode == 0 and wt_commit.stdout.strip():
+                    cand_sha = wt_commit.stdout.strip()
+                    up_ref = _run_git(["update-ref", "HEAD", cand_sha], cwd=wt_dir, check=False)
+                    if up_ref.returncode == 0:
+                        baseline_sha = cand_sha
+        if not baseline_sha:
+            _run_git(["commit", "--allow-empty", "-m", "cc-agy-baseline"], cwd=wt_dir, check=True)
+            sha_res = _run_git(["rev-parse", "HEAD"], cwd=wt_dir, check=True)
+            baseline_sha = sha_res.stdout.strip()
 
         exclude_file = wt_dir / ".git" / "info" / "exclude"
         try:
@@ -1622,6 +2954,7 @@ class JobManager:
             cwd=wt_dir,
             check=False,
         )
+        dropped_ignored: list[str] = []
         if ign_res.returncode == 0 and ign_res.stdout.strip():
             for line in ign_res.stdout.splitlines():
                 rel_i = line.strip()
@@ -1630,7 +2963,13 @@ class JobManager:
                     and not _is_ignored_build_artifact(rel_i, root=wt_dir)
                     and rel_i not in untracked_to_stage
                 ):
+                    if allowed_paths and not _matches_allowed_paths(rel_i, allowed_paths):
+                        dropped_ignored.append(rel_i)
+                        continue
                     untracked_to_stage.append(rel_i)
+        if not hasattr(self, "_dropped_ignored_by_wt"):
+            self._dropped_ignored_by_wt: dict[str, list[str]] = {}
+        self._dropped_ignored_by_wt[str(wt_dir)] = dropped_ignored
 
         if untracked_to_stage:
             _run_git(["add", "-f", "-N", "--", *untracked_to_stage], cwd=wt_dir, check=False)
@@ -1934,6 +3273,7 @@ class JobManager:
                 max_tool_calls=max_tool_calls,
                 max_total_tokens=max_total_tokens,
                 progress_path=progress_path,
+                acceptance=acceptance,
             )
 
             response_text = str(worker_out.get("text") or "")
@@ -1948,7 +3288,25 @@ class JobManager:
             )
             new_requests = new_usage.get("requests")
             if isinstance(new_requests, list) and new_requests:
-                usage.setdefault("requests", []).extend(new_requests)
+                tagged_reqs = [
+                    ({**r, "model": r.get("model") or model} if isinstance(r, dict) else r)
+                    for r in new_requests
+                ]
+                usage.setdefault("requests", []).extend(tagged_reqs)
+            elif usage.get("requests") and any(
+                int(new_usage.get(k) or 0) > 0
+                for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count")
+            ):
+                usage["requests"].append(
+                    {
+                        "prompt_token_count": int(new_usage.get("prompt_token_count") or 0),
+                        "cached_content_token_count": int(new_usage.get("cached_content_token_count") or 0),
+                        "candidates_token_count": int(new_usage.get("candidates_token_count") or 0),
+                        "thoughts_token_count": int(new_usage.get("thoughts_token_count") or 0),
+                        "total_token_count": int(new_usage.get("total_token_count") or 0),
+                        "model": model,
+                    }
+                )
             new_max_req = int(new_usage.get("max_request_prompt_tokens") or 0)
             if new_max_req > 0 or usage.get("max_request_prompt_tokens"):
                 usage["max_request_prompt_tokens"] = max(
@@ -1986,6 +3344,8 @@ class JobManager:
                 worker_out["containment"] = getattr(exc, "partial_containment")
             if getattr(exc, "partial_containment_warning", None):
                 worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
+            if getattr(exc, "partial_command_runs", None):
+                worker_out["command_runs"] = getattr(exc, "partial_command_runs")
         except Exception as exc:
             with self._lock:
                 is_canc = job_id in self._cancelled
@@ -2000,6 +3360,8 @@ class JobManager:
                 worker_out["containment"] = getattr(exc, "partial_containment")
             if getattr(exc, "partial_containment_warning", None):
                 worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
+            if getattr(exc, "partial_command_runs", None):
+                worker_out["command_runs"] = getattr(exc, "partial_command_runs")
         finally:
             try:
                 hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
@@ -2046,13 +3408,49 @@ class JobManager:
                 auto_default_acceptance = bool(effective_acceptance)
             if effective_acceptance and runnable_acc_status:
                 try:
-                    acceptance_results = run_acceptance(effective_acceptance, target_acc_cwd)
+                    reused_acc = (
+                        self._try_reuse_worker_acceptance(
+                            target_acc_cwd,
+                            files_changed,
+                            effective_acceptance,
+                            worker_runs=worker_out.get("command_runs") if isinstance(worker_out, dict) else None,
+                        )
+                        if os.environ.get("CC_AGY_REUSE_WORKER_ACCEPTANCE", "1").strip().lower() not in ("0", "false", "no")
+                        else None
+                    )
+                    if reused_acc is not None:
+                        acceptance_results = reused_acc
+                    else:
+                        acceptance_results = run_acceptance(effective_acceptance, target_acc_cwd)
                     if auto_default_acceptance:
                         for dr in acceptance_results:
                             dr["auto_discovered_default"] = True
+                            dr_counts = dr.get("counts") if isinstance(dr.get("counts"), dict) else {}
+                            dr_tail = str(dr.get("output_tail") or "")
                             if dr.get("exit_code") == 5:
                                 dr["passed"] = True
                                 dr["no_tests_collected"] = True
+                            elif dr.get("exit_code") == 127 or (
+                                not dr.get("passed")
+                                and int(dr_counts.get("passed") or 0) == 0
+                                and int(dr_counts.get("failed") or 0) == 0
+                                and (
+                                    "command not found" in dr_tail.lower()
+                                    or "not recognized as an internal or external command" in dr_tail.lower()
+                                    or "no module named pytest" in dr_tail.lower()
+                                )
+                            ):
+                                dr["passed"] = True
+                                dr["runner_incompatible_skipped"] = True
+                            elif (
+                                not dr.get("passed")
+                                and int(dr_counts.get("passed") or 0) == 0
+                                and int(dr_counts.get("failed") or 0) == 0
+                                and int(dr_counts.get("errors") or 0) > 0
+                                and "module 'py' has no attribute 'test'" in dr_tail
+                            ):
+                                dr["passed"] = True
+                                dr["runner_incompatible_skipped"] = True
                     elif (
                         files_changed
                         and os.environ.get("CC_AGY_AUTO_REGRESSION_TESTS", "1").strip().lower()
@@ -2151,6 +3549,40 @@ class JobManager:
                     status = "cancelled"
                     error_msg = error_msg or "Cancelled by user via delegate_cancel."
 
+            external_tamper = bool(not in_place and files_changed and not workspace_dir_accessed)
+            no_tests_re = re.compile(r"\bno tests ran\b|\bcollected 0 items\b|\bRan 0 tests\b", re.I)
+            real_acc_passed_on_job = (
+                bool(acceptance_results)
+                and all(isinstance(r, dict) and r.get("passed") is True for r in acceptance_results)
+                and any(
+                    isinstance(r, dict)
+                    and r.get("passed") is True
+                    and not r.get("auto_discovered_default")
+                    and not r.get("auto_discovered_regression")
+                    and not r.get("no_tests_collected")
+                    and not r.get("runner_incompatible_skipped")
+                    and not r.get("auto_import_smoke")
+                    and not no_tests_re.search(str(r.get("output_tail") or ""))
+                    for r in acceptance_results
+                )
+            )
+            recovered_from_timeout = False
+            timeout_note: str | None = None
+            if (
+                status == "timeout"
+                and files_changed
+                and not scope_violations
+                and not symlink_escapes
+                and not missing_prompt_symbols
+                and not external_tamper
+                and real_acc_passed_on_job
+                and env_flag("CC_AGY_PROMOTE_VERIFIED_TIMEOUT") is not False
+            ):
+                status = "ok"
+                recovered_from_timeout = True
+                timeout_note = error_msg
+                error_msg = None
+
             finished_at = round(time.time(), 3)
             clipped_text, was_truncated, orig_tokens = truncate_to_token_budget(
                 response_text, MAX_TOOL_RESPONSE_TOKENS
@@ -2193,6 +3625,7 @@ class JobManager:
                 "thinking_level": thinking_level,
                 "plan": plan or [],
                 "acceptance": acceptance or [],
+                "timeout_seconds": timeout_seconds,
                 "budget": {"max_tool_calls": max_tool_calls, "max_total_tokens": max_total_tokens},
                 "stop_reason": stop_reason,
                 "containment": worker_out.get("containment", "none") if isinstance(worker_out, dict) else "none",
@@ -2204,9 +3637,22 @@ class JobManager:
                     all(r.get("passed") for r in acceptance_results) if acceptance_results else None
                 ),
                 "missing_prompt_symbols": missing_prompt_symbols,
-                "external_worktree_tamper": bool(not in_place and files_changed and not workspace_dir_accessed),
+                "external_worktree_tamper": external_tamper,
                 "preloaded_files": list(preloaded_files or []),
+                **(
+                    {"recovered_from_timeout": True, "timeout_note": timeout_note}
+                    if recovered_from_timeout
+                    else {}
+                ),
             }
+            dropped_ign = getattr(self, "_dropped_ignored_by_wt", {}).pop(str(wt_dir), [])
+            if dropped_ign:
+                receipt_payload["dropped_out_of_scope_ignored"] = dropped_ign
+            with self._lock:
+                sparse_count = self._sparse_worktrees.get(job_id)
+            if sparse_count is not None:
+                receipt_payload["sparse_worktree"] = True
+                receipt_payload["worktree_file_count"] = sparse_count
             receipt_payload.update(self._escalation_fields(job_id, receipt_payload))
             if in_place:
                 # The edits are already in the user's working tree, so the job counts as applied
@@ -2323,6 +3769,107 @@ class JobManager:
         if isinstance(partial_th, list):
             thoughts.extend(partial_th)
 
+    @staticmethod
+    def _try_reuse_worker_acceptance(
+        target_cwd: Path,
+        files_changed: list[str],
+        acceptance_cmds: list[str],
+        worker_runs: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """If the worker already ran every acceptance command via `run_command` after its last file edit
+        and all exited 0, reuse those passing results instead of re-spawning the test suite."""
+        if not acceptance_cmds:
+            return None
+        records: list[dict[str, Any]] = []
+        if isinstance(worker_runs, list) and worker_runs:
+            for rec in worker_runs:
+                if isinstance(rec, dict) and verify_worker_run_record(rec):
+                    records.append(rec)
+        else:
+            runs_log = target_cwd / ".ctx-session-reads" / "worker_runs.jsonl"
+            if not runs_log.is_file():
+                return None
+            try:
+                for line in runs_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if isinstance(rec, dict) and verify_worker_run_record(rec):
+                        records.append(rec)
+            except Exception:
+                return None
+        if not records:
+            return None
+        max_mtime = 0.0
+        missing_rels: list[str] = []
+        current_hashes: dict[str, str] = {}
+        for rel in files_changed:
+            fp = target_cwd / rel
+            try:
+                if fp.exists() and fp.is_file():
+                    max_mtime = max(max_mtime, fp.stat().st_mtime)
+                    current_hashes[rel] = sha256_bytes(fp.read_bytes())
+                else:
+                    missing_rels.append(rel)
+                    parent_dir = fp.parent if fp.parent.exists() else target_cwd
+                    max_mtime = max(max_mtime, parent_dir.stat().st_mtime)
+            except OSError:
+                return None
+        reused: list[dict[str, Any]] = []
+        for acc_cmd in acceptance_cmds:
+            norm_acc = " ".join(acc_cmd.strip().split())
+            matched_rec: dict[str, Any] | None = None
+            for rec in reversed(records):
+                rec_ts = float(rec.get("ts") or 0.0)
+                if max_mtime > 0.0 and rec_ts < max_mtime:
+                    continue
+                if rec.get("exit_code") != 0 or rec.get("timed_out"):
+                    continue
+                rec_wd = str(rec.get("working_directory") or "").strip()
+                if rec_wd not in ("", "."):
+                    continue
+                if missing_rels:
+                    deleted_at_run = rec.get("deleted_files")
+                    present_at_run = rec.get("present_files")
+                    if isinstance(deleted_at_run, list):
+                        if any(m not in deleted_at_run for m in missing_rels):
+                            continue
+                    elif isinstance(present_at_run, list):
+                        if any(m in present_at_run for m in missing_rels):
+                            continue
+                    else:
+                        continue
+                rec_hashes = rec.get("file_hashes")
+                if not isinstance(rec_hashes, dict):
+                    continue
+                if any(rec_hashes.get(rel) != sha_val for rel, sha_val in current_hashes.items()):
+                    continue
+                if isinstance(rec.get("deleted_files"), list) and set(rec_hashes.keys()) != set(current_hashes.keys()):
+                    continue
+                if any(rel in rec_hashes for rel in missing_rels):
+                    continue
+                rec_cmd = " ".join(str(rec.get("command") or "").strip().split())
+                if rec_cmd == norm_acc:
+                    matched_rec = rec
+                    break
+            if matched_rec is None:
+                return None
+            out_tail = str(matched_rec.get("output_tail") or "")
+            counts = _parse_test_counts(out_tail)
+            reused.append(
+                {
+                    "command": acc_cmd,
+                    "passed": True,
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "duration_seconds": round(float(matched_rec.get("duration_seconds") or 0.0), 3),
+                    "counts": counts,
+                    "output_tail": out_tail,
+                    "reused_from_worker": True,
+                }
+            )
+        return reused
+
     def delegate_start(
         self,
         prompt: str,
@@ -2346,6 +3893,9 @@ class JobManager:
         max_total_tokens: int | None = None,
         preload_files: bool = True,
         auto_apply: bool | None = None,
+        spec_files: list[str] | None = None,
+        context_files: list[str] | None = None,
+        checklist: list[str] | None = None,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
 
@@ -2377,10 +3927,19 @@ class JobManager:
                     prev_status in ("timeout", "checkpoint", "needs_input")
                     or (prev_status == "ok" and prev_rec.get("acceptance_passed") is False)
                 )
+                prev_allowed = prev_rec.get("allowed_paths")
+                new_allowed_probe = validate_allowed_paths(allowed_paths) if allowed_paths else None
+                paths_clearly_disjoint = bool(
+                    prev_allowed
+                    and new_allowed_probe
+                    and not any(_matches_allowed_paths(p, new_allowed_probe) for p in prev_allowed)
+                    and not any(_matches_allowed_paths(p, prev_allowed) for p in new_allowed_probe)
+                )
                 if (
                     prev_jid
                     and not prev_is_cancelled
                     and prev_continuable
+                    and not paths_clearly_disjoint
                     and prev_rec.get("files_changed")
                     and not prev_rec.get("applied")
                     and not (prev_rec.get("escalation") or {}).get("escalate_to_lead")
@@ -2408,20 +3967,16 @@ class JobManager:
                 "allowed_paths cannot be enforced in in_place mode (edits land directly in your "
                 "files). Drop allowed_paths or use the default isolated copy."
             )
-        req_model_clean = (model or "").strip()
-        if req_model_clean and not req_model_clean.startswith("${"):
-            chosen_model = req_model_clean
-        else:
-            chosen_model = first_valid_env(
-                os.environ,
-                "CC_AGY_DEFAULT_DELEGATE_MODEL",
-                "CLAUDE_PLUGIN_OPTION_DEFAULT_DELEGATE_MODEL",
-                "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
-                default="gemini-3.1-pro-preview",
-            )
+        chosen_model = resolve_default_delegate_model(model, env=os.environ)
         escalated_from_model: str | None = None
         target_esc_model = self._resolve_escalation_target_model(chosen_model)
-        if target_esc_model and self._session_has_completed_delegate_job():
+        if target_esc_model and self._should_escalate_new_delegate_start(
+            prompt,
+            allowed_paths=validated_paths,
+            context_files=context_files,
+            spec_files=spec_files,
+            acceptance=acceptance,
+        ):
             escalated_from_model = chosen_model
             chosen_model = target_esc_model
         resolved_thinking = resolve_thinking_level(
@@ -2431,7 +3986,11 @@ class JobManager:
         )
         plan_steps = validate_plan(plan)
         acceptance_cmds = validate_acceptance(acceptance, self.workspace_root)
-        budget_calls, budget_tokens = resolve_budget(max_tool_calls, max_total_tokens)
+        budget_calls, budget_tokens = resolve_budget(
+            max_tool_calls,
+            max_total_tokens,
+            model=chosen_model,
+        )
         preloaded_pairs: list[tuple[str, str]] = (
             select_candidate_files(self.workspace_root, prompt) if preload_files else []
         )
@@ -2445,11 +4004,97 @@ class JobManager:
         focus_targets = list(dict.fromkeys([*(validated_paths or []), *preloaded_rel_paths]))
         if not focus_targets and use_repo_map:
             focus_targets = [rel for rel, _ in select_candidate_files(self.workspace_root, prompt, max_files=6)]
+        raw_user_prompt_text = ""
+        if not spec_files:
+            user_prompt_path = self.store.data_dir / ".last_user_prompt.json"
+            if user_prompt_path.is_file():
+                try:
+                    up_obj = json.loads(user_prompt_path.read_text(encoding="utf-8"))
+                    if isinstance(up_obj, dict):
+                        up_ts = float(up_obj.get("ts") or 0.0)
+                        up_text = str(up_obj.get("prompt") or "").strip()
+                        up_sid = str(up_obj.get("session_id") or "").strip()
+                        session_since = self._created_at_epoch - 1.0
+                        active_sid = ""
+                        marker = self.store.data_dir / ".lead_session_started"
+                        if marker.exists():
+                            session_since = marker.stat().st_mtime
+                            try:
+                                m_obj = json.loads(marker.read_text(encoding="utf-8"))
+                                if isinstance(m_obj, dict):
+                                    active_sid = str(m_obj.get("session_id") or "").strip()
+                                    if m_obj.get("ts"):
+                                        session_since = float(m_obj["ts"])
+                            except Exception:
+                                pass
+                        sid_matches = not (active_sid and up_sid and active_sid != up_sid)
+                        if (
+                            up_text
+                            and sid_matches
+                            and up_ts >= session_since
+                            and len(up_text) > len(prompt.strip()) * 1.25
+                            and up_text not in prompt
+                        ):
+                            clipped_up, _, _ = truncate_to_token_budget(up_text, 3000)
+                            raw_user_prompt_text = clipped_up
+                except Exception:
+                    raw_user_prompt_text = ""
+        lead_read_paths: list[str] = []
+        lead_read_windows: dict[str, tuple[int, int]] = {}
+        lead_rf_path = self.store.data_dir / ".lead_read_files.json"
+        if lead_rf_path.is_file():
+            try:
+                parsed_lrf = json.loads(lead_rf_path.read_text(encoding="utf-8"))
+                if isinstance(parsed_lrf, list):
+                    lead_read_paths = [str(x) for x in parsed_lrf if isinstance(x, str)]
+            except Exception:
+                lead_read_paths = []
+        lead_rw_path = self.store.data_dir / ".lead_read_windows.json"
+        if lead_rw_path.is_file():
+            try:
+                parsed_lrw = json.loads(lead_rw_path.read_text(encoding="utf-8"))
+                if isinstance(parsed_lrw, dict):
+                    for k, v in parsed_lrw.items():
+                        if isinstance(k, str) and isinstance(v, list) and len(v) == 2:
+                            lead_read_windows[k] = (int(v[0]), int(v[1]))
+            except Exception:
+                lead_read_windows = {}
+        merged_ctx_paths = list(dict.fromkeys([*(context_files or []), *lead_read_paths]))
+        if (
+            os.environ.get("CC_AGY_INLINE_CANDIDATE_FILES", "").strip().lower() in ("1", "true", "yes")
+            and len(preloaded_rel_paths) <= 4
+        ):
+            for pr_path in preloaded_rel_paths:
+                if pr_path not in merged_ctx_paths:
+                    merged_ctx_paths.append(pr_path)
+        spec_inlined = _load_safe_workspace_files(self.workspace_root, spec_files, max_total_tokens=8000)
+        spec_rel_set = {r for r, _ in spec_inlined}
+        raw_ctx_inlined = _load_safe_workspace_files(
+            self.workspace_root,
+            [p for p in merged_ctx_paths if p not in spec_rel_set],
+            max_total_tokens=4000,
+            line_windows=lead_read_windows,
+        )
+        ctx_inlined: list[tuple[str, str]] = []
+        for rel_c, content_c in raw_ctx_inlined:
+            stripped_c = content_c.strip()
+            if (
+                "[truncated:" not in content_c
+                and len(stripped_c) >= 40
+                and (stripped_c in prompt or (raw_user_prompt_text and stripped_c in raw_user_prompt_text))
+            ):
+                continue
+            ctx_inlined.append((rel_c, content_c))
+        fully_inlined_rels = {
+            r for r, c in (*spec_inlined, *ctx_inlined) if "[truncated:" not in c
+        }
+        outline_targets = [p for p in focus_targets if p not in fully_inlined_rels]
         focused_outline_text = (
-            build_focused_file_outline(self.workspace_root, focus_targets, max_tokens=500)
-            if use_repo_map and focus_targets
+            build_focused_file_outline(self.workspace_root, outline_targets, max_tokens=500)
+            if use_repo_map and outline_targets
             else ""
         )
+        clean_checklist = [str(item).strip() for item in (checklist or []) if str(item).strip()]
         worker_prompt = render_worker_prompt(
             prompt,
             plan=plan_steps,
@@ -2459,6 +4104,10 @@ class JobManager:
             preloaded_files=preloaded_pairs,
             repo_map=repo_map_text,
             focused_outline=focused_outline_text,
+            spec_files_inlined=spec_inlined,
+            context_files_inlined=ctx_inlined,
+            checklist=clean_checklist,
+            raw_user_prompt=raw_user_prompt_text,
         )
 
         auth = resolve_auth_config(
@@ -2485,13 +4134,19 @@ class JobManager:
                 raise
             wt_dir, baseline_hashes = self.workspace_root, {}
         else:
-            wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(job_id)
+            wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(
+                job_id,
+                allowed_paths=validated_paths,
+                context_files=merged_ctx_paths,
+                spec_files=spec_files,
+            )
 
         with self._lock:
             if resolved_project:
                 self._raw_projects[job_id] = resolved_project
             if resolved_key:
                 self._raw_api_keys[job_id] = resolved_key
+            sparse_init_count = self._sparse_worktrees.get(job_id)
 
         initial_receipt = {
             "job_id": job_id,
@@ -2528,10 +4183,14 @@ class JobManager:
             "thinking_level": resolved_thinking or "DEFAULT",
             "plan": plan_steps,
             "acceptance": acceptance_cmds,
+            "timeout_seconds": timeout_seconds,
             "budget": {"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
             "preloaded_files": preloaded_rel_paths,
             "error": None,
         }
+        if sparse_init_count is not None:
+            initial_receipt["sparse_worktree"] = True
+            initial_receipt["worktree_file_count"] = sparse_init_count
         if escalated_from_model:
             initial_receipt["escalated_from_model"] = escalated_from_model
         self.store.write_receipt(
@@ -2576,52 +4235,21 @@ class JobManager:
             self._futures[job_id] = fut
 
         if wait:
-            self._wait_for_future_or_cancel(job_id, fut, timeout=max(0.5, float(timeout_seconds) + 30.0))
+            wait_started_mono = time.monotonic()
+            wait_slice = self._resolve_wait_slice_seconds(timeout_seconds)
+            self._wait_for_future_or_cancel(job_id, fut, timeout=wait_slice)
             receipt = self.store.read_receipt(job_id)
-            if (
-                self._is_bounded_lead_session()
-                and not in_place
-                and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is not None
-                and (
-                    worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
-                    or receipt.get("status") in ("checkpoint", "needs_input")
-                )
-                and receipt.get("status") not in ("cancelled", "interrupted")
-            ):
-                acc_failures = [
-                    f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
-                    for r in (receipt.get("acceptance_results") or [])
-                    if isinstance(r, dict) and not r.get("passed")
-                ]
-                fail_detail = (
-                    "\n\nFailing acceptance commands from the Flash attempt:\n" + "\n\n".join(acc_failures)
-                    if acc_failures
-                    else f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
-                )
-                return self.delegate_continue(
-                    job_id=job_id,
-                    follow_up_prompt=(
-                        "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
-                        "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
-                        "complete all requirements from the original task specification, and ensure all acceptance "
-                        "and unit tests pass." + fail_detail
-                    ),
-                    allowed_paths=allowed_paths,
-                    acceptance=acceptance,
-                    timeout_seconds=timeout_seconds,
-                    wait=True,
-                    project=project,
-                    location=location,
-                    api_key=api_key,
-                    scrub_receipt=scrub_receipt,
-                    auto_apply=auto_apply,
-                )
-            digest = self._digest_with_progress(receipt)
-            return self._maybe_auto_apply_digest(
+            if not fut.done() or receipt.get("status") == "running":
+                with self._lock:
+                    self._wait_sliced_auto_apply[job_id] = auto_apply
+                return self._digest_with_progress(receipt)
+            return self._finalize_completed_wait_job(
                 job_id,
-                digest,
+                receipt,
                 auto_apply=auto_apply,
                 in_place=in_place,
+                wait_elapsed=time.monotonic() - wait_started_mono,
+                timeout_seconds=timeout_seconds,
             )
 
         return {
@@ -2645,7 +4273,7 @@ class JobManager:
         timeout: float,
     ) -> None:
         """Wait for `fut` to complete or for `job_id` to be added to `self._cancelled`."""
-        deadline = time.monotonic() + max(0.1, float(timeout))
+        deadline = time.monotonic() + max(0.01, float(timeout))
         while not fut.done():
             with self._lock:
                 if job_id in self._cancelled:
@@ -2673,6 +4301,21 @@ class JobManager:
         if job_id:
             safe_id = validate_job_id(job_id)
             receipt = self.store.read_receipt(safe_id)
+            if receipt.get("status") != "running":
+                with self._lock:
+                    was_wait_sliced = safe_id in self._wait_sliced_auto_apply
+                    sliced_auto_apply = self._wait_sliced_auto_apply.pop(safe_id, None)
+                if was_wait_sliced:
+                    digest = self._finalize_completed_wait_job(
+                        safe_id,
+                        receipt,
+                        auto_apply=sliced_auto_apply,
+                        in_place=bool(receipt.get("in_place")),
+                        wait_elapsed=0.0,
+                        timeout_seconds=float(receipt.get("timeout_seconds") or 600.0),
+                    )
+                    digest["baseline_head_sha"] = active_baseline_sha
+                    return digest
             digest = self._digest_with_progress(receipt, include_summary=True)
             digest["baseline_head_sha"] = active_baseline_sha
             return digest
@@ -2703,6 +4346,71 @@ class JobManager:
             "totals": totals,
         }
 
+    def _finalize_completed_wait_job(
+        self,
+        job_id: str,
+        receipt: dict[str, Any],
+        *,
+        auto_apply: bool | None,
+        in_place: bool,
+        wait_elapsed: float = 0.0,
+        timeout_seconds: float | None = None,
+        wait_budget: float | None = None,
+    ) -> dict[str, Any]:
+        """Handle post-completion escalation (Flash -> Argon) or auto-apply for a synchronous/wait-sliced job."""
+        allow_turn1_inplace_escalation = (
+            self.worker_backend is None
+            or is_strict_mode_enabled()
+            or bool(os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip())
+        )
+        if (
+            self._is_bounded_lead_session()
+            and allow_turn1_inplace_escalation
+            and not in_place
+            and not receipt.get("escalated_from_model")
+            and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is not None
+            and (
+                worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+                or receipt.get("status") in ("checkpoint", "needs_input")
+            )
+            and receipt.get("status") not in ("cancelled", "interrupted")
+        ):
+            acc_failures = [
+                f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
+                for r in (receipt.get("acceptance_results") or [])
+                if isinstance(r, dict) and not r.get("passed")
+            ]
+            fail_detail = (
+                "\n\nFailing acceptance commands from the Flash attempt:\n" + "\n\n".join(acc_failures)
+                if acc_failures
+                else f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
+            )
+            worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+            return self.delegate_continue(
+                job_id=job_id,
+                follow_up_prompt=(
+                    "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
+                    "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
+                    "complete all requirements from the original task specification, and ensure all acceptance "
+                    "and unit tests pass." + fail_detail
+                ),
+                allowed_paths=receipt.get("allowed_paths"),
+                acceptance=receipt.get("acceptance"),
+                timeout_seconds=worker_timeout,
+                wait=True,
+                scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                auto_apply=auto_apply,
+                _wait_elapsed=wait_elapsed,
+                _wait_budget=wait_budget,
+            )
+        digest = self._digest_with_progress(receipt)
+        return self._maybe_auto_apply_digest(
+            job_id,
+            digest,
+            auto_apply=auto_apply,
+            in_place=in_place,
+        )
+
     def delegate_result(
         self,
         job_id: str,
@@ -2712,12 +4420,31 @@ class JobManager:
     ) -> dict[str, Any]:
         """Return the compact completion digest for job_id, optionally waiting if still running."""
         safe_id = validate_job_id(job_id)
+        wait_started_mono = time.monotonic()
         with self._lock:
             fut = self._futures.get(safe_id)
+            has_sliced_state = safe_id in self._wait_sliced_auto_apply
+        capped_timeout = self._resolve_wait_slice_seconds(min(float(timeout), 540.0))
+        if capped_timeout < 1.0 and float(timeout) <= 30.0 and has_sliced_state:
+            capped_timeout = max(capped_timeout, float(timeout))
         if fut is not None and wait and not fut.done():
-            capped_timeout = max(0.1, min(float(timeout), 540.0))
             self._wait_for_future_or_cancel(safe_id, fut, timeout=capped_timeout)
         receipt = self.store.read_receipt(safe_id)
+        if (fut is not None and not fut.done()) or receipt.get("status") == "running":
+            return self._digest_with_progress(receipt)
+        with self._lock:
+            was_wait_sliced = safe_id in self._wait_sliced_auto_apply
+            sliced_auto_apply = self._wait_sliced_auto_apply.pop(safe_id, None)
+        if was_wait_sliced:
+            return self._finalize_completed_wait_job(
+                safe_id,
+                receipt,
+                auto_apply=sliced_auto_apply,
+                in_place=bool(receipt.get("in_place")),
+                wait_elapsed=time.monotonic() - wait_started_mono,
+                timeout_seconds=float(receipt.get("timeout_seconds") or 600.0),
+                wait_budget=capped_timeout,
+            )
         return self._digest_with_progress(receipt)
 
     @staticmethod
@@ -2891,25 +4618,51 @@ class JobManager:
         receipt = self.store.read_receipt(safe_id)
         if receipt.get("applied"):
             prov = receipt.get("provenance") or {}
+            acc_list_prev = receipt.get("acceptance_results")
+            real_prev = (
+                receipt.get("acceptance_passed") is True
+                and isinstance(acc_list_prev, list)
+                and bool(acc_list_prev)
+                and any(
+                    isinstance(r, dict)
+                    and r.get("passed") is True
+                    and not r.get("auto_discovered_default")
+                    and not r.get("auto_discovered_regression")
+                    and not r.get("no_tests_collected")
+                    and not r.get("runner_incompatible_skipped")
+                    and not r.get("auto_import_smoke")
+                    for r in acc_list_prev
+                )
+            )
             return {
                 "job_id": safe_id,
                 "applied": True,
                 "already_applied": True,
                 "applied_files": receipt.get("applied_files", []),
                 "diff_sha256": prov.get("diff_sha256"),
+                "acceptance_passed": receipt.get("acceptance_passed"),
+                **({"real_acceptance_passed": True} if real_prev else {}),
             }
 
         status = receipt.get("status")
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
         baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
         if status == "running" and self._futures.get(safe_id) is None and wt_dir.exists():
-            rec_diff, rec_files, rec_escapes = self._collect_worktree_diff(wt_dir, baseline_sha)
+            orphan_allowed = validate_allowed_paths(receipt.get("allowed_paths") or [])
+            rec_diff, rec_files, rec_escapes = self._collect_worktree_diff(
+                wt_dir, baseline_sha, allowed_paths=orphan_allowed
+            )
             if rec_files and not rec_escapes:
+                orphan_violations = [
+                    f for f in rec_files
+                    if orphan_allowed and not _matches_allowed_paths(f, orphan_allowed)
+                ]
                 self.store.diff_path(safe_id).write_text(rec_diff, encoding="utf-8")
-                receipt["status"] = "timeout"
+                receipt["status"] = "scope_violation" if orphan_violations else "timeout"
                 receipt["files_changed"] = rec_files
                 receipt["symlink_escapes"] = rec_escapes
-                status = "timeout"
+                receipt["scope_violations"] = orphan_violations
+                status = receipt["status"]
         has_clean_timeout_edits = (
             status in ("timeout", "interrupted")
             and bool(receipt.get("files_changed"))
@@ -3113,12 +4866,30 @@ class JobManager:
             workspace_root=str(self.workspace_root),
         )
 
+        acc_list_apply = receipt.get("acceptance_results")
+        real_apply_pass = (
+            receipt.get("acceptance_passed") is True
+            and isinstance(acc_list_apply, list)
+            and bool(acc_list_apply)
+            and any(
+                isinstance(r, dict)
+                and r.get("passed") is True
+                and not r.get("auto_discovered_default")
+                and not r.get("auto_discovered_regression")
+                and not r.get("no_tests_collected")
+                and not r.get("runner_incompatible_skipped")
+                and not r.get("auto_import_smoke")
+                for r in acc_list_apply
+            )
+        )
         return {
             "job_id": safe_id,
             "applied": True,
             "applied_files": applied_files,
             **({"kept_host_copy": skipped_ignored_conflicts} if skipped_ignored_conflicts else {}),
             "diff_sha256": applied_prov["diff_sha256"],
+            "acceptance_passed": receipt.get("acceptance_passed"),
+            **({"real_acceptance_passed": True} if real_apply_pass else {}),
             "revert_hint": f"delegate_revert(job_id={safe_id!r}) restores these files to their pre-apply state.",
         }
 
@@ -3302,14 +5073,7 @@ class JobManager:
             return False
         if raw_auto in ("1", "true", "yes", "on"):
             return True
-        for key in (
-            "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
-            "CC_AGY_STRICT_MODE",
-            "CC_AGY_USERCFG_STRICT_MODE",
-        ):
-            if os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on"):
-                return True
-        return False
+        return is_strict_mode_enabled()
 
     def _maybe_auto_apply_digest(
         self,
@@ -3347,7 +5111,103 @@ class JobManager:
             digest["diff_sha256"] = apply_res.get("diff_sha256")
             if apply_res.get("kept_host_copy"):
                 digest["kept_host_copy"] = apply_res["kept_host_copy"]
-            digest.pop("next_action", None)
+            real_acc_passed = False
+            has_worker_caveat = False
+            raw_summary_text = str(digest.get("summary") or "").strip()
+            if re.search(r"\bBLOCKED\b", raw_summary_text, re.I) or "?" in raw_summary_text:
+                has_worker_caveat = True
+            for p_item in (digest.get("progress") or digest.get("recent_progress") or []):
+                if isinstance(p_item, dict) and str(p_item.get("kind") or "").lower() in ("question", "blocker"):
+                    has_worker_caveat = True
+            if digest.get("acceptance_passed") is True:
+                try:
+                    full_rec = self.store.read_receipt(job_id)
+                    acc_list = full_rec.get("acceptance_results")
+                    if isinstance(acc_list, list) and acc_list:
+                        real_acc_passed = any(
+                            isinstance(r, dict)
+                            and r.get("passed") is True
+                            and not r.get("auto_discovered_default")
+                            and not r.get("auto_discovered_regression")
+                            and not r.get("no_tests_collected")
+                            and not r.get("runner_incompatible_skipped")
+                            and not r.get("auto_import_smoke")
+                            for r in acc_list
+                        )
+                except Exception:
+                    real_acc_passed = False
+            if real_acc_passed:
+                digest["real_acceptance_passed"] = True
+                if has_worker_caveat:
+                    digest["has_worker_caveat"] = True
+                verbose_applied = (
+                    env_flag("CC_AGY_VERBOSE_APPLIED_DIGEST") is True
+                    or "CC_AGY_APPLIED_DIFF_PREVIEW_TOKENS" in os.environ
+                )
+                if verbose_applied:
+                    applied_preview_budget = _env_int("CC_AGY_APPLIED_DIFF_PREVIEW_TOKENS", 250)
+                    if applied_preview_budget > 0 and isinstance(digest.get("diff_preview"), str):
+                        short_prev, was_trunc, _ = truncate_to_token_budget(
+                            digest["diff_preview"], applied_preview_budget
+                        )
+                        digest["diff_preview"] = short_prev
+                        if was_trunc:
+                            digest["diff_preview_complete"] = False
+                else:
+                    one_line_summary = " ".join(raw_summary_text.split())
+                    if one_line_summary:
+                        if has_worker_caveat:
+                            if len(one_line_summary) > 240:
+                                head_s = one_line_summary[:240]
+                                if not (re.search(r"\bBLOCKED\b", head_s, re.I) or "?" in head_s):
+                                    one_line_summary = f"{one_line_summary[:90]} … {one_line_summary[-140:]}"
+                                else:
+                                    one_line_summary = f"{head_s}…"
+                        elif len(one_line_summary) > 140:
+                            one_line_summary = f"{one_line_summary[:140]}…"
+                    for heavy_key in (
+                        "kind",
+                        "diff_preview",
+                        "diff_preview_complete",
+                        "diff_tokens_estimated",
+                        "summary",
+                        "summary_truncated",
+                        "summary_tokens_estimated",
+                        "usage",
+                        "cost",
+                        "acceptance_results",
+                        "recent_progress",
+                        "thoughts_count",
+                        "budget",
+                        "containment",
+                        "containment_warning",
+                        "vertex_location",
+                        "reroute_note",
+                        "auth_mode",
+                        "allowed_paths",
+                        "thinking_level",
+                        "tool_call_count",
+                        "stop_reason",
+                        "error",
+                        "failed_attempts",
+                    ):
+                        digest.pop(heavy_key, None)
+                    if not has_worker_caveat:
+                        digest.pop("progress", None)
+                    if one_line_summary:
+                        digest["summary"] = one_line_summary
+                    if not digest.get("in_place"):
+                        digest.pop("in_place", None)
+                    if not digest.get("scope_violations"):
+                        digest.pop("scope_violations", None)
+                if not has_worker_caveat:
+                    digest["next_action"] = (
+                        "Applied after acceptance passed. Finish now in one concise sentence without host reads or pytest."
+                    )
+                else:
+                    digest.pop("next_action", None)
+            else:
+                digest.pop("next_action", None)
         return digest
 
     def delegate_continue(
@@ -3365,6 +5225,8 @@ class JobManager:
         force_retry: bool = False,
         scrub_receipt: bool | None = None,
         auto_apply: bool | None = None,
+        _wait_elapsed: float = 0.0,
+        _wait_budget: float | None = None,
     ) -> dict[str, Any]:
         """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
         safe_id = validate_job_id(job_id)
@@ -3423,8 +5285,75 @@ class JobManager:
             wt_dir = Path(str(receipt.get("worktree_dir") or ""))
             baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
             baseline_hashes = dict(receipt.get("baseline_file_hashes") or {})
+            effective_cont_allowed = (
+                validate_allowed_paths(allowed_paths)
+                if allowed_paths is not None
+                else receipt.get("allowed_paths")
+            )
             if not wt_dir.exists():
-                wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(safe_id)
+                wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(
+                    safe_id,
+                    allowed_paths=effective_cont_allowed,
+                )
+            elif receipt.get("sparse_worktree") and allowed_paths is not None:
+                saved_worker_edits: dict[str, tuple[str, Any, int]] = {}
+                for rel_chg in receipt.get("files_changed") or []:
+                    norm_chg = str(rel_chg or "").replace("\\", "/").strip("/")
+                    if not norm_chg or ".." in Path(norm_chg).parts:
+                        continue
+                    p_chg = wt_dir / norm_chg
+                    if p_chg.is_symlink():
+                        saved_worker_edits[norm_chg] = ("symlink", os.readlink(p_chg), 0)
+                    elif p_chg.is_file():
+                        saved_worker_edits[norm_chg] = ("file", p_chg.read_bytes(), p_chg.stat().st_mode)
+                    else:
+                        saved_worker_edits[norm_chg] = ("deleted", None, 0)
+                merged_sparse_allowed = (
+                    []
+                    if effective_cont_allowed == []
+                    else list(
+                        dict.fromkeys(
+                            [
+                                *(receipt.get("allowed_paths") or []),
+                                *(effective_cont_allowed or []),
+                                *saved_worker_edits.keys(),
+                            ]
+                        )
+                    )
+                )
+                wt_dir, baseline_sha, baseline_hashes = self._prepare_worktree(
+                    safe_id,
+                    allowed_paths=merged_sparse_allowed,
+                )
+                for norm_chg, (kind_chg, payload_chg, mode_chg) in saved_worker_edits.items():
+                    dst_chg = wt_dir / norm_chg
+                    if kind_chg == "symlink":
+                        if dst_chg.exists() or dst_chg.is_symlink():
+                            dst_chg.unlink()
+                        dst_chg.parent.mkdir(parents=True, exist_ok=True)
+                        os.symlink(str(payload_chg), dst_chg)
+                    elif kind_chg == "file":
+                        if dst_chg.is_symlink():
+                            dst_chg.unlink()
+                        dst_chg.parent.mkdir(parents=True, exist_ok=True)
+                        dst_chg.write_bytes(payload_chg)
+                        if mode_chg:
+                            try:
+                                os.chmod(dst_chg, mode_chg & 0o777)
+                            except OSError:
+                                pass
+                    else:
+                        if dst_chg.exists() or dst_chg.is_symlink():
+                            dst_chg.unlink()
+                if saved_worker_edits:
+                    baseline_hashes = self._compute_changed_baseline_hashes(
+                        wt_dir, baseline_sha, list(saved_worker_edits.keys()), baseline_hashes
+                    )
+                with self._lock:
+                    is_still_sparse = safe_id in self._sparse_worktrees
+                receipt["sparse_worktree"] = is_still_sparse
+                receipt["baseline_commit_sha"] = baseline_sha
+                receipt["baseline_file_hashes"] = baseline_hashes
 
         if receipt.get("cancelled") or receipt.get("status") in ("cancelled", "interrupted"):
             # A new turn supersedes a prior cancel or a server-restart interruption; otherwise
@@ -3464,6 +5393,20 @@ class JobManager:
             if raw_fp and raw_fp not in prior_inspected_files and len(prior_inspected_files) < 8:
                 prior_inspected_files.append(raw_fp)
 
+        prior_model = str(receipt.get("model") or "gemini-3.8-flash")
+        model = prior_model
+        escalated_from: str | None = None
+        target_esc_model = self._resolve_escalation_target_model(model)
+        prior_turn_needs_escalation = (
+            worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+            or receipt.get("status") in ("checkpoint", "needs_input", "scope_violation")
+            or bool(receipt.get("missing_prompt_symbols"))
+            or (isinstance(receipt.get("qa_review"), dict) and receipt["qa_review"].get("passed") is False)
+        )
+        if target_esc_model and prior_turn_needs_escalation:
+            escalated_from = str(receipt.get("escalated_from_model") or model)
+            model = target_esc_model
+
         # Attach a concise context note of the original task and latest turn so the fresh
         # Antigravity session retains task context without re-executing prior turns.
         if prior_prompts:
@@ -3481,10 +5424,18 @@ class JobManager:
                     f"(already inspected: {prior_inspected_files}). Do NOT re-read all files from scratch; "
                     f"open at most 1-2 target sections and immediately apply your changes with edit_file / create_file."
                 )
+            diffstat_note = ""
+            if escalated_from is not None and receipt.get("files_changed") and wt_dir.exists():
+                try:
+                    ds_res = _run_git(["diff", "--stat", baseline_sha], cwd=wt_dir, check=False)
+                    if ds_res.returncode == 0 and ds_res.stdout.strip():
+                        diffstat_note = f"\nWorktree diffstat from prior {escalated_from} attempt:\n{ds_res.stdout.strip()}"
+                except Exception:
+                    diffstat_note = ""
             context_note = (
                 f"[Prior turn context (baseline {baseline_sha}, files_changed={receipt.get('files_changed', [])}, "
                 f"run `git diff {baseline_sha}` to inspect prior work): "
-                f"{prior_summary}]{no_edits_warning}\n{clean_followup}"
+                f"{prior_summary}]{no_edits_warning}{diffstat_note}\n{clean_followup}"
             )
             worker_prompts = [context_note]
         else:
@@ -3495,10 +5446,16 @@ class JobManager:
         else:
             acceptance_cmds = list(receipt.get("acceptance") or [])
         budget = receipt.get("budget") or {}
+        stored_calls = (budget.get("max_tool_calls") or 0) if "max_tool_calls" in budget else None
+        if escalated_from is not None:
+            prior_flash_default, _ = resolve_budget(None, None, model=escalated_from)
+            if stored_calls in (DEFAULT_FLASH_MAX_TOOL_CALLS, prior_flash_default):
+                stored_calls = None
         # A stored None means the lead disabled that cap; a missing key (older receipt) means defaults.
         budget_calls, budget_tokens = resolve_budget(
-            (budget.get("max_tool_calls") or 0) if "max_tool_calls" in budget else None,
+            stored_calls,
             (budget.get("max_total_tokens") or 0) if "max_total_tokens" in budget else None,
+            model=model,
         )
         use_repo_map = os.environ.get("CC_AGY_REPO_MAP", "1").strip().lower() not in ("0", "false", "no")
         repo_map_text = (
@@ -3530,13 +5487,6 @@ class JobManager:
                 focused_outline=cont_focused_outline,
             )
         ]
-
-        model = str(receipt.get("model") or "gemini-3.1-pro-preview")
-        escalated_from: str | None = None
-        target_esc_model = self._resolve_escalation_target_model(model)
-        if target_esc_model:
-            escalated_from = str(receipt.get("escalated_from_model") or model)
-            model = target_esc_model
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
@@ -3594,46 +5544,44 @@ class JobManager:
         enable_subagents = bool(receipt.get("enable_subagents", False))
         eff_scrub = bool(scrub_receipt) if scrub_receipt is not None else bool(receipt.get("scrub_receipt", False))
         started_at = float(receipt.get("started_at_epoch") or time.time())
+        prior_usage_snapshot = dict(receipt.get("usage") or {})
+        if (
+            not prior_usage_snapshot.get("requests")
+            and any(
+                int(prior_usage_snapshot.get(k) or 0) > 0
+                for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count")
+            )
+        ):
+            prior_usage_snapshot["requests"] = [
+                {
+                    "prompt_token_count": int(prior_usage_snapshot.get("prompt_token_count") or 0),
+                    "cached_content_token_count": int(prior_usage_snapshot.get("cached_content_token_count") or 0),
+                    "candidates_token_count": int(prior_usage_snapshot.get("candidates_token_count") or 0),
+                    "thoughts_token_count": int(prior_usage_snapshot.get("thoughts_token_count") or 0),
+                    "total_token_count": int(prior_usage_snapshot.get("total_token_count") or 0),
+                    "model": prior_model,
+                }
+            ]
+        elif isinstance(prior_usage_snapshot.get("requests"), list):
+            prior_usage_snapshot["requests"] = [
+                ({**r, "model": r.get("model") or prior_model} if isinstance(r, dict) else r)
+                for r in prior_usage_snapshot["requests"]
+            ]
+        prior_tool_calls_snapshot = list(receipt.get("tool_calls") or [])
+        prior_thinking = receipt.get("thinking_level")
+        prior_preloaded = receipt.get("preloaded_files")
 
-        if wait:
-            updated = self._execute_job(
-                job_id=safe_id,
-                worker_prompts=worker_prompts,
-                recorded_prompts=recorded_prompts,
-                model=model,
-                auth_mode=auth_mode,
-                api_key=resolved_key,
-                project=resolved_project,
-                location=resolved_location,
-                reroute_note=reroute_note,
-                allowed_paths=allowed_paths,
-                timeout_seconds=timeout_seconds,
-                enabled_tools=enabled_tools,
-                disabled_tools=disabled_tools,
-                enable_subagents=enable_subagents,
-                wt_dir=wt_dir,
-                baseline_sha=baseline_sha,
-                baseline_file_hashes=baseline_hashes,
-                started_at=started_at,
-                prior_usage=receipt.get("usage"),
-                prior_tool_calls=receipt.get("tool_calls"),
-                scrub_receipt=eff_scrub,
-                in_place=in_place,
-                pre_untracked=pre_untracked,
-                thinking_level=receipt.get("thinking_level"),
-                plan=plan_steps,
-                acceptance=acceptance_cmds,
-                max_tool_calls=budget_calls,
-                max_total_tokens=budget_tokens,
-                preloaded_files=receipt.get("preloaded_files"),
-            )
-            digest = self._digest_with_progress(updated)
-            return self._maybe_auto_apply_digest(
+        receipt["status"] = "running"
+        receipt["error"] = None
+        try:
+            self.store.write_receipt(
                 safe_id,
-                digest,
-                auto_apply=auto_apply,
-                in_place=in_place,
+                receipt,
+                scrub=bool(receipt.get("scrub_receipt", False)),
+                workspace_root=str(self.workspace_root),
             )
+        except Exception:
+            pass
 
         fut = self._executor.submit(
             self._execute_job,
@@ -3655,19 +5603,40 @@ class JobManager:
             baseline_sha=baseline_sha,
             baseline_file_hashes=baseline_hashes,
             started_at=started_at,
-            prior_usage=receipt.get("usage"),
-            prior_tool_calls=receipt.get("tool_calls"),
+            prior_usage=prior_usage_snapshot,
+            prior_tool_calls=prior_tool_calls_snapshot,
             scrub_receipt=eff_scrub,
             in_place=in_place,
             pre_untracked=pre_untracked,
-            thinking_level=receipt.get("thinking_level"),
+            thinking_level=prior_thinking,
             plan=plan_steps,
             acceptance=acceptance_cmds,
             max_tool_calls=budget_calls,
             max_total_tokens=budget_tokens,
+            preloaded_files=prior_preloaded,
         )
         with self._lock:
             self._futures[safe_id] = fut
+
+        if wait:
+            slice_target = float(_wait_budget) if _wait_budget is not None else float(timeout_seconds)
+            wait_slice = self._resolve_wait_slice_seconds(slice_target, elapsed_seconds=_wait_elapsed)
+            if _wait_budget is not None and wait_slice < 1.0 and float(_wait_budget) <= 30.0:
+                wait_slice = max(wait_slice, float(_wait_budget) - float(_wait_elapsed))
+            self._wait_for_future_or_cancel(safe_id, fut, timeout=wait_slice)
+            updated = self.store.read_receipt(safe_id)
+            if not fut.done() or updated.get("status") == "running":
+                with self._lock:
+                    self._wait_sliced_auto_apply[safe_id] = auto_apply
+                return self._digest_with_progress(updated)
+            digest = self._digest_with_progress(updated)
+            return self._maybe_auto_apply_digest(
+                safe_id,
+                digest,
+                auto_apply=auto_apply,
+                in_place=in_place,
+            )
+
         return {
             "job_id": safe_id,
             "status": "running",
@@ -4082,6 +6051,8 @@ class JobManager:
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
         if receipt.get("escalated_from_model"):
             digest["escalated_from_model"] = receipt.get("escalated_from_model")
+        if receipt.get("recovered_from_timeout"):
+            digest["recovered_from_timeout"] = True
         if receipt.get("missing_prompt_symbols"):
             digest["missing_prompt_symbols"] = list(receipt.get("missing_prompt_symbols") or [])
         if receipt.get("applied"):

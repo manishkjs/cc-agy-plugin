@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
+import hmac
 import inspect
 import json
 import os
 from pathlib import Path
+import secrets
+import shlex
 import shutil
 import sqlite3
 import tempfile
@@ -16,9 +20,64 @@ import time
 from typing import Any, Callable
 
 from server.regions import (
+    env_flag,
+    is_strict_mode_enabled,
     resolve_auth_config,
+    resolve_cost_profile,
     sanitize_placeholder_env,
 )
+
+_WORKER_RUNS_SECRET = secrets.token_bytes(32)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def sign_worker_run_record(rec: dict[str, Any]) -> str:
+    """Compute an in-process HMAC over a worker run record so forged worktree files are rejected."""
+    raw_hashes = rec.get("file_hashes")
+    clean_hashes = (
+        {str(k): str(v) for k, v in raw_hashes.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(raw_hashes, dict)
+        else {}
+    )
+    payload = json.dumps(
+        {
+            "ts": round(float(rec.get("ts") or 0.0), 6),
+            "command": str(rec.get("command") or ""),
+            "working_directory": str(rec.get("working_directory") or ""),
+            "exit_code": rec.get("exit_code"),
+            "timed_out": bool(rec.get("timed_out", False)),
+            "output_tail": str(rec.get("output_tail") or ""),
+            "file_hashes": clean_hashes,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    return hmac.new(_WORKER_RUNS_SECRET, payload, hashlib.sha256).hexdigest()
+
+
+def verify_worker_run_record(rec: dict[str, Any]) -> bool:
+    """Verify that a worker run record was signed by this host process and has a plausible timestamp."""
+    if not isinstance(rec, dict):
+        return False
+    sig = str(rec.get("hmac") or "")
+    if not sig:
+        return False
+    try:
+        rec_ts = float(rec.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if rec_ts <= 0.0 or rec_ts > time.time() + 1.0:
+        return False
+    expected = sign_worker_run_record(rec)
+    return hmac.compare_digest(sig, expected)
 
 
 async def maybe_await(value: Any) -> Any:
@@ -76,6 +135,25 @@ WORKER_SYSTEM_PROMPT = (
 )
 
 
+def resolve_containment_profile(
+    profile: str | None = None,
+    *,
+    enabled_tools: list[str] | None = None,
+    disabled_tools: list[str] | None = None,
+) -> str:
+    """Resolve the active Straitjacket profile (`full`, `read-only`, or `command-output`).
+
+    Defaults to `read-only` when all mutating tools are excluded, and `full` otherwise
+    (unless overridden by an explicit `profile` argument or `CC_AGY_CONTAINMENT_PROFILE`).
+    """
+    explicit = (profile or os.environ.get("CC_AGY_CONTAINMENT_PROFILE") or "").strip().lower()
+    if explicit in ("command-output", "full", "read-only"):
+        return explicit
+    if is_read_only_tool_set(enabled_tools, disabled_tools):
+        return "read-only"
+    return "full"
+
+
 def build_worker_system_prompt(
     ws_str: str,
     *,
@@ -83,7 +161,7 @@ def build_worker_system_prompt(
     has_report_to_lead: bool = False,
 ) -> str:
     """Build a workspace-aware system instruction block for the active Straitjacket tool profile."""
-    eff_profile = (profile or os.environ.get("CC_AGY_CONTAINMENT_PROFILE") or "command-output").strip().lower()
+    eff_profile = resolve_containment_profile(profile)
     if eff_profile == "read-only":
         tool_list = "ctx_get, ctx_search, view_file, search_dir, list_dir, find_file, ctx_query"
     elif eff_profile == "full":
@@ -96,11 +174,11 @@ def build_worker_system_prompt(
         f"{WORKER_SYSTEM_PROMPT}\n"
         f"- Workspace root (use exact absolute path for file tools): {ws_str}\n"
         f"- Active tools ({eff_profile}): {tool_list}.\n"
-        "- Read & edit early: batch view_file calls in parallel (1..500 lines, no 50-100 slices or re-reads); edit within <=8 calls.\n"
+        "- Read & edit early: skip view_file on inlined files; batch view_file calls (1..260 lines, no re-reads) and edit within <=8 calls.\n"
         "- Bounded thinking: never draft full code in thinking (<1,500 tokens/turn); emit create_file/edit_file directly.\n"
         "- Direct verification: skip `python3 -c` / `node -e` probes; edit files, run Acceptance tests, and stop once green.\n"
         "- Non-interactive: never ask the user; call report_to_lead(kind='question'|'blocker', ...) only if blocked.\n"
-        "- Credential & git hygiene: never read/edit .env*, .mcp.json, .netrc, *.pem, *.key, or .claude/settings*.json; never run git commit/reset/checkout/clean."
+        "- Hygiene: never read/edit .env*, .mcp.json, .netrc, *.pem, *.key, or .claude/settings*.json; never run git commit/reset/checkout/clean."
     )
 
 
@@ -140,7 +218,7 @@ def resolve_thinking_level(
     forced_env = (os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL") or "").strip().upper()
     if not read_only and forced_env in THINKING_LEVELS:
         return forced_env
-    default_level = "HIGH" if read_only else "LOW"
+    default_level = "HIGH" if read_only else ("MEDIUM" if resolve_cost_profile() == "quality" else "LOW")
     raw = (value or raw_env or default_level).strip().upper()
     if raw.startswith("${"):
         raw = default_level
@@ -472,6 +550,7 @@ def build_straitjacket_tools(
     profile: str | None = None,
     is_lead_orchestrator: bool = False,
     lead_read_limit: int = 12,
+    acceptance_commands: list[str] | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -541,38 +620,54 @@ def build_straitjacket_tools(
         scrubbed_env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
         scrubbed_env["VIRTUAL_ENV"] = str(ws_resolved / ".venv")
     from dataclasses import replace as _dc_replace
+    import hashlib as _hashlib
 
-    class _ExpandedToolSession(ToolSession):
+    sj_result_tokens = max(200, _env_int("CC_AGY_SJ_RESULT_TOKENS", 6000))
+    sj_turn_retrieval_tokens = max(
+        sj_result_tokens,
+        _env_int("CC_AGY_SJ_TURN_RETRIEVAL_TOKENS", 40000),
+    )
+    sj_max_inline_lines = max(50, _env_int("CC_AGY_SJ_MAX_INLINE_LINES", 400))
+    sj_max_inline_bytes = max(4096, _env_int("CC_AGY_SJ_MAX_INLINE_BYTES", 32768))
+    sj_session_read_bytes = max(sj_max_inline_bytes, _env_int("CC_AGY_SJ_SESSION_READ_BYTES", 1048576))
+
+    class _BoundedToolSession(ToolSession):
         def _workspace(self):
             ws = super()._workspace()
             b = ws.config.budgets
+            budget_updates: dict[str, Any] = {
+                "result_tokens": sj_result_tokens,
+                "turn_retrieval_tokens": sj_turn_retrieval_tokens,
+                "max_inline_lines": sj_max_inline_lines,
+                "max_inline_bytes": sj_max_inline_bytes,
+            }
+            if hasattr(b, "max_tool_output_bytes"):
+                budget_updates["max_tool_output_bytes"] = max(
+                    int(getattr(b, "max_tool_output_bytes", 16384) or 16384),
+                    sj_max_inline_bytes,
+                )
+            if hasattr(b, "session_read_budget_bytes"):
+                budget_updates["session_read_budget_bytes"] = max(
+                    int(getattr(b, "session_read_budget_bytes", 262144) or 262144),
+                    sj_session_read_bytes,
+                )
             return _dc_replace(
                 ws,
                 config=_dc_replace(
                     ws.config,
-                    budgets=_dc_replace(
-                        b,
-                        result_tokens=max(b.result_tokens, 6400),
-                        turn_retrieval_tokens=max(b.turn_retrieval_tokens, 16000),
-                        max_inline_lines=max(b.max_inline_lines, 750),
-                        max_inline_bytes=max(b.max_inline_bytes, 40960),
-                    ),
+                    budgets=_dc_replace(b, **budget_updates),
                 ),
             )
 
-    session = _ExpandedToolSession(
+    session = _BoundedToolSession(
         ws_resolved,
         timeout=session_timeout,
         env=scrubbed_env,
         producer="cc-agy-plugin",
     )
 
-    disable_web_tools = (
-        os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() in ("1", "true", "yes")
-        or (
-            os.environ.get("CC_AGY_STRICT_MODE", "").strip().lower() in ("1", "true", "yes")
-            and os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() not in ("0", "false", "no")
-        )
+    disable_web_tools = env_flag("CC_AGY_DISABLE_WEB_TOOLS") is True or (
+        is_strict_mode_enabled() and env_flag("CC_AGY_DISABLE_WEB_TOOLS") is not False
     )
     import re as _re
     _direct_network_tokens = (
@@ -670,12 +765,494 @@ def build_straitjacket_tools(
             )
         return raw_output
 
+    command_runs: list[dict[str, Any]] = []
+
+    def _snapshot_run_hashes() -> tuple[list[str] | None, set[str], dict[str, str]]:
+        hash_targets: set[str] = set()
+        deleted_set: set[str] = set()
+        used_git_status = False
+        if (ws_resolved / ".git").exists():
+            try:
+                gs_res = _sp.run(
+                    ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                    cwd=str(ws_resolved),
+                    capture_output=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                if gs_res.returncode == 0:
+                    used_git_status = True
+                    parts_z = gs_res.stdout.split(b"\x00")
+                    idx_z = 0
+                    while idx_z < len(parts_z):
+                        raw_e = parts_z[idx_z]
+                        idx_z += 1
+                        if not raw_e:
+                            continue
+                        e_str = raw_e.decode("utf-8", errors="surrogateescape")
+                        if len(e_str) > 3 and e_str[2] == " ":
+                            xy = e_str[:2]
+                            rel_p = e_str[3:]
+                            if "D" in xy:
+                                deleted_set.add(rel_p)
+                            else:
+                                hash_targets.add(rel_p)
+                            if xy[0] in ("R", "C") and idx_z < len(parts_z):
+                                old_raw = parts_z[idx_z]
+                                idx_z += 1
+                                if old_raw and xy[0] == "R":
+                                    deleted_set.add(old_raw.decode("utf-8", errors="surrogateescape"))
+            except Exception:
+                used_git_status = False
+        def _is_ephemeral_cache_path(rel_path: str) -> bool:
+            parts = rel_path.split("/")
+            if any(
+                seg in (
+                    ".git",
+                    ".ctx-session-reads",
+                    "__pycache__",
+                    ".pytest_cache",
+                    ".mypy_cache",
+                    ".ruff_cache",
+                    ".hypothesis",
+                )
+                for seg in parts
+            ):
+                return True
+            return rel_path.endswith((".pyc", ".pyo"))
+
+        deleted_set = {d for d in deleted_set if not _is_ephemeral_cache_path(d)}
+        existing_files: list[str] | None = None
+        if not used_git_status:
+            existing_files = [
+                rel_s
+                for p in ws_resolved.rglob("*")
+                if p.is_file() and not _is_ephemeral_cache_path(rel_s := p.relative_to(ws_resolved).as_posix())
+            ]
+            if len(existing_files) <= 500:
+                hash_targets.update(existing_files)
+        fhashes: dict[str, str] = {}
+        for rel_t in hash_targets:
+            if _is_ephemeral_cache_path(rel_t):
+                continue
+            fp_t = ws_resolved / rel_t
+            try:
+                if fp_t.is_file():
+                    fhashes[rel_t] = hashlib.sha256(fp_t.read_bytes()).hexdigest()
+            except OSError:
+                pass
+        return existing_files, deleted_set, fhashes
+
+    norm_acc_cmds = list(
+        dict.fromkeys(
+            " ".join(str(c).strip().split())
+            for c in (acceptance_commands or [])
+            if str(c or "").strip()
+        )
+    )
+    post_acc_guard_enabled = (
+        bool(norm_acc_cmds)
+        and not is_lead_orchestrator
+        and resolved_profile != "read-only"
+        and env_flag("CC_AGY_POST_ACCEPTANCE_STOP_GUARD") is not False
+    )
+    _is_git_ws = (ws_resolved / ".git").exists()
+    _baseline_non_git_hashes: dict[str, str] = {}
+    if post_acc_guard_enabled and not _is_git_ws:
+        try:
+            _, _, _baseline_non_git_hashes = _snapshot_run_hashes()
+        except Exception:
+            _baseline_non_git_hashes = {}
+    _no_tests_re = _re.compile(r"\bno tests ran\b|\bcollected 0 items\b|\bRan 0 tests\b", _re.I)
+    _py_exe_re = _re.compile(r"^python(?:\d+(?:\.\d+)*)?$", _re.I)
+    _redir_re = _re.compile(r"^\d*(?:>>?|<<?|>&|&>|\|>).*$")
+    _pytest_val_flags = frozenset({
+        "-k", "-m", "-c", "-o", "-p", "-n", "-W", "-r", "-d",
+        "--tb", "--maxfail", "--rootdir", "--confcutdir", "--basetemp",
+        "--durations", "--import-mode", "--capture", "--color", "--cov",
+        "--cov-report", "--cov-config", "--junitxml", "--log-cli-level",
+        "--timeout", "--tx", "--dist", "--ignore", "--ignore-glob", "--deselect",
+    })
+    _pager_exes = frozenset({"head", "tail", "cat", "less", "more", "wc", "nl"})
+
+    def _split_shell_segments(cmd: str) -> list[str]:
+        segs: list[str] = []
+        buf: list[str] = []
+        in_sq = False
+        in_dq = False
+        esc = False
+        n = len(cmd)
+        idx = 0
+        while idx < n:
+            ch = cmd[idx]
+            if esc:
+                buf.append(ch)
+                esc = False
+                idx += 1
+                continue
+            if ch == "\\" and not in_sq:
+                buf.append(ch)
+                esc = True
+                idx += 1
+                continue
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+                buf.append(ch)
+                idx += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                idx += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch in (";", "\n"):
+                    seg_s = "".join(buf).strip()
+                    if seg_s:
+                        segs.append(seg_s)
+                    buf = []
+                    idx += 1
+                    continue
+                if ch in ("&", "|"):
+                    if idx + 1 < n and cmd[idx + 1] == ch:
+                        seg_s = "".join(buf).strip()
+                        if seg_s:
+                            segs.append(seg_s)
+                        buf = []
+                        idx += 2
+                        continue
+                    if ch == "|":
+                        # Avoid splitting `2>&1` or `|&` weirdly: treat `|` (and `|&`) as pipeline separator.
+                        seg_s = "".join(buf).strip()
+                        if seg_s:
+                            segs.append(seg_s)
+                        buf = []
+                        idx += 2 if (idx + 1 < n and cmd[idx + 1] == "&") else 1
+                        continue
+            buf.append(ch)
+            idx += 1
+        tail_s = "".join(buf).strip()
+        if tail_s:
+            segs.append(tail_s)
+        return segs
+
+    def _parse_pytest_args(args: list[str]) -> tuple[str, tuple[str, ...]]:
+        pos_targets: list[str] = []
+        has_selector = False
+        after_dd = False
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if after_dd:
+                pos_targets.append(tok)
+                i += 1
+                continue
+            if tok == "--":
+                after_dd = True
+                i += 1
+                continue
+            if tok.startswith("-"):
+                if (
+                    tok in (
+                        "-k", "-m", "--lf", "--ff", "--last-failed", "--failed-first",
+                        "--co", "--collect-only", "--deselect", "--ignore", "--ignore-glob",
+                        "--setup-only", "--setup-plan",
+                    )
+                    or tok.startswith(("-k=", "-m=", "--deselect=", "--ignore=", "--ignore-glob="))
+                    or (len(tok) > 2 and tok[:2] in ("-k", "-m") and not tok.startswith("--"))
+                ):
+                    has_selector = True
+                if "=" not in tok and tok in _pytest_val_flags:
+                    i += 2
+                    continue
+                i += 1
+                continue
+            pos_targets.append(tok)
+            i += 1
+        norm_targets: list[str] = []
+        for raw_t in pos_targets:
+            s_t = raw_t.strip()
+            if not s_t:
+                continue
+            node_part = ""
+            path_part = s_t
+            if "::" in s_t:
+                path_part, node_part = s_t.split("::", 1)
+            p_cand = Path(path_part)
+            if p_cand.is_absolute():
+                try:
+                    rel_p = p_cand.resolve().relative_to(ws_resolved).as_posix()
+                except Exception:
+                    rel_p = path_part.rstrip("/") or "."
+            else:
+                rel_p = path_part.lstrip("./").rstrip("/") or "."
+            norm_targets.append(f"{rel_p}::{node_part}" if node_part else rel_p)
+        _suite_roots = frozenset({".", "tests", "test", "src"})
+        specific = [
+            t for t in norm_targets
+            if "::" in t or t not in _suite_roots
+        ]
+        if has_selector:
+            # Selector-filtered run (-k/-m/--lf/--co/--deselect): treat as specific to its exact flag signature.
+            return "selector_test", tuple(sorted(specific))
+        if specific:
+            return "targeted_test", tuple(sorted(specific))
+        return "whole_suite", ()
+
+    def _parse_unittest_args(args: list[str]) -> tuple[str, tuple[str, ...]]:
+        if not args:
+            return "whole_suite", ()
+        rem_u = list(args)
+        is_discover = False
+        if rem_u[0] == "discover":
+            is_discover = True
+            rem_u = rem_u[1:]
+        pos_u: list[str] = []
+        has_custom_pattern = False
+        i = 0
+        while i < len(rem_u):
+            tok = rem_u[i]
+            if tok in ("-s", "--start-directory", "-t", "--top-level-directory"):
+                i += 2
+                continue
+            if tok in ("-p", "--pattern"):
+                if i + 1 < len(rem_u) and rem_u[i + 1] not in ("test*.py", "test_*.py"):
+                    has_custom_pattern = True
+                i += 2
+                continue
+            if tok.startswith(("--pattern=",)):
+                pat_v = tok.split("=", 1)[1]
+                if pat_v not in ("test*.py", "test_*.py"):
+                    has_custom_pattern = True
+                i += 1
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            pos_u.append(tok.lstrip("./") or ".")
+            i += 1
+        if is_discover:
+            return ("selector_test", ()) if has_custom_pattern else ("whole_suite", ())
+        if pos_u:
+            return "targeted_test", tuple(sorted(pos_u))
+        return "whole_suite", ()
+
+    def _classify_post_acc_segment(seg: str) -> tuple[str, tuple[str, ...]]:
+        try:
+            raw_tokens = shlex.split(seg, posix=True)
+        except ValueError:
+            return "other", ()
+        tokens: list[str] = []
+        skip_next = False
+        for tok in raw_tokens:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in (">", ">>", "<", "2>", "&>", "1>"):
+                skip_next = True
+                continue
+            if _redir_re.match(tok):
+                continue
+            tokens.append(tok)
+        idx = 0
+        n = len(tokens)
+        while idx < n:
+            tok = tokens[idx]
+            if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+                idx += 1
+                continue
+            base = Path(tok).name.lower()
+            if base == "env":
+                idx += 1
+                while idx < n:
+                    et = tokens[idx]
+                    if "=" in et and not et.startswith("-"):
+                        idx += 1
+                    elif et in ("-i", "-0", "--ignore-environment", "--null"):
+                        idx += 1
+                    elif et in ("-u", "--unset", "-C", "--chdir") and idx + 1 < n:
+                        idx += 2
+                    elif et.startswith(("--unset=", "--chdir=")):
+                        idx += 1
+                    else:
+                        break
+                continue
+            if base == "timeout":
+                idx += 1
+                while idx < n and tokens[idx].startswith("-"):
+                    tt = tokens[idx]
+                    if tt in ("-k", "-s") and idx + 1 < n:
+                        idx += 2
+                    else:
+                        idx += 1
+                if idx < n:
+                    idx += 1  # duration
+                continue
+            if base in ("time", "nohup"):
+                idx += 1
+                continue
+            if base == "nice":
+                idx += 1
+                if idx + 1 < n and tokens[idx] == "-n":
+                    idx += 2
+                continue
+            if base == "stdbuf":
+                idx += 1
+                while idx < n and tokens[idx].startswith("-"):
+                    idx += 1
+                continue
+            if base in ("uv", "poetry", "pdm") and idx + 1 < n and tokens[idx + 1] == "run":
+                idx += 2
+                while idx < n and tokens[idx].startswith("-"):
+                    idx += 1
+                continue
+            break
+        if idx >= n:
+            return "other", ()
+        exe = Path(tokens[idx]).name.lower()
+        rest = tokens[idx + 1:]
+        if exe in _pager_exes:
+            return "pager", ()
+        if exe == "git":
+            gi = 0
+            sub = ""
+            while gi < len(rest):
+                gt = rest[gi]
+                if gt in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") and gi + 1 < len(rest):
+                    gi += 2
+                    continue
+                if gt.startswith("-"):
+                    gi += 1
+                    continue
+                sub = gt.lower()
+                break
+            if sub in ("diff", "status", "log"):
+                return "git_meta", ()
+            return "other", ()
+        if _py_exe_re.match(exe):
+            pi = 0
+            while pi < len(rest):
+                pt = rest[pi]
+                if pt == "-c":
+                    return "other", ()
+                if pt == "-m" and pi + 1 < len(rest):
+                    mod = rest[pi + 1].lower()
+                    mod_args = rest[pi + 2:]
+                    if mod in ("pytest", "py.test"):
+                        return _parse_pytest_args(mod_args)
+                    if mod == "unittest":
+                        return _parse_unittest_args(mod_args)
+                    return "other", ()
+                if pt in ("-W", "-X") and pi + 1 < len(rest):
+                    pi += 2
+                    continue
+                if pt.startswith("-"):
+                    pi += 1
+                    continue
+                return "other", ()
+            return "other", ()
+        if exe in ("pytest", "py.test"):
+            return _parse_pytest_args(rest)
+        if exe in ("tox", "nox"):
+            return "whole_suite", ()
+        if exe in ("cargo", "go", "npm", "pnpm", "yarn"):
+            if rest and rest[0] == "test":
+                extra = [a for a in rest[1:] if not a.startswith("-") and a not in ("--", "./...", ".")]
+                return ("targeted_test", tuple(sorted(extra))) if extra else ("whole_suite", ())
+            return "other", ()
+        return "other", ()
+
+    _acc_covered_targets: set[str] = set()
+    _acc_covered_files: set[str] = set()
+    _acc_covered_dirs: set[str] = set()
+    _acc_target_to_norm_cmds: dict[tuple[str, ...], list[str]] = {}
+    for _ac in norm_acc_cmds:
+        _ac_segs = _split_shell_segments(_ac)
+        if len(_ac_segs) == 1:
+            _ac_kind, _ac_tgts = _classify_post_acc_segment(_ac_segs[0])
+            if _ac_kind == "targeted_test" and _ac_tgts:
+                for _t in _ac_tgts:
+                    _acc_covered_targets.add(_t)
+                    if "::" not in _t:
+                        if _t.endswith((".py", ".txt", ".rst", ".doctest")):
+                            _acc_covered_files.add(_t)
+                        else:
+                            _acc_covered_dirs.add(_t)
+                _acc_target_to_norm_cmds.setdefault(_ac_tgts, []).append(_ac)
+
+    _acc_guard_state: dict[str, Any] = {
+        "state_key": None,
+        "passed_cmds": set(),
+        "active": False,
+    }
+
+    def _worktree_state_key(
+        post_del: set[str] | None = None,
+        post_h: dict[str, str] | None = None,
+    ) -> tuple[bool, tuple[Any, ...]]:
+        if post_del is None or post_h is None:
+            try:
+                _, post_del, post_h = _snapshot_run_hashes()
+            except Exception:
+                return False, ((), ())
+        if _is_git_ws:
+            has_changes = bool(post_h or post_del)
+        else:
+            has_changes = (post_h != _baseline_non_git_hashes) or bool(post_del)
+        return has_changes, (tuple(sorted(post_h.items())), tuple(sorted(post_del)))
+
+    def _is_redundant_post_acc_command(raw_cmd: str) -> bool:
+        norm_c = " ".join(raw_cmd.strip().split())
+        if norm_c in norm_acc_cmds:
+            return True
+        segs = _split_shell_segments(raw_cmd)
+        if not segs:
+            return False
+        classified = [_classify_post_acc_segment(s) for s in segs]
+        has_git_meta = any(k == "git_meta" for k, _ in classified)
+        if has_git_meta and all(k in ("git_meta", "pager") for k, _ in classified):
+            return True
+        for k, tgts in classified:
+            if k == "whole_suite":
+                return True
+            if k == "targeted_test" and tgts and all(
+                (
+                    t in _acc_covered_targets
+                    or t.split("::", 1)[0] in _acc_covered_files
+                    or any(
+                        t.split("::", 1)[0] == d or t.split("::", 1)[0].startswith(f"{d}/")
+                        for d in _acc_covered_dirs
+                    )
+                )
+                for t in tgts
+            ):
+                return True
+        return False
+
+    def _check_post_acceptance_short_circuit(raw_cmd: str) -> str | None:
+        if not post_acc_guard_enabled or not _acc_guard_state["active"]:
+            return None
+        has_changes, cur_key = _worktree_state_key()
+        if not has_changes or cur_key != _acc_guard_state["state_key"]:
+            _acc_guard_state["state_key"] = cur_key
+            _acc_guard_state["passed_cmds"] = set()
+            _acc_guard_state["active"] = False
+            return None
+        if not _is_redundant_post_acc_command(raw_cmd):
+            return None
+        return (
+            "[ACCEPTANCE_PASSED_STOP_NOW: Command NOT executed (skipped because all configured acceptance "
+            "commands already passed on your current modified files). Do NOT claim this skipped command ran "
+            "or passed. If all task requirements are implemented, end your turn now; if another requirement "
+            "still needs code changes, edit the target file first.]"
+        )
+
     async def run_command(
         command: str,
         working_directory: str = "",
         timeout_seconds: float = default_cmd_timeout,
     ) -> str:
-        """Execute a shell command with typed status and bounded output. Large output (>240 lines or >4,000 tokens)
+        """Execute a shell command with typed status and bounded output. Large output (>400 lines or >6,000 tokens)
         is saved to a local evidence store and returns a concise digest with a run address (run:<id>#stdout).
         Use ctx_get or ctx_search to retrieve omitted lines."""
         cmd_str = str(command or "")
@@ -713,17 +1290,102 @@ def build_straitjacket_tools(
                         })
                 except Exception:
                     pass
+        sc_msg = _check_post_acceptance_short_circuit(cmd_str)
+        if sc_msg:
+            return json.dumps({
+                "status": "skipped",
+                "exit_code": None,
+                "short_circuited": True,
+                "message": sc_msg,
+            })
         try:
             raw_timeout = float(timeout_seconds) if timeout_seconds is not None else default_cmd_timeout
         except (TypeError, ValueError, OverflowError):
             raw_timeout = default_cmd_timeout
         eff_timeout = min(max(1.0, raw_timeout if raw_timeout > 0 else default_cmd_timeout), session_timeout)
+        try:
+            _pre_files, pre_deleted, pre_hashes = _snapshot_run_hashes()
+        except Exception:
+            pre_deleted, pre_hashes = set(), {}
+        t0_mono = time.monotonic()
         result = await session.run(
             ["bash", "-c", cmd_str],
             working_directory=str(working_directory or ""),
             timeout_seconds=eff_timeout,
         )
+        dur_sec = round(max(0.0, time.monotonic() - t0_mono), 3)
+        post_deleted: set[str] = set()
+        post_hashes: dict[str, str] = {}
+        tail_src = ""
+        try:
+            reads_dir = ws_resolved / ".ctx-session-reads"
+            reads_dir.mkdir(parents=True, exist_ok=True)
+            tail_src = str(getattr(result, "stdout", None) or getattr(result, "digest", None) or "")
+            existing_files, post_deleted, post_hashes = _snapshot_run_hashes()
+            file_hashes = {
+                k: v for k, v in post_hashes.items() if pre_hashes.get(k) == v
+            }
+            run_record: dict[str, Any] = {
+                "ts": round(time.time(), 6),
+                "command": cmd_str,
+                "working_directory": str(working_directory or ""),
+                "exit_code": getattr(result, "command_exit_code", None),
+                "timed_out": bool(getattr(result, "timed_out", False)),
+                "duration_seconds": dur_sec,
+                "output_tail": tail_src[-2000:],
+                "file_hashes": file_hashes,
+            }
+            if existing_files is not None:
+                run_record["present_files"] = existing_files[:5000]
+            else:
+                run_record["deleted_files"] = sorted(pre_deleted & post_deleted)
+            run_record["hmac"] = sign_worker_run_record(run_record)
+            command_runs.append(run_record)
+            with open(reads_dir / "worker_runs.jsonl", "a", encoding="utf-8") as rfh:
+                rfh.write(json.dumps(run_record) + "\n")
+        except Exception:
+            pass
+        if post_acc_guard_enabled:
+            has_changes, post_state_key = _worktree_state_key(post_deleted, post_hashes)
+            if not has_changes or post_state_key != _acc_guard_state["state_key"]:
+                _acc_guard_state["state_key"] = post_state_key
+                _acc_guard_state["passed_cmds"] = set()
+                _acc_guard_state["active"] = False
+            norm_cmd = " ".join(cmd_str.strip().split())
+            matched_acc: list[str] = []
+            if norm_cmd in norm_acc_cmds:
+                matched_acc.append(norm_cmd)
+            else:
+                _run_segs = _split_shell_segments(cmd_str)
+                if len(_run_segs) == 1:
+                    _rk, _rtgts = _classify_post_acc_segment(_run_segs[0])
+                    if _rk == "targeted_test" and _rtgts:
+                        _rset = set(_rtgts)
+                        for _atgts, _ac_list in _acc_target_to_norm_cmds.items():
+                            if _rset >= set(_atgts):
+                                matched_acc.extend(_ac_list)
+            if (
+                matched_acc
+                and has_changes
+                and pre_hashes == post_hashes
+                and pre_deleted == post_deleted
+                and getattr(result, "command_exit_code", None) == 0
+                and not bool(getattr(result, "timed_out", False))
+                and str(working_directory or "").strip() in ("", ".")
+                and not _no_tests_re.search(tail_src)
+            ):
+                _acc_guard_state["passed_cmds"].update(matched_acc)
+                if _acc_guard_state["passed_cmds"] >= set(norm_acc_cmds):
+                    _acc_guard_state["active"] = True
+                    return (
+                        f"{result.to_json()}\n"
+                        "[ACCEPTANCE_PASSED_STOP_NOW: All acceptance commands passed (exit_code=0) on your modified "
+                        "files. Do NOT run git diff, git status, or broader test suites. End your turn immediately "
+                        "with 'Done.' in <=5 words.]"
+                    )
         return _maybe_append_turn_budget_note(result.to_json())
+
+    setattr(run_command, "command_runs", command_runs)
 
     def _normalize_safe_repo_path(rel_path: str) -> tuple[str, str | None]:
         raw_rel = str(rel_path or "").strip()
@@ -774,7 +1436,7 @@ def build_straitjacket_tools(
             })
         return None
 
-    async def ctx_get(address: str, start_line: int = 1, end_line: int = 100) -> str:
+    async def ctx_get(address: str, start_line: int = 1, end_line: int = 300) -> str:
         """Retrieve a bounded, inclusive line range from an evidence address (e.g. 'run:<id>#stdout')."""
         cap_err = _check_lead_read_cap()
         if cap_err:
@@ -783,7 +1445,7 @@ def build_straitjacket_tools(
         if err:
             return json.dumps({"error": err, "address": str(address or "")})
         s_line = _coerce_line_number(start_line, 1)
-        e_line = max(s_line, _coerce_line_number(end_line, 100))
+        e_line = max(s_line, _coerce_line_number(end_line, 300))
         try:
             out = await session.get(norm_addr, start_line=s_line, end_line=e_line)
             return _maybe_append_turn_budget_note(out)
@@ -807,10 +1469,15 @@ def build_straitjacket_tools(
     if resolved_profile == "command-output":
         return [run_command, ctx_get, ctx_search], ["RUN_COMMAND"]
 
-    import shlex
+    _seen_view_spans: dict[tuple[str, str], list[tuple[int, int]]] = {}
 
-    async def view_file(path: str, start_line: int = 1, end_line: int = 500) -> str:
-        """Read a bounded, 1-indexed file span (minimum 250 lines by default); omitted evidence remains addressable."""
+    async def view_file(
+        path: str,
+        start_line: int = 1,
+        end_line: int = 400,
+        fresh: bool = False,
+    ) -> str:
+        """Read a bounded, 1-indexed file span (up to 400 inline lines by default); omitted evidence remains addressable."""
         cap_err = _check_lead_read_cap()
         if cap_err:
             return cap_err
@@ -818,16 +1485,68 @@ def build_straitjacket_tools(
         if err:
             return json.dumps({"error": err, "path": str(path or "")})
         s_line = _coerce_line_number(start_line, 1)
-        e_line = max(s_line, _coerce_line_number(end_line, 500))
+        e_line = max(s_line, _coerce_line_number(end_line, 400))
+        file_sha = ""
+        try:
+            target_f = ws_resolved / norm_rel
+            if target_f.is_file():
+                file_sha = _hashlib.sha256(target_f.read_bytes()).hexdigest()
+        except Exception:
+            file_sha = ""
         try:
             min_span = max(0, int(os.environ.get("CC_AGY_MIN_VIEW_LINES", "250")))
         except (TypeError, ValueError):
             min_span = 250
+        prev_spans = _seen_view_spans.get((norm_rel, file_sha), []) if file_sha else []
+        if not fresh and file_sha:
+            for prev_s, prev_e in prev_spans:
+                if prev_s <= s_line and e_line <= prev_e:
+                    dedup_msg = (
+                        f"[ctx read repo:{norm_rel} L{s_line}:{e_line} · already in context from earlier "
+                        f"view_file(L{prev_s}:{prev_e}) at identical sha256:{file_sha[:12]}; "
+                        f"refer to lines L{s_line}..L{e_line} above or pass fresh=True]"
+                    )
+                    return _maybe_append_turn_budget_note(dedup_msg)
         if min_span > 0 and (e_line - s_line + 1) < min_span:
-            s_line = max(1, s_line - 20)
+            floor_line = (
+                1
+                if fresh
+                else max([pe + 1 for ps, pe in prev_spans if ps <= s_line <= pe + 20 and e_line > pe], default=1)
+            )
+            s_line = max(floor_line, s_line - 20)
             e_line = max(e_line, s_line + min_span - 1)
+        if not fresh and file_sha:
+            for prev_s, prev_e in prev_spans:
+                if prev_s <= s_line and e_line <= prev_e:
+                    dedup_msg = (
+                        f"[ctx read repo:{norm_rel} L{s_line}:{e_line} · already in context from earlier "
+                        f"view_file(L{prev_s}:{prev_e}) at identical sha256:{file_sha[:12]}; "
+                        f"refer to lines L{s_line}..L{e_line} above or pass fresh=True]"
+                    )
+                    return _maybe_append_turn_budget_note(dedup_msg)
         try:
-            out = await session.get(f"repo:{norm_rel}", start_line=s_line, end_line=e_line)
+            out = await session.get(f"repo:{norm_rel}", start_line=s_line, end_line=e_line, fresh=bool(fresh))
+            if file_sha:
+                delivered_nums = [int(m.group(1)) for m in _re.finditer(r"^L(\d+):", out, _re.M)]
+                if delivered_nums:
+                    raw_spans = list(_seen_view_spans.get((norm_rel, file_sha), []))
+                    seg_s = delivered_nums[0]
+                    seg_e = seg_s
+                    for ln in delivered_nums[1:]:
+                        if ln == seg_e + 1:
+                            seg_e = ln
+                        else:
+                            raw_spans.append((seg_s, seg_e))
+                            seg_s = seg_e = ln
+                    raw_spans.append((seg_s, seg_e))
+                    raw_spans.sort()
+                    merged_spans: list[tuple[int, int]] = []
+                    for cur_s, cur_e in raw_spans:
+                        if merged_spans and cur_s <= merged_spans[-1][1] + 1:
+                            merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], cur_e))
+                        else:
+                            merged_spans.append((cur_s, cur_e))
+                    _seen_view_spans[(norm_rel, file_sha)] = merged_spans
             return _maybe_append_turn_budget_note(out)
         except Exception as exc:
             return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
@@ -961,6 +1680,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             ep_kwargs["api_key"] = os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN", "custom-endpoint")
         endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
+    resolved_model = str(request.get("model") or "")
     model_cfg = types.ModelTarget(
         name=request["model"],
         types=[types.ModelType.TEXT],
@@ -986,13 +1706,9 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         cap_kwargs["disabled_tools"] = _coerce_builtin_tools(list(request["disabled_tools"]))
 
     # Always disable interactive/UI/workflow tools that cannot function in a headless background worker,
-    # and disable SEARCH_WEB / READ_URL_CONTENT when CC_AGY_DISABLE_WEB_TOOLS or CC_AGY_STRICT_MODE is active.
-    disable_web_tools = (
-        os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() in ("1", "true", "yes")
-        or (
-            os.environ.get("CC_AGY_STRICT_MODE", "").strip().lower() in ("1", "true", "yes")
-            and os.environ.get("CC_AGY_DISABLE_WEB_TOOLS", "").strip().lower() not in ("0", "false", "no")
-        )
+    # and disable SEARCH_WEB / READ_URL_CONTENT when CC_AGY_DISABLE_WEB_TOOLS or strict mode is active.
+    disable_web_tools = env_flag("CC_AGY_DISABLE_WEB_TOOLS") is True or (
+        is_strict_mode_enabled() and env_flag("CC_AGY_DISABLE_WEB_TOOLS") is not False
     )
     headless_disabled_names = ["ASK_QUESTION", "GENERATE_IMAGE", "SCHEDULE", "RUN_WORKFLOW"]
     if disable_web_tools:
@@ -1053,13 +1769,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
     containment_mode = "none"
     containment_warning: str | None = None
-    inferred_profile = (
-        "read-only"
-        if (
-            not os.environ.get("CC_AGY_CONTAINMENT_PROFILE", "").strip()
-            and is_read_only_tool_set(request.get("enabled_tools"), request.get("disabled_tools"))
-        )
-        else None
+    sj_command_runs: list[dict[str, Any]] = []
+    inferred_profile = resolve_containment_profile(
+        enabled_tools=request.get("enabled_tools"),
+        disabled_tools=request.get("disabled_tools"),
     )
     use_containment = os.environ.get("CC_AGY_CONTAINMENT", "1").lower() not in ("0", "false", "no")
     if use_containment:
@@ -1073,7 +1786,11 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 timeout_seconds=float(request.get("timeout_seconds") or 300.0),
                 profile=inferred_profile,
                 is_lead_orchestrator=is_lead_orch,
+                acceptance_commands=request.get("acceptance"),
             )
+            for sj_fn in sj_tools:
+                if getattr(sj_fn, "__name__", "") == "run_command" and isinstance(getattr(sj_fn, "command_runs", None), list):
+                    sj_command_runs = getattr(sj_fn, "command_runs")
             custom_tools.extend(sj_tools)
             disabled_list = list(cap_kwargs.get("disabled_tools") or [])
             enabled_list = list(cap_kwargs.get("enabled_tools") or []) if "enabled_tools" in cap_kwargs else None
@@ -1090,6 +1807,14 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             cap_kwargs["disabled_tools"] = disabled_list
             if enabled_list is not None:
                 cap_kwargs["enabled_tools"] = enabled_list
+            if (
+                tool_max_tokens > 0
+                and request.get("tool_output_max_tokens") is None
+                and "CC_AGY_TOOL_OUTPUT_MAX_TOKENS" not in os.environ
+                and hasattr(types, "ToolOutputTruncationConfig")
+            ):
+                sj_floor = max(tool_max_tokens, _env_int("CC_AGY_SJ_RESULT_TOKENS", 6000) + 500)
+                cap_kwargs["tool_output_truncation_config"] = types.ToolOutputTruncationConfig(max_tokens=sj_floor)
             capabilities = types.CapabilitiesConfig(**cap_kwargs)
             containment_mode = "straitjacket"
         except (ImportError, Exception) as sj_exc:
@@ -1220,7 +1945,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                         async for st in steps_stream:
                             st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
                             if any(st_u.values()):
-                                usage["requests"].append({**st_u, "per_call": True})
+                                usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
                                 usage["max_request_prompt_tokens"] = max(
                                     int(usage.get("max_request_prompt_tokens") or 0),
                                     int(st_u.get("prompt_token_count") or 0),
@@ -1229,7 +1954,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                         for st in steps_stream:
                             st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
                             if any(st_u.values()):
-                                usage["requests"].append({**st_u, "per_call": True})
+                                usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
                                 usage["max_request_prompt_tokens"] = max(
                                     int(usage.get("max_request_prompt_tokens") or 0),
                                     int(st_u.get("prompt_token_count") or 0),
@@ -1256,7 +1981,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             + int(usage.get("thoughts_token_count") or 0),
         )
         if not usage.get("requests") and sqlite_telemetry.get("requests"):
-            usage["requests"] = list(sqlite_telemetry["requests"])
+            usage["requests"] = [
+                ({**r, "model": r.get("model") or resolved_model} if isinstance(r, dict) else r)
+                for r in sqlite_telemetry["requests"]
+            ]
             usage["max_request_prompt_tokens"] = max(
                 int(usage.get("max_request_prompt_tokens") or 0),
                 int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
@@ -1286,7 +2014,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 int(sqlite_telemetry.get(k) or 0),
             )
         if not usage.get("requests") and sqlite_telemetry.get("requests"):
-            usage["requests"] = list(sqlite_telemetry["requests"])
+            usage["requests"] = [
+                ({**r, "model": r.get("model") or resolved_model} if isinstance(r, dict) else r)
+                for r in sqlite_telemetry["requests"]
+            ]
             usage["max_request_prompt_tokens"] = max(
                 int(usage.get("max_request_prompt_tokens") or 0),
                 int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
@@ -1300,12 +2031,14 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             setattr(timeout_exc, "partial_thoughts", thoughts_log)
             setattr(timeout_exc, "partial_containment", containment_mode)
             setattr(timeout_exc, "partial_containment_warning", containment_warning)
+            setattr(timeout_exc, "partial_command_runs", list(sj_command_runs))
             raise timeout_exc from exc
         setattr(exc, "partial_usage", usage)
         setattr(exc, "partial_tool_calls", tool_calls_log)
         setattr(exc, "partial_thoughts", thoughts_log)
         setattr(exc, "partial_containment", containment_mode)
         setattr(exc, "partial_containment_warning", containment_warning)
+        setattr(exc, "partial_command_runs", list(sj_command_runs))
         raise
     finally:
         if entered:
@@ -1324,6 +2057,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "stop_reason": stop_reason,
         "containment": containment_mode,
         "containment_warning": containment_warning,
+        "command_runs": list(sj_command_runs),
     }
 
 
@@ -1386,6 +2120,7 @@ def run_antigravity_worker(
     progress_path: str | Path | None = None,
     extra_tools: list[Any] | None = None,
     system_prompt: str | None = None,
+    acceptance: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     auth = resolve_auth_config(
@@ -1424,6 +2159,7 @@ def run_antigravity_worker(
         "progress_path": str(progress_path) if progress_path else None,
         "extra_tools": list(extra_tools) if extra_tools else None,
         "system_prompt": system_prompt,
+        "acceptance": list(acceptance) if acceptance else [],
     }
 
     active_backend = backend or _default_antigravity_backend
@@ -1449,6 +2185,7 @@ def run_antigravity_worker(
         "stop_reason": result.get("stop_reason"),
         "containment": containment_val,
         "containment_warning": containment_warn,
+        "command_runs": list(result.get("command_runs") or []),
         "auth_mode": auth_mode,
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,

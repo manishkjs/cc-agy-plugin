@@ -225,7 +225,7 @@ def resolve_vertex_location(
     """Resolve a valid Vertex AI location for the given model.
 
     Returns (resolved_location, reroute_note).
-    If a global-only model (such as gemini-3.5-flash-lite or gemini-3.1-pro-preview)
+    If a global-only model (such as gemini-3.8-flash or gemini-4-argon)
     is requested against a regional endpoint like asia-south1 or us-central1,
     automatically routes to 'global' and returns an explanatory note.
     """
@@ -263,6 +263,110 @@ def resolve_vertex_location(
     return raw_loc, None
 
 
+_TRUTHY_FLAG_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_FALSY_FLAG_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
+
+
+def env_flag(name: str, env: Any = None) -> bool | None:
+    """Parse a boolean env flag: True for 1/true/yes/on, False for 0/false/no/off, None if unset or unrecognized."""
+    source = env if env is not None else os.environ
+    val = str(source.get(name) or "").strip().lower()
+    if val in _TRUTHY_FLAG_VALUES:
+        return True
+    if val in _FALSY_FLAG_VALUES:
+        return False
+    return None
+
+
+STRICT_MODE_ENV_KEYS: tuple[str, ...] = (
+    "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
+    "CC_AGY_STRICT_MODE",
+    "CC_AGY_USERCFG_STRICT_MODE",
+)
+
+VALID_COST_PROFILES: tuple[str, ...] = ("economy", "balanced", "quality")
+
+COST_PROFILE_ENV_KEYS: tuple[str, ...] = (
+    "CC_AGY_COST_PROFILE",
+    "CLAUDE_PLUGIN_OPTION_COST_PROFILE",
+    "CC_AGY_USERCFG_COST_PROFILE",
+)
+
+
+def resolve_cost_profile(env: Any = None, *, strict: bool = False) -> str:
+    """Resolve the active cost/quality preset ('economy', 'balanced', or 'quality')."""
+    source = env if env is not None else os.environ
+    raw = first_valid_env(source, *COST_PROFILE_ENV_KEYS, default="balanced").lower()
+    if raw in VALID_COST_PROFILES:
+        return raw
+    if strict:
+        raise ValueError(
+            f"Unsupported cost_profile {raw!r}. Expected one of {list(VALID_COST_PROFILES)}."
+        )
+    return "balanced"
+
+
+def resolve_default_delegate_model(
+    requested_model: str | None = None,
+    *,
+    env: Any = None,
+) -> str:
+    """Resolve the worker model from explicit argument, environment/userConfig override, or cost_profile."""
+    req_clean = (requested_model or "").strip()
+    if req_clean and not req_clean.startswith("${"):
+        return req_clean
+    source = env if env is not None else os.environ
+    override = first_valid_env(
+        source,
+        "CC_AGY_DEFAULT_DELEGATE_MODEL",
+        "CLAUDE_PLUGIN_OPTION_DEFAULT_DELEGATE_MODEL",
+        "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
+        default="",
+    )
+    if override:
+        return override
+    profile = resolve_cost_profile(source)
+    if profile == "quality":
+        return "gemini-4-argon"
+    return "gemini-3.8-flash"
+
+
+def resolve_default_ask_model(
+    requested_model: str | None = None,
+    *,
+    env: Any = None,
+) -> str:
+    """Resolve the single-shot ask_gemini model from explicit argument, env/userConfig override, or cost_profile."""
+    req_clean = (requested_model or "").strip()
+    if req_clean and not req_clean.startswith("${"):
+        return req_clean
+    source = env if env is not None else os.environ
+    override = first_valid_env(
+        source,
+        "CC_AGY_DEFAULT_ASK_MODEL",
+        "CLAUDE_PLUGIN_OPTION_DEFAULT_ASK_MODEL",
+        "CC_AGY_USERCFG_DEFAULT_ASK_MODEL",
+        default="",
+    )
+    if override:
+        return override
+    profile = resolve_cost_profile(source)
+    if profile == "quality":
+        return "gemini-4-argon"
+    return "gemini-3.8-flash"
+
+
+def is_strict_mode_enabled(env: Any = None) -> bool:
+    """Return True when strict orchestrator mode is on via any supported route.
+
+    Strict mode can arrive as `CC_AGY_STRICT_MODE` (shell env), `CC_AGY_USERCFG_STRICT_MODE`
+    (`.mcp.json` userConfig passthrough), or `CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE`
+    (Claude Code plugin option). Every server and hook check goes through this one helper.
+    """
+    source = env if env is not None else os.environ
+    return any(env_flag(key, source) is True for key in STRICT_MODE_ENV_KEYS)
+
+
 def sanitize_placeholder_env() -> None:
     """Remove unsubstituted Claude Code ${user_config...} placeholders from credential env vars."""
     for var in (
@@ -280,6 +384,9 @@ def sanitize_placeholder_env() -> None:
         "VERTEX_LOCATION",
         "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_LOCATION",
         "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION",
+        "CC_AGY_COST_PROFILE",
+        "CLAUDE_PLUGIN_OPTION_COST_PROFILE",
+        "CC_AGY_USERCFG_COST_PROFILE",
         "CC_AGY_DEFAULT_DELEGATE_MODEL",
         "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
         "CC_AGY_DEFAULT_ASK_MODEL",
@@ -460,6 +567,21 @@ def _cost_for_turn(
     return input_cost, cached_cost, output_cost
 
 
+def _resolve_rates_for_model(model_str: str) -> tuple[dict[str, float], bool]:
+    norm = normalize_model_id(model_str)
+    known = norm in MODEL_PRICING_PER_1M_USD
+    resolved = MODEL_PRICING_PER_1M_USD.get(norm)
+    if resolved is None:
+        for known_prefix, known_rates in MODEL_PRICING_PER_1M_USD.items():
+            if norm.startswith(known_prefix):
+                resolved = known_rates
+                known = True
+                break
+    if resolved is None:
+        resolved = MODEL_PRICING_PER_1M_USD["gemini-2.5-flash"]
+    return resolved, known
+
+
 def estimate_cost_usd(
     model: str,
     usage: dict[str, Any],
@@ -478,19 +600,7 @@ def estimate_cost_usd(
     / `single_request=True`. Total token volume is always anchored to the turn totals so partial
     per-step entries never undercount total usage.
     """
-    normalized_model = normalize_model_id(model)
-    pricing_known = normalized_model in MODEL_PRICING_PER_1M_USD
-
-    # Match family prefix if exact snapshot suffix is used (e.g. gemini-2.5-flash-001)
-    rates = MODEL_PRICING_PER_1M_USD.get(normalized_model)
-    if rates is None:
-        for known_prefix, known_rates in MODEL_PRICING_PER_1M_USD.items():
-            if normalized_model.startswith(known_prefix):
-                rates = known_rates
-                pricing_known = True
-                break
-    if rates is None:
-        rates = MODEL_PRICING_PER_1M_USD["gemini-2.5-flash"]
+    rates, pricing_known = _resolve_rates_for_model(model)
 
     prompt_tokens = _safe_tok_int(usage.get("prompt_token_count"))
     cached_tokens = _safe_tok_int(usage.get("cached_content_token_count"))
@@ -523,8 +633,13 @@ def estimate_cost_usd(
             req_long = is_single_call and (req_prompt > 200_000)
             if req_long:
                 long_context_applied = True
+            req_model_raw = req_u.get("model")
+            if isinstance(req_model_raw, str) and req_model_raw.strip():
+                req_rates, _ = _resolve_rates_for_model(req_model_raw)
+            else:
+                req_rates = rates
             ic, cc, oc = _cost_for_turn(
-                rates,
+                req_rates,
                 req_u,
                 apply_long_context=req_long,
             )

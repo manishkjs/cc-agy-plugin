@@ -719,7 +719,7 @@ class ReceiptStore:
             record.setdefault("workspace_root", str(Path(workspace_root).resolve()))
 
         usage = record.get("usage") or {}
-        model = str(record.get("model") or "gemini-3.1-pro-preview")
+        model = str(record.get("model") or "gemini-3.8-flash")
         precomputed = record.get("precomputed_cost")
         if isinstance(precomputed, dict) and "total_cost_cents" in precomputed:
             # Jobs that mix models (e.g. Gemini writers plus a Claude fallback) price each call themselves.
@@ -838,7 +838,7 @@ class ReceiptStore:
 
             usage = r.get("usage") or {}
             cost = r.get("cost") or estimate_cost_usd(
-                str(r.get("model") or "gemini-3.1-pro-preview"),
+                str(r.get("model") or "gemini-3.8-flash"),
                 usage,
                 single_request=(r.get("kind") == "ask"),
             )

@@ -62,7 +62,7 @@
   <!-- bottom promise strip -->
   <rect x="30" y="372" width="940" height="66" rx="12" fill="#202124"/>
   <text x="187" y="402" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Safe</text>
-  <text x="187" y="424" text-anchor="middle" font-size="12.5" fill="#bdc1c6">Repo changes only after tests pass</text>
+  <text x="187" y="424" text-anchor="middle" font-size="12.5" fill="#bdc1c6">Isolated copy; failed checks blocked</text>
   <text x="500" y="402" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Traceable</text>
   <text x="500" y="424" text-anchor="middle" font-size="12.5" fill="#bdc1c6">Signed receipt per change, one-call undo</text>
   <text x="813" y="402" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Measured</text>

@@ -19,18 +19,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 
-def is_strict_mode_enabled(env: dict[str, str] | None = None) -> bool:
-    """Check whether strict orchestrator delegation mode is enabled."""
-    source = env if env is not None else os.environ
-    for key in (
-        "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
-        "CC_AGY_STRICT_MODE",
-        "CC_AGY_USERCFG_STRICT_MODE",
-    ):
-        val = str(source.get(key) or "").strip().lower()
-        if val in ("1", "true", "yes", "on"):
-            return True
-    return False
+from server.regions import is_strict_mode_enabled  # noqa: E402  (shared strict-mode check, re-exported)
 
 
 def resolve_project_root(
@@ -692,9 +681,15 @@ _FORBIDDEN_INLINE_PYTHON_ATTRS: frozenset[str] = frozenset(
 
 
 def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
-    """Extra strict-mode Lead reads granted once a worker job started in the current session exists."""
+    """Extra strict-mode Lead reads granted once a worker job started in the current session exists.
+
+    When a job auto-applied cleanly with passing acceptance checks and no missing symbols (and
+    `CC_AGY_LEAD_REVIEW_READ_LIMIT` was not explicitly overridden), returns 0 so the Lead finishes
+    immediately instead of re-reading already-verified files.
+    """
+    raw_override = (env.get("CC_AGY_LEAD_REVIEW_READ_LIMIT") or "").strip()
     try:
-        bonus = int((env.get("CC_AGY_LEAD_REVIEW_READ_LIMIT") or "6").strip() or "6")
+        bonus = int(raw_override or "6")
     except ValueError:
         bonus = 6
     if bonus <= 0:
@@ -702,27 +697,118 @@ def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
     try:
         marker = data_root / ".lead_session_started"
         since = marker.stat().st_mtime if marker.exists() else 0.0
-        for receipt in (data_root / "receipts").glob("job-*"):
-            if receipt.stat().st_mtime >= since:
-                return bonus
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return 0
+        session_files = [
+            p for p in receipts_dir.glob("job-*")
+            if p.stat().st_mtime >= since
+        ]
+        if not session_files:
+            return 0
+        json_receipts = [
+            p for p in session_files
+            if p.name.endswith(".json") and not p.name.endswith(".progress.jsonl")
+        ]
+        if json_receipts and not raw_override:
+            latest_json = max(json_receipts, key=lambda p: p.stat().st_mtime)
+            try:
+                rec = json.loads(latest_json.read_text(encoding="utf-8"))
+                if (
+                    isinstance(rec, dict)
+                    and rec.get("status") == "ok"
+                    and rec.get("applied") is True
+                    and rec.get("acceptance_passed") is True
+                    and not rec.get("scope_violations")
+                    and not rec.get("missing_prompt_symbols")
+                ):
+                    acc_list = rec.get("acceptance_results")
+                    has_real_pass = True
+                    if isinstance(acc_list, list) and acc_list:
+                        has_real_pass = any(
+                            isinstance(r, dict)
+                            and r.get("passed") is True
+                            and not r.get("no_tests_collected")
+                            and not r.get("runner_incompatible_skipped")
+                            and not r.get("auto_import_smoke")
+                            for r in acc_list
+                        )
+                    if has_real_pass:
+                        return 0
+            except Exception:
+                pass
+        return bonus
     except OSError:
         return 0
-    return 0
 
 
-def _is_safe_python_inline_ast(code_str: str) -> bool:
-    """Validate `python -c <code>` using an AST allowlist so dynamic/obfuscated mutations are rejected."""
+def _is_workspace_python_package(root_mod: str, ws_root: Path | tuple[Path, ...] | None) -> bool:
+    """Return True if `root_mod` is a valid Python package directory (`__init__.py`) inside `ws_root` (or `ws_root/src`)."""
+    if (
+        ws_root is None
+        or not root_mod
+        or not root_mod.isidentifier()
+        or root_mod in ("server", "scripts", "tests", "test", "setup", "conftest")
+    ):
+        return False
+    roots = ws_root if isinstance(ws_root, tuple) else (ws_root,)
+    for r in roots:
+        if (r / root_mod / "__init__.py").is_file() or (r / "src" / root_mod / "__init__.py").is_file():
+            return True
+    return False
+
+
+def _is_safe_workspace_pythonpath(
+    val: str,
+    ws_root: Path,
+    out_dir: str | Path | None,
+    active_cwd: Path,
+    env: dict[str, str] | None,
+) -> bool:
+    """Return True if every path segment in `PYTHONPATH=<val>` resolves strictly inside `ws_root`."""
+    raw = (val or "").strip().strip("'\"")
+    if not raw:
+        return True
+    segments = [s.strip() for s in raw.split(":") if s.strip() and s.strip() not in ("$PYTHONPATH", "${PYTHONPATH}")]
+    if not segments:
+        return True
+    ws_resolved = ws_root.resolve()
+    cwd_resolved = active_cwd.resolve()
+    for seg in segments:
+        expanded = _expand_shell_vars_in_path(seg, active_cwd, ws_root)
+        if any(ch in expanded for ch in ("$", "`", "~")):
+            return False
+        cand = Path(expanded)
+        if ".." in cand.parts:
+            return False
+        resolved = (cwd_resolved / cand).resolve() if not cand.is_absolute() else cand.resolve()
+        if not (resolved.is_relative_to(ws_resolved) and resolved.is_relative_to(cwd_resolved)):
+            return False
+        if classify_path(str(resolved), ws_root, out_dir, cwd=active_cwd, env=env) != "workspace":
+            return False
+    return True
+
+
+def _is_safe_python_inline_ast(code_str: str, ws_root: Path | tuple[Path, ...] | None = None) -> bool:
+    """Validate `python -c <code>` using a two-pass AST allowlist so dynamic/obfuscated mutations are rejected."""
     try:
         tree = ast.parse(code_str, mode="exec")
     except (SyntaxError, ValueError, TypeError):
         return False
 
-    for node in ast.walk(tree):
+    all_nodes = list(ast.walk(tree))
+    ws_imported_names: set[str] = set()
+    # Pass 1: collect all imports first (ast.walk is breadth-first, so nested imports appear after top-level functions).
+    for node in all_nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root_mod = alias.name.split(".", 1)[0]
-                if root_mod not in _SAFE_INLINE_PYTHON_MODULES:
-                    return False
+                if root_mod in _SAFE_INLINE_PYTHON_MODULES:
+                    continue
+                if _is_workspace_python_package(root_mod, ws_root):
+                    ws_imported_names.add(alias.asname or root_mod)
+                    continue
+                return False
         elif isinstance(node, ast.ImportFrom):
             if not node.module:
                 return False
@@ -732,12 +818,20 @@ def _is_safe_python_inline_ast(code_str: str) -> bool:
             for alias in node.names:
                 if alias.name.startswith("_") or alias.name in _FORBIDDEN_INLINE_PYTHON_ATTRS:
                     return False
-        elif isinstance(node, ast.Name):
+
+    # Pass 2: validate names, attributes, string constants, and calls against collected imports.
+    for node in all_nodes:
+        if isinstance(node, ast.Name):
             if node.id.startswith("_") or node.id in _FORBIDDEN_INLINE_PYTHON_NAMES:
                 return False
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("_") or node.attr in _FORBIDDEN_INLINE_PYTHON_ATTRS:
                 return False
+            # If workspace packages were imported (`allow_workspace_inline_imports=True`), forbid arbitrary
+            # attribute traversal on them (e.g. `mypkg.shutil.rmtree(...)`) and allow only `<pkg>.test(...)`.
+            if ws_imported_names:
+                if not (isinstance(node.value, ast.Name) and node.value.id in ws_imported_names and node.attr in ("test", "doctest")):
+                    return False
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             segments = [seg for seg in re.split(r"[.\[\]:!]", node.value) if seg]
             if (
@@ -755,6 +849,14 @@ def _is_safe_python_inline_ast(code_str: str) -> bool:
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == "print":
                 if any(kw.arg in ("file", None) for kw in node.keywords):
+                    return False
+            if ws_imported_names:
+                if not (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in ws_imported_names
+                    and node.func.attr in ("test", "doctest")
+                ):
                     return False
     return True
 
@@ -909,6 +1011,12 @@ _BLOCKED_PYTEST_FLAG_PREFIXES: tuple[str, ...] = (
     "--self-contained-html",
     "--import-mode",
     "--pastebin",
+    "--snapshot-update",
+    "--update-snapshots",
+    "--force-regen",
+    "--regen-all",
+    "--inline-snapshot",
+    "--record-mode",
 )
 
 
@@ -1102,6 +1210,7 @@ def detect_bash_workspace_mutation(
     *,
     cwd: str | Path | None = None,
     env: dict[str, str] | None = None,
+    allow_workspace_inline_imports: bool = False,
     _depth: int = 0,
 ) -> dict[str, Any]:
     """Inspect a Bash command for direct workspace or receipt-store mutations in strict mode."""
@@ -1217,6 +1326,7 @@ def detect_bash_workspace_mutation(
             out_dir,
             cwd=active_cwd,
             env=env,
+            allow_workspace_inline_imports=allow_workspace_inline_imports,
             _depth=_depth + 1,
         )
         if sub_verdict["blocked"]:
@@ -1279,6 +1389,7 @@ def detect_bash_workspace_mutation(
             active_cwd=active_cwd,
             env=env,
             depth=_depth,
+            allow_workspace_inline_imports=allow_workspace_inline_imports,
         )
         if verdict["blocked"]:
             return verdict
@@ -1294,6 +1405,7 @@ def _inspect_segment_tokens(
     active_cwd: Path,
     env: dict[str, str] | None,
     depth: int,
+    allow_workspace_inline_imports: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     """Inspect a single tokenized command segment, unwrapping prefixes and tracking `cd`."""
     idx = 0
@@ -1304,8 +1416,13 @@ def _inspect_segment_tokens(
         tok = Path(tokens[idx]).name if tokens[idx].startswith("/") else tokens[idx]
         # Inspect and skip leading VAR=val assignments
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
-            var_name = tok.split("=", 1)[0]
+            var_name, var_val = tok.split("=", 1)
             if var_name in _BLOCKED_ENV_VARS:
+                if var_name == "PYTHONPATH" and _is_safe_workspace_pythonpath(
+                    var_val, ws_root, out_dir, active_cwd, env
+                ):
+                    idx += 1
+                    continue
                 return {
                     "blocked": True,
                     "reason": f"Strict orchestrator mode blocked environment override `{var_name}=...`.",
@@ -1378,8 +1495,13 @@ def _inspect_segment_tokens(
                 elif etok.startswith("-"):
                     idx += 1
                 elif "=" in etok and etok.split("=", 1)[0].isidentifier():
-                    var_name = etok.split("=", 1)[0]
+                    var_name, var_val = etok.split("=", 1)
                     if var_name in _BLOCKED_ENV_VARS:
+                        if var_name == "PYTHONPATH" and _is_safe_workspace_pythonpath(
+                            var_val, ws_root, out_dir, active_cwd, env
+                        ):
+                            idx += 1
+                            continue
                         return {
                             "blocked": True,
                             "reason": f"Strict orchestrator mode blocked `env {var_name}=...`.",
@@ -1592,18 +1714,262 @@ def _inspect_segment_tokens(
             }, active_cwd
         return {"blocked": False, "reason": None}, active_cwd
 
-    if binary in ("npm", "pnpm", "yarn", "npx"):
+    if binary in ("npm", "pnpm", "yarn", "bun"):
+        blocked_js_flags = (
+            "-u",
+            "--update",
+            "--updateSnapshot",
+            "--update-snapshots",
+            "--snapshot-update",
+            "--fix",
+            "--unsafe-fixes",
+            "--write",
+            "--force-regen",
+            "--regen-all",
+            "--prefix",
+            "--cwd",
+            "-C",
+        )
+        if any(a in blocked_js_flags or a.startswith(("--prefix=", "--cwd=", "--fix=")) for a in args):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `{binary} {' '.join(args[:3])}`.",
+            }, active_cwd
+        pre_dd_pos: list[str] = []
+        skip_next = False
+        for a in args:
+            if a == "--":
+                break
+            if skip_next:
+                skip_next = False
+                continue
+            if a in ("--filter", "-F", "--workspace", "-w", "--loglevel", "--reporter", "--config", "-t", "--grep", "--testNamePattern"):
+                skip_next = True
+                continue
+            if a.startswith("-"):
+                continue
+            pre_dd_pos.append(a)
+        subcmd = pre_dd_pos[0] if pre_dd_pos else ""
+        subcmd_arg = pre_dd_pos[1] if len(pre_dd_pos) > 1 else ""
+        blocked_js_subcmds = (
+            "install",
+            "i",
+            "add",
+            "remove",
+            "rm",
+            "uninstall",
+            "unlink",
+            "update",
+            "up",
+            "upgrade",
+            "ci",
+            "link",
+            "audit",
+            "fmt",
+            "format",
+            "init",
+            "create",
+            "pm",
+            "x",
+            "exec",
+            "dlx",
+            "patch",
+            "patch-commit",
+            "publish",
+            "pack",
+            "version",
+            "rebuild",
+            "dedupe",
+            "prune",
+            "shrinkwrap",
+            "import",
+            "set",
+            "unset",
+            "delete",
+            "unplug",
+            "stage",
+            "deploy",
+            "fetch",
+        )
+        mutating_script_suffixes = (":fix", ":write", ":format", "-fix", "-write", "-format")
         if (
-            binary == "npx"
-            or any(
-                a in ("install", "i", "add", "remove", "uninstall", "update", "ci", "link", "audit", "fmt", "format", "--prefix", "-C")
-                or a.startswith("--prefix=")
-                for a in args
-            )
+            not subcmd
+            or subcmd in blocked_js_subcmds
+            or subcmd.endswith(mutating_script_suffixes)
         ):
             return {
                 "blocked": True,
-                "reason": f"Strict orchestrator mode blocked `{binary} {' '.join(args[:2])}`.",
+                "reason": f"Strict orchestrator mode blocked `{binary} {' '.join(args[:3])}`.",
+            }, active_cwd
+        if subcmd == "pkg" and subcmd_arg != "get":
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `{binary} pkg {subcmd_arg}`.",
+            }, active_cwd
+        if subcmd == "plugin" and subcmd_arg != "list":
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked `{binary} plugin {subcmd_arg}`.",
+            }, active_cwd
+        if subcmd in ("config", "c") and subcmd_arg not in ("get", "list", "ls"):
+            allow_user_npm_cfg = (
+                binary == "npm"
+                and subcmd_arg in ("set", "delete")
+                and any(a in ("--location=user", "--global", "-g") for a in args)
+            )
+            if not allow_user_npm_cfg:
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `{binary} {subcmd} {subcmd_arg}`.",
+                }, active_cwd
+        if subcmd in ("run", "run-script"):
+            script_name = subcmd_arg
+            if (
+                not script_name
+                or script_name in ("fmt", "format", "fix", "write", "codegen", "generate", "migrate", "seed", "deploy", "publish", "release", "clean")
+                or script_name.endswith(mutating_script_suffixes)
+            ):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `{binary} {' '.join(args[:3])}`.",
+                }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
+    if binary in ("npx", "bunx", "pnpx"):
+        # Allow read-only local test/typecheck/lint runners while blocking remote package installs and snapshot writes.
+        if any(
+            a
+            in (
+                "-y",
+                "--yes",
+                "-p",
+                "--package",
+                "-c",
+                "--call",
+                "-u",
+                "--update",
+                "--updateSnapshot",
+                "--update-snapshots",
+                "--snapshot-update",
+                "--fix",
+                "--unsafe-fixes",
+                "--write",
+                "--force-regen",
+                "--regen-all",
+            )
+            or a.startswith(("--package=", "--yes=", "--fix="))
+            for a in args
+        ):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked mutating or remote-install `{binary}` flags: `{binary} {' '.join(args[:3])}`.",
+            }, active_cwd
+        npx_non_flags = [a for a in args if a != "--no-install" and not a.startswith("-")]
+        runner_tok = npx_non_flags[0] if npx_non_flags else ""
+        if runner_tok in ("vitest", "jest", "mocha", "ava"):
+            return {"blocked": False, "reason": None}, active_cwd
+        if runner_tok == "tsc" and "--noEmit" in args:
+            return {"blocked": False, "reason": None}, active_cwd
+        if runner_tok == "eslint":
+            return {"blocked": False, "reason": None}, active_cwd
+        return {
+            "blocked": True,
+            "reason": f"Strict orchestrator mode blocked `{binary} {' '.join(args[:2])}`.",
+        }, active_cwd
+
+    if binary == "cargo":
+        cargo_non_flags = [a for a in args if not a.startswith("-") and not a.startswith("+")]
+        cargo_sub = cargo_non_flags[0] if cargo_non_flags else ""
+        if cargo_sub == "fmt":
+            if "--check" not in args:
+                return {
+                    "blocked": True,
+                    "reason": "Strict orchestrator mode blocked `cargo fmt` without `--check`.",
+                }, active_cwd
+            return {"blocked": False, "reason": None}, active_cwd
+        if cargo_sub == "clippy" and "--fix" in args:
+            return {
+                "blocked": True,
+                "reason": "Strict orchestrator mode blocked `cargo clippy --fix`.",
+            }, active_cwd
+        if cargo_sub == "insta":
+            insta_sub = cargo_non_flags[1] if len(cargo_non_flags) > 1 else ""
+            if insta_sub != "test" or any(
+                a in ("--accept", "--review", "--force-update-snapshots")
+                or a.startswith("--unreferenced=")
+                for a in args
+            ):
+                return {
+                    "blocked": True,
+                    "reason": "Strict orchestrator mode blocked mutating `cargo insta` snapshot command.",
+                }, active_cwd
+            return {"blocked": False, "reason": None}, active_cwd
+        if cargo_sub in ("fix", "add", "remove", "rm", "init", "new", "install", "uninstall", "clean", "update", "vendor", "publish"):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked mutating `cargo {cargo_sub}` command.",
+            }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
+    if binary == "go":
+        go_non_flags = [a for a in args if not a.startswith("-")]
+        go_sub = go_non_flags[0] if go_non_flags else ""
+        if go_sub in ("fmt", "generate", "get", "install", "clean", "mod", "work"):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked mutating `go {go_sub}` command.",
+            }, active_cwd
+        if go_sub in ("test", "build"):
+            if go_sub == "test" and any(
+                a in ("-update", "--update", "-golden", "--golden", "-u")
+                or a.startswith(("-update=", "--update=", "-golden=", "--golden="))
+                for a in args
+            ):
+                return {
+                    "blocked": True,
+                    "reason": "Strict orchestrator mode blocked `go test` golden/snapshot update flag.",
+                }, active_cwd
+            for i_g, garg in enumerate(args):
+                out_dest: str | None = None
+                if garg in ("-o", "-coverprofile") and i_g + 1 < len(args):
+                    out_dest = args[i_g + 1]
+                elif garg.startswith(("-o=", "-coverprofile=")):
+                    out_dest = garg.split("=", 1)[1]
+                if out_dest and out_dest != "/dev/null":
+                    if classify_path(out_dest, ws_root, out_dir, cwd=active_cwd, env=env) in ("workspace", "out_dir"):
+                        return {
+                            "blocked": True,
+                            "reason": f"Strict orchestrator mode blocked `go {go_sub}` writing output into workspace ({out_dest!r}).",
+                        }, active_cwd
+            if go_sub == "build" and not any(a == "-o" or a.startswith("-o=") for a in args):
+                return {
+                    "blocked": True,
+                    "reason": "Strict orchestrator mode blocked `go build` without `-o /dev/null` or `-o /tmp/...` (use `go test` or `go vet`).",
+                }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
+    if binary in ("mvn", "mvnw", "gradle", "gradlew"):
+        bad_jvm_goals = ("clean", "deploy", "install", "spotless:apply", "spotlessApply", "rewrite:run", "rewriteRun")
+        for jarg in args:
+            if jarg in bad_jvm_goals or jarg.startswith("release:"):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked mutating `{binary} {jarg}` goal.",
+                }, active_cwd
+        return {"blocked": False, "reason": None}, active_cwd
+
+    if binary == "dotnet":
+        dn_non_flags = [a for a in args if not a.startswith("-")]
+        dn_sub = dn_non_flags[0] if dn_non_flags else ""
+        if dn_sub == "format" and "--verify-no-changes" not in args:
+            return {
+                "blocked": True,
+                "reason": "Strict orchestrator mode blocked `dotnet format` without `--verify-no-changes`.",
+            }, active_cwd
+        if dn_sub in ("new", "add", "remove", "clean", "publish", "pack", "workload", "tool"):
+            return {
+                "blocked": True,
+                "reason": f"Strict orchestrator mode blocked mutating `dotnet {dn_sub}` command.",
             }, active_cwd
         return {"blocked": False, "reason": None}, active_cwd
 
@@ -1647,6 +2013,38 @@ def _inspect_segment_tokens(
                 "blocked": True,
                 "reason": f"Strict orchestrator mode blocked `xargs {binary}` execution.",
             }, active_cwd
+        if binary == "node" and "--test" in args:
+            blocked_node_test_flags = (
+                "-e",
+                "--eval",
+                "-c",
+                "--check",
+                "-r",
+                "--require",
+                "--import",
+                "--loader",
+                "--experimental-loader",
+                "--test-update-snapshots",
+            )
+            if any(
+                a in blocked_node_test_flags
+                or a.startswith(("--eval=", "--require=", "--import=", "--loader=", "--experimental-loader="))
+                for a in args
+            ):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked mutating or custom-loader `node --test` flag: `node {' '.join(args[:3])}`.",
+                }, active_cwd
+            for narg in args:
+                if narg.startswith("-"):
+                    continue
+                if classify_path(narg, ws_root, out_dir, cwd=active_cwd, env=env) != "workspace":
+                    return {
+                        "blocked": True,
+                        "reason": f"Strict orchestrator mode blocked `node --test` targeting non-workspace path {narg!r}.",
+                    }, active_cwd
+            return {"blocked": False, "reason": None}, active_cwd
+
         for i, arg in enumerate(args):
             inline_code: str | None = None
             if (
@@ -1654,7 +2052,11 @@ def _inspect_segment_tokens(
                 or (arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and arg[1:-1].isalpha() and arg[-1] in ("c", "e"))
             ) and i + 1 < len(args):
                 inline_code = args[i + 1]
-            elif arg.startswith(("-c", "-e", "-r")) and not arg.startswith("--") and len(arg) > 2:
+            elif (
+                arg.startswith(("-c", "-e", "-r"))
+                and not arg.startswith("--")
+                and len(arg) > 2
+            ):
                 inline_code = arg[2:]
             elif arg.startswith("--eval="):
                 inline_code = arg.split("=", 1)[1]
@@ -1672,7 +2074,18 @@ def _inspect_segment_tokens(
                             "`delegate_apply`, `get_diff`) directly."
                         ),
                     }, active_cwd
-                if binary in ("node", "ruby", "perl", "php", "lua") or not _is_safe_python_inline_ast(inline_code):
+                ws_roots_for_inline: Path | tuple[Path, ...] | None = None
+                if allow_workspace_inline_imports:
+                    try:
+                        if active_cwd.resolve().is_relative_to(ws_root.resolve()):
+                            ws_roots_for_inline = (ws_root, active_cwd)
+                        else:
+                            ws_roots_for_inline = (ws_root,)
+                    except Exception:
+                        ws_roots_for_inline = (ws_root,)
+                if binary in ("node", "ruby", "perl", "php", "lua") or not _is_safe_python_inline_ast(
+                    inline_code, ws_root=ws_roots_for_inline
+                ):
                     return {
                         "blocked": True,
                         "reason": (
@@ -1733,11 +2146,38 @@ def _inspect_segment_tokens(
             script_arg = non_flags[0]
             script_name = Path(script_arg).name
             script_cls = classify_path(script_arg, ws_root, out_dir, cwd=active_cwd, env=env)
+            script_cand = Path(script_arg)
+            cwd_resolved = active_cwd.resolve()
+            ws_resolved = ws_root.resolve()
+            script_resolved = (
+                (cwd_resolved / script_cand).resolve()
+                if not script_cand.is_absolute()
+                else script_cand.resolve()
+            )
+            script_inside_ws = (
+                not any(ch in script_arg for ch in ("$", "`", "~"))
+                and ".." not in script_cand.parts
+                and script_resolved.is_relative_to(ws_resolved)
+                and script_resolved.is_relative_to(cwd_resolved)
+            )
+            script_rel = (
+                str(script_resolved.relative_to(cwd_resolved)).replace("\\", "/")
+                if script_inside_ws
+                else ""
+            )
             is_allowed_test_runner = (
                 script_cls == "workspace"
+                and script_inside_ws
                 and (
                     (script_name == "manage.py" and len(non_flags) >= 2 and non_flags[1] == "test")
-                    or bool(re.match(r"^(?:run_tests\.py|test_.*\.py|.*_test\.py)$", script_name))
+                    or (binary == "php" and script_name == "artisan" and len(non_flags) >= 2 and non_flags[1] == "test")
+                    or (
+                        binary == "ruby"
+                        and script_name.endswith("_test.rb")
+                        and not any(a.startswith(("-i", "-r")) for a in args)
+                    )
+                    or bool(re.match(r"^(?:run_tests\.py|runtests\.py|test_.*\.py|.*_test\.py)$", script_name))
+                    or script_rel in ("bin/test", "bin/doctest", "tests/runtests.py", "runtests.py", "run_tests.py")
                 )
             )
             if is_allowed_test_runner:
@@ -1746,7 +2186,8 @@ def _inspect_segment_tokens(
                 "blocked": True,
                 "reason": (
                     f"Strict orchestrator mode blocked executing script `{binary} {script_arg}`. "
-                    f"Use `python3 -m unittest` / `pytest` for tests or delegate edits to Vertex."
+                    f"Use a read-only test runner (pytest, npm/pnpm/yarn/bun test, node --test, go test, cargo test, ./gradlew test, ./mvnw test) "
+                    f"or delegate workspace changes via delegate_start."
                 ),
             }, active_cwd
         if any(a in ("--version", "-V", "--help", "-h") for a in args):
@@ -1755,7 +2196,8 @@ def _inspect_segment_tokens(
             "blocked": True,
             "reason": (
                 f"Strict orchestrator mode blocked `{binary}` reading script from stdin/pipe. "
-                f"Use `python3 -m unittest` / `pytest` for tests or delegate edits via delegate_start."
+                f"Use a read-only test runner (pytest, npm/pnpm/yarn/bun test, node --test, go test, cargo test, ./gradlew test, ./mvnw test) "
+                f"or delegate workspace changes via delegate_start."
             ),
         }, active_cwd
 
@@ -1976,6 +2418,357 @@ def _inspect_segment_tokens(
     return {"blocked": False, "reason": None}, active_cwd
 
 
+_BASH_READ_BINARIES: frozenset[str] = frozenset(
+    {
+        "cat",
+        "head",
+        "tail",
+        "nl",
+        "less",
+        "more",
+        "bat",
+        "sed",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ripgrep",
+        "ack",
+        "ag",
+        "cut",
+        "od",
+        "wc",
+        "sort",
+        "uniq",
+        "diff",
+        "comm",
+        "paste",
+        "join",
+        "pr",
+        "fmt",
+        "fold",
+        "expand",
+        "unexpand",
+        "tac",
+        "rev",
+        "strings",
+        "hexdump",
+        "xxd",
+        "jq",
+        "yq",
+    }
+)
+
+
+def _expand_brace_patterns(arg_str: str, max_depth: int = 8) -> list[str]:
+    cleaned = re.sub(r"\{,+\}", "", arg_str)
+    if max_depth <= 0 or "{" not in cleaned or "}" not in cleaned:
+        return [cleaned]
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", cleaned)
+    if not m:
+        return [cleaned]
+    prefix = cleaned[: m.start()]
+    suffix = cleaned[m.end() :]
+    out: list[str] = []
+    choices = list(dict.fromkeys(m.group(1).split(",")))[:16]
+    for choice in choices:
+        for exp in _expand_brace_patterns(f"{prefix}{choice}{suffix}", max_depth - 1):
+            if exp not in out:
+                out.append(exp)
+                if len(out) >= 64:
+                    return out
+    return out
+
+
+def _resolve_bash_read_arg(
+    raw_arg: str,
+    active_cwd: Path,
+    ws_root: Path,
+) -> tuple[list[str], bool]:
+    """Expand braces/globs in `raw_arg` and return `(workspace_rel_files, saw_workspace_path)`."""
+    import glob as _glob
+
+    clean_arg = raw_arg.strip()
+    if not clean_arg or clean_arg in ("-", "--", "/dev/null", "{}"):
+        return [], False
+    files_out: list[str] = []
+    saw_ws = False
+    for expanded in _expand_brace_patterns(clean_arg):
+        if any(ch in expanded for ch in "*?["):
+            pat_path = Path(expanded).expanduser()
+            glob_pat = str((active_cwd / pat_path) if not pat_path.is_absolute() else pat_path)
+            try:
+                matches = sorted(_glob.glob(glob_pat, recursive=True))
+            except Exception:
+                matches = []
+            for m_str in matches[:50]:
+                try:
+                    res_p = Path(m_str).resolve()
+                except OSError:
+                    continue
+                if res_p.is_relative_to(ws_root) and res_p.exists():
+                    saw_ws = True
+                    if res_p.is_file():
+                        rel_p = res_p.relative_to(ws_root).as_posix()
+                        if rel_p not in files_out:
+                            files_out.append(rel_p)
+        else:
+            try:
+                cand_p = Path(expanded).expanduser()
+                res_p = (active_cwd / cand_p).resolve() if not cand_p.is_absolute() else cand_p.resolve()
+            except OSError:
+                continue
+            if res_p.is_relative_to(ws_root) and res_p.exists():
+                saw_ws = True
+                if res_p.is_file():
+                    rel_p = res_p.relative_to(ws_root).as_posix()
+                    if rel_p not in files_out:
+                        files_out.append(rel_p)
+    return files_out, saw_ws
+
+
+def detect_bash_workspace_read(
+    command: str,
+    workdir: str | Path,
+    out_dir: str | Path | None = None,
+    *,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+    _depth: int = 0,
+) -> list[str]:
+    """Identify read-only Bash commands that inspect workspace file contents or diffs.
+
+    Returns a non-empty list of workspace-relative file paths (or `["<workspace-search>"]`)
+    when `command` reads or searches repository files via `cat`, `sed`, `head`, `tail`, `nl`,
+    `awk`, `grep`, `rg`, `cut`, `od`, `find -exec`, subshells, redirects, or `git diff`/`show`/`log`/`cat-file`,
+    so `evaluate_pre_tool_use` counts each read file against `.lead_read_count` on par with `Read`/`Grep`/`Glob`.
+    """
+    if not command or not command.strip() or _depth > 12:
+        return []
+    ws_root = Path(workdir).resolve()
+    active_cwd = Path(cwd).resolve() if cwd else ws_root
+    cmd_without_herestrings = re.sub(r"<<<", "   ", command)
+    cmd_without_heredocs = re.sub(r"<<-?\s*['\"]?\w+['\"]?", "   ", cmd_without_herestrings)
+    matched_targets: list[str] = []
+    saw_read_cmd = False
+
+    def _add_targets(new_files: list[str], saw_ws: bool = False) -> None:
+        nonlocal saw_read_cmd
+        if saw_ws or new_files:
+            saw_read_cmd = True
+        for f in new_files:
+            if f == "<workspace-search>":
+                saw_read_cmd = True
+            elif f not in matched_targets:
+                matched_targets.append(f)
+
+    # 1. Inspect command substitutions `$(...)` and backticks `` `...` ``
+    for sub_m in re.finditer(r"\$\(([^()]+)\)|`([^`]+)`", cmd_without_heredocs):
+        inner_cmd = sub_m.group(1) or sub_m.group(2) or ""
+        if inner_cmd.strip():
+            sub_res = detect_bash_workspace_read(
+                inner_cmd, ws_root, out_dir, cwd=active_cwd, env=env, _depth=_depth + 1
+            )
+            _add_targets(sub_res)
+
+    # 2. Inspect input redirections `< file` (excluding heredocs/herestrings/fd-dups)
+    for redir_m in re.finditer(r"(?<![<>])<\s*(?![<&>])(\"[^\"]+\"|'[^']+'|[^\s;|&><()\"']+)", cmd_without_heredocs):
+        raw_redir = redir_m.group(1).strip("\"'")
+        exp_redir = _expand_shell_vars_in_path(raw_redir, active_cwd, ws_root)
+        r_files, r_saw = _resolve_bash_read_arg(exp_redir, active_cwd, ws_root)
+        _add_targets(r_files, r_saw)
+
+    segments = _split_shell_segments(cmd_without_heredocs)
+    for raw_seg in segments:
+        seg = raw_seg.strip()
+        while seg and (seg[0] in "({" or seg[-1] in ")}"):
+            seg = seg.lstrip("({ \t").rstrip(")} \t")
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        if not tokens:
+            continue
+        tokens = [_expand_shell_vars_in_path(t, active_cwd, ws_root) for t in tokens]
+        idx = 0
+        n = len(tokens)
+        while idx < n:
+            tok = Path(tokens[idx]).name if tokens[idx].startswith("/") else tokens[idx]
+            if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+                idx += 1
+                continue
+            if tok in ("command", "nohup", "time", "exec", "builtin", "setsid", "busybox", "env"):
+                idx += 1
+                while idx < n and (
+                    tokens[idx].startswith("-")
+                    or ("=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier())
+                ):
+                    idx += 1
+                continue
+            if tok == "timeout":
+                idx += 1
+                while idx < n and tokens[idx].startswith("-"):
+                    flag_t = tokens[idx]
+                    idx += 1
+                    if flag_t in ("-k", "-s", "--kill-after", "--signal") and idx < n:
+                        idx += 1
+                if idx < n and re.match(r"^\d+(?:\.\d+)?[smhd]?$", tokens[idx]):
+                    idx += 1
+                continue
+            if tok in ("nice", "ionice", "chrt", "stdbuf", "watch"):
+                idx += 1
+                while idx < n and tokens[idx].startswith("-"):
+                    flag_t = tokens[idx]
+                    idx += 1
+                    if flag_t in ("-n", "-c", "-p") and idx < n and re.match(r"^-?\d+$", tokens[idx]):
+                        idx += 1
+                continue
+            if tok == "xargs":
+                idx += 1
+                while idx < n and tokens[idx].startswith("-"):
+                    flag_t = tokens[idx]
+                    idx += 1
+                    if flag_t in ("-n", "-P", "-I", "-L", "-s", "-d", "-a", "--max-args", "--max-procs") and idx < n:
+                        idx += 1
+                continue
+            break
+        if idx >= n:
+            continue
+        binary = Path(tokens[idx]).name
+        args = tokens[idx + 1 :]
+        if binary == "cd":
+            if args:
+                cand_cd = Path(args[0]).expanduser()
+                active_cwd = (active_cwd / cand_cd).resolve() if not cand_cd.is_absolute() else cand_cd.resolve()
+            continue
+
+        if binary in ("bash", "sh", "zsh", "dash", "ksh") and "-c" in args:
+            c_idx = args.index("-c")
+            if c_idx + 1 < len(args):
+                sub_res = detect_bash_workspace_read(
+                    args[c_idx + 1], ws_root, out_dir, cwd=active_cwd, env=env, _depth=_depth + 1
+                )
+                _add_targets(sub_res)
+            continue
+
+        if binary == "eval" and args:
+            sub_res = detect_bash_workspace_read(
+                " ".join(args), ws_root, out_dir, cwd=active_cwd, env=env, _depth=_depth + 1
+            )
+            _add_targets(sub_res)
+            continue
+
+        if binary == "find":
+            search_roots: list[Path] = []
+            name_pats: list[str] = []
+            has_read_exec = False
+            i_f = 0
+            while i_f < len(args):
+                a_f = args[i_f]
+                if a_f in ("-name", "-iname", "-path", "-wholename") and i_f + 1 < len(args):
+                    name_pats.append(args[i_f + 1])
+                    i_f += 2
+                    continue
+                if a_f in ("-exec", "-execdir"):
+                    for exec_tok in args[i_f + 1 :]:
+                        if exec_tok in (";", "+"):
+                            break
+                        if Path(exec_tok).name in _BASH_READ_BINARIES:
+                            has_read_exec = True
+                            break
+                    break
+                if not a_f.startswith("-") and a_f not in ("!", "(", ")", ","):
+                    try:
+                        cand_r = Path(a_f).expanduser()
+                        res_r = (active_cwd / cand_r).resolve() if not cand_r.is_absolute() else cand_r.resolve()
+                        if res_r.is_relative_to(ws_root) and res_r.exists():
+                            search_roots.append(res_r)
+                    except OSError:
+                        pass
+                i_f += 1
+            if has_read_exec:
+                if not search_roots and active_cwd.is_relative_to(ws_root):
+                    search_roots.append(active_cwd)
+                for sr in search_roots:
+                    saw_read_cmd = True
+                    if sr.is_file():
+                        _add_targets([sr.relative_to(ws_root).as_posix()], True)
+                    elif sr.is_dir():
+                        pats = name_pats or ["*"]
+                        for pat in pats:
+                            for m_p in sorted(sr.rglob(pat))[:50]:
+                                if m_p.is_file() and m_p.is_relative_to(ws_root):
+                                    _add_targets([m_p.relative_to(ws_root).as_posix()], True)
+            continue
+
+        if binary in ("python", "python3") or re.match(r"^python3\.\d+$", binary):
+            if "-m" in args:
+                m_idx = args.index("-m")
+                if m_idx + 1 < len(args):
+                    mod_name = args[m_idx + 1]
+                    if mod_name in ("tokenize", "ast", "dis", "json.tool", "doctest", "py_compile", "tabnanny"):
+                        for a_py in args[m_idx + 2 :]:
+                            if a_py.startswith("-"):
+                                continue
+                            r_files, r_saw = _resolve_bash_read_arg(a_py, active_cwd, ws_root)
+                            _add_targets(r_files, r_saw)
+            continue
+
+        if binary == "git":
+            git_sub = next((a for a in args if not a.startswith("-")), "")
+            if git_sub in ("diff", "show", "grep", "blame", "log", "cat-file"):
+                if git_sub == "log" and not any(
+                    a in ("-p", "--patch", "--stat") or a.startswith("-L") for a in args
+                ):
+                    continue
+                if active_cwd.is_relative_to(ws_root):
+                    saw_read_cmd = True
+                    for a in args:
+                        if a == git_sub or a.startswith("-"):
+                            continue
+                        cand_str = a.split(":", 1)[-1] if ":" in a and git_sub in ("show", "cat-file") else a
+                        r_files, r_saw = _resolve_bash_read_arg(cand_str, active_cwd, ws_root)
+                        _add_targets(r_files, r_saw)
+            continue
+
+        if binary in _BASH_READ_BINARIES:
+            saw_outside_arg = False
+            saw_ws_arg = False
+            for a in args:
+                if a.startswith("-"):
+                    continue
+                r_files, r_saw = _resolve_bash_read_arg(a, active_cwd, ws_root)
+                if r_saw or r_files:
+                    saw_ws_arg = True
+                elif "/" in a or a.startswith("."):
+                    try:
+                        cand_out = Path(a).expanduser()
+                        res_out = (active_cwd / cand_out).resolve() if not cand_out.is_absolute() else cand_out.resolve()
+                        if res_out.exists() and not res_out.is_relative_to(ws_root):
+                            saw_outside_arg = True
+                    except OSError:
+                        pass
+                _add_targets(r_files, r_saw)
+            if (
+                not matched_targets
+                and not saw_ws_arg
+                and not saw_outside_arg
+                and binary in ("grep", "egrep", "fgrep", "rg", "ripgrep", "ack", "ag")
+                and active_cwd.is_relative_to(ws_root)
+            ):
+                saw_read_cmd = True
+
+    if saw_read_cmd and not matched_targets:
+        return ["<workspace-search>"]
+    return matched_targets
+
+
 def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = None) -> dict[str, Any]:
     """Evaluate a Claude Code PreToolUse event and return hookSpecificOutput if blocked."""
     if not isinstance(payload, dict):
@@ -2133,6 +2926,41 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 try:
                     data_root.mkdir(parents=True, exist_ok=True)
                     counter_path.write_text(str(current_reads + 1), encoding="utf-8")
+                    if tool_name == "Read":
+                        raw_fp = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
+                        if raw_fp:
+                            cand_fp = Path(raw_fp).expanduser()
+                            res_fp = (Path(cwd).resolve() / cand_fp).resolve() if not cand_fp.is_absolute() else cand_fp.resolve()
+                            if res_fp.is_relative_to(ws_root) and res_fp.is_file():
+                                rel_fp = res_fp.relative_to(ws_root).as_posix()
+                                read_files_path = data_root / ".lead_read_files.json"
+                                existing_list: list[str] = []
+                                if read_files_path.exists():
+                                    try:
+                                        parsed_rf = json.loads(read_files_path.read_text(encoding="utf-8"))
+                                        if isinstance(parsed_rf, list):
+                                            existing_list = [str(x) for x in parsed_rf if isinstance(x, str)]
+                                    except Exception:
+                                        existing_list = []
+                                if rel_fp not in existing_list:
+                                    existing_list.append(rel_fp)
+                                    read_files_path.write_text(json.dumps(existing_list), encoding="utf-8")
+                                raw_off = tool_input.get("offset")
+                                raw_lim = tool_input.get("limit")
+                                if raw_off is not None or raw_lim is not None:
+                                    try:
+                                        w_off = max(1, int(raw_off)) if raw_off is not None else 1
+                                        w_lim = max(50, int(raw_lim)) if raw_lim is not None else 250
+                                        rw_path = data_root / ".lead_read_windows.json"
+                                        existing_wins: dict[str, list[int]] = {}
+                                        if rw_path.exists():
+                                            parsed_rw = json.loads(rw_path.read_text(encoding="utf-8"))
+                                            if isinstance(parsed_rw, dict):
+                                                existing_wins = parsed_rw
+                                        existing_wins[rel_fp] = [w_off, w_lim]
+                                        rw_path.write_text(json.dumps(existing_wins), encoding="utf-8")
+                                    except Exception:
+                                        pass
                 except Exception:
                     pass
 
@@ -2174,7 +3002,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     }
                 }
 
-    # 3. Block Bash mutations targeting workspace or out_dir
+    # 3. Block Bash mutations targeting workspace or out_dir, and enforce Lead read cap on Bash workspace reads
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
         verdict = detect_bash_workspace_mutation(
@@ -2188,6 +3016,83 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     "permissionDecisionReason": verdict["reason"],
                 }
             }
+        bash_read_targets = detect_bash_workspace_read(
+            command, ws_root, out_dir, cwd=cwd, env=source_env
+        )
+        if bash_read_targets:
+            raw_limit = (
+                source_env.get("CC_AGY_LEAD_READ_LIMIT")
+                or source_env.get("CC_AGY_MAX_LEAD_READS")
+                or "2"
+            ).strip()
+            try:
+                read_limit = int(raw_limit) if raw_limit else 0
+            except ValueError:
+                read_limit = 0
+            if read_limit > 0:
+                try:
+                    from server.receipts import ReceiptStore
+
+                    data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
+                except Exception:
+                    data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+                counter_path = data_root / ".lead_read_count"
+                read_limit += _lead_review_read_bonus(data_root, source_env)
+                try:
+                    current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
+                except Exception:
+                    current_reads = 0
+                file_targets = [t for t in bash_read_targets if t != "<workspace-search>"]
+                read_cost = max(1, len(file_targets))
+                if current_reads >= read_limit or (len(file_targets) > 1 and current_reads + read_cost > read_limit):
+                    reason_msg = (
+                        f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
+                        "delegation mode (including Bash file/diff inspection commands). Do NOT read more files on "
+                        "the Lead orchestrator. Call delegate_start (with wait=true and a concise prompt <500 words; "
+                        "preload_files=true and auto_apply=true are enabled automatically), delegate_continue, "
+                        "get_diff, or delegate_apply immediately — the worker has full repository and test access."
+                    )
+                    if file_targets:
+                        try:
+                            from server.repo_map import build_focused_file_outline
+
+                            outline = build_focused_file_outline(ws_root, file_targets[:2], max_tokens=450)
+                            if outline:
+                                reason_msg += (
+                                    "\n\nFocused File Outline (auto-attached so you can call delegate_start immediately):\n"
+                                    + outline
+                                )
+                        except Exception:
+                            pass
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason_msg,
+                        }
+                    }
+                try:
+                    data_root.mkdir(parents=True, exist_ok=True)
+                    counter_path.write_text(str(current_reads + read_cost), encoding="utf-8")
+                    if file_targets:
+                        read_files_path = data_root / ".lead_read_files.json"
+                        existing_list: list[str] = []
+                        if read_files_path.exists():
+                            try:
+                                parsed_rf = json.loads(read_files_path.read_text(encoding="utf-8"))
+                                if isinstance(parsed_rf, list):
+                                    existing_list = [str(x) for x in parsed_rf if isinstance(x, str)]
+                            except Exception:
+                                existing_list = []
+                        changed = False
+                        for rel_fp in file_targets:
+                            if rel_fp not in existing_list:
+                                existing_list.append(rel_fp)
+                                changed = True
+                        if changed:
+                            read_files_path.write_text(json.dumps(existing_list), encoding="utf-8")
+                except Exception:
+                    pass
 
     return {}
 

@@ -23,14 +23,15 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from server.jobs import capture_live_workspace_diff
 from server.receipts import ReceiptStore, extract_diff_provenance, resolve_workspace_root
+from server.regions import is_strict_mode_enabled
 
 
-def verify_mcp_server_health() -> dict[str, Any]:
+def verify_mcp_server_health(env: dict[str, str] | None = None) -> dict[str, Any]:
     """Perform a fast self-check verifying that the cc-agy-plugin MCP stdio tool catalog loads cleanly."""
     try:
         from server.mcp_stdio import get_tool_definitions
 
-        tools = get_tool_definitions()
+        tools = get_tool_definitions(env)
         tool_names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
         required = {"delegate_start", "delegate_continue", "delegate_apply", "get_diff"}
         missing = sorted(required - set(tool_names))
@@ -46,12 +47,13 @@ def verify_mcp_server_health() -> dict[str, Any]:
 
 
 _CHECKLIST_STEP_1 = (
-    "1. Before delegating, include the user's verbatim task specification in the delegate prompt "
-    "(do not paraphrase away exact sentences, formulas, or examples), and also write every behavioral "
-    "requirement from the task as a numbered list (names, signatures, defaults, error cases, edge cases). "
-    "Put the whole list in the delegate prompt. "
-    "Ask the worker to add one test per item, and to search for every caller and consumer of each API it "
-    "changes and update them too.\n"
+    "1. Delegate on Turn 1 without pre-reading target files when their paths are already named. "
+    "The plugin automatically attaches the user's verbatim task specification from the session prompt "
+    "(and inlines any spec_files/context_files you pass to delegate_start), so do not re-type the full "
+    "specification in your delegate_start prompt: keep your delegate_start call concise (<150 output tokens) "
+    "and pass checklist with the key behavioral requirements and edge cases (names, signatures, defaults, "
+    "error cases). Ask the worker to add one test per item, and to search for every caller and consumer "
+    "of each API it changes and update them too.\n"
 )
 
 # Strict mode applies a job automatically when its tests pass, and an applied job cannot be continued,
@@ -59,8 +61,10 @@ _CHECKLIST_STEP_1 = (
 REVIEW_AFTER_APPLY_GUIDANCE = (
     "cc-agy-plugin delegation checklist:\n"
     + _CHECKLIST_STEP_1
-    + "2. A job whose tests pass is applied to the workspace automatically. Then check each numbered item "
-    "on the workspace: read the changed files and run pytest.\n"
+    + "2. A job whose tests pass is applied to the workspace automatically. If applied is true, "
+    "acceptance_passed is true, and auto_apply_skipped is absent, finish immediately in one short sentence "
+    "without re-reading the changed files or re-running pytest on the host (only read the changed files and "
+    "run pytest if a numbered item was not covered by acceptance).\n"
     "3. If any item is missing or wrong, start one follow-up job with delegate_start that names the exact "
     "items to fix (or delegate_revert if the result is wrong overall). Never delegate_continue a job that "
     "was applied.\n"
@@ -91,10 +95,7 @@ def _auto_apply_on_pass(env: dict[str, str]) -> bool:
         return False
     if raw in _TRUTHY:
         return True
-    return any(
-        str(env.get(k) or "").strip().lower() in _TRUTHY
-        for k in ("CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE", "CC_AGY_STRICT_MODE", "CC_AGY_USERCFG_STRICT_MODE")
-    )
+    return is_strict_mode_enabled(env)
 
 
 def review_guidance_for(env: dict[str, str]) -> str:
@@ -114,7 +115,7 @@ def handle_session_start(
 ) -> dict[str, Any]:
     """Record the workspace baseline for a new Claude Code session_id and verify MCP server health."""
     source_env = env if env is not None else os.environ
-    health = verify_mcp_server_health()
+    health = verify_mcp_server_health(dict(source_env))
     out: dict[str, Any] = {}
     if _review_guidance_enabled(dict(source_env)):
         out["hookSpecificOutput"] = {
@@ -154,12 +155,17 @@ def handle_session_start(
     head_sha = head_res.stdout.strip() if head_res.returncode == 0 else None
     receipt_store = store or ReceiptStore(workspace_root=ws_path)
     # The strict-mode Lead read budget is per session: reset the counter and mark when this session
-    # started, so review reads are granted only for worker jobs started in this session.
-    try:
-        (receipt_store.data_dir / ".lead_read_count").write_text("0", encoding="utf-8")
-        (receipt_store.data_dir / ".lead_session_started").write_text(str(time.time()), encoding="utf-8")
-    except OSError:
-        pass
+    # started on fresh startup/clear (not on compact/resume, which are mid-session events).
+    session_source = str(payload.get("source") or "startup").strip().lower()
+    if session_source in ("startup", "clear", ""):
+        try:
+            (receipt_store.data_dir / ".lead_read_count").write_text("0", encoding="utf-8")
+            marker_payload = json.dumps({"ts": round(time.time(), 3), "session_id": session_id})
+            (receipt_store.data_dir / ".lead_session_started").write_text(marker_payload, encoding="utf-8")
+            (receipt_store.data_dir / ".lead_read_files.json").write_text("[]", encoding="utf-8")
+            (receipt_store.data_dir / ".lead_read_windows.json").write_text("{}", encoding="utf-8")
+        except OSError:
+            pass
     live_diff = capture_live_workspace_diff(ws_path, baseline_head_sha=head_sha)
     prov = extract_diff_provenance(live_diff)
     receipt_store.record_session_baseline(
@@ -172,6 +178,12 @@ def handle_session_start(
 
 
 def main() -> int:
+    if "--doctor" in sys.argv[1:]:
+        from server.doctor import run_doctor
+
+        report = run_doctor()
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        return 0 if report.get("healthy") else 1
     try:
         raw = sys.stdin.read().strip()
         payload: dict[str, Any] = json.loads(raw) if raw else {}

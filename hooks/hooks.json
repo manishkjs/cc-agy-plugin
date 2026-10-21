@@ -12,9 +12,20 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/user_prompt_submit.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Bash|mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Bash|mcp__plugin_cc-agy-plugin_vertex__delegate_.*|mcp__vertex__delegate_.*|mcp__.*__delegate_.*",
         "hooks": [
           {
             "type": "command",
@@ -26,7 +37,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_cc-agy-plugin_vertex__.*|mcp__vertex__.*",
+        "matcher": "mcp__plugin_cc-agy-plugin_vertex__.*|mcp__vertex__.*|mcp__.*__(?:delegate_start|delegate_continue|delegate_result|delegate_to_gemini|delegate_apply)",
         "hooks": [
           {
             "type": "command",

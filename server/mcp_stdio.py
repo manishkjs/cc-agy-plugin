@@ -12,6 +12,7 @@ import sys
 import threading
 from typing import Any, BinaryIO
 
+from server.doctor import run_doctor
 from server.genai_ask import ask_gemini
 from server.jobs import (
     QA_DIFF_AUDIT_SYSTEM,
@@ -23,7 +24,7 @@ from server.jobs import (
     validate_plan,
 )
 from server.receipts import ReceiptStore
-from server.regions import truncate_to_token_budget
+from server.regions import is_strict_mode_enabled, truncate_to_token_budget
 from server.true_cost import true_total_report
 from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_plan
 from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
@@ -52,7 +53,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-2.5-flash).",
+                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash; respects cost_profile).",
                 },
                 "context_files": {
                     "type": "array",
@@ -105,15 +106,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "Concise, outcome-oriented task specification (keep under 500 words / 1,000 tokens; "
-                        "state the behavioral requirements, edge cases, and target file paths directly without "
-                        "'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines of "
-                        "implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
+                        "Concise, outcome-oriented task brief (keep under 200 tokens when passing spec_files/context_files, "
+                        "or under 500 words otherwise; state the behavioral requirements, edge cases, and target file paths "
+                        "directly without 'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines "
+                        "of implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
                     ),
+                },
+                "spec_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional workspace-relative paths to specification or instruction files (e.g. ['PROMPT.md', 'docs/spec.md']) "
+                        "whose contents are inlined verbatim into the worker's Turn-1 prompt so you do not have to re-type them."
+                    ),
+                },
+                "context_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional workspace-relative paths to target/source files whose contents are inlined into the worker's "
+                        "Turn-1 prompt so the worker can edit immediately without calling view_file."
+                    ),
+                },
+                "checklist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of concise behavioral requirement items for the worker to implement and verify.",
                 },
                 "model": {
                     "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-3.1-pro-preview).",
+                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
                 },
                 "allowed_paths": {
                     "type": "array",
@@ -451,7 +473,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-3.1-pro-preview).",
+                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
                 },
                 "allowed_paths": {
                     "type": "array",
@@ -666,20 +688,132 @@ TOOL_DEFINITIONS.extend([
         ),
         "inputSchema": {"type": "object", "properties": {**_WRITER_PROPS, **_AUTH_PROPS}},
     },
+    {
+        "name": "doctor",
+        "description": (
+            "Run offline readiness diagnostics (zero model or network calls): checks MCP tool health, "
+            "cost_profile, authentication config (without exposing API keys), installed SDKs "
+            "(google-genai, google.antigravity, Straitjacket ctx), git workspace status, detected "
+            "language test runner, and receipt store writability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ])
 
 KNOWN_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in TOOL_DEFINITIONS)
 
 CORE_TOOL_NAMES: tuple[str, ...] = (
-    "ask_gemini",
     "delegate_start",
     "delegate_continue",
     "delegate_apply",
     "delegate_result",
     "delegate_status",
     "delegate_cancel",
+    "delegate_revert",
     "get_diff",
+    "doctor",
 )
+
+_CORE_OMIT_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "project",
+        "location",
+        "scrub_receipt",
+        "enabled_tools",
+        "disabled_tools",
+        "enable_subagents",
+        "in_place",
+        "qa_review_model",
+        "preload_files",
+        "max_total_tokens",
+        "limit",
+        "receipt_id",
+        "dry_run",
+        "skip_dirty",
+    }
+)
+
+_CORE_CONCISE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "delegate_start": "Run an isolated Gemini worker copy; auto-applies when wait=true and acceptance passes.",
+    "delegate_result": "Wait up to 240s for a running job_id and return its bounded digest.",
+    "delegate_status": "Check status/cost for job_id or list recent jobs.",
+    "delegate_cancel": "Cancel a running job_id and clean up its worktree.",
+    "delegate_revert": "Restore files touched by an applied job_id to their pre-apply state.",
+    "get_diff": "Read paginated unified diff or file_stats for a job_id.",
+    "delegate_apply": "Apply a completed job_id's changes to the workspace.",
+    "delegate_continue": "Continue an existing job_id in its worktree with follow_up_prompt.",
+    "doctor": "Run local readiness diagnostics (auth, SDKs, git, test runner).",
+}
+
+_CORE_CONCISE_PROP_DESCRIPTIONS: dict[tuple[str, str], str] = {
+    ("delegate_start", "prompt"): "Concise task brief (<500 words; no self-debate or >8-line code blocks).",
+    ("delegate_start", "spec_files"): "Spec paths inlined verbatim.",
+    ("delegate_start", "context_files"): "Source paths inlined into worker prompt.",
+    ("delegate_start", "checklist"): "Requirement items to verify.",
+    ("delegate_start", "model"): "Gemini model ID.",
+    ("delegate_start", "allowed_paths"): "Relative paths worker may edit.",
+    ("delegate_start", "plan"): "Ordered outcome steps.",
+    ("delegate_start", "acceptance"): "Up to 5 read-only test commands.",
+    ("delegate_start", "max_tool_calls"): "Worker tool cap.",
+    ("delegate_start", "thinking_level"): "Reasoning depth.",
+    ("delegate_start", "timeout_seconds"): "Worker timeout seconds.",
+    ("delegate_start", "wait"): "Block up to 240s slice.",
+    ("delegate_start", "auto_apply"): "Auto-apply on passing acceptance.",
+    ("delegate_continue", "job_id"): "Job ID.",
+    ("delegate_continue", "follow_up_prompt"): "Follow-up instruction.",
+    ("delegate_continue", "allowed_paths"): "Updated allowed paths.",
+    ("delegate_continue", "acceptance"): "Updated acceptance commands.",
+    ("delegate_continue", "timeout_seconds"): "Worker timeout seconds.",
+    ("delegate_continue", "wait"): "Wait for completion.",
+    ("delegate_continue", "force_retry"): "Retry past escalation.",
+    ("delegate_continue", "auto_apply"): "Auto-apply on pass.",
+    ("delegate_result", "job_id"): "Job ID.",
+    ("delegate_result", "wait"): "Wait if running.",
+    ("delegate_result", "timeout"): "Max wait seconds (default 240).",
+    ("delegate_status", "job_id"): "Optional job ID.",
+    ("delegate_cancel", "job_id"): "Job ID.",
+    ("delegate_cancel", "cleanup_worktree"): "Remove worktree.",
+    ("delegate_revert", "job_id"): "Applied job ID.",
+    ("get_diff", "job_id"): "Job ID.",
+    ("get_diff", "file_filter"): "Path/glob filter.",
+    ("get_diff", "page"): "1-based page.",
+    ("get_diff", "page_tokens"): "Tokens per page.",
+    ("get_diff", "summary_only"): "Only file_stats.",
+    ("get_diff", "focus_symbols"): "Filter hunks by symbol.",
+    ("delegate_apply", "job_id"): "Job ID.",
+    ("delegate_apply", "cleanup_worktree"): "Remove worktree after apply.",
+    ("delegate_apply", "allow_scope_violations"): "Approve out-of-scope edits.",
+}
+
+
+def _compact_core_tool_def(tool_def: dict[str, Any]) -> dict[str, Any]:
+    name = str(tool_def.get("name") or "")
+    raw_schema = tool_def.get("inputSchema") or {}
+    raw_props = raw_schema.get("properties") or {}
+    compact_props: dict[str, Any] = {}
+    for prop_name, prop_val in raw_props.items():
+        if prop_name in _CORE_OMIT_PROPERTIES or not isinstance(prop_val, dict):
+            continue
+        short_desc = _CORE_CONCISE_PROP_DESCRIPTIONS.get((name, prop_name))
+        if short_desc is not None:
+            compact_props[prop_name] = {**prop_val, "description": short_desc}
+        else:
+            compact_props[prop_name] = dict(prop_val)
+    compact_schema: dict[str, Any] = {
+        "type": raw_schema.get("type", "object"),
+        "properties": compact_props,
+    }
+    if "required" in raw_schema:
+        compact_schema["required"] = list(raw_schema["required"])
+    return {
+        "name": name,
+        "description": _CORE_CONCISE_TOOL_DESCRIPTIONS.get(name, str(tool_def.get("description") or "")),
+        "inputSchema": compact_schema,
+    }
 
 
 def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, Any]]:
@@ -687,20 +821,12 @@ def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, An
     active_env = os.environ if env is None else env
     raw_profile = (active_env.get("CC_AGY_TOOL_PROFILE") or "").strip().lower()
     if not raw_profile:
-        strict_active = any(
-            str(active_env.get(k) or "").strip().lower() in ("1", "true", "yes", "on")
-            for k in (
-                "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
-                "CC_AGY_STRICT_MODE",
-                "CC_AGY_USERCFG_STRICT_MODE",
-            )
-        )
-        profile = "core" if strict_active else "full"
+        profile = "core" if is_strict_mode_enabled(active_env) else "full"
     else:
         profile = raw_profile
-    if profile == "core":
+    if profile in ("core", "compact"):
         core_set = set(CORE_TOOL_NAMES)
-        return [t for t in TOOL_DEFINITIONS if t["name"] in core_set]
+        return [_compact_core_tool_def(t) for t in TOOL_DEFINITIONS if t["name"] in core_set]
     return TOOL_DEFINITIONS
 
 
@@ -872,6 +998,8 @@ class MCPServer:
             return responses if responses else None
 
         return self._handle_single_message(message)
+
+    handle_message = handle_Message
 
     def _handle_single_message(self, message: Any) -> dict[str, Any] | None:
         if not isinstance(message, dict):
@@ -1124,6 +1252,12 @@ class MCPServer:
                 edits_only=edits_only,
             )
 
+        if name == "doctor":
+            return run_doctor(
+                workspace_root=self.job_manager.workspace_root,
+                store=self.store,
+            )
+
         if name == "probe_writers":
             try:
                 settings = resolve_batch_settings(args)
@@ -1163,6 +1297,9 @@ class MCPServer:
             prompt_str = _require_str(args.get("prompt"), "prompt")
             enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
             disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
+            spec_f = _validate_optional_str_list(args.get("spec_files"), "spec_files")
+            context_f = _validate_optional_str_list(args.get("context_files"), "context_files")
+            checklist_items = _validate_optional_str_list(args.get("checklist"), "checklist")
             qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
                 os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
             )
@@ -1214,6 +1351,9 @@ class MCPServer:
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
                 preload_files=preload_b,
                 auto_apply=False if will_run_qa else auto_apply_arg,
+                spec_files=spec_f,
+                context_files=context_f,
+                checklist=checklist_items,
             )
             if will_run_qa and qa_review_model:
                 digest = self._maybe_run_qa_review(

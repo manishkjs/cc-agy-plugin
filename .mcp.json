@@ -9,6 +9,7 @@
         "CC_AGY_USERCFG_GEMINI_API_KEY": "${user_config.gemini_api_key}",
         "CC_AGY_USERCFG_GOOGLE_CLOUD_PROJECT": "${user_config.google_cloud_project}",
         "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION": "${user_config.google_cloud_location}",
+        "CC_AGY_USERCFG_COST_PROFILE": "${user_config.cost_profile}",
         "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL": "${user_config.default_delegate_model}",
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL": "${user_config.default_ask_model}",
         "CC_AGY_USERCFG_STRICT_MODE": "${user_config.strict_delegation_mode}"

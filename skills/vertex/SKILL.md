@@ -10,16 +10,16 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
 1. **Single-Shot Review Tier (`ask_gemini`)**:
    - Calls Gemini directly via `google-genai` without loading the Antigravity SDK's built-in agent system prompt and tool declarations.
    - Use for architecture reviews, root-cause hypotheses, and second opinions on diffs or specific `context_files`.
-   - Default model: `gemini-2.5-flash` (override via `model=...` or `CC_AGY_DEFAULT_ASK_MODEL`).
+   - Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`, or override via `model=...` / `CC_AGY_DEFAULT_ASK_MODEL`).
 
-2. **Agentic Worker Tier (`delegate_start`, `delegate_result`, `get_diff`, `delegate_apply`, `delegate_revert`, `delegate_continue`, `delegate_cancel`, `delegate_to_gemini`, `cost_report`)**:
+2. **Agentic Worker Tier (`delegate_start`, `delegate_result`, `get_diff`, `delegate_apply`, `delegate_revert`, `delegate_continue`, `delegate_cancel`, `delegate_to_gemini`, `cost_report`, `doctor`)**:
    - Spawns `google.antigravity.Agent` with `vertex=False` (`GeminiAPIEndpoint`) in API-key mode or `vertex=True` (`VertexEndpoint`) in Vertex AI mode.
-   - Default model: `gemini-3.1-pro-preview` (or pass `gemini-3.5-flash-lite`, `gemini-3.8-flash`, or `gemini-4-argon`).
-   - By default (`in_place=false`), runs inside a standalone git repository copy under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) initialized with `git init -b main`. Failed or timed-out runs leave your working tree untouched. Note: this provides git-level checkout isolation, not an OS container sandbox; worker commands execute with your user account's OS authority.
+   - Default model: `gemini-3.8-flash` under the default `balanced` cost profile, escalating automatically to `gemini-4-argon` on retries, failed checks, or overlapping follow-up fixes (`cost_profile="quality"` starts directly on `gemini-4-argon`; `cost_profile="economy"` stays on `gemini-3.8-flash`).
+   - By default (`in_place=false`), runs inside a standalone git repository copy under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) initialized with `git init -b main`. When `CC_AGY_SPARSE_WORKTREE=1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>` is set on large monorepos, passing `allowed_paths` materializes a scoped sparse copy (including 2-hop local imports) so worktree setup stays fast without marking omitted files as deleted. Failed or timed-out runs leave your working tree untouched. Note: this provides git-level checkout isolation, not an OS container sandbox; worker commands execute with your user account's OS authority.
    - With `in_place=true`, edits your live working tree directly (requires a clean tracked tree, one `in_place` job at a time, and no `allowed_paths`), unwinds any worker commits or branch switches back to the baseline commit while keeping file edits on disk, and provides a shell-quoted `undo_hint`.
-   - When `ctx-harness` (Straitjacket) is installed, replaces unbounded `RUN_COMMAND` with `run_command`, `ctx_get`, and `ctx_search` (capturing command outputs exceeding 240 lines or 4,000 tokens in a local evidence store).
+   - When `ctx-harness` (Straitjacket) is installed, replaces unbounded `RUN_COMMAND` with `run_command`, `ctx_get`, and `ctx_search` (capturing command outputs exceeding 400 lines or 6,000 tokens in a local evidence store).
    - Always pass outcome-oriented prompts (never paste more than 8 consecutive lines of implementation code into `prompt` or `plan`).
-   - Pass `plan` (up to 15 outcome steps), `acceptance` (up to 5 read-only check commands such as `["pytest -q"]`), `max_tool_calls` (default `100`), `max_total_tokens` (default `5,000,000`), and `allowed_paths` when delegating scoped tasks.
+   - Pass `plan` (up to 15 outcome steps), `acceptance` (up to 5 read-only check commands such as `["pytest -q"]`, `["go test ./..."]`, `["cargo test"]`, or `["npx vitest run"]`), `max_tool_calls` (default `40` on Flash, `100` on Argon), `max_total_tokens` (default `5,000,000`), and `allowed_paths` when delegating scoped tasks.
    - Every run writes an HMAC-SHA256 signed receipt in `$CC_AGY_DATA_DIR` / `$CLAUDE_PLUGIN_DATA` (or `~/.cache/cc-agy-plugin/<workspace-slug>/receipts/<job_id>.json`).
 
 ## Pick the route first
@@ -56,10 +56,10 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
    - `intent` is the outcome in prose (no pasted code). `interface` is the exact import or signature other files rely on, so writers working in parallel agree on how files connect.
    - `depends_on` orders tasks; `repro_test` (optional) is a test that must fail before the change and pass after it.
    - Checks and acceptance must be read-only test or lint commands. Tasks that only run syntax/compile checks are listed in `syntax_only_tasks` in the digest.
-2. **Run it:** `delegate_file_batch(plan_path="/tmp/<task>-plan.json")`. Pass `model="mechanical"` (`gemini-3.5-flash-lite`) for purely mechanical file orders, or `read_budget=6` on messy brownfield repos where writers need up to 6 read-only lookups. A bad plan comes back as `status: "invalid_plan"` with every problem and its JSON path; fix them all in one edit.
+2. **Run it:** `delegate_file_batch(plan_path="/tmp/<task>-plan.json")`. Pass `read_budget=6` on brownfield repos where writers need up to 6 read-only lookups, or `model="gemini-4-argon"` for harder file specs. A bad plan comes back as `status: "invalid_plan"` with every problem and its JSON path; fix them all in one edit.
 3. **Read the digest:** each task is `landed`, `unchanged` (already done in a previous run), `failed` (with a short `check_tail`) or `held` (a dependency failed). Re-sending the same plan resumes the job and skips finished tasks at no cost.
 4. **Land it:** If `acceptance_passed=true` and `review_required`/`syntax_only_tasks` are empty, call `delegate_apply(job_id=...)` directly; otherwise spot-check with `get_diff(job_id=..., file_filter="...")` before `delegate_apply(job_id=...)`. Fix a failed task yourself, or adjust its intent and re-send.
-5. **Cost:** writers default to `gemini-3.8-flash` with LOW thinking (`gemini-3.5-flash-lite` when `model="mechanical"`); the third attempt goes to Claude (`claude -p`, no tools). Run `probe_writers` once per session to catch auth problems before a batch.
+5. **Cost:** writers default to `gemini-3.8-flash` with LOW thinking; the third attempt goes to Claude (`claude -p`, no tools). Run `doctor` for a zero-cost offline readiness check or `probe_writers` once per session to verify live writer auth before a batch.
 
 ## Agent worker workflow (`delegate_start`)
 

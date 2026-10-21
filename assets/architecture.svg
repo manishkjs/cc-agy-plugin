@@ -96,7 +96,7 @@
   <text class="body-bold" x="800" y="276">Straitjacket Containment (ctx.sdk)</text>
   <text class="body-text" x="800" y="295">Replaces unbounded RUN_COMMAND:</text>
   <text class="mono" x="800" y="315">• run_command() -&gt; run:&lt;id&gt;#stdout</text>
-  <text class="body-text" x="812" y="331">Caps output &gt;240 lines / &gt;4,000 tokens</text>
+  <text class="body-text" x="812" y="331">Caps output &gt;400 lines / &gt;6,000 tokens</text>
   <text class="mono" x="800" y="350">• ctx_get(addr, start, end)</text>
   <text class="mono" x="800" y="368">• ctx_search(addr, pattern)</text>
 

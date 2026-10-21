@@ -1120,9 +1120,12 @@ class TestCostControls(unittest.TestCase):
             res = jm.delegate_start("edit greet", project="p", wait=True)
             self.assertEqual(res["status"], "checkpoint")
             self.assertEqual(res["stop_reason"], "MAX_TOOL_CALLS_EXCEEDED")
-            self.assertEqual(res["budget"], {"max_tool_calls": 100, "max_total_tokens": 5_000_000})
-            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (100, 5_000_000))
+            self.assertEqual(res["budget"], {"max_tool_calls": 40, "max_total_tokens": 5_000_000})
+            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (40, 5_000_000))
             self.assertTrue(jm.delegate_apply(res["job_id"])["applied"])
+
+            argon_res = jm.delegate_start("edit greet argon", model="gemini-4-argon", project="p", wait=True)
+            self.assertEqual(argon_res["budget"], {"max_tool_calls": 100, "max_total_tokens": 5_000_000})
 
             no_cap = jm.delegate_start("x", project="p", wait=True, max_tool_calls=0, max_total_tokens=0)
             self.assertEqual(no_cap["budget"], {"max_tool_calls": None, "max_total_tokens": None})

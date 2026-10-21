@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-165%20passing-1e8e3e)](tests/)
+[![Tests](https://img.shields.io/badge/tests-209%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Antigravity-f9ab00)](#how-it-works)
 
@@ -31,7 +31,7 @@ Coding agents are good at understanding a problem but expensive when they also d
 | Today | With cc-agy-plugin |
 |:--|:--|
 | The agent re-reads the whole repo for every task | The worker gets a cached map of the repo and a short brief |
-| Edits can land in the wrong place or half-finished | Work happens in a copy and lands only after tests pass |
+| Edits can land in the wrong place or half-finished | Work happens in a copy; failed checks never auto-apply |
 | No record of which model changed which line | Every change has a signed receipt and a one-call undo |
 | Cost is a monthly surprise | Cost per job, in cents, including the agent's own session |
 | A timed-out run loses its work | Finished edits are applied and unfinished ones are saved |
@@ -67,10 +67,11 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, sa
 
 | Capability | What it does |
 |:--|:--|
-| **Delegation** | Start, continue, review and apply worker jobs from any MCP-capable agent |
+| **Delegation** | Start, continue, review and apply worker jobs (`gemini-3.8-flash` + `gemini-4-argon`) from any MCP-capable agent |
+| **Multi-language** | Auto-detects test runners and outlines across Python, TypeScript/JS, Go, Rust, Java/Kotlin and Make |
 | **Batch writing** | Many-file changes from one plan, with per-file checks and a cheap-first model ladder |
 | **Guardrails** | Strict mode routes all edits through the audited path; worker shell is fenced to the copy |
-| **Recovery** | Auto-apply on success, save on shutdown, resume a paused job instead of restarting |
+| **Diagnostics** | Offline `/cc-agy-plugin:doctor` checks auth, SDKs, `cost_profile`, git state and test runners at zero token cost |
 | **Accounting** | Signed receipts per job and a true-total cost report that includes the agent's session |
 
 ## Get started
@@ -94,7 +95,7 @@ Then ask your agent: *"Use `delegate_start` to add input validation to `api/orde
 | Item | Detail |
 |:--|:--|
 | **Version** | 0.2.0, Apache 2.0 |
-| **Quality** | 165 automated tests |
+| **Quality** | 209 automated tests |
 | **Known gap** | If another process force-kills the plugin server, unapplied worker edits are not saved |
 | **Next** | Finish the 33-task benchmark, run the full flow inside Antigravity, publish cost guidance per pattern |
 
@@ -116,7 +117,7 @@ Setup, internals and configuration for engineers. Click a section to expand it.
    - Reviews the token-paginated git diff returned by the worker and decides whether to merge it (`delegate_apply`) or send follow-up instructions (`delegate_continue`).
 2. **Google Antigravity SDK + Gemini executes in an isolated copy**:
    - Spins up a headless Antigravity agent inside a standalone git repository copy (or `in_place` when requested).
-   - **Straitjacket (`ctx-harness`) shell containment** intercepts noisy test and build outputs (>240 lines or >4,000 tokens), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite does not flood the worker's context window.
+   - **Straitjacket (`ctx-harness`) shell containment** intercepts noisy test and build outputs (>400 lines or >6,000 tokens), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite does not flood the worker's context window.
 3. **Your working tree stays clean until verified (Git-Level Isolation)**:
    - In the default isolated mode (`in_place=false`), the worker edits a standalone copy of tracked files under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`), so failed or timed-out runs leave uncommitted files in your checkout untouched. Changes are only merged when `delegate_apply` verifies baseline SHA-256 hashes (using a 3-way merge when needed) and records an HMAC-SHA256 signed receipt.
    - *Security note*: Isolated copies provide git-level checkout isolation, not an OS container or VM sandbox. Worker shell commands run with your local user account's OS permissions; HMAC receipts and child-env scrubbing enforce workflow provenance and prevent accidental secret leakage, not isolation against a hostile local process running as the same OS user. The plugin snapshots and restores host `.git/hooks` and `.git/config` around every run.
@@ -128,10 +129,10 @@ Configured model rates in `server/regions.py` per 1M tokens (for single model ca
 | Model | Role | Uncached Input / 1M | Cached Input / 1M | Output / 1M |
 |---|---|---|---|---|
 | **Claude Opus 5.5** | Lead Planner & Reviewer (Unverified assumed proxy list rate) | $4.00 | $0.40 | $20.00 |
-| **Gemini 3.1 Pro / Gemini 4 Argon** | Frontier Reasoning Worker (Default) | $2.00 | $0.20 | $12.00 |
-| **Gemini 3.8 Flash** | Fast Daily Coding Worker | $0.50 | $0.05 | $3.00 |
-| **Gemini 3.5 Flash-Lite** | High-Volume Execution Worker | $0.10 | $0.01 | $0.40 |
-| **Gemini 2.5 Flash** | Single-Shot Review (`ask_gemini` Default) | $0.30 | $0.03 | $2.50 |
+| **Gemini 3.8 Flash** | Default Worker & Review Model (`balanced` / `economy`) | $0.50 | $0.05 | $3.00 |
+| **Gemini 4 Argon** | Escalation & `quality` Profile Reasoning Worker | $2.00 | $0.20 | $12.00 |
+| **Gemini 3.1 Pro** | Supported Pro Preview Model | $2.00 | $0.20 | $12.00 |
+| **Gemini 2.5 Flash** | Supported Regional Review Model | $0.30 | $0.03 | $2.50 |
 
 Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` reports cumulative workspace spend in USD and cents based on the rate table in `server/regions.py`, and the `cost_report` tool adds your Claude Code session's own cost on top for the true total.
 
@@ -186,13 +187,16 @@ claude --plugin-dir /path/to/cc-agy-plugin
 3. `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY` in the environment -> **Google AI Studio** (`auth_mode="api_key"`, even if `GOOGLE_CLOUD_PROJECT` is also exported in the shell).
 4. `GOOGLE_CLOUD_PROJECT`, `VERTEX_PROJECT`, `GCLOUD_PROJECT`, `CLOUD_ML_PROJECT_ID`, or `CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT` in the environment -> **Vertex AI** (`auth_mode="vertex"`).
 
-### Default Models & Overrides
+### Cost Profiles, Default Models & Overrides
 
-- **`delegate_start` / `delegate_to_gemini`**: defaults to `gemini-3.1-pro-preview` (override per call with `model="gemini-3.5-flash-lite"`, `model="gemini-3.8-flash"`, or `model="gemini-4-argon"`, or globally via `CC_AGY_DEFAULT_DELEGATE_MODEL` / `userConfig.default_delegate_model`).
-- **`ask_gemini`**: defaults to `gemini-2.5-flash` (override per call with `model=...` or globally via `CC_AGY_DEFAULT_ASK_MODEL` / `userConfig.default_ask_model`).
+Set `userConfig.cost_profile` in Claude Code (or `CC_AGY_COST_PROFILE`) to choose how the plugin balances cost and reasoning depth:
+- **`balanced` (default)**: `delegate_start`, `delegate_to_gemini`, and `ask_gemini` start on `gemini-3.8-flash` (`LOW` thinking on mutating turns) and automatically escalate to `gemini-4-argon` (`HIGH` thinking) on retries, failed checks, or overlapping follow-up fixes. Unrelated follow-on tasks in the same session stay on `gemini-3.8-flash`.
+- **`economy`**: keeps all worker and `ask_gemini` calls on `gemini-3.8-flash` and disables automatic escalation to `gemini-4-argon`.
+- **`quality`**: starts `delegate_start`, `delegate_to_gemini`, and `ask_gemini` directly on `gemini-4-argon` with `MEDIUM`/`HIGH` thinking.
+- **Explicit overrides**: pass `model="gemini-3.8-flash"` or `model="gemini-4-argon"` per call, or set `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL`.
 
-Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, then try:
-> *"Use `delegate_start` with `model="gemini-3.5-flash-lite"` to add a `hello()` function in `hello.py`, inspect the change with `get_diff`, and apply it with `delegate_apply`."*
+Inside Claude Code, run `/mcp` or `/cc-agy-plugin:doctor` to verify the `vertex` MCP server, SDKs, and repository test runner are ready, then try:
+> *"Use `delegate_start` to add a `hello()` function with unit tests, inspect the change with `get_diff`, and apply it with `delegate_apply`."*
 
 ---
 
@@ -222,31 +226,33 @@ Inside Claude Code, run `/mcp` to verify the `vertex` MCP server is connected, t
 </details>
 
 <details>
-<summary><b>MCP tools reference (17 tools)</b></summary>
+<summary><b>MCP tools reference (18 tools)</b></summary>
 
 | Tool | Purpose |
 |---|---|
-| `ask_gemini` | Fast single-shot query via `google-genai` (without loading the Antigravity SDK's agent prompt and tool declarations). Best for code reviews, architecture checks, and second opinions. Default model: `gemini-2.5-flash`. |
-| `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, `api_key`, and `project`. Default model: `gemini-3.1-pro-preview`. |
+| `ask_gemini` | Fast single-shot query via `google-genai` (without loading the Antigravity SDK's agent prompt and tool declarations). Best for code reviews, architecture checks, and second opinions. Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`). |
+| `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, `api_key`, and `project`. Default model: `gemini-3.8-flash` (auto-escalating to `gemini-4-argon` on retries). |
 | `delegate_result` | Wait for a background job to finish (default `240s` wait cap so Claude Code's 5-minute prompt cache stays warm) and return its compact digest. |
 | `delegate_status` | Inspect live progress signals (`report_to_lead`), token usage, and USD/cents cost for a single `job_id`, or omit `job_id` to list recent jobs and cumulative totals for the active workspace. |
 | `get_diff` | Retrieve the unified git diff from a job's worktree, filtered by file or glob and paginated by token budget (`default: 4000`, `max: 8000` tokens per page). |
 | `delegate_apply` | Verify host file SHA-256 hashes against the job's baseline, apply the diff (with 3-way merge fallback), back up each target file's pre-apply bytes, record provenance hashes on the HMAC receipt, and clean up the worktree. |
 | `delegate_revert` | Undo an applied job (isolated or `in_place`): restore every file it touched to its pre-apply state. Refuses, and writes nothing, if any of those files changed after the apply; `skip_dirty=true` reverts only the clean ones, `dry_run=true` only reports. |
-| `delegate_continue` | Send a follow-up instruction into an existing job's worktree (preserving the job's `auth_mode`, `plan`, `acceptance`, and budget caps across turns). After two failed turns in a row (acceptance failed, error or timeout; set `CC_AGY_ESCALATE_AFTER_FAILURES`), the job is escalated to the Lead and further Gemini attempts are refused unless `force_retry=true`. |
+| `delegate_continue` | Send a follow-up instruction into an existing job's worktree (preserving the job's `auth_mode`, `plan`, `acceptance`, and budget caps across turns). Under `balanced` routing, a failed Flash turn escalates to `gemini-4-argon`; after two consecutive failed turns on the active model (set `CC_AGY_ESCALATE_AFTER_FAILURES`), the job is escalated to the Lead unless `force_retry=true`. |
 | `cost_report` | Dispatched cost (Gemini calls from receipts) vs true total cost (dispatched plus the Claude Code lead session, rebuilt from its transcripts under `~/.claude/projects/<hash>/` or `$CLAUDE_CONFIG_DIR/projects/<hash>/`). Also runs as `python -m server.true_cost --workspace .`. |
 | `delegate_cancel` | Cancel an in-flight worker job and remove its temporary worktree. |
 | `delegate_file_batch` | Write many files from one Lead-authored plan in a single call: single-shot writers (no exploration), per-task checks in an isolated job copy, retry with the failure output, Claude as the third attempt, compact per-task digest, resumable. Land with `get_diff` + `delegate_apply`. |
+| `batch_task_log` | Retrieve stored check output, writer prompt excerpt, or raw writer response for one task in a `delegate_file_batch` job (`attempt` optional). |
 | `draft_document` | One new doc from purpose, audience, sections and facts whose quotes are verified verbatim; must contain every section and link only to real paths. |
 | `write_tests_from_cases` | One new test file from named cases; every case and expected value must appear verbatim and the test command must pass. |
 | `replicate_edit` | Repeat a change you made by hand in one file across other files as exact edits, then run one check. |
 | `probe_writers` | Preflight each configured writer with a tiny call; fails fast with the exact fix. |
+| `doctor` | Zero-network readiness check: verifies MCP tools, `cost_profile`, auth config (redacting keys), installed SDKs, git workspace status, detected language test runner, and receipt store writability. |
 | `delegate_to_gemini` | Synchronous convenience wrapper: runs `delegate_start(..., wait=true)` and automatically calls `delegate_apply` if `status == "ok"` (leaving `checkpoint`, `needs_input` and escalated jobs unapplied without flagging `is_error`). |
 
 ### Cost scope, escalation and undo
 
 - **Dispatched vs true total.** Receipts only see what the plugin sent to Gemini. The Claude Code lead's own loop (reasoning, file reads, reviewing diffs) is billed separately and is often most of the bill. `cost_report` adds it back from the session transcripts, priced per model at Claude list rates (override with `CC_AGY_LEAD_RATES`), and keeps the two figures side by side. Compare setups on true total.
-- **Escalate after two failures.** The worker gets two consecutive attempts. On the second failure the digest carries `escalation.escalate_to_lead=true` and a recommendation: the Lead (Opus) takes over with `get_diff`, finishes the work itself, or discards the job.
+- **Escalate after two failures.** Each active worker model gets up to two consecutive attempts (in `balanced` mode, a failed Flash turn escalates first to `gemini-4-argon`). On the second consecutive failure on the active model, the digest carries `escalation.escalate_to_lead=true` and a recommendation: the Lead takes over with `get_diff`, finishes the work itself, or discards the job.
 - **Revert.** `delegate_apply` backs up the pre-apply bytes of every file it writes under `<data_dir>/backups/<job_id>/` and signs their hashes into the receipt. `delegate_revert` restores them and records `reverted_files`; the strict-mode Stop hook treats reverted files as expected to be back at their pre-apply content.
 
 ---
@@ -303,16 +309,18 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 
 | Variable | Default | What it does |
 |---|---|---|
+| `CC_AGY_COST_PROFILE` | `balanced` | Preset controlling model routing and escalation: `economy` (Flash only), `balanced` (Flash first, Argon on retries/follow-ups), or `quality` (Argon first). |
 | `CC_AGY_AUTO_APPLY_ON_PASS` | on in strict mode, off otherwise | Applies a finished worker diff automatically when the job is `ok`, changed files, did not fail acceptance and has no scope violations. Set `0` to always apply by hand. |
 | `CC_AGY_SALVAGE_ON_SHUTDOWN` | on in bounded Lead sessions | When the MCP server shuts down with no applied job, applies the best unapplied worker edits so a timed-out Lead does not leave an empty patch. |
-| `CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE` | on in strict mode | Routes a second `delegate_start` to `delegate_continue` on the latest paused (`timeout`, `checkpoint`, `needs_input`, failed acceptance) job instead of starting over. |
+| `CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE` | on in strict mode | Routes a second `delegate_start` to `delegate_continue` on the latest paused (`timeout`, `checkpoint`, `needs_input`, failed acceptance) job when scopes overlap instead of starting over. |
+| `CC_AGY_SPARSE_WORKTREE` | off (opt-in via `1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>`) | Materializes only scoped directories, directly imported modules, configs, and matching tests for large monorepos when `allowed_paths` is set. |
 | `CC_AGY_MIN_VIEW_LINES` | `250` | Widens small `view_file` reads to at least this many lines. `0` disables it. |
 | `CC_AGY_QA_REVIEW_MODEL` | unset | Runs a spec-vs-diff QA review with this model before auto-apply (also `qa_review_model` per call). |
-| `CC_AGY_TOOL_PROFILE` | `core` in strict mode, `full` otherwise | `core` exposes only the 8 delegation tools, which cuts the MCP tool list from about 6,800 to about 2,500 tokens. |
+| `CC_AGY_TOOL_PROFILE` | `core` in strict mode, `full` otherwise | `core` exposes only the 9 core delegation and diagnostic tools, which cuts the MCP tool list from about 6,800 to under 1,250 tokens. |
 | `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`) | `2` in strict mode | Caps direct Lead file reads so the Lead delegates instead of reading the repo twice. `0` removes the cap. |
 | `CC_AGY_VERTEX_BASE_URL` (alias `GOOGLE_VERTEX_BASE_URL`) | unset | Sends worker and `ask_gemini` calls to a custom Vertex-compatible endpoint, such as a corporate gateway. `CC_AGY_VERTEX_BASE_URL_TOKEN` sets the bearer token it receives. |
 
-Acceptance runs also add existing tests for each changed module (`tests/test_<module>.py` or `<module>_test.py`), and job results include a `next_action` hint for the Lead.
+Acceptance runs automatically discover related tests across Python (`pytest`, `unittest`, `bin/test`), Node.js/TypeScript (`vitest`, `jest`, `pnpm`, `yarn`, `bun`, `node --test`), Go (`go test`), Rust (`cargo test`), JVM (`gradlew`, `mvnw`, `mvn`), and `Makefile`, and job results include a `next_action` hint for the Lead.
 
 </details>
 
@@ -355,6 +363,7 @@ cc-agy-plugin/
 │   ├── verify.py            # Runs verification commands for file tasks
 │   ├── assist_tools.py      # Small bounded helper tools for normal chat
 │   ├── true_cost.py         # Dispatched cost vs. true total cost
+│   ├── doctor.py            # Offline readiness diagnostics (auth, SDKs, git, test runner, receipts)
 │   └── harness_validator.py # Pre-flight check of prompt budgets, skills, scripts, and hooks
 ├── skills/
 │   └── vertex/
@@ -363,16 +372,18 @@ cc-agy-plugin/
 │   └── gemini-delegator.md  # Orchestrator subagent (disallowedTools: Write, Edit, ...)
 ├── commands/
 │   ├── delegate.md          # /cc-agy-plugin:delegate slash command
+│   ├── doctor.md            # /cc-agy-plugin:doctor slash command
 │   ├── jobs.md              # /cc-agy-plugin:jobs slash command
 │   └── cost.md              # /cc-agy-plugin:cost slash command
 ├── hooks/
-│   └── hooks.json           # SessionStart, PreToolUse, PostToolUse, and Stop hook registrations
+│   └── hooks.json           # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
 ├── scripts/
-│   ├── session_start.py     # SessionStart hook: records the per-session baseline
+│   ├── session_start.py     # SessionStart hook: records the per-session baseline and --doctor CLI
+│   ├── user_prompt_submit.py # UserPromptSubmit hook: records prompt timestamp and resets read budgets
 │   ├── pre_tool_guard.py    # Strict mode PreToolUse guard + 9-line code dictation linter
 │   ├── post_tool_ledger.py  # PostToolUse MCP audit logger
 │   └── provenance_check.py  # Stop-hook git diff vs HMAC-receipt provenance verifier
-├── tests/                   # Plugin, batch, writer, assist-tool, and harness guardrail suites
+├── tests/                   # Plugin, batch, writer, assist-tool, generality, and guardrail suites
 └── LICENSE                  # Apache License 2.0
 ```
 
@@ -382,7 +393,7 @@ cc-agy-plugin/
 <summary><b>Running tests</b></summary>
 
 ```bash
-pytest tests/ -q   # 165 tests
+pytest tests/ -q   # 209 tests
 ```
 
 </details>

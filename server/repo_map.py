@@ -36,6 +36,14 @@ _TS_SIG_RE = re.compile(
 )
 _GO_SIG_RE = re.compile(r"^(?:func\s+(?:\([^)]+\)\s*)?[A-Z][A-Za-z0-9_]*\s*\([^)]*\)|type\s+[A-Z][A-Za-z0-9_]*\s+(?:struct|interface))", re.M)
 _RS_SIG_RE = re.compile(r"^\s*pub\s+(?:async\s+)?(?:fn|struct|enum|trait)\s+[A-Za-z_][A-Za-z0-9_]*", re.M)
+_JAVA_KT_SIG_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:(?:public|protected|internal)\s+)?(?:static\s+|final\s+|abstract\s+|sealed\s+|data\s+|open\s+|override\s+|suspend\s+|inline\s+|operator\s+)*(?:class|interface|enum|record|object|fun)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)\n]*\))?"
+    r"|"
+    r"(?:public|protected)\s+(?:static\s+|final\s+|synchronized\s+|abstract\s+|default\s+)*(?:<[^>\n]+>\s+)?[A-Za-z_][A-Za-z0-9_<>,.\[\]?]*\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)\n]*\)"
+    r")",
+    re.M,
+)
 
 _MAX_CACHE_ENTRIES = 16
 _MEM_CACHE: dict[str, str] = {}
@@ -222,6 +230,13 @@ def _extract_signatures(path: Path, ext: str, limit: int = 8) -> list[str]:
             out.append(f"{sig[:88]} (L{lineno})")
             if len(out) >= limit:
                 break
+    elif ext in (".java", ".kt"):
+        for m in _JAVA_KT_SIG_RE.finditer(text):
+            lineno = _line_number_at(text, m.start())
+            sig = " ".join(m.group(0).split())
+            out.append(f"{sig[:88]} (L{lineno})")
+            if len(out) >= limit:
+                break
     return out
 
 
@@ -272,16 +287,37 @@ def _detect_test_hints(root: Path, files: list[str]) -> list[str]:
     file_set = set(files)
     if "pyproject.toml" in file_set or "pytest.ini" in file_set or any(f.startswith("tests/") and f.endswith(".py") for f in files):
         hints.append("pytest -q")
+    elif "manage.py" in file_set:
+        hints.append("python3 manage.py test")
     if "package.json" in file_set:
+        pm = "npm"
+        if "pnpm-lock.yaml" in file_set:
+            pm = "pnpm"
+        elif "yarn.lock" in file_set:
+            pm = "yarn"
+        elif "bun.lockb" in file_set or "bun.lock" in file_set:
+            pm = "bun"
         try:
             pkg = json.loads((root / "package.json").read_text(encoding="utf-8", errors="replace"))
             scripts = (pkg.get("scripts") or {}) if isinstance(pkg, dict) else {}
             for k in ("test", "typecheck", "lint", "build"):
                 if k in scripts:
-                    hints.append(f"npm run {k}")
+                    hints.append(f"{pm} test" if k == "test" else f"{pm} run {k}")
         except Exception:
             pass
-    return hints[:4]
+    if "go.mod" in file_set:
+        hints.append("go test ./...")
+    if "Cargo.toml" in file_set:
+        hints.append("cargo test --quiet")
+    if "gradlew" in file_set:
+        hints.append("./gradlew test")
+    elif "build.gradle" in file_set or "build.gradle.kts" in file_set:
+        hints.append("gradle test")
+    elif "mvnw" in file_set:
+        hints.append("./mvnw -q test")
+    elif "pom.xml" in file_set:
+        hints.append("mvn -q test")
+    return hints[:5]
 
 
 def repo_map_cache_key(workspace_root: Path, *, _info: tuple[str, list[str]] | None = None) -> str:
