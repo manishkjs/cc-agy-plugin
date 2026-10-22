@@ -675,6 +675,7 @@ def test_daily_budget_cap_blocks_paid_dispatches_and_surfaces_in_doctor(
         assert err_payload["max_daily_cents"] == 5.0
         assert calls == 1
 
+        monkeypatch.setattr("server.doctor._module_available", lambda _name: True)
         doc = run_doctor(workspace_root=repo, store=store)
         assert doc["healthy"] is True
         assert doc["daily_budget"]["exceeded"] is True
