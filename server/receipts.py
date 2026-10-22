@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import hmac
@@ -14,9 +15,9 @@ import secrets
 import subprocess
 import tempfile
 import time
-from typing import Any
+from typing import Any, Mapping
 
-from server.regions import estimate_cost_usd
+from server.regions import estimate_cost_usd, resolve_max_daily_cents
 
 _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _BINARY_DIFF_RE = re.compile(r"^Binary files (.+?) and (.+?) differ$")
@@ -172,6 +173,11 @@ def resolve_workspace_root(
         env_proj = (source_env.get("CLAUDE_PROJECT_DIR") or "").strip()
         if env_proj and not env_proj.startswith("${"):
             base = Path(env_proj).resolve()
+    if base is None:
+        # Host-neutral override for MCP clients that launch the server outside the project directory.
+        env_ws = (source_env.get("CC_AGY_WORKSPACE_ROOT") or "").strip()
+        if env_ws and not env_ws.startswith("${"):
+            base = Path(env_ws).expanduser().resolve()
     if base is None:
         base = Path.cwd().resolve()
 
@@ -888,3 +894,98 @@ class ReceiptStore:
             m_entry["total_cost_cents"] = round(m_entry["total_cost_usd"] * 100.0, 6)
 
         return totals
+
+    def daily_spend_summary(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+        now_epoch: float | None = None,
+    ) -> dict[str, Any]:
+        """Sum Gemini spend in cents across receipts stamped on the current UTC calendar day."""
+        now_ts = float(now_epoch if now_epoch is not None else time.time())
+        utc_day = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        target_ws = workspace_root if workspace_root is not None else self.workspace_root
+        receipts = self.list_receipts(workspace_root=target_ws)
+        spent_usd = 0.0
+        jobs_today = 0
+        for rec in receipts:
+            stamp = float(rec.get("finished_at_epoch") or rec.get("started_at_epoch") or 0.0)
+            if stamp <= 0.0:
+                continue
+            if datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d") != utc_day:
+                continue
+            jobs_today += 1
+            usage = rec.get("usage") or {}
+            cost = rec.get("cost") or estimate_cost_usd(
+                str(rec.get("model") or "gemini-3.8-flash"),
+                usage,
+                single_request=(rec.get("kind") == "ask"),
+            )
+            spent_usd = round(spent_usd + float(cost.get("total_cost_usd") or 0.0), 8)
+        spent_cents = round(spent_usd * 100.0, 6)
+        return {
+            "utc_date": utc_day,
+            "jobs_today": jobs_today,
+            "spent_today_usd": spent_usd,
+            "spent_today_cents": spent_cents,
+            "workspace_root": str(Path(target_ws).resolve()) if target_ws else None,
+        }
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised before launching a paid model call when today's spend has reached CC_AGY_MAX_DAILY_CENTS."""
+
+    def __init__(
+        self,
+        *,
+        spent_today_cents: float,
+        max_daily_cents: float,
+        utc_date: str,
+        workspace_root: str | None = None,
+    ) -> None:
+        self.spent_today_cents = round(float(spent_today_cents), 6)
+        self.max_daily_cents = round(float(max_daily_cents), 6)
+        self.utc_date = utc_date
+        self.workspace_root = workspace_root
+        super().__init__(
+            f"Daily Gemini budget reached ({self.spent_today_cents:.2f}c spent today on {utc_date} UTC; "
+            f"limit is {self.max_daily_cents:.2f}c). Raise or unset CC_AGY_MAX_DAILY_CENTS (or userConfig.max_daily_cents) "
+            "to run more Gemini tasks today, or handle this change directly on the host agent."
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": "budget_exceeded",
+            "is_error": True,
+            "utc_date": self.utc_date,
+            "spent_today_cents": self.spent_today_cents,
+            "max_daily_cents": self.max_daily_cents,
+            "workspace_root": self.workspace_root,
+            "error": str(self),
+        }
+
+
+def enforce_daily_budget(
+    store: ReceiptStore,
+    *,
+    workspace_root: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any] | None:
+    """Check today's workspace spend against CC_AGY_MAX_DAILY_CENTS and raise BudgetExceededError if reached."""
+    cap_cents = resolve_max_daily_cents(env)
+    if cap_cents is None:
+        return None
+    summary = store.daily_spend_summary(workspace_root=workspace_root, now_epoch=now_epoch)
+    spent_cents = float(summary["spent_today_cents"])
+    summary["max_daily_cents"] = cap_cents
+    summary["remaining_cents"] = round(max(0.0, cap_cents - spent_cents), 6)
+    summary["exceeded"] = spent_cents >= cap_cents
+    if spent_cents >= cap_cents:
+        raise BudgetExceededError(
+            spent_today_cents=spent_cents,
+            max_daily_cents=cap_cents,
+            utc_date=str(summary["utc_date"]),
+            workspace_root=summary.get("workspace_root"),
+        )
+    return summary

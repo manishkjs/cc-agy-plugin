@@ -9,11 +9,13 @@ import time
 from typing import Any, Callable
 import uuid
 
-from server.receipts import ReceiptStore, resolve_workspace_root
+from server.receipts import ReceiptStore, enforce_daily_budget, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     resolve_auth_config,
     resolve_default_ask_model,
+    resolve_vertex_base_url,
+    resolve_vertex_base_url_token,
     sanitize_placeholder_env,
     truncate_to_token_budget,
 )
@@ -49,20 +51,16 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
 
     sanitize_placeholder_env()
     timeout_ms = int(request.get("timeout_ms") or 600_000)
-    vertex_base_url = (
-        request.get("base_url")
-        or os.environ.get("CC_AGY_VERTEX_BASE_URL")
-        or os.environ.get("GOOGLE_VERTEX_BASE_URL")
-        or ""
-    ).strip()
+    vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
     if request.get("api_key"):
         http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(api_key=request["api_key"], http_options=http_opts)
     elif vertex_base_url:
+        gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
         http_opts = genai_types.HttpOptions(
             timeout=timeout_ms,
             base_url=vertex_base_url,
-            headers={"Authorization": "Bearer " + os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN", "custom-endpoint")},
+            headers={"Authorization": f"Bearer {gateway_tok}"},
         )
         client = genai.Client(
             vertexai=True,
@@ -150,6 +148,7 @@ def ask_gemini(
 
     ws_root = resolve_workspace_root(workspace_root)
     receipt_store = store or ReceiptStore(workspace_root=ws_root)
+    enforce_daily_budget(receipt_store, workspace_root=ws_root)
 
     chosen_model = resolve_default_ask_model(model, env=os.environ)
 

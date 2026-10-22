@@ -30,6 +30,7 @@ import uuid
 from server.batch_journal import BatchJournal
 from server.batch_plan import BatchPlan, FileTask, needs_review
 from server.model_routes import BatchSettings
+from server.receipts import enforce_daily_budget
 from server.repo_map import build_repo_map
 from server.task_graph import DONE_STATES, run_task_graph
 from server.verify import failure_tail, has_behavioral_check, run_commands
@@ -306,6 +307,7 @@ class FileBatchRunner:
         content_gate: ContentGate | None = None,
         shared_note: str = "",
     ) -> dict[str, Any]:
+        enforce_daily_budget(self.store, workspace_root=self.root)
         lock, lock_file = self._plan_lock(plan)
         with lock, open(lock_file, "w", encoding="utf-8") as handle:
             # One run per plan at a time (threads and processes); a concurrent identical call waits,

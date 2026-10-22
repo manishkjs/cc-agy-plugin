@@ -59,13 +59,22 @@ def _maybe_reexec_into_sdk_venv() -> None:
     if importlib.util.find_spec("google.antigravity") is not None:
         return
 
-    for candidate in (
+    candidates = [
         PLUGIN_ROOT / ".venv" / "bin" / "python",
         PLUGIN_ROOT.parent / ".venv" / "bin" / "python",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            os.environ["_CC_AGY_REEXEC"] = "1"
-            os.execv(str(candidate), [str(candidate), *sys.argv])
+    ]
+    usable = [c for c in candidates if c.is_file() and os.access(c, os.X_OK)]
+    # Prefer a virtualenv that actually has the SDK installed; fall back to the first one that exists.
+    with_sdk = [c for c in usable if _venv_has_antigravity(c)]
+    for candidate in with_sdk or usable[:1]:
+        os.environ["_CC_AGY_REEXEC"] = "1"
+        os.execv(str(candidate), [str(candidate), *sys.argv])
+
+
+def _venv_has_antigravity(python_bin: Path) -> bool:
+    """True when the virtualenv owning `python_bin` has google-antigravity in site-packages."""
+    venv_dir = python_bin.parent.parent
+    return any(venv_dir.glob("lib/python3*/site-packages/google/antigravity/__init__.py"))
 
 
 _maybe_reexec_into_sdk_venv()

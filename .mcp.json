@@ -12,7 +12,10 @@
         "CC_AGY_USERCFG_COST_PROFILE": "${user_config.cost_profile}",
         "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL": "${user_config.default_delegate_model}",
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL": "${user_config.default_ask_model}",
-        "CC_AGY_USERCFG_STRICT_MODE": "${user_config.strict_delegation_mode}"
+        "CC_AGY_USERCFG_STRICT_MODE": "${user_config.strict_delegation_mode}",
+        "CC_AGY_USERCFG_VERTEX_BASE_URL": "${user_config.vertex_base_url}",
+        "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN": "${user_config.vertex_base_url_token}",
+        "CC_AGY_USERCFG_MAX_DAILY_CENTS": "${user_config.max_daily_cents}"
       },
       "timeout": 1800000
     }

@@ -22,6 +22,8 @@ from server.regions import (
     resolve_cost_profile,
     resolve_default_ask_model,
     resolve_default_delegate_model,
+    resolve_max_daily_cents,
+    resolve_vertex_base_url,
 )
 
 
@@ -87,9 +89,7 @@ def run_doctor(
         mcp_info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     # 2. Authentication configuration (never expose raw API key values)
-    custom_gateway = bool(
-        (active_env.get("CC_AGY_VERTEX_BASE_URL") or active_env.get("GOOGLE_VERTEX_BASE_URL") or "").strip()
-    )
+    custom_gateway = bool(resolve_vertex_base_url(env=active_env))
     auth_info: dict[str, Any]
     try:
         resolved_auth = resolve_auth_config(model=default_delegate_model, env=dict(active_env))
@@ -181,9 +181,10 @@ def run_doctor(
         "detected_test_runner": detected_runner,
     }
 
-    # 5. Receipt store writability
+    # 5. Receipt store writability and daily spend budget
     store_writable = False
     data_dir_str = ""
+    daily_budget_info: dict[str, Any] = {"max_daily_cents": None}
     try:
         active_store = store or ReceiptStore(workspace_root=ws_path)
         data_dir_str = str(active_store.data_dir)
@@ -192,6 +193,20 @@ def run_doctor(
         probe_file.write_text("ok", encoding="utf-8")
         probe_file.unlink(missing_ok=True)
         store_writable = True
+        cap_cents = resolve_max_daily_cents(active_env)
+        today = active_store.daily_spend_summary(workspace_root=ws_path)
+        daily_budget_info = {
+            **today,
+            "max_daily_cents": cap_cents,
+            "remaining_cents": round(max(0.0, cap_cents - float(today["spent_today_cents"])), 6) if cap_cents is not None else None,
+            "exceeded": bool(cap_cents is not None and float(today["spent_today_cents"]) >= cap_cents),
+        }
+        if daily_budget_info["exceeded"]:
+            warnings.append(
+                f"Daily Gemini budget reached ({today['spent_today_cents']:.2f}c / {cap_cents:.2f}c on {today['utc_date']} UTC)."
+            )
+    except ValueError as exc:
+        issues.append(str(exc))
     except Exception as exc:
         issues.append(f"Receipt store directory is not writable: {type(exc).__name__}: {exc}")
     receipt_store_info = {
@@ -213,6 +228,7 @@ def run_doctor(
         "sdks": sdk_info,
         "workspace": workspace_info,
         "receipt_store": receipt_store_info,
+        "daily_budget": daily_budget_info,
         "issues": issues,
         "warnings": warnings,
         "remediations": list(dict.fromkeys(remediations)),

@@ -24,6 +24,8 @@ from server.regions import (
     is_strict_mode_enabled,
     resolve_auth_config,
     resolve_cost_profile,
+    resolve_vertex_base_url,
+    resolve_vertex_base_url_token,
     sanitize_placeholder_env,
 )
 
@@ -1666,12 +1668,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             options=options,
         )
     else:
-        vertex_base_url = (
-            request.get("base_url")
-            or os.environ.get("CC_AGY_VERTEX_BASE_URL")
-            or os.environ.get("GOOGLE_VERTEX_BASE_URL")
-            or ""
-        ).strip()
+        vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
         ep_kwargs: dict[str, Any] = {
             "project": request["project"],
             "location": request["location"],
@@ -1679,7 +1676,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         }
         if vertex_base_url:
             ep_kwargs["base_url"] = vertex_base_url
-            ep_kwargs["api_key"] = os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN", "custom-endpoint")
+            ep_kwargs["api_key"] = resolve_vertex_base_url_token() or "custom-endpoint"
         endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     resolved_model = str(request.get("model") or "")

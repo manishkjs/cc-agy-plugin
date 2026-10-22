@@ -1,0 +1,20 @@
+{
+  "name": "cc-agy",
+  "interface": {
+    "displayName": "CC Agy Plugin"
+  },
+  "plugins": [
+    {
+      "name": "cc-agy-plugin",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cc-agy-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

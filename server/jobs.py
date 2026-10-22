@@ -31,7 +31,9 @@ from server.agy_runner import (
 )
 from server.repo_map import build_focused_file_outline, build_repo_map
 from server.receipts import (
+    BudgetExceededError,
     ReceiptStore,
+    enforce_daily_budget,
     extract_diff_provenance,
     parse_diff_git_header,
     parse_unified_header_path,
@@ -502,16 +504,51 @@ def worker_turn_failed(status: str | None, acceptance_passed: bool | None) -> bo
     """A turn fails when its acceptance checks fail or the worker errors or times out."""
     return acceptance_passed is False or status in ("error", "timeout")
 
-QA_DIFF_AUDIT_SYSTEM = """You are a senior software engineer performing a 1-shot code review of a git diff against a task specification.
-Check strictly for:
-1. Missing requirements or edge cases explicitly stated in the task specification.
-2. Subtle logic bugs, off-by-one errors, state leaks, or broken imports/exports.
-3. Missing or weak unit test coverage for the required behavior.
+_PROMPT_ASKS_FOR_TESTS_RE = re.compile(
+    r"\b(?:unit\s+tests?|integration\s+tests?|test\s+cases?|test\s+suite|write\s+tests?|add\s+tests?|pytest|vitest|jest)\b",
+    re.IGNORECASE,
+)
 
+_QUOTA_OR_RATE_LIMIT_RE = re.compile(
+    r"(?:\b429\b|RESOURCE_EXHAUSTED|QUOTA_EXHAUSTED|\brate[- ]limit(?:ed|s)?\b|\b503\b.*?\b(?:UNAVAILABLE|overloaded)\b|\bUNAVAILABLE\b.*?\b503\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def is_quota_or_rate_limit_error(error_text: str | None) -> bool:
+    """Return True when an error string indicates a Gemini 429/503 quota or rate-limit failure."""
+    return bool(error_text and _QUOTA_OR_RATE_LIMIT_RE.search(error_text))
+
+
+QA_DIFF_AUDIT_SYSTEM = """You are a senior software engineer performing a 1-shot blocker-only code review of a git diff against a task specification.
+Report ONLY High or Medium functional blockers:
+1. Missing requirements or edge cases explicitly stated in the task specification.
+2. Subtle logic bugs, off-by-one errors, state leaks, security bugs, or broken imports/exports.
+3. Missing or weak unit test coverage when the repository has automated tests or the task asked for tests.
+
+Do NOT report Low, Optional, polish, naming, style, formatting, or future-hardening suggestions.
 Output format:
-- If the diff is complete and sound, start with `VERDICT: PASS` on line 1.
-- If there is at least one concrete bug or missing requirement, start with `VERDICT: NEEDS_FIXES` on line 1, followed by concise bullet points (`- ISSUE: <file:line>: <exact bug and how to fix it>`).
-Do NOT nitpick formatting or style."""
+- If there are no High or Medium blockers, start with `VERDICT: PASS` on line 1.
+- If there is at least one concrete blocker, start with `VERDICT: NEEDS_FIXES` on line 1, followed by concise bullet points (`- ISSUE: <file:line>: <exact bug and how to fix it>`)."""
+
+
+def build_qa_diff_audit_system(*, verification: str | None = None, prompt: str = "") -> str:
+    """Build the 1-shot QA review system prompt, skipping test-coverage demands on testless repos."""
+    ver = str(verification or "").strip().lower()
+    if ver in ("smoke_only", "unverified") and not _PROMPT_ASKS_FOR_TESTS_RE.search(prompt or ""):
+        return (
+            "You are a senior software engineer performing a 1-shot blocker-only code review of a git diff against a task specification.\n"
+            "Report ONLY High or Medium functional blockers:\n"
+            "1. Missing requirements or edge cases explicitly stated in the task specification.\n"
+            "2. Subtle logic bugs, off-by-one errors, state leaks, security bugs, or broken imports/exports.\n\n"
+            f"This repository has no automated test suite covering this change (verification={ver!r}). "
+            "Do NOT fail the diff for missing unit tests unless the task specification explicitly asked to add tests.\n"
+            "Do NOT report Low, Optional, polish, naming, style, formatting, or future-hardening suggestions.\n"
+            "Output format:\n"
+            "- If there are no High or Medium blockers, start with `VERDICT: PASS` on line 1.\n"
+            "- If there is at least one concrete blocker, start with `VERDICT: NEEDS_FIXES` on line 1, followed by concise bullet points (`- ISSUE: <file:line>: <exact bug and how to fix it>`)."
+        )
+    return QA_DIFF_AUDIT_SYSTEM
 
 
 def parse_qa_audit_verdict(text: str) -> dict[str, Any]:
@@ -1074,6 +1111,7 @@ def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> 
             ["bash", "-c", cmd],
             cwd=str(cwd),
             env=exec_env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2796,6 +2834,170 @@ def build_import_smoke_command(
     ]
 
 
+# Output signatures that mean a compile check could not run in this environment (missing toolchain,
+# offline dependency fetch, no lockfile entry), as opposed to the worker's code failing to compile.
+COMPILE_SMOKE_ENV_FAILURE_RE = re.compile(
+    r"command not found|not recognized as an internal or external command|"
+    r"cannot find module 'typescript'|could not resolve host|failed to download|"
+    r"no matching package named|unable to update registry|dial tcp|network is unreachable|"
+    r"missing go\.sum entry|cannot find module providing package|"
+    r"attempting to make an http request, but --offline|failed to get .* as a dependency",
+    re.I,
+)
+
+# Exits 0 unless an error line from the compiler names one of the files passed as arguments, so errors that
+# already existed elsewhere in the project never fail a smoke check for an unrelated change.
+_CHANGED_FILE_ERROR_FILTER = (
+    "import re,sys\n"
+    "rc=int(sys.argv[1]); files=sys.argv[2:]; out=sys.stdin.read()\n"
+    "pats=[re.compile(r'^\\s*(?:-->\\s*)?(?:\\./)?'+re.escape(f)+r'(?::\\d+|\\(\\d+,\\d+\\))') for f in files]\n"
+    "hits=[l for l in out.splitlines() if any(p.search(l) for p in pats)]\n"
+    "print('\\n'.join(hits[-40:]) if hits else out[-2000:])\n"
+    "sys.exit(1 if rc and hits else 0)\n"
+)
+
+
+def build_compile_smoke_commands(
+    cwd: Path,
+    files_changed: list[str],
+    *,
+    max_files: int = 8,
+) -> list[str]:
+    """Build fast compile/syntax checks for modified files across common languages.
+
+    These run when a job has no explicit acceptance commands (for example a repository without tests), so
+    a change that does not parse or compile still fails acceptance and triggers escalation instead of
+    passing silently. Every command is read-only, uses toolchains that are already installed in the
+    workspace or on PATH, and never downloads packages. Results are recorded as smoke checks, never as an
+    explicit test pass.
+    """
+    if not files_changed:
+        return []
+    exec_env = _build_workdir_exec_env(cwd)
+    path_str = exec_env.get("PATH")
+    norm_files: list[str] = []
+    for rel in files_changed:
+        norm = rel.replace("\\", "/").strip("/")
+        if norm and norm not in norm_files and (cwd / norm).is_file():
+            norm_files.append(norm)
+
+    def _pick(exts: tuple[str, ...]) -> list[str]:
+        return [f for f in norm_files if f.lower().endswith(exts)][:max_files]
+
+    def _quoted(files: list[str]) -> str:
+        return " ".join(shlex.quote(f) for f in files)
+
+    py_bin = "python3"
+    for cand in (".venv/bin/python", "venv/bin/python"):
+        if (cwd / cand).is_file():
+            py_bin = cand
+            break
+
+    cmds: list[str] = []
+
+    # Python: parse every modified file, including top-level scripts the import smoke check skips.
+    py_files = _pick((".py",))
+    if py_files:
+        parse_script = "import ast,sys\nfor p in sys.argv[1:]:\n    ast.parse(open(p,'rb').read(), p)\n"
+        cmds.append(f"{py_bin} -c {shlex.quote(parse_script)} {_quoted(py_files)}")
+
+    # TypeScript: type-check the project with the repository's own tsc, failing only on changed files.
+    ts_files = _pick((".ts", ".tsx", ".mts", ".cts"))
+    tsc_bin = cwd / "node_modules" / ".bin" / "tsc"
+    if ts_files and (cwd / "tsconfig.json").is_file() and tsc_bin.is_file():
+        cmds.append(
+            "out=$(./node_modules/.bin/tsc --noEmit --pretty false -p tsconfig.json 2>&1); rc=$?; "
+            f"printf '%s\\n' \"$out\" | python3 -c {shlex.quote(_CHANGED_FILE_ERROR_FILTER)} \"$rc\" "
+            f"{_quoted(ts_files)}"
+        )
+
+    # Plain JavaScript: syntax check with node (JSX needs a build step, so it is skipped).
+    js_files = _pick((".js", ".mjs", ".cjs"))
+    if js_files and shutil.which("node", path=path_str):
+        cmds.append(" && ".join(f"node --check {shlex.quote('./' + f)}" for f in js_files))
+
+    # Go: compile the changed packages without writing a binary (test-only edits are left to `go test`).
+    go_files = [f for f in _pick((".go",)) if not f.endswith("_test.go")]
+    if go_files and (cwd / "go.mod").is_file() and shutil.which("go", path=path_str):
+        pkgs: list[str] = []
+        for f in go_files:
+            parent = Path(f).parent.as_posix()
+            spec = "." if parent in ("", ".") else f"./{parent}"
+            if spec not in pkgs:
+                pkgs.append(spec)
+        cmds.append(f"go build -o /dev/null {' '.join(shlex.quote(p) for p in pkgs)}")
+
+    # Rust: only with a warm host target directory, so the check never triggers a cold full build.
+    rs_files = _pick((".rs",))
+    if rs_files and (cwd / "Cargo.toml").is_file() and shutil.which("cargo", path=path_str):
+        if (cwd / "target").is_dir():
+            cmds.append("cargo check --offline --quiet")
+
+    # Shell scripts and JSON documents (JSON-with-comments config files are skipped).
+    sh_files = _pick((".sh", ".bash"))
+    if sh_files and shutil.which("bash", path=path_str):
+        cmds.append(" && ".join(f"bash -n {shlex.quote('./' + f)}" for f in sh_files))
+    json_files = [
+        f
+        for f in _pick((".json",))
+        if not re.match(r"^(?:tsconfig|jsconfig|\.eslintrc|devcontainer|\.babelrc)", Path(f).name, re.I)
+        and not any(part in (".vscode", ".devcontainer") for part in Path(f).parts[:-1])
+    ]
+    if json_files:
+        json_script = "import json,sys\nfor p in sys.argv[1:]:\n    json.load(open(p,encoding='utf-8-sig'))\n"
+        cmds.append(f"python3 -c {shlex.quote(json_script)} {_quoted(json_files)}")
+
+    return cmds
+
+
+def has_real_acceptance_pass(acceptance_results: Any) -> bool:
+    """True when at least one explicit acceptance command passed (not auto-discovered, smoke, or skipped)."""
+    if not isinstance(acceptance_results, list) or not acceptance_results:
+        return False
+    return any(
+        isinstance(r, dict)
+        and r.get("passed") is True
+        and not r.get("auto_discovered_default")
+        and not r.get("auto_discovered_regression")
+        and not r.get("no_tests_collected")
+        and not r.get("runner_incompatible_skipped")
+        and not r.get("auto_import_smoke")
+        for r in acceptance_results
+    )
+
+
+def classify_verification(acceptance_results: Any, acceptance_passed: bool | None) -> str:
+    """Summarize how strongly a worker's change was verified.
+
+    Returns `failed`, `acceptance_tests` (an explicit acceptance command passed), `related_tests` (existing
+    tests the plugin discovered passed, but no explicit check covered the request), `smoke_only` (only
+    parse/compile/import checks ran), or `unverified` (nothing ran, or every check was skipped).
+    """
+    if acceptance_passed is False:
+        return "failed"
+    if has_real_acceptance_pass(acceptance_results):
+        return "acceptance_tests"
+    results = acceptance_results if isinstance(acceptance_results, list) else []
+    ran = [
+        r
+        for r in results
+        if isinstance(r, dict)
+        and r.get("passed") is True
+        and not r.get("no_tests_collected")
+        and not r.get("runner_incompatible_skipped")
+    ]
+    if any(
+        not r.get("compile_smoke")
+        and not r.get("auto_import_smoke")
+        and int(((r.get("counts") or {}) if isinstance(r.get("counts"), dict) else {}).get("passed") or 0) > 0
+        for r in ran
+    ):
+        return "related_tests"
+    if ran:
+        return "smoke_only"
+    return "unverified"
+
+
 def find_missing_prompt_symbols(
     prompt: str,
     diff_text: str,
@@ -3853,6 +4055,8 @@ class JobManager:
                 [
                     ".venv",
                     ".venv/",
+                    "node_modules",
+                    "node_modules/",
                     ".pytest_cache/",
                     "__pycache__/",
                     ".mypy_cache/",
@@ -4004,6 +4208,29 @@ class JobManager:
             if esc not in files:
                 files.append(esc)
         return diff_text, files, symlink_escapes
+
+    def _link_host_node_modules_for_checks(self, wt_dir: Path) -> Path | None:
+        """Symlink the host's node_modules into an isolated copy for plugin-run checks; returns the link."""
+        if env_flag("CC_AGY_LINK_NODE_MODULES") is False:
+            return None
+        host_nm = self.workspace_root / "node_modules"
+        link = wt_dir / "node_modules"
+        if not host_nm.is_dir() or not wt_dir.is_dir() or link.exists() or link.is_symlink():
+            return None
+        try:
+            os.symlink(str(host_nm.resolve()), str(link))
+        except OSError:
+            return None
+        return link
+
+    @staticmethod
+    def _unlink_checks_node_modules(link: Path | None) -> None:
+        """Remove a link created by _link_host_node_modules_for_checks (never the host directory itself)."""
+        if link is not None and link.is_symlink():
+            try:
+                link.unlink()
+            except OSError:
+                pass
 
     def _cleanup_worktree(self, wt_dir: Path) -> None:
         if not wt_dir.exists():
@@ -4413,13 +4640,22 @@ class JobManager:
             )
             effective_acceptance = list(acceptance or [])
             auto_default_acceptance = False
+            compile_smoke_cmds: set[str] = set()
             target_acc_cwd = self.workspace_root if in_place else wt_dir
+            # The worker never sees host node_modules, but the plugin's own checks (repo test runners,
+            # TypeScript compile smoke) need installed packages, so link them for the acceptance phase only.
+            acc_node_modules_link = self._link_host_node_modules_for_checks(wt_dir) if not in_place else None
             if not effective_acceptance and runnable_acc_status and files_changed and self._should_run_default_acceptance():
                 effective_acceptance = discover_related_test_commands(target_acc_cwd, files_changed, [])
                 if os.environ.get("CC_AGY_AUTO_IMPORT_CHECK", "1").strip().lower() not in ("0", "false", "no", "off"):
                     for icmd in build_import_smoke_command(target_acc_cwd, files_changed):
                         if icmd not in effective_acceptance:
                             effective_acceptance.append(icmd)
+                if os.environ.get("CC_AGY_AUTO_COMPILE_CHECK", "1").strip().lower() not in ("0", "false", "no", "off"):
+                    for ccmd in build_compile_smoke_commands(target_acc_cwd, files_changed):
+                        if ccmd not in effective_acceptance:
+                            effective_acceptance.append(ccmd)
+                            compile_smoke_cmds.add(ccmd)
                 auto_default_acceptance = bool(effective_acceptance)
             if effective_acceptance and runnable_acc_status and is_mutating_job and not files_changed:
                 # Never run acceptance commands on an unmodified worktree for a mutating coding job:
@@ -4454,6 +4690,14 @@ class JobManager:
                             dr["auto_discovered_default"] = True
                             dr_counts = dr.get("counts") if isinstance(dr.get("counts"), dict) else {}
                             dr_tail = str(dr.get("output_tail") or "")
+                            if dr.get("command") in compile_smoke_cmds:
+                                dr["compile_smoke"] = True
+                                if not dr.get("passed") and (
+                                    dr.get("exit_code") == 127 or COMPILE_SMOKE_ENV_FAILURE_RE.search(dr_tail)
+                                ):
+                                    dr["passed"] = True
+                                    dr["runner_incompatible_skipped"] = True
+                                continue
                             if dr.get("exit_code") == 5:
                                 dr["passed"] = True
                                 dr["no_tests_collected"] = True
@@ -4509,6 +4753,7 @@ class JobManager:
                     acceptance_results = [
                         {"command": "<acceptance>", "passed": False, "error": f"{type(acc_exc).__name__}: {acc_exc}"}
                     ]
+                self._unlink_checks_node_modules(acc_node_modules_link)
                 try:
                     if in_place:
                         diff_text, files_changed, symlink_escapes, in_place_notes = self._finalize_in_place(
@@ -4529,6 +4774,7 @@ class JobManager:
                         )
                 except Exception:
                     pass
+            self._unlink_checks_node_modules(acc_node_modules_link)
             if symlink_escapes:
                 for esc in symlink_escapes:
                     if esc not in scope_violations:
@@ -5038,6 +5284,7 @@ class JobManager:
         """
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
+        enforce_daily_budget(self.store, workspace_root=self.workspace_root)
         if wait and not in_place and self._is_bounded_lead_session():
             delegate_receipts = [
                 r
@@ -5268,13 +5515,17 @@ class JobManager:
         ):
             per_probe_limit = min(15.0, max(0.3, float(timeout_seconds) * 0.4))
             total_probe_limit = min(25.0, max(0.5, float(timeout_seconds) * 0.5))
-            baseline_probe = probe_baseline_acceptance(
-                acceptance_cmds,
-                wt_dir,
-                per_cmd_timeout=per_probe_limit,
-                total_timeout=total_probe_limit,
-                reset_tracked=True,
-            )
+            probe_nm_link = self._link_host_node_modules_for_checks(wt_dir)
+            try:
+                baseline_probe = probe_baseline_acceptance(
+                    acceptance_cmds,
+                    wt_dir,
+                    per_cmd_timeout=per_probe_limit,
+                    total_timeout=total_probe_limit,
+                    reset_tracked=True,
+                )
+            finally:
+                self._unlink_checks_node_modules(probe_nm_link)
 
         worker_prompt = render_worker_prompt(
             prompt,
@@ -5554,24 +5805,30 @@ class JobManager:
                 else f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
             )
             worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
-            return self.delegate_continue(
-                job_id=job_id,
-                follow_up_prompt=(
-                    "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
-                    "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
-                    "complete all requirements from the original task specification, and ensure all acceptance "
-                    "and unit tests pass." + fail_detail
-                ),
-                allowed_paths=receipt.get("allowed_paths"),
-                acceptance=receipt.get("acceptance"),
-                timeout_seconds=worker_timeout,
-                wait=True,
-                scrub_receipt=bool(receipt.get("scrub_receipt", False)),
-                auto_apply=auto_apply,
-                _wait_elapsed=wait_elapsed,
-                _wait_budget=wait_budget,
-                _prompt_source="plugin_escalation",
-            )
+            try:
+                return self.delegate_continue(
+                    job_id=job_id,
+                    follow_up_prompt=(
+                        "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
+                        "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
+                        "complete all requirements from the original task specification, and ensure all acceptance "
+                        "and unit tests pass." + fail_detail
+                    ),
+                    allowed_paths=receipt.get("allowed_paths"),
+                    acceptance=receipt.get("acceptance"),
+                    timeout_seconds=worker_timeout,
+                    wait=True,
+                    scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                    auto_apply=auto_apply,
+                    _wait_elapsed=wait_elapsed,
+                    _wait_budget=wait_budget,
+                    _prompt_source="plugin_escalation",
+                )
+            except BudgetExceededError as exc:
+                digest = self._digest_with_progress(receipt)
+                digest["budget_exceeded"] = True
+                digest["budget_exceeded_note"] = str(exc)
+                return digest
         digest = self._digest_with_progress(receipt)
         return self._maybe_auto_apply_digest(
             job_id,
@@ -6083,6 +6340,21 @@ class JobManager:
         count = prior_failed + 1 if failed else 0
         out: dict[str, Any] = {"failed_attempts": count}
         threshold = escalate_after_failures()
+        if str(payload.get("status") or "") == "error" and is_quota_or_rate_limit_error(str(payload.get("error") or "")):
+            out["escalation"] = {
+                "escalate_to_lead": True,
+                "reason": "quota_or_rate_limit",
+                "failed_attempts": count,
+                "threshold": threshold,
+                "last_status": payload.get("status"),
+                "last_acceptance_passed": payload.get("acceptance_passed"),
+                "recommendation": (
+                    "Gemini hit a rate limit or quota error (429/503). Do not retry the worker right now: "
+                    f"inspect get_diff(job_id={job_id!r}) and finish the change directly on the host agent, "
+                    "or pass force_retry=true to delegate_continue after switching credentials."
+                ),
+            }
+            return out
         if threshold and count >= threshold:
             out["escalation"] = {
                 "escalate_to_lead": True,
@@ -6399,7 +6671,15 @@ class JobManager:
                 else:
                     digest.pop("next_action", None)
             else:
-                digest.pop("next_action", None)
+                # Applied without an explicit test pass (no tests in the repo, or only smoke/compile checks ran):
+                # the Lead must review the diff against the request before finishing.
+                digest["review_required"] = True
+                digest["next_action"] = (
+                    f"Applied, but no explicit acceptance test verified it (verification="
+                    f"{digest.get('verification', 'unverified')!r}). Review diff_preview (or "
+                    f"get_diff(job_id={job_id!r})) against every requirement before finishing; if something is "
+                    f"wrong, call delegate_revert(job_id={job_id!r}) or start a targeted delegate_start follow-up."
+                )
         return digest
 
     def delegate_continue(
@@ -6440,14 +6720,17 @@ class JobManager:
                 prior_receipt = self.store.read_receipt(safe_id)
             except FileNotFoundError:
                 prior_receipt = {}
-            if (
-                (prior_receipt.get("escalation") or {}).get("escalate_to_lead")
-                and self._resolve_escalation_target_model(str(prior_receipt.get("model") or "")) is None
+            prior_esc = prior_receipt.get("escalation") or {}
+            if prior_esc.get("escalate_to_lead") and (
+                prior_esc.get("reason") == "quota_or_rate_limit"
+                or self._resolve_escalation_target_model(str(prior_receipt.get("model") or "")) is None
             ):
                 digest = self._compact_digest(prior_receipt, include_summary=False)
                 digest["status"] = "escalated"
                 digest["continued"] = False
                 return digest
+
+        enforce_daily_budget(self.store, workspace_root=self.workspace_root)
 
         with self._lock:
             fut = self._futures.get(safe_id)
@@ -7104,10 +7387,23 @@ class JobManager:
                     digest.get("status") == "ok"
                     and digest.get("acceptance_passed") is not False
                     and not digest.get("scope_violations")
+                    and has_real_acceptance_pass(receipt.get("acceptance_results"))
                 ):
                     digest["next_action"] = (
                         f"Acceptance checks passed and scope_violations=[]. Call delegate_apply(job_id={job_id!r}) "
                         f"directly to land these changes without re-running the same test suite.{missing_note}"
+                    )
+                elif (
+                    digest.get("status") == "ok"
+                    and digest.get("acceptance_passed") is not False
+                    and not digest.get("scope_violations")
+                ):
+                    digest["next_action"] = (
+                        f"No explicit acceptance test verified this change (verification="
+                        f"{digest.get('verification', 'unverified')!r}). Review diff_preview (or "
+                        f"get_diff(job_id={job_id!r})) against every requirement, then call "
+                        f"delegate_apply(job_id={job_id!r}) or send the missing items with "
+                        f"delegate_continue(job_id={job_id!r}, follow_up_prompt=...).{missing_note}"
                     )
                 elif digest.get("status") == "ok" and digest.get("acceptance_passed") is False:
                     digest["next_action"] = (
@@ -7384,6 +7680,10 @@ class JobManager:
             "acceptance_passed": receipt.get("acceptance_passed"),
             "error": receipt.get("error"),
         }
+        if receipt.get("files_changed") and receipt.get("status") != "running":
+            digest["verification"] = classify_verification(
+                receipt.get("acceptance_results"), receipt.get("acceptance_passed")
+            )
         if receipt.get("preloaded_files"):
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
         if receipt.get("escalated_from_model"):

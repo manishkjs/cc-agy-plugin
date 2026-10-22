@@ -87,7 +87,7 @@ class TestPluginManifestAndStructure(unittest.TestCase):
             )
 
         for child in (PLUGIN_ROOT / ".claude-plugin").iterdir():
-            self.assertEqual(child.name, "plugin.json")
+            self.assertIn(child.name, ("plugin.json", "marketplace.json"))
 
         for required_path in (
             ".mcp.json",

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+require_file() {
+  if [[ ! -f "$1" ]]; then
+    printf 'Missing required file: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+for rel in \
+  pyproject.toml \
+  LICENSE \
+  README.md \
+  .mcp.json \
+  .claude-plugin/plugin.json \
+  .claude-plugin/marketplace.json \
+  .agents/plugins/marketplace.json \
+  plugins/cc-agy-plugin/.codex-plugin/plugin.json \
+  plugins/cc-agy-plugin/LICENSE \
+  plugins/cc-agy-plugin/skills/vertex/SKILL.md \
+  skills/vertex/SKILL.md; do
+  require_file "$root/$rel"
+done
+
+if ! cmp -s "$root/LICENSE" "$root/plugins/cc-agy-plugin/LICENSE"; then
+  printf 'Codex plugin LICENSE does not match root LICENSE byte-for-byte.\n' >&2
+  exit 1
+fi
+
+python3 - "$root" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+m_ver = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+assert m_ver, "version missing in pyproject.toml"
+ver = m_ver.group(1)
+
+claude_plugin = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+claude_market = json.loads((root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+codex_market = json.loads((root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+codex_plugin = json.loads((root / "plugins" / "cc-agy-plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+
+assert claude_plugin["version"] == ver, (claude_plugin["version"], ver)
+assert claude_market["plugins"][0]["version"] == ver, (claude_market["plugins"][0]["version"], ver)
+assert codex_plugin["version"] == ver, (codex_plugin["version"], ver)
+assert codex_market["plugins"][0]["name"] == codex_plugin["name"] == "cc-agy-plugin"
+assert codex_market["plugins"][0]["source"]["path"] == "./plugins/cc-agy-plugin"
+for prompt in codex_plugin["interface"].get("defaultPrompt", []):
+    assert len(prompt) <= 128, f"defaultPrompt exceeds 128 bytes: {prompt!r}"
+
+readme = (root / "README.md").read_text(encoding="utf-8")
+assert f"badge/version-{ver}-" in readme, f"README version badge out of sync with {ver}"
+assert f"| **Version** | {ver}," in readme, f"README status version out of sync with {ver}"
+m_badge_tests = re.search(r"badge/tests-(\d+)%20passing", readme)
+m_table_tests = re.search(r"\|\s*\*\*Quality\*\*\s*\|\s*(\d+)\s+automated tests", readme)
+assert m_badge_tests and m_table_tests, "README test count missing in badge or status table"
+assert m_badge_tests.group(1) == m_table_tests.group(1), (
+    f"README test badge ({m_badge_tests.group(1)}) != status table ({m_table_tests.group(1)})"
+)
+PY
+
+tmp_home="$(mktemp -d "${TMPDIR:-/tmp}/cc-agy-validate.XXXXXX")"
+trap 'rm -rf "$tmp_home"' EXIT
+
+install_json="$(
+  cd "$root"
+  CODEX_HOME="$tmp_home" GEMINI_API_KEY="test-key-not-written" \
+    python3 -m server.install --host codex --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --non-interactive --json || true
+)"
+
+python3 - "$install_json" <<'PY'
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+assert report["preflight"]["auth_mode"] == "gateway", report["preflight"]
+codex_host = next(h for h in report["hosts"] if h["host"] == "codex")
+assert codex_host["status"] == "installed", codex_host
+PY
+
+test -f "$tmp_home/config.toml"
+test -f "$tmp_home/skills/cc-agy-plugin/SKILL.md"
+if grep -q "test-key-not-written" "$tmp_home/config.toml"; then
+  printf 'API key leaked into config.toml!\n' >&2
+  exit 1
+fi
+
+printf 'Validation passed.\n'

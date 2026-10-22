@@ -457,14 +457,9 @@ def make_genai_writer(
     from server.regions import estimate_cost_usd
 
     def _write(req: WriterRequest) -> WriterReply:
-        from google import genai
         from google.genai import types as gt
 
-        http_opts = gt.HttpOptions(timeout=timeout_ms)
-        if auth.get("api_key"):
-            client = genai.Client(api_key=auth["api_key"], http_options=http_opts)
-        else:
-            client = genai.Client(vertexai=True, project=auth.get("project"), location=auth.get("location"), http_options=http_opts)
+        client = _build_genai_client(auth, timeout_ms=timeout_ms)
         try:
             cfg: dict[str, Any] = {
                 "response_mime_type": "application/json",
@@ -514,6 +509,39 @@ def make_genai_writer(
     return _write
 
 
+def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) -> Any:
+    """Construct a google-genai Client honoring API keys, Vertex ADC, and custom Vertex gateways."""
+    from google import genai
+    from google.genai import types as gt
+    from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
+
+    if auth.get("api_key"):
+        http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
+        return genai.Client(api_key=auth["api_key"], **({"http_options": http_opts} if http_opts else {}))
+    base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
+    if base_url:
+        tok = resolve_vertex_base_url_token() or "custom-endpoint"
+        opt_kwargs: dict[str, Any] = {
+            "base_url": base_url,
+            "headers": {"Authorization": f"Bearer {tok}"},
+        }
+        if timeout_ms:
+            opt_kwargs["timeout"] = timeout_ms
+        return genai.Client(
+            vertexai=True,
+            project=auth.get("project") or "custom-endpoint",
+            location=auth.get("location") or "global",
+            http_options=gt.HttpOptions(**opt_kwargs),
+        )
+    http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
+    return genai.Client(
+        vertexai=True,
+        project=auth.get("project"),
+        location=auth.get("location"),
+        **({"http_options": http_opts} if http_opts else {}),
+    )
+
+
 def create_shared_cache(
     auth: dict[str, Any], model: str, system: str, shared_text: str, *, ttl_seconds: int = 3600
 ) -> str | None:
@@ -521,11 +549,9 @@ def create_shared_cache(
     if not shared_text.strip():
         return None
     try:
-        from google import genai
         from google.genai import types as gt
 
-        client = genai.Client(api_key=auth["api_key"]) if auth.get("api_key") else genai.Client(
-            vertexai=True, project=auth.get("project"), location=auth.get("location"))
+        client = _build_genai_client(auth)
         cache = client.caches.create(
             model=model,
             config=gt.CreateCachedContentConfig(
@@ -544,10 +570,7 @@ def delete_shared_cache(auth: dict[str, Any], name: str | None) -> None:
     if not name:
         return
     try:
-        from google import genai
-
-        client = genai.Client(api_key=auth["api_key"]) if auth.get("api_key") else genai.Client(
-            vertexai=True, project=auth.get("project"), location=auth.get("location"))
+        client = _build_genai_client(auth)
         client.caches.delete(name=name)
     except Exception:  # noqa: BLE001 - the TTL expires it anyway
         pass

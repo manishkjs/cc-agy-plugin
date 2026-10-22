@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-agy-plugin"
-version = "0.2.0"
-description = "Claude Code plugin for delegating tasks to Google AI Studio and Vertex AI Gemini models via the Google Antigravity SDK, google-genai, and Straitjacket shell containment."
+version = "0.3.0"
+description = "Claude Code and Codex plugin for delegating tasks to Google AI Studio and Vertex AI Gemini models via the Google Antigravity SDK, google-genai, and Straitjacket shell containment."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -13,6 +13,9 @@ dependencies = [
     "google-genai>=1.0.0",
     "pydantic>=2.0.0",
 ]
+
+[project.scripts]
+cc-agy-install = "server.install:main"
 
 [project.optional-dependencies]
 antigravity = [

@@ -5,10 +5,10 @@
 **Let your coding agent hand real work to a cheaper Gemini worker, safely, with a receipt for every change.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-209%20passing-1e8e3e)](tests/)
+[![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
+[![Tests](https://img.shields.io/badge/tests-259%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
-[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Antigravity-f9ab00)](#how-it-works)
+[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Codex%20%7C%20Antigravity-f9ab00)](#how-it-works)
 
 [Why it matters](#why-it-matters) · [Results](#results) · [How it works](#how-it-works) · [Get started](#get-started) · [Technical reference](#technical-reference)
 
@@ -58,7 +58,7 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, sa
   <img src="assets/overview.svg" alt="The Lead agent sends a brief to cc-agy-plugin, which runs a Gemini worker in an isolated copy, tests the result, and returns a signed, costed diff" width="100%">
 </p>
 
-1. **You ask your agent** (Claude Code or Antigravity) for a change, as usual.
+1. **You ask your agent** (Claude Code or Codex) for a change, as usual.
 2. **The agent writes a short brief**: the goal, a plan and the tests that prove it works.
 3. **The plugin runs a Gemini worker** in an isolated copy of the repository. It edits, runs the new and existing tests, and retries until they pass.
 4. **The agent reviews the diff** and the plugin applies it with a signed receipt and a cost line. One call undoes it.
@@ -76,26 +76,55 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, sa
 
 ## Get started
 
+Works with Claude Code and Codex. Run `cc-agy-install` with no flags for an interactive 4-step setup, or pass options directly:
+
 ```bash
 # 1. Install the plugin with the Antigravity SDK and Straitjacket
+git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
 python3 -m pip install -e ".[antigravity]"
 
-# 2. Add a Gemini API key (or use Google Cloud credentials, see full setup below)
-export GEMINI_API_KEY="your-key"
+# 2. Set your Gemini key (or Google Cloud project, or corporate AI gateway)
+export GEMINI_API_KEY="your-key"          # or: gcloud auth application-default login
+                                          #     export GOOGLE_CLOUD_PROJECT="your-project"
 
-# 3. Start Claude Code in your repo with the plugin loaded, then run /mcp to confirm
-cd /path/to/your/repo
-claude --plugin-dir /path/to/cc-agy-plugin
+# 3. Interactive wizard (asks 4 questions in plain English; never saves keys to disk)
+cc-agy-install
+
+# Or non-interactive one-liners:
+cc-agy-install --host codex --max-daily-cents 500        # Codex + $5/day spend cap + routing skill
+cc-agy-install --host claude                             # Claude Code marketplace + plugin install
+cc-agy-install --host all --profile quality --dry-run    # preview both, Argon-first routing
 ```
 
+On newer Codex releases with plugin marketplace commands, you can also add the repository catalog directly after running `cc-agy-install --host codex`:
+
+```bash
+codex plugin marketplace add manishkjs/cc-agy-plugin --ref main
+codex plugin add cc-agy-plugin@cc-agy
+```
+
+| Option | Values | Default |
+|:--|:--|:--|
+| Credentials | `GEMINI_API_KEY` (AI Studio), `GOOGLE_CLOUD_PROJECT` / `--project` (Vertex AI), or `--base-url` / `CC_AGY_VERTEX_BASE_URL` / `GOOGLE_VERTEX_BASE_URL` + `CC_AGY_VERTEX_BASE_URL_TOKEN` (corporate AI gateway; takes priority over an ambient shell `GEMINI_API_KEY`) | read from your shell |
+| `--profile` | `economy` (Flash only), `balanced` (Flash, escalates to Argon on failure), `quality` (Argon first) | `balanced` |
+| `--max-daily-cents` | optional daily workspace spend cap in US cents (for example `500` for \$5/day; also via `CC_AGY_MAX_DAILY_CENTS`) | unlimited |
+| `--location` | any Vertex region; global-only models are routed automatically | unset |
+| Strict mode | Claude Code `userConfig.strict_delegation_mode` (needs hooks, so Claude Code only) | off |
+
+Codex forwards secrets from your shell through `env_vars`, syncs the routing skill into `~/.codex/skills/cc-agy-plugin/SKILL.md`, and sets a 30-minute MCP tool timeout so long worker jobs finish. Claude Code prompts for the same settings through its plugin `userConfig`. For a one-off Claude Code session without installing, run `claude --plugin-dir /path/to/cc-agy-plugin`.
+
 Then ask your agent: *"Use `delegate_start` to add input validation to `api/orders.py` with tests, show me the diff, and apply it."*
+
+### Repositories without tests
+
+Every digest carries a `verification` field. `acceptance_tests` means an explicit acceptance command passed. Otherwise the plugin still runs cheap read-only checks on the changed files (Python parse and import, `tsc --noEmit` with the repo's own TypeScript, `node --check`, `go build`, `cargo check --offline` with a warm target directory, `bash -n`, JSON parse), so a change that does not compile fails and escalates to Argon. A passing smoke check reports `smoke_only`, and the digest asks the lead agent to review the diff against the request before finishing, including after a strict-mode auto-apply.
 
 ## Status
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.2.0, Apache 2.0 |
-| **Quality** | 209 automated tests |
+| **Version** | 0.3.0, Apache 2.0 |
+| **Quality** | 259 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
 | **Known gap** | If another process force-kills the plugin server, unapplied worker edits are not saved |
 | **Next** | Finish the 33-task benchmark, run the full flow inside Antigravity, publish cost guidance per pattern |
 

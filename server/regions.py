@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Mapping
 
 # Vertex models that return 404 NOT_FOUND on regional endpoints (such as
 # asia-south1 or europe-west4) and require the "global" Vertex endpoint.
@@ -393,6 +393,16 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL",
         "CC_AGY_STRICT_MODE",
         "CC_AGY_USERCFG_STRICT_MODE",
+        "CC_AGY_VERTEX_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+        "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL",
+        "CC_AGY_USERCFG_VERTEX_BASE_URL",
+        "CC_AGY_VERTEX_BASE_URL_TOKEN",
+        "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN",
+        "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN",
+        "CC_AGY_MAX_DAILY_CENTS",
+        "CLAUDE_PLUGIN_OPTION_MAX_DAILY_CENTS",
+        "CC_AGY_USERCFG_MAX_DAILY_CENTS",
         "CC_AGY_DATA_DIR",
     ):
         val = os.environ.get(var)
@@ -433,7 +443,7 @@ def resolve_api_key(
 def resolve_vertex_base_url(
     requested_base_url: str | None = None,
     *,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Resolve an optional custom Vertex AI / proxy base URL from arguments or environment."""
     source_env = env if env is not None else os.environ
@@ -441,11 +451,70 @@ def resolve_vertex_base_url(
         requested_base_url,
         source_env.get("CC_AGY_VERTEX_BASE_URL"),
         source_env.get("GOOGLE_VERTEX_BASE_URL"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL"),
+        source_env.get("CC_AGY_USERCFG_VERTEX_BASE_URL"),
     ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
-            if cleaned and not cleaned.startswith("${"):
+            if (
+                cleaned
+                and not cleaned.startswith("${")
+                and cleaned.lower() not in ("<base-url>", "dummy", "none", "null")
+            ):
                 return cleaned
+    return None
+
+
+def resolve_vertex_base_url_token(
+    requested_token: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an optional bearer/virtual-key token for a custom Vertex AI gateway."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_token,
+        source_env.get("CC_AGY_VERTEX_BASE_URL_TOKEN"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN"),
+        source_env.get("CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            cleaned = candidate.strip()
+            if (
+                cleaned
+                and not cleaned.startswith("${")
+                and cleaned.lower() not in ("<token>", "dummy-key", "dummy", "none", "null")
+            ):
+                return cleaned
+    return None
+
+
+def resolve_max_daily_cents(
+    env: Mapping[str, str] | None = None,
+) -> float | None:
+    """Resolve an optional workspace daily spend ceiling in cents (> 0), or None when unset."""
+    import math
+
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        source_env.get("CC_AGY_MAX_DAILY_CENTS"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_MAX_DAILY_CENTS"),
+        source_env.get("CC_AGY_USERCFG_MAX_DAILY_CENTS"),
+    ):
+        if candidate is None:
+            continue
+        cleaned = str(candidate).strip()
+        if not cleaned or cleaned.startswith("${"):
+            continue
+        if cleaned.lower() in ("none", "null", "off", "0", "0.0"):
+            return None
+        try:
+            parsed = float(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"CC_AGY_MAX_DAILY_CENTS must be a positive number of cents (got {cleaned!r})") from exc
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValueError(f"CC_AGY_MAX_DAILY_CENTS must be a finite positive number of cents (got {cleaned!r})")
+        return round(parsed, 6)
     return None
 
 
@@ -507,8 +576,10 @@ def resolve_auth_config(
         if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
             explicit_project = cleaned_req_proj
 
-    # Use API key if explicitly passed, or if present in environment without an explicit project argument
-    if resolved_key and (requested_api_key or not explicit_project):
+    has_gateway = bool(resolve_vertex_base_url(env=source_env))
+
+    # Use API key when explicitly passed, or when present in the environment without an explicit project or gateway
+    if resolved_key and (requested_api_key or (not explicit_project and not has_gateway)):
         return {
             "auth_mode": "api_key",
             "api_key": resolved_key,

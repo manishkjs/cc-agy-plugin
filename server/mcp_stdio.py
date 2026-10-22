@@ -18,13 +18,14 @@ from server.jobs import (
     QA_DIFF_AUDIT_SYSTEM,
     QA_REVIEW_MAX_TOKENS,
     JobManager,
+    build_qa_diff_audit_system,
     parse_qa_audit_verdict,
     validate_acceptance,
     validate_allowed_paths,
     validate_plan,
 )
-from server.receipts import ReceiptStore
-from server.regions import is_strict_mode_enabled, truncate_to_token_budget
+from server.receipts import BudgetExceededError, ReceiptStore
+from server.regions import env_flag, is_strict_mode_enabled, truncate_to_token_budget
 from server.true_cost import true_total_report
 from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_plan
 from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
@@ -816,6 +817,34 @@ def _compact_core_tool_def(tool_def: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+HOST_REVIEW_INSTRUCTIONS = (
+    "Gemini worker workflow: 1) Call delegate_start(prompt, checklist=[...], acceptance=[...], wait=true) with "
+    "the requirements and, when the repository has tests, the test command that proves the change. "
+    "2) Read the digest: verification='acceptance_tests' means an explicit acceptance command passed; "
+    "'smoke_only', 'related_tests' or 'unverified' means no explicit test covered the request (common in "
+    "repositories without tests), so review diff_preview or get_diff against every requirement yourself. "
+    "3) Land the change with delegate_apply, send the missing items with delegate_continue, or discard it with "
+    "delegate_cancel. delegate_revert undoes an applied job."
+)
+
+
+def server_instructions_for_host(env: dict[str, str] | None = None) -> str | None:
+    """MCP `initialize` instructions for hosts without plugin hooks (for example Codex).
+
+    Claude Code already receives the same checklist from the SessionStart hook, so the instructions are
+    omitted there to avoid paying for it twice. `CC_AGY_MCP_INSTRUCTIONS=1|0` forces them on or off.
+    """
+    active_env = os.environ if env is None else env
+    forced = env_flag("CC_AGY_MCP_INSTRUCTIONS", active_env)
+    if forced is False:
+        return None
+    if forced is not True:
+        claude_root = str(active_env.get("CLAUDE_PLUGIN_ROOT") or "").strip()
+        if (claude_root and not claude_root.startswith("${")) or str(active_env.get("CLAUDECODE") or "") == "1":
+            return None
+    return HOST_REVIEW_INSTRUCTIONS
+
+
 def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Return MCP tool definitions filtered by `CC_AGY_TOOL_PROFILE` (`core` default in strict mode, else `full`)."""
     active_env = os.environ if env is None else env
@@ -1057,19 +1086,23 @@ class MCPServer:
                     if requested_version in SUPPORTED_MCP_VERSIONS
                     else MCP_PROTOCOL_VERSION
                 )
+                init_result: dict[str, Any] = {
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                    },
+                    "serverInfo": {
+                        "name": "cc-agy-plugin-vertex",
+                        "version": "0.3.0",
+                    },
+                }
+                host_instructions = server_instructions_for_host()
+                if host_instructions:
+                    init_result["instructions"] = host_instructions
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "result": {
-                        "protocolVersion": negotiated,
-                        "capabilities": {
-                            "tools": {"listChanged": False},
-                        },
-                        "serverInfo": {
-                            "name": "cc-agy-plugin-vertex",
-                            "version": "0.1.0",
-                        },
-                    },
+                    "result": init_result,
                 }
 
             if method == "ping":
@@ -1136,6 +1169,20 @@ class MCPServer:
                 "error": {
                     "code": -32602,
                     "message": f"Invalid params: {exc}",
+                },
+            }
+        except BudgetExceededError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(exc.as_dict(), indent=2),
+                        }
+                    ],
+                    "isError": True,
                 },
             }
         except (Exception, asyncio.CancelledError) as exc:
@@ -1722,12 +1769,16 @@ class MCPServer:
             f"## Candidate Git Diff{' (truncated)' if qa_truncated else ''}\n```diff\n{qa_diff}\n```"
             f"{slices_block}"
         )
+        qa_system = build_qa_diff_audit_system(
+            verification=str(digest.get("verification") or ""),
+            prompt=prompt_str,
+        )
         qa_error: str | None = None
         try:
             qa_res = ask_gemini(
                 prompt=qa_prompt,
                 model=qa_review_model.strip(),
-                system_instruction=QA_DIFF_AUDIT_SYSTEM,
+                system_instruction=qa_system,
                 thinking_level="HIGH",
                 api_key=req_api_key,
                 project=req_project,
