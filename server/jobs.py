@@ -729,6 +729,8 @@ def render_worker_prompt(
     context_files_inlined: list[tuple[str, str]] | None = None,
     checklist: list[str] | None = None,
     raw_user_prompt: str = "",
+    baseline_acceptance_probe: list[dict[str, Any]] | None = None,
+    allowed_paths: list[str] | None = None,
 ) -> str:
     """Wrap the lead's brief with repository map, budget/reporting rules, inlined context, plan, and acceptance."""
     static_parts: list[str] = []
@@ -773,10 +775,19 @@ def render_worker_prompt(
 
     dynamic_parts: list[str] = []
     if raw_user_prompt and raw_user_prompt.strip():
-        dynamic_parts.append(
-            "## Original User Request (Verbatim — Do Not Omit Any Requirement)\n"
-            + raw_user_prompt.strip()
-        )
+        if allowed_paths:
+            dynamic_parts.append(
+                "## Background User Context (Reference Only — Scope Restricted to allowed_paths)\n"
+                f"Scope restriction: implement ONLY the Lead's brief above and modify ONLY files within "
+                f"`allowed_paths={list(allowed_paths)}`. Ignore any parts of this background request that "
+                "target other files/directories or ask to run multiple workers:\n"
+                + raw_user_prompt.strip()
+            )
+        else:
+            dynamic_parts.append(
+                "## Original User Request (Verbatim — Do Not Omit Any Requirement)\n"
+                + raw_user_prompt.strip()
+            )
     if spec_files_inlined:
         full_specs = [(r, c) for r, c in spec_files_inlined if "[truncated:" not in c]
         trunc_specs = [(r, c) for r, c in spec_files_inlined if "[truncated:" in c]
@@ -824,15 +835,45 @@ def render_worker_prompt(
     if plan:
         dynamic_parts.append("## Plan from the lead\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(plan, 1)))
     if acceptance:
+        baseline_notes: list[str] = []
+        for bp in baseline_acceptance_probe or []:
+            if not isinstance(bp, dict) or bp.get("passed") or bp.get("timed_out"):
+                continue
+            bp_rc = bp.get("exit_code")
+            if bp_rc in (None, 0):
+                continue
+            bp_cmd = str(bp.get("command") or "").strip()
+            bp_tail = " | ".join(
+                ln.strip() for ln in str(bp.get("error_tail") or "").splitlines() if ln.strip()
+            )[:280]
+            cwd_hint = ""
+            if bp.get("subdir_cwd_passed") and bp.get("passing_cwd"):
+                p_cwd = str(bp["passing_cwd"])
+                cwd_hint = (
+                    f" Note: existing tests under `{p_cwd}` pass (`rc=0`) on HEAD when run with "
+                    f"`working_directory={p_cwd!r}`. Verify `{p_cwd}` with `working_directory={p_cwd!r}` and run "
+                    f"your new/modified tests (e.g. `--ignore={p_cwd}`), then stop once both pass — post-worker "
+                    f"acceptance automatically accounts for this pre-existing HEAD `cwd` quirk."
+                )
+            baseline_notes.append(
+                f"[Baseline Acceptance Note] Command `{bp_cmd}` already exited non-zero (`rc={bp_rc}`) on "
+                f"unmodified HEAD before any edits ({bp_tail or 'failed on baseline'}).{cwd_hint} Inspect how "
+                f"existing tests configure `cwd`, fixtures, or environment variables before editing; NEVER modify "
+                f"or shadow existing production class/module attributes or default paths in `__init__` just to "
+                f"work around a test runner's current working directory (`cwd`)."
+            )
+        baseline_block = ("\n" + "\n".join(baseline_notes)) if baseline_notes else ""
         dynamic_parts.append(
             "## Acceptance\nWhen you finish, the plugin runs these commands and reports the results to the lead. "
             "Make them pass:\n"
             + "\n".join(f"- `{c}`" for c in acceptance)
-            + "\nIMPORTANT: Create or update all requested implementation and test files FIRST, and verify your "
-            "new/changed test files directly. Once the Acceptance command(s) above pass and any temporary scratch "
-            "files are removed, stop and report immediately; do NOT run unrequested full-repository test suites or "
-            "linters (e.g. ruff, mypy, flake8, eslint) that are not listed above. Never modify unrelated files to "
-            "fix pre-existing test failures outside your task scope or allowed_paths."
+            + baseline_block
+            + "\nIMPORTANT: Create or update all requested implementation and test files (you may inspect how an "
+            "existing test file sets up fixtures or `cwd` when needed), and verify your new/changed test files "
+            "plus the Acceptance command(s) above. Once they pass and any temporary scratch files are removed, "
+            "stop and report immediately; do NOT run unrequested linters (e.g. ruff, mypy, flake8, eslint) or "
+            "unrelated full-repository suites not listed above. Never modify unrelated files or production default "
+            "paths to work around pre-existing test failures outside your task scope or allowed_paths."
         )
     return "\n\n".join([brief.strip(), *static_parts, *dynamic_parts])
 
@@ -1051,15 +1092,36 @@ def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> 
                 pass
             out, _ = proc.communicate()
         tail, _, _ = truncate_to_token_budget((out or "")[-20000:], ACCEPTANCE_OUTPUT_TOKENS)
+        counts = _parse_test_counts(out or "")
+        has_skipped_only = bool(
+            proc.returncode == 0
+            and re.search(
+                r"\b(?:[1-9]\d*\s+skipped|skipped\s*[=:]\s*[1-9]\d*|Skipped:\s*[1-9]\d*|[1-9]\d*\s+ignored)\b",
+                out or "",
+                re.I,
+            )
+        )
+        vacuous_zero_tests = bool(
+            not timed_out
+            and proc.returncode in (0, 5)
+            and int(counts.get("passed") or 0) == 0
+            and int(counts.get("failed") or 0) == 0
+            and int(counts.get("errors") or 0) == 0
+            and (
+                bool(re.search(r"\b(?:ran\s+0\s+tests|collected\s+0\s+items|no\s+tests\s+ran)\b", out or "", re.I))
+                or has_skipped_only
+            )
+        )
         results.append(
             {
                 "command": cmd,
                 "exit_code": None if timed_out else proc.returncode,
                 "timed_out": timed_out,
-                "passed": (not timed_out) and proc.returncode == 0,
+                "passed": (not timed_out) and proc.returncode == 0 and not vacuous_zero_tests,
                 "duration_seconds": round(time.time() - started, 1),
-                "counts": _parse_test_counts(out or ""),
+                "counts": counts,
                 "output_tail": tail,
+                **({"vacuous": True} if vacuous_zero_tests else {}),
             }
         )
     created = [rel for rel in _snapshot_untracked_hashes(cwd) if rel not in before]
@@ -1070,6 +1132,949 @@ def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> 
     if created and results:
         results[-1]["cleaned_artifacts"] = created[:20]
     return results
+
+
+_PROBE_SKIP_TOP_DIRS = frozenset({
+    ".git",
+    ".venv",
+    ".cc-agy-data",
+    ".worktrees",
+    ".ctx-session-reads",
+    ".cc-agy-review",
+})
+
+
+def _snapshot_probe_worktree_state(cwd: Path) -> tuple[dict[str, bytes | None], set[str]]:
+    """Snapshot all untracked files (including small gitignored files) and directory paths in `cwd`."""
+    files_snap: dict[str, bytes | None] = {}
+
+    def _record_untracked_file(rel: str) -> None:
+        p = cwd / rel
+        data: bytes | None = None
+        try:
+            if not p.is_symlink() and p.is_file() and p.stat().st_size <= 1_048_576:
+                data = p.read_bytes()
+        except OSError:
+            data = None
+        files_snap[rel] = data
+
+    res = subprocess.run(
+        ["git", "ls-files", "--others", "-z"],
+        cwd=str(cwd),
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode == 0:
+        for raw in res.stdout.split(b"\x00"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", errors="surrogateescape")
+            top = rel.split("/", 1)[0]
+            if top not in _PROBE_SKIP_TOP_DIRS:
+                _record_untracked_file(rel)
+    dirs_set: set[str] = set()
+    for cur_root, dirnames, filenames in os.walk(str(cwd)):
+        rel_root = os.path.relpath(cur_root, str(cwd))
+        if rel_root == ".":
+            dirnames[:] = [d for d in dirnames if d not in _PROBE_SKIP_TOP_DIRS]
+            rel_prefix = ""
+        else:
+            rel_prefix = Path(rel_root).as_posix()
+            dirs_set.add(rel_prefix)
+        if res.returncode != 0:
+            for fn in filenames:
+                _record_untracked_file(f"{rel_prefix}/{fn}" if rel_prefix else fn)
+    return files_snap, dirs_set
+
+
+def _restore_probe_worktree_state(
+    cwd: Path,
+    before_files: dict[str, bytes | None] | set[str],
+    before_dirs: set[str],
+    *,
+    reset_tracked: bool = True,
+) -> list[str]:
+    """Restore clean worktree state after an acceptance probe by reverting tracked/untracked mutations and removing new files/dirs."""
+    if reset_tracked:
+        _run_git(["checkout", "--", "."], cwd=cwd, check=False)
+    after_files, after_dirs = _snapshot_probe_worktree_state(cwd)
+    before_keys = set(before_files.keys()) if isinstance(before_files, dict) else set(before_files)
+    removed: list[str] = []
+    for rel in sorted(set(after_files.keys()) - before_keys):
+        p = cwd / rel
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink(missing_ok=True)
+                removed.append(rel)
+        except OSError:
+            pass
+    if isinstance(before_files, dict):
+        for rel, prev_bytes in before_files.items():
+            if prev_bytes is None:
+                continue
+            p = cwd / rel
+            try:
+                if p.is_symlink():
+                    p.unlink(missing_ok=True)
+                if not p.is_file() or after_files.get(rel) != prev_bytes:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(prev_bytes)
+            except OSError:
+                pass
+    for rel_dir in sorted(after_dirs - before_dirs, key=lambda d: d.count("/"), reverse=True):
+        dpath = cwd / rel_dir
+        try:
+            if dpath.is_symlink():
+                dpath.unlink(missing_ok=True)
+            elif dpath.is_dir():
+                shutil.rmtree(dpath, ignore_errors=True)
+        except OSError:
+            pass
+    return removed
+
+
+def _extract_short_error_tail(output: str, max_lines: int = 3) -> str:
+    """Return a compact 3-line summary of the failure from ANSI-stripped test output."""
+    clean = _ANSI_ESCAPE_RE.sub("", output or "")
+    non_empty = [ln.strip() for ln in clean.splitlines() if ln.strip()]
+    if not non_empty:
+        return ""
+    priority = [
+        ln
+        for ln in non_empty
+        if re.match(r"^(?:FAILED|ERROR)\b", ln)
+        or ln.startswith("E   ")
+        or re.search(r"\b(?:[A-Za-z]+Error|Exception|AssertionError):", ln)
+    ]
+    chosen = priority[-max_lines:] if priority else non_empty[-max_lines:]
+    return "\n".join(ln[:180] for ln in chosen)
+
+
+def _extract_failing_test_nodes_and_files(output: str, cwd: Path) -> tuple[list[str], list[str]]:
+    """Extract failing test node IDs (e.g. `tests/sub/test_x.py::test_y`) and existing relative test file paths."""
+    clean = _ANSI_ESCAPE_RE.sub("", output or "")
+    nodes: list[str] = []
+    files: list[str] = []
+
+    def _record_file(cand: str) -> str | None:
+        norm = cand.strip().lstrip("./").replace("\\", "/")
+        if not norm:
+            return None
+        p = (cwd / norm).resolve()
+        try:
+            rel_norm = p.relative_to(cwd.resolve()).as_posix()
+        except ValueError:
+            return None
+        if p.is_file():
+            if rel_norm not in files:
+                files.append(rel_norm)
+            return rel_norm
+        return None
+
+    for m in re.finditer(r"(?m)^(?:FAILED|ERROR(?:\s+at\s+\w+\s+of|\s+collecting)?)\s+([^\s]+\.py(?:::[^\s]+)*)", clean):
+        raw_node = m.group(1).strip().rstrip(",")
+        file_part = raw_node.split("::", 1)[0]
+        rel_f = _record_file(file_part)
+        if rel_f:
+            suffix = raw_node[len(file_part):]
+            norm_node = f"{rel_f}{suffix}"
+            if norm_node not in nodes:
+                nodes.append(norm_node)
+
+    # Traceback location fallback for `pytest -x -q` or custom formatters that omit `FAILED <node>` summary lines
+    current_func: str | None = None
+    for ln in clean.splitlines():
+        m_hdr = re.match(r"^_{3,}\s+([A-Za-z_][\w.\[\]-]*)\s+_{3,}$", ln.strip())
+        if m_hdr:
+            current_func = m_hdr.group(1)
+            continue
+        m_loc = re.match(r"^([\w./\\-]+?\.py):(\d+):", ln.strip())
+        if m_loc:
+            cand_f = m_loc.group(1)
+            base_n = Path(cand_f).name
+            if base_n.startswith("test_") or base_n.endswith("_test.py"):
+                rel_f = _record_file(cand_f)
+                if rel_f:
+                    fallback_node = f"{rel_f}::{current_func.replace('.', '::')}" if current_func else rel_f
+                    if not any(n == fallback_node or n.startswith(f"{rel_f}::") for n in nodes):
+                        nodes.append(fallback_node)
+
+    # Standard library unittest header: `FAIL: test_foo (pkg.sub.test_bar.TestCls)`
+    for m_ut in re.finditer(r"(?m)^(?:FAIL|ERROR):\s+([A-Za-z_]\w*)\s+\(([\w.]+)\)", clean):
+        func_name, qual_cls = m_ut.group(1), m_ut.group(2)
+        parts = qual_cls.split(".")
+        for split_idx in range(len(parts), 0, -1):
+            cand_rel = "/".join(parts[:split_idx]) + ".py"
+            rel_f = _record_file(cand_rel)
+            if rel_f:
+                cls_part = "::".join(parts[split_idx:])
+                ut_node = f"{rel_f}::{cls_part}::{func_name}" if cls_part else f"{rel_f}::{func_name}"
+                if ut_node not in nodes:
+                    nodes.append(ut_node)
+                break
+
+    return nodes, files
+
+
+def _extract_pytest_runner_prefix(cmd: str) -> str | None:
+    """If `cmd` is a single simple pytest invocation, return its runner prefix (e.g. `.venv/bin/pytest`)."""
+    stripped = cmd.strip()
+    if any(sep in stripped for sep in ("&&", "||", ";", "|", "\n")):
+        return None
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    idx = 0
+    while idx < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[idx]):
+        idx += 1
+    if idx >= len(tokens):
+        return None
+    head_base = Path(tokens[idx]).name
+    if head_base in ("pytest", "py.test"):
+        return shlex.join(tokens[: idx + 1])
+    if (
+        head_base.startswith("python")
+        and idx + 2 < len(tokens)
+        and tokens[idx + 1] == "-m"
+        and tokens[idx + 2] in ("pytest", "py.test")
+    ):
+        return shlex.join(tokens[: idx + 3])
+    if (
+        head_base == "uv"
+        and idx + 2 < len(tokens)
+        and tokens[idx + 1] == "run"
+        and Path(tokens[idx + 2]).name in ("pytest", "py.test")
+    ):
+        return shlex.join(tokens[: idx + 3])
+    return None
+
+
+def _strip_pytest_exitfirst_flags(cmd: str) -> str:
+    """Return `cmd` with `-x`, `--exitfirst`, and `--maxfail=...` removed so remaining tests all execute."""
+    try:
+        tokens = shlex.split(cmd.strip())
+    except ValueError:
+        return cmd
+    cleaned: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("-x", "--exitfirst"):
+            continue
+        if tok == "--maxfail":
+            skip_next = True
+            continue
+        if tok.startswith("--maxfail="):
+            continue
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 2 and "x" in tok[1:]:
+            rem = "-" + tok[1:].replace("x", "")
+            if rem != "-":
+                cleaned.append(rem)
+            continue
+        cleaned.append(tok)
+    return shlex.join(cleaned) if cleaned else cmd
+
+
+def _run_bounded_probe_cmd(
+    cmd: str,
+    *,
+    cwd: Path,
+    exec_env: dict[str, str],
+    timeout_s: float,
+) -> tuple[int | None, bool, str]:
+    proc = subprocess.Popen(
+        ["bash", "-c", cmd],
+        cwd=str(cwd),
+        env=exec_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        out, _ = proc.communicate(timeout=max(0.1, timeout_s))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        out, _ = proc.communicate()
+    return (None if timed_out else proc.returncode), timed_out, (out or "")
+
+
+def probe_baseline_acceptance(
+    cmds: list[str],
+    cwd: Path,
+    *,
+    per_cmd_timeout: float = 15.0,
+    total_timeout: float = 25.0,
+    reset_tracked: bool = True,
+) -> list[dict[str, Any]]:
+    """Probe explicit acceptance commands on clean HEAD (`0` model tokens) and restore 100% worktree hygiene."""
+    if not cmds or not cwd.is_dir():
+        return []
+    before_files, before_dirs = _snapshot_probe_worktree_state(cwd)
+    exec_env = _build_workdir_exec_env(cwd)
+    probe_started = time.monotonic()
+    probes: list[dict[str, Any]] = []
+    try:
+        for cmd in cmds:
+            elapsed = time.monotonic() - probe_started
+            remaining = total_timeout - elapsed
+            if remaining < 0.2:
+                break
+            cmd_limit = min(per_cmd_timeout, remaining)
+            rc, timed_out, out = _run_bounded_probe_cmd(
+                cmd, cwd=cwd, exec_env=exec_env, timeout_s=cmd_limit
+            )
+            _restore_probe_worktree_state(cwd, before_files, before_dirs, reset_tracked=reset_tracked)
+            if timed_out:
+                probes.append({"command": cmd, "exit_code": None, "timed_out": True, "passed": False})
+                continue
+            counts = _parse_test_counts(out)
+            if rc == 0:
+                probes.append({"command": cmd, "exit_code": 0, "timed_out": False, "passed": True, "counts": counts})
+                continue
+            nodes, files = _extract_failing_test_nodes_and_files(out, cwd)
+            short_tail = _extract_short_error_tail(out, max_lines=3)
+            entry: dict[str, Any] = {
+                "command": cmd,
+                "exit_code": rc,
+                "timed_out": False,
+                "passed": False,
+                "counts": counts,
+                "error_tail": short_tail,
+                "failing_nodes": nodes[:20],
+                "failing_files": files[:10],
+            }
+            pytest_runner = _extract_pytest_runner_prefix(cmd)
+            if pytest_runner and files:
+                cand_dirs = list(
+                    dict.fromkeys(
+                        str(Path(f).parent.as_posix())
+                        for f in files
+                        if str(Path(f).parent.as_posix()) not in ("", ".")
+                    )
+                )
+                rem_after = total_timeout - (time.monotonic() - probe_started)
+                if len(cand_dirs) == 1 and rem_after >= 0.4:
+                    sub_rel = cand_dirs[0]
+                    sub_dir = cwd / sub_rel
+                    if sub_dir.is_dir():
+                        sub_rc, sub_to, sub_out = _run_bounded_probe_cmd(
+                            f"{pytest_runner} -q",
+                            cwd=sub_dir,
+                            exec_env=exec_env,
+                            timeout_s=min(10.0, rem_after),
+                        )
+                        _restore_probe_worktree_state(cwd, before_files, before_dirs, reset_tracked=reset_tracked)
+                        sub_counts = _parse_test_counts(sub_out)
+                        if (
+                            not sub_to
+                            and sub_rc == 0
+                            and int(sub_counts.get("passed") or 0) >= 1
+                            and int(sub_counts.get("failed") or 0) == 0
+                            and int(sub_counts.get("errors") or 0) == 0
+                        ):
+                            entry["subdir_cwd_passed"] = True
+                            entry["passing_cwd"] = sub_rel
+                            entry["subdir_counts"] = sub_counts
+            probes.append(entry)
+    finally:
+        _restore_probe_worktree_state(cwd, before_files, before_dirs, reset_tracked=reset_tracked)
+    return probes
+
+
+def evaluate_post_worker_baseline_failures(
+    acceptance_results: list[dict[str, Any]],
+    baseline_probe: list[dict[str, Any]] | None,
+    cwd: Path,
+    files_changed: list[str],
+    *,
+    timeout: float = 30.0,
+) -> list[str]:
+    """Account for pre-existing clean-HEAD `cwd` or untouched baseline test failures without hiding regressions."""
+    if not acceptance_results or not baseline_probe or not files_changed or not cwd.is_dir():
+        return []
+    probe_by_cmd = {
+        str(p.get("command") or "").strip(): p
+        for p in baseline_probe
+        if isinstance(p, dict) and not p.get("passed") and not p.get("timed_out") and p.get("exit_code") not in (None, 0)
+    }
+    if not probe_by_cmd:
+        return []
+
+    exec_env = _build_workdir_exec_env(cwd)
+    warnings: list[str] = []
+
+    for r in acceptance_results:
+        if not isinstance(r, dict) or r.get("passed") or r.get("timed_out"):
+            continue
+        cmd = str(r.get("command") or "").strip()
+        probe = probe_by_cmd.get(cmd)
+        if not probe:
+            continue
+        post_tail = str(r.get("output_tail") or "")
+        post_nodes, post_files = _extract_failing_test_nodes_and_files(post_tail, cwd)
+        pytest_runner = _extract_pytest_runner_prefix(cmd)
+
+        # Case 1: Pre-existing clean-HEAD subdir `cwd` quirk (passed on HEAD when run from `passing_cwd`).
+        if probe.get("subdir_cwd_passed") and probe.get("passing_cwd") and pytest_runner:
+            passing_cwd = str(probe["passing_cwd"])
+            sub_dir = cwd / passing_cwd
+            # Root run must only have failed inside `passing_cwd` (not on a new root test before it).
+            if sub_dir.is_dir() and post_files and all(
+                f == passing_cwd or f.startswith(f"{passing_cwd}/") for f in post_files
+            ):
+                before_files, before_dirs = _snapshot_probe_worktree_state(cwd)
+                try:
+                    sub_rc, sub_to, sub_out = _run_bounded_probe_cmd(
+                        f"{pytest_runner} -q",
+                        cwd=sub_dir,
+                        exec_env=exec_env,
+                        timeout_s=min(20.0, timeout),
+                    )
+                finally:
+                    _restore_probe_worktree_state(cwd, before_files, before_dirs, reset_tracked=False)
+                sub_counts = _parse_test_counts(sub_out)
+                sub_ok = (
+                    not sub_to
+                    and sub_rc == 0
+                    and int(sub_counts.get("passed") or 0) >= 1
+                    and int(sub_counts.get("failed") or 0) == 0
+                    and int(sub_counts.get("errors") or 0) == 0
+                )
+                if sub_ok:
+                    rest_cmd = f"{_strip_pytest_exitfirst_flags(cmd)} --ignore={shlex.quote(passing_cwd)}"
+                    before_files2, before_dirs2 = _snapshot_probe_worktree_state(cwd)
+                    try:
+                        rest_rc, rest_to, rest_out = _run_bounded_probe_cmd(
+                            rest_cmd,
+                            cwd=cwd,
+                            exec_env=exec_env,
+                            timeout_s=min(30.0, timeout),
+                        )
+                    finally:
+                        _restore_probe_worktree_state(cwd, before_files2, before_dirs2, reset_tracked=False)
+                    rest_counts = _parse_test_counts(rest_out)
+                    rest_ok = (
+                        not rest_to
+                        and rest_rc in (0, 5)
+                        and int(rest_counts.get("failed") or 0) == 0
+                        and int(rest_counts.get("errors") or 0) == 0
+                    )
+                    if rest_ok:
+                        total_passed = int(sub_counts.get("passed") or 0) + int(rest_counts.get("passed") or 0)
+                        r["original_exit_code"] = r.get("exit_code")
+                        r["exit_code"] = 0
+                        r["passed"] = True
+                        r["preexisting_baseline_failure_ignored"] = True
+                        r["passing_cwd"] = passing_cwd
+                        r["counts"] = {"passed": total_passed, "failed": 0, "errors": 0}
+                        warnings.append(
+                            f"Baseline `cwd` failure in `{cmd}` ignored: `{passing_cwd}` already failed from repo "
+                            f"root on clean HEAD and passed from `{passing_cwd}` ({sub_counts.get('passed', 0)} "
+                            f"passed in `{passing_cwd}`, {rest_counts.get('passed', 0)} passed in remaining suite)."
+                        )
+                        continue
+
+        # Case 2: Non-subdir clean-HEAD failures remain failing — NEVER flip `passed` to True
+        # (an unfixed TDD acceptance test must never auto-apply even if the worker also added
+        # unrelated passing tests). Record an informational diagnostic for the Lead only.
+        base_nodes = [str(n) for n in (probe.get("failing_nodes") or []) if n]
+        if base_nodes and post_nodes and set(post_nodes) <= set(base_nodes):
+            warnings.append(
+                f"Diagnostic: failing node(s) {post_nodes} in `{cmd}` also failed on clean HEAD "
+                f"(acceptance remains failed so unfixed TDD targets are never auto-applied)."
+            )
+
+    return warnings
+
+
+_DESCRIPTOR_CALL_NAMES = frozenset({"property", "classmethod", "staticmethod", "cached_property"})
+_TRY_STAR_TYPES = (ast.Try, getattr(ast, "TryStar", ast.Try))
+_MATCH_TYPES = (getattr(ast, "Match", ()),) if hasattr(ast, "Match") else ()
+
+
+def _is_descriptor_expr(expr: ast.AST | None) -> bool:
+    if not isinstance(expr, ast.Call):
+        return False
+    fn = expr.func
+    if isinstance(fn, ast.Name):
+        return fn.id in _DESCRIPTOR_CALL_NAMES
+    if isinstance(fn, ast.Attribute):
+        return fn.attr in _DESCRIPTOR_CALL_NAMES
+    return False
+
+
+def _collect_ast_class_map(tree: ast.Module) -> dict[str, ast.ClassDef]:
+    """Map qualified class names (e.g. `Runner` or `Outer.Inner`) in `tree` to their `ast.ClassDef`."""
+    mapping: dict[str, ast.ClassDef] = {}
+
+    def _visit_block(stmts: list[ast.stmt], prefix: str) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.ClassDef):
+                qual = f"{prefix}.{stmt.name}" if prefix else stmt.name
+                mapping[qual] = stmt
+                _visit_block(stmt.body, qual)
+
+    _visit_block(tree.body, "")
+    return mapping
+
+
+def _collect_direct_class_attrs(cls_node: ast.ClassDef) -> set[str]:
+    """Return non-dunder class-body attributes defined with concrete values directly on `cls_node`."""
+    attrs: set[str] = set()
+
+    def _add_target(t: ast.AST) -> None:
+        if isinstance(t, ast.Name):
+            name = t.id
+            if not (name.startswith("__") and name.endswith("__")):
+                attrs.add(name)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for elt in t.elts:
+                _add_target(elt)
+
+    for stmt in cls_node.body:
+        if isinstance(stmt, ast.Assign) and not _is_descriptor_expr(stmt.value):
+            for t in stmt.targets:
+                _add_target(t)
+        elif (
+            isinstance(stmt, ast.AnnAssign)
+            and stmt.value is not None
+            and not _is_descriptor_expr(stmt.value)
+        ):
+            _add_target(stmt.target)
+    return attrs
+
+
+def _collect_param_is_not_none_guards(test_expr: ast.AST, param_names: set[str]) -> frozenset[str]:
+    """Return optional parameter names guaranteed `is not None` when `test_expr` holds."""
+    if (
+        isinstance(test_expr, ast.Compare)
+        and len(test_expr.ops) == 1
+        and isinstance(test_expr.ops[0], ast.IsNot)
+        and len(test_expr.comparators) == 1
+        and isinstance(test_expr.comparators[0], ast.Constant)
+        and test_expr.comparators[0].value is None
+        and isinstance(test_expr.left, ast.Name)
+        and test_expr.left.id in param_names
+    ):
+        return frozenset({test_expr.left.id})
+    if isinstance(test_expr, ast.BoolOp) and isinstance(test_expr.op, ast.And):
+        found: set[str] = set()
+        for val in test_expr.values:
+            found |= _collect_param_is_not_none_guards(val, param_names)
+        return frozenset(found)
+    return frozenset()
+
+
+def _rhs_reads_unshadowed_class_attr(
+    val_expr: ast.AST | None,
+    attr_name: str,
+    self_name: str,
+    cls_name: str,
+    *,
+    already_written: bool,
+) -> bool:
+    """Return True if `val_expr` copies/wraps `self.<attr_name>` or `<cls_name>.<attr_name>` without conditional fallback."""
+    if val_expr is None or already_written:
+        return False
+    has_ref = False
+    for node in ast.walk(val_expr):
+        if isinstance(node, (ast.IfExp, ast.BoolOp, ast.Lambda)):
+            return False
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == attr_name
+            and isinstance(node.value, ast.Name)
+            and node.value.id in (self_name, cls_name)
+        ):
+            has_ref = True
+    return has_ref
+
+
+def _dotted_expr_parts(expr: ast.AST) -> list[str] | None:
+    """Unroll a dotted `ast.Name` / `ast.Attribute` chain (e.g. `pkg.base.Base` -> `['pkg', 'base', 'Base']`)."""
+    parts: list[str] = []
+    cur: ast.AST = expr
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        parts.reverse()
+        return parts
+    return None
+
+
+def _collect_init_self_writes(
+    cls_node: ast.ClassDef,
+) -> dict[str, list[tuple[str, int, bool]]]:
+    """Collect `self.<attr>` writes in `__init__` and `self.<helper>` methods called from `__init__`.
+
+    Returns `{attr: [(method_name, lineno, is_guarded_or_class_default_copy), ...]}`.
+    """
+    methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        stmt.name: stmt
+        for stmt in cls_node.body
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if "__init__" not in methods:
+        return {}
+
+    writes: dict[str, list[tuple[str, int, bool]]] = {}
+    visited: set[str] = set()
+    queue: list[str] = ["__init__"]
+
+    while queue:
+        m_name = queue.pop(0)
+        if m_name in visited or m_name not in methods:
+            continue
+        visited.add(m_name)
+        fn_node = methods[m_name]
+        all_pos = list(fn_node.args.posonlyargs) + list(fn_node.args.args)
+        if not all_pos:
+            continue
+        self_name = all_pos[0].arg
+
+        # Identify parameters with default `None` on `__init__` for caller-override guard detection
+        none_default_params: set[str] = set()
+        if m_name == "__init__":
+            defaults = list(fn_node.args.defaults)
+            non_self = all_pos[1:]
+            pad = len(non_self) - len(defaults)
+            for idx_p, arg_node in enumerate(non_self):
+                def_idx = idx_p - pad
+                if def_idx >= 0 and isinstance(defaults[def_idx], ast.Constant) and defaults[def_idx].value is None:
+                    none_default_params.add(arg_node.arg)
+            for kw_arg, kw_def in zip(fn_node.args.kwonlyargs, fn_node.args.kw_defaults):
+                if isinstance(kw_def, ast.Constant) and kw_def.value is None:
+                    none_default_params.add(kw_arg.arg)
+
+        def _is_guarded_rhs(attr_name: str, val_expr: ast.AST | None, guarded_params: frozenset[str]) -> bool:
+            if guarded_params and val_expr is not None:
+                if any(isinstance(n, ast.Name) and n.id in guarded_params for n in ast.walk(val_expr)):
+                    return True
+            return _rhs_reads_unshadowed_class_attr(
+                val_expr,
+                attr_name,
+                self_name,
+                cls_node.name,
+                already_written=(attr_name in writes),
+            )
+
+        def _scan_expr(expr: ast.AST | None, guarded_params: frozenset[str], fallback_lineno: int) -> None:
+            if expr is None:
+                return
+            for sub in ast.walk(expr):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(sub, ast.Call):
+                    if (
+                        isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id == self_name
+                        and sub.func.attr in methods
+                        and sub.func.attr not in visited
+                    ):
+                        queue.append(sub.func.attr)
+                    elif (
+                        isinstance(sub.func, ast.Name)
+                        and sub.func.id == "setattr"
+                        and len(sub.args) == 3
+                        and isinstance(sub.args[0], ast.Name)
+                        and sub.args[0].id == self_name
+                        and isinstance(sub.args[1], ast.Constant)
+                        and isinstance(sub.args[1].value, str)
+                    ):
+                        s_attr = sub.args[1].value
+                        if s_attr and not (s_attr.startswith("__") and s_attr.endswith("__")):
+                            is_g = _is_guarded_rhs(s_attr, sub.args[2], guarded_params)
+                            writes.setdefault(s_attr, []).append(
+                                (m_name, getattr(sub, "lineno", fallback_lineno), is_g)
+                            )
+
+        def _walk_stmts(stmts: list[ast.stmt], guarded_params: frozenset[str]) -> None:
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(st, ast.If):
+                    _scan_expr(st.test, guarded_params, st.lineno)
+                    g_params = guarded_params | _collect_param_is_not_none_guards(st.test, none_default_params)
+                    _walk_stmts(st.body, g_params)
+                    _walk_stmts(st.orelse, guarded_params)
+                    continue
+                if _MATCH_TYPES and isinstance(st, _MATCH_TYPES):
+                    _scan_expr(getattr(st, "subject", None), guarded_params, st.lineno)
+                    for mc in getattr(st, "cases", []):
+                        _scan_expr(getattr(mc, "guard", None), guarded_params, st.lineno)
+                        _walk_stmts(mc.body, guarded_params)
+                    continue
+                if isinstance(st, (ast.For, ast.AsyncFor)):
+                    _scan_expr(st.iter, guarded_params, st.lineno)
+                    _walk_stmts(st.body, guarded_params)
+                    _walk_stmts(st.orelse, guarded_params)
+                    continue
+                if isinstance(st, ast.While):
+                    _scan_expr(st.test, guarded_params, st.lineno)
+                    _walk_stmts(st.body, guarded_params)
+                    _walk_stmts(st.orelse, guarded_params)
+                    continue
+                if isinstance(st, (ast.With, ast.AsyncWith)):
+                    for item in st.items:
+                        _scan_expr(item.context_expr, guarded_params, st.lineno)
+                    _walk_stmts(st.body, guarded_params)
+                    continue
+                if isinstance(st, _TRY_STAR_TYPES):
+                    _walk_stmts(st.body, guarded_params)
+                    for h in getattr(st, "handlers", []):
+                        if isinstance(h, ast.ExceptHandler):
+                            _walk_stmts(h.body, guarded_params)
+                    _walk_stmts(st.orelse, guarded_params)
+                    _walk_stmts(st.finalbody, guarded_params)
+                    continue
+
+                # Simple statement: scan expressions for helper calls and `setattr(self, ...)`
+                _scan_expr(st, guarded_params, st.lineno)
+                if isinstance(st, ast.Assign):
+                    for tgt in st.targets:
+                        targets_iter = tgt.elts if isinstance(tgt, (ast.Tuple, ast.List)) else [tgt]
+                        for item_t in targets_iter:
+                            if (
+                                isinstance(item_t, ast.Attribute)
+                                and isinstance(item_t.value, ast.Name)
+                                and item_t.value.id == self_name
+                            ):
+                                is_g = _is_guarded_rhs(item_t.attr, st.value, guarded_params)
+                                writes.setdefault(item_t.attr, []).append((m_name, st.lineno, is_g))
+                elif (
+                    isinstance(st, ast.AnnAssign)
+                    and st.value is not None
+                    and isinstance(st.target, ast.Attribute)
+                    and isinstance(st.target.value, ast.Name)
+                    and st.target.value.id == self_name
+                ):
+                    is_g = _is_guarded_rhs(st.target.attr, st.value, guarded_params)
+                    writes.setdefault(st.target.attr, []).append((m_name, st.lineno, is_g))
+                elif (
+                    isinstance(st, ast.AugAssign)
+                    and isinstance(st.target, ast.Attribute)
+                    and isinstance(st.target.value, ast.Name)
+                    and st.target.value.id == self_name
+                ):
+                    writes.setdefault(st.target.attr, []).append((m_name, st.lineno, False))
+
+        _walk_stmts(fn_node.body, frozenset())
+
+    return writes
+
+
+def _collect_top_level_import_map(
+    tree: ast.Module,
+    current_rel: str,
+) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """Return `(symbol_imports, module_aliases)` from top-level imports in `tree`.
+
+    `symbol_imports[local_name] = (module_dotted_base, exported_symbol_name)`
+    `module_aliases[local_alias] = module_dotted_base`
+    """
+    pkg_parts = list(Path(current_rel).parent.parts)
+    if pkg_parts == ["."]:
+        pkg_parts = []
+    sym_map: dict[str, tuple[str, str]] = {}
+    mod_map: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ImportFrom):
+            base_parts = list(pkg_parts)
+            if stmt.level > 0:
+                trim = stmt.level - 1
+                base_parts = base_parts[: max(0, len(base_parts) - trim)] if trim > 0 else base_parts
+                mod_parts = base_parts + (stmt.module.split(".") if stmt.module else [])
+            else:
+                mod_parts = stmt.module.split(".") if stmt.module else []
+            mod_dotted = ".".join(p for p in mod_parts if p)
+            if not mod_dotted:
+                continue
+            for alias in stmt.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                sym_map[local] = (mod_dotted, alias.name)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if alias.asname:
+                    mod_map[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    mod_map[top] = top
+    return sym_map, mod_map
+
+
+def detect_class_attribute_shadowing(
+    worktree_root: Path,
+    files_changed: list[str],
+    *,
+    baseline_ref: str = "HEAD",
+) -> list[str]:
+    """Detect non-test `.py` edits where `C.__init__` (or helpers it calls) newly shadows an existing `HEAD` class attribute."""
+    if not files_changed or not worktree_root.is_dir():
+        return []
+
+    parsed_head_cache: dict[str, tuple[ast.Module, dict[str, ast.ClassDef]] | None] = {}
+
+    def _load_head_module(rel_path: str) -> tuple[ast.Module, dict[str, ast.ClassDef]] | None:
+        if rel_path in parsed_head_cache:
+            return parsed_head_cache[rel_path]
+        res = _run_git(["show", f"{baseline_ref}:{rel_path}"], cwd=worktree_root, check=False)
+        if res.returncode != 0 or not res.stdout:
+            parsed_head_cache[rel_path] = None
+            return None
+        try:
+            mod_tree = ast.parse(res.stdout, filename=rel_path)
+        except SyntaxError:
+            parsed_head_cache[rel_path] = None
+            return None
+        entry = (mod_tree, _collect_ast_class_map(mod_tree))
+        parsed_head_cache[rel_path] = entry
+        return entry
+
+    def _resolve_dotted_module_rel(mod_dotted: str) -> str | None:
+        rel_stem = mod_dotted.replace(".", "/")
+        cands = [f"{rel_stem}.py", f"{rel_stem}/__init__.py"]
+        if not rel_stem.startswith("src/"):
+            cands.extend([f"src/{rel_stem}.py", f"src/{rel_stem}/__init__.py"])
+        for cand in cands:
+            if _load_head_module(cand) is not None:
+                return cand
+        return None
+
+    def _resolve_imported_chain(full_parts: list[str]) -> tuple[str, str] | None:
+        for split_idx in range(len(full_parts) - 1, 0, -1):
+            cand_rel = _resolve_dotted_module_rel(".".join(full_parts[:split_idx]))
+            if cand_rel is not None:
+                return cand_rel, ".".join(full_parts[split_idx:])
+        return None
+
+    contract_cache: dict[tuple[str, str], tuple[set[str], set[str]]] = {}
+
+    def _effective_head_contract(
+        rel_path: str,
+        qual_cls: str,
+        visiting: frozenset[tuple[str, str]] = frozenset(),
+    ) -> tuple[set[str], set[str]]:
+        key = (rel_path, qual_cls)
+        if key in contract_cache:
+            return contract_cache[key]
+        if key in visiting:
+            return set(), set()
+        loaded = _load_head_module(rel_path)
+        if loaded is None:
+            return set(), set()
+        mod_tree, mod_classes = loaded
+        sym_imports, mod_aliases = _collect_top_level_import_map(mod_tree, rel_path)
+        next_visiting = visiting | {key}
+        cls_node = mod_classes.get(qual_cls)
+        if cls_node is None:
+            q_parts = qual_cls.split(".")
+            reexp_chain: list[str] = []
+            if q_parts[0] in sym_imports:
+                imp_mod, orig_sym = sym_imports[q_parts[0]]
+                reexp_chain = [*imp_mod.split("."), orig_sym, *q_parts[1:]]
+            elif q_parts[0] in mod_aliases and len(q_parts) >= 2:
+                reexp_chain = [*mod_aliases[q_parts[0]].split("."), *q_parts[1:]]
+            resolved_reexp = _resolve_imported_chain(reexp_chain) if reexp_chain else None
+            if resolved_reexp is not None:
+                res = _effective_head_contract(resolved_reexp[0], resolved_reexp[1], next_visiting)
+                contract_cache[key] = res
+                return res
+            return set(), set()
+
+        eff_attrs = set(_collect_direct_class_attrs(cls_node))
+        eff_unguarded = {
+            a
+            for a, locs in _collect_init_self_writes(cls_node).items()
+            if any(not is_g for _, _, is_g in locs)
+        }
+        parent_prefix = qual_cls.rsplit(".", 1)[0] if "." in qual_cls else ""
+
+        for base_expr in cls_node.bases:
+            b_rel: str | None = None
+            b_qual: str | None = None
+            b_parts = _dotted_expr_parts(base_expr)
+            if not b_parts:
+                continue
+            joined_base = ".".join(b_parts)
+            scoped_cand = f"{parent_prefix}.{joined_base}" if parent_prefix else joined_base
+            if scoped_cand in mod_classes:
+                b_rel, b_qual = rel_path, scoped_cand
+            elif joined_base in mod_classes:
+                b_rel, b_qual = rel_path, joined_base
+            else:
+                imp_chain: list[str] = []
+                if b_parts[0] in sym_imports:
+                    imp_mod, orig_sym = sym_imports[b_parts[0]]
+                    imp_chain = [*imp_mod.split("."), orig_sym, *b_parts[1:]]
+                elif b_parts[0] in mod_aliases and len(b_parts) >= 2:
+                    imp_chain = [*mod_aliases[b_parts[0]].split("."), *b_parts[1:]]
+                resolved_imp = _resolve_imported_chain(imp_chain) if imp_chain else None
+                if resolved_imp is not None:
+                    b_rel, b_qual = resolved_imp
+            if b_rel and b_qual:
+                inh_attrs, inh_unguarded = _effective_head_contract(b_rel, b_qual, next_visiting)
+                eff_attrs |= inh_attrs
+                eff_unguarded |= inh_unguarded
+
+        contract_cache[key] = (eff_attrs, eff_unguarded)
+        return eff_attrs, eff_unguarded
+
+    warnings: list[str] = []
+    for rel in files_changed:
+        if not rel.endswith(".py") or _is_test_or_doc_path(rel):
+            continue
+        wt_file = worktree_root / rel
+        if not wt_file.is_file() or wt_file.is_symlink():
+            continue
+        loaded_head = _load_head_module(rel)
+        if loaded_head is None:
+            continue
+        _head_tree, head_classes = loaded_head
+        try:
+            wt_tree = ast.parse(wt_file.read_text(encoding="utf-8", errors="replace"), filename=rel)
+        except SyntaxError:
+            continue
+        wt_classes = _collect_ast_class_map(wt_tree)
+        for qual_cls in head_classes:
+            wt_cls = wt_classes.get(qual_cls)
+            if wt_cls is None:
+                continue
+            head_attrs, head_unguarded_writes = _effective_head_contract(rel, qual_cls)
+            if not head_attrs:
+                continue
+            wt_init_writes = _collect_init_self_writes(wt_cls)
+            for attr, locs in wt_init_writes.items():
+                if attr not in head_attrs or attr in head_unguarded_writes:
+                    continue
+                unguarded_locs = [(m_name, ln) for m_name, ln, is_guarded in locs if not is_guarded]
+                if not unguarded_locs:
+                    continue
+                m_name, lineno = unguarded_locs[0]
+                loc_method = f"{qual_cls}.__init__" if m_name == "__init__" else f"{qual_cls}.{m_name} (called from __init__)"
+                warnings.append(
+                    f"ClassAttributeShadowed: {rel}:{lineno}: {loc_method} newly assigns self.{attr}, "
+                    f"shadowing existing class attribute {qual_cls}.{attr} on HEAD "
+                    f"(breaks monkeypatch.setattr({qual_cls}, {attr!r}, ...) unless only set when explicitly passed by caller)."
+                )
+    return warnings
 
 
 import builtins as _py_builtins
@@ -2043,6 +3048,8 @@ class JobManager:
         self._apply_lock = threading.Lock()
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
+        self._cancel_hooks: dict[str, Callable[[], None]] = {}
+        self._shutting_down: bool = False
         self._raw_projects: dict[str, str] = {}
         self._raw_api_keys: dict[str, str] = {}
         self._wait_sliced_auto_apply: dict[str, bool | None] = {}
@@ -3189,6 +4196,9 @@ class JobManager:
         max_tool_calls: int | None = None,
         max_total_tokens: int | None = None,
         preloaded_files: list[str] | None = None,
+        prompt_sources: list[str] | None = None,
+        recorded_budget: dict[str, int | None] | None = None,
+        baseline_acceptance_probe: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         token_keys = (
             "prompt_token_count",
@@ -3219,6 +4229,8 @@ class JobManager:
         symlink_escapes: list[str] = []
         stop_reason: str | None = None
         acceptance_results: list[dict[str, Any]] = []
+        baseline_acceptance_warnings: list[str] = []
+        contract_warnings: list[str] = []
         progress_path = self.store.progress_path(job_id)
         progress_before = len(read_progress(progress_path, limit=10**6))
 
@@ -3250,6 +4262,20 @@ class JobManager:
             def tracked_backend(req: dict[str, Any]) -> Any:
                 return raw_backend(_TrackedReq(req))
 
+        def _register_cancel_hook(fn: Callable[[], None] | None) -> None:
+            should_fire_immediately = False
+            with self._lock:
+                if fn is None:
+                    self._cancel_hooks.pop(job_id, None)
+                else:
+                    self._cancel_hooks[job_id] = fn
+                    should_fire_immediately = job_id in self._cancelled
+            if should_fire_immediately and fn is not None:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
         try:
             with self._lock:
                 if job_id in self._cancelled:
@@ -3274,6 +4300,7 @@ class JobManager:
                 max_total_tokens=max_total_tokens,
                 progress_path=progress_path,
                 acceptance=acceptance,
+                register_cancel=_register_cancel_hook,
             )
 
             response_text = str(worker_out.get("text") or "")
@@ -3286,27 +4313,7 @@ class JobManager:
                 + usage["candidates_token_count"]
                 + usage["thoughts_token_count"],
             )
-            new_requests = new_usage.get("requests")
-            if isinstance(new_requests, list) and new_requests:
-                tagged_reqs = [
-                    ({**r, "model": r.get("model") or model} if isinstance(r, dict) else r)
-                    for r in new_requests
-                ]
-                usage.setdefault("requests", []).extend(tagged_reqs)
-            elif usage.get("requests") and any(
-                int(new_usage.get(k) or 0) > 0
-                for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count")
-            ):
-                usage["requests"].append(
-                    {
-                        "prompt_token_count": int(new_usage.get("prompt_token_count") or 0),
-                        "cached_content_token_count": int(new_usage.get("cached_content_token_count") or 0),
-                        "candidates_token_count": int(new_usage.get("candidates_token_count") or 0),
-                        "thoughts_token_count": int(new_usage.get("thoughts_token_count") or 0),
-                        "total_token_count": int(new_usage.get("total_token_count") or 0),
-                        "model": model,
-                    }
-                )
+            self._append_phase_usage_requests(usage, new_usage, model)
             new_max_req = int(new_usage.get("max_request_prompt_tokens") or 0)
             if new_max_req > 0 or usage.get("max_request_prompt_tokens"):
                 usage["max_request_prompt_tokens"] = max(
@@ -3327,19 +4334,25 @@ class JobManager:
                     if stop_reason in CHECKPOINT_STOP_REASONS:
                         # Budget reached: not an error. The lead reviews and continues or redirects.
                         status = "checkpoint"
+                    elif new_signals and new_signals[-1].get("kind") == "spec_conflict":
+                        status = "spec_conflict"
                     elif new_signals and new_signals[-1].get("kind") in ("question", "blocker"):
                         status = "needs_input"
 
         except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as exc:
             with self._lock:
                 is_canc = job_id in self._cancelled
+                is_shutting_down = self._shutting_down
             if is_canc:
                 status = "cancelled"
                 error_msg = "Job cancelled during execution."
+            elif is_shutting_down:
+                status = "interrupted"
+                error_msg = "MCP server shut down before worker completed."
             else:
                 status = "timeout"
                 error_msg = f"TimeoutError: {exc}"
-            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
+            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts, model=model)
             if getattr(exc, "partial_containment", None):
                 worker_out["containment"] = getattr(exc, "partial_containment")
             if getattr(exc, "partial_containment_warning", None):
@@ -3355,7 +4368,7 @@ class JobManager:
             else:
                 status = "error"
                 error_msg = f"{type(exc).__name__}: {exc}"
-            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts)
+            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts, model=model)
             if getattr(exc, "partial_containment", None):
                 worker_out["containment"] = getattr(exc, "partial_containment")
             if getattr(exc, "partial_containment_warning", None):
@@ -3392,6 +4405,8 @@ class JobManager:
                 if status in ("running", "ok"):
                     status = "error"
                     error_msg = f"Failed to collect worktree diff: {type(fin_exc).__name__}: {fin_exc}"
+            is_mutating_job = not is_read_only_tool_set(enabled_tools, disabled_tools)
+            vacuous_acceptance = False
             runnable_acc_status = (
                 status in ("ok", "checkpoint", "needs_input")
                 or (status == "timeout" and bool(files_changed))
@@ -3406,6 +4421,11 @@ class JobManager:
                         if icmd not in effective_acceptance:
                             effective_acceptance.append(icmd)
                 auto_default_acceptance = bool(effective_acceptance)
+            if effective_acceptance and runnable_acc_status and is_mutating_job and not files_changed:
+                # Never run acceptance commands on an unmodified worktree for a mutating coding job:
+                # pre-existing baseline tests passing with zero edits is vacuous (e.g. an early tool-budget checkpoint).
+                vacuous_acceptance = True
+                effective_acceptance = []
             if effective_acceptance and runnable_acc_status:
                 try:
                     reused_acc = (
@@ -3422,6 +4442,13 @@ class JobManager:
                         acceptance_results = reused_acc
                     else:
                         acceptance_results = run_acceptance(effective_acceptance, target_acc_cwd)
+                    if not auto_default_acceptance and baseline_acceptance_probe and files_changed:
+                        baseline_acceptance_warnings = evaluate_post_worker_baseline_failures(
+                            acceptance_results,
+                            baseline_acceptance_probe,
+                            target_acc_cwd,
+                            files_changed,
+                        )
                     if auto_default_acceptance:
                         for dr in acceptance_results:
                             dr["auto_discovered_default"] = True
@@ -3543,6 +4570,15 @@ class JobManager:
                 if files_changed
                 else []
             )
+            contract_warnings = (
+                detect_class_attribute_shadowing(
+                    self.workspace_root if in_place else wt_dir,
+                    files_changed,
+                    baseline_ref=baseline_sha or "HEAD",
+                )
+                if files_changed
+                else []
+            )
 
             with self._lock:
                 if job_id in self._cancelled:
@@ -3587,6 +4623,28 @@ class JobManager:
             clipped_text, was_truncated, orig_tokens = truncate_to_token_budget(
                 response_text, MAX_TOOL_RESPONSE_TOKENS
             )
+            effective_prompt_sources = list(prompt_sources or ["lead"] * len(recorded_prompts))
+            if len(effective_prompt_sources) < len(recorded_prompts):
+                effective_prompt_sources.extend(["lead"] * (len(recorded_prompts) - len(effective_prompt_sources)))
+            effective_budget = (
+                dict(recorded_budget)
+                if isinstance(recorded_budget, dict)
+                else {"max_tool_calls": max_tool_calls, "max_total_tokens": max_total_tokens}
+            )
+            spec_conflict_msg: str | None = None
+            if status == "spec_conflict":
+                latest_sigs = read_progress(progress_path, limit=8)
+                for sig in reversed(latest_sigs):
+                    if sig.get("kind") == "spec_conflict" and sig.get("message"):
+                        spec_conflict_msg = str(sig["message"])
+                        break
+            if any(isinstance(r, dict) and r.get("vacuous") for r in acceptance_results):
+                vacuous_acceptance = True
+            computed_acc_passed = (
+                False
+                if vacuous_acceptance and acceptance_results
+                else (all(r.get("passed") for r in acceptance_results) if acceptance_results else None)
+            )
             receipt_payload = {
                 "job_id": job_id,
                 "kind": "delegate",
@@ -3597,6 +4655,7 @@ class JobManager:
                 "vertex_location": location,
                 "reroute_note": reroute_note,
                 "prompts": recorded_prompts,
+                "prompt_sources": effective_prompt_sources,
                 "allowed_paths": allowed_paths,
                 "enabled_tools": enabled_tools,
                 "disabled_tools": disabled_tools,
@@ -3626,17 +4685,20 @@ class JobManager:
                 "plan": plan or [],
                 "acceptance": acceptance or [],
                 "timeout_seconds": timeout_seconds,
-                "budget": {"max_tool_calls": max_tool_calls, "max_total_tokens": max_total_tokens},
+                "budget": effective_budget,
                 "stop_reason": stop_reason,
                 "containment": worker_out.get("containment", "none") if isinstance(worker_out, dict) else "none",
                 "containment_warning": (
                     worker_out.get("containment_warning") if isinstance(worker_out, dict) else None
                 ),
                 "acceptance_results": acceptance_results,
-                "acceptance_passed": (
-                    all(r.get("passed") for r in acceptance_results) if acceptance_results else None
-                ),
+                "acceptance_passed": computed_acc_passed,
+                **({"vacuous_acceptance": True} if vacuous_acceptance else {}),
+                **({"spec_conflict": spec_conflict_msg} if spec_conflict_msg else {}),
                 "missing_prompt_symbols": missing_prompt_symbols,
+                "contract_warnings": contract_warnings,
+                **({"baseline_acceptance_probe": baseline_acceptance_probe} if baseline_acceptance_probe else {}),
+                **({"baseline_acceptance_warnings": baseline_acceptance_warnings} if baseline_acceptance_warnings else {}),
                 "external_worktree_tamper": external_tamper,
                 "preloaded_files": list(preloaded_files or []),
                 **(
@@ -3691,17 +4753,33 @@ class JobManager:
                 prior_disk_rec = self.store.read_receipt(job_id)
             except Exception:
                 prior_disk_rec = {}
-            if prior_disk_rec.get("cancelled") or prior_disk_rec.get("status") == "cancelled" or status == "cancelled":
+            with self._lock:
+                explicitly_cancelled = job_id in self._cancelled
+            if prior_disk_rec.get("cancelled") or prior_disk_rec.get("status") == "cancelled" or explicitly_cancelled:
                 receipt_payload["status"] = "cancelled"
                 receipt_payload["cancelled"] = True
                 if not receipt_payload.get("error"):
                     receipt_payload["error"] = prior_disk_rec.get("error") or "Cancelled by user via delegate_cancel."
-            elif prior_disk_rec.get("status") == "interrupted":
+            elif prior_disk_rec.get("status") == "interrupted" or status == "interrupted":
                 receipt_payload["status"] = "interrupted"
                 if not receipt_payload.get("error"):
-                    receipt_payload["error"] = prior_disk_rec.get("error")
+                    receipt_payload["error"] = prior_disk_rec.get("error") or error_msg
+            elif status == "cancelled":
+                receipt_payload["status"] = "cancelled"
+                receipt_payload["cancelled"] = True
+                if not receipt_payload.get("error"):
+                    receipt_payload["error"] = "Cancelled."
             if prior_disk_rec.get("escalated_from_model") and not receipt_payload.get("escalated_from_model"):
                 receipt_payload["escalated_from_model"] = prior_disk_rec["escalated_from_model"]
+            for ctx_key in (
+                "raw_user_prompt",
+                "checklist",
+                "spec_files",
+                "context_files",
+                "baseline_acceptance_probe",
+            ):
+                if prior_disk_rec.get(ctx_key) and not receipt_payload.get(ctx_key):
+                    receipt_payload[ctx_key] = prior_disk_rec[ctx_key]
             if prior_disk_rec.get("applied") and not in_place:
                 for preserve_key in (
                     "applied",
@@ -3731,11 +4809,67 @@ class JobManager:
         return saved
 
     @staticmethod
+    def _append_phase_usage_requests(
+        usage: dict[str, Any],
+        phase_usage: dict[str, Any],
+        model: str,
+    ) -> None:
+        """Append per-call requests from `phase_usage` (tagged with `model`) plus any unitemized remainder."""
+        phase_reqs = phase_usage.get("requests")
+        phase_p = int(phase_usage.get("prompt_token_count") or 0)
+        phase_c = int(phase_usage.get("cached_content_token_count") or 0)
+        phase_cand = int(phase_usage.get("candidates_token_count") or 0)
+        phase_th = int(phase_usage.get("thoughts_token_count") or 0)
+        phase_tot = max(
+            int(phase_usage.get("total_token_count") or 0),
+            phase_p + phase_cand + phase_th,
+        )
+        if isinstance(phase_reqs, list) and phase_reqs:
+            tagged_reqs = [
+                ({**r, "model": r.get("model") or model} if isinstance(r, dict) else r)
+                for r in phase_reqs
+            ]
+            usage.setdefault("requests", []).extend(tagged_reqs)
+            sum_p = sum(int(r.get("prompt_token_count") or 0) for r in tagged_reqs if isinstance(r, dict))
+            sum_c = sum(int(r.get("cached_content_token_count") or 0) for r in tagged_reqs if isinstance(r, dict))
+            sum_cand = sum(int(r.get("candidates_token_count") or 0) for r in tagged_reqs if isinstance(r, dict))
+            sum_th = sum(int(r.get("thoughts_token_count") or 0) for r in tagged_reqs if isinstance(r, dict))
+            rem_p = max(0, phase_p - sum_p)
+            rem_c = min(rem_p, max(0, phase_c - sum_c))
+            rem_cand = max(0, phase_cand - sum_cand)
+            rem_th = max(0, phase_th - sum_th)
+            if rem_p > 0 or rem_cand > 0 or rem_th > 0:
+                usage["requests"].append(
+                    {
+                        "prompt_token_count": rem_p,
+                        "cached_content_token_count": rem_c,
+                        "candidates_token_count": rem_cand,
+                        "thoughts_token_count": rem_th,
+                        "total_token_count": rem_p + rem_cand + rem_th,
+                        "model": model,
+                    }
+                )
+        elif usage.get("requests") and (phase_p > 0 or phase_cand > 0 or phase_th > 0):
+            usage["requests"].append(
+                {
+                    "prompt_token_count": phase_p,
+                    "cached_content_token_count": phase_c,
+                    "candidates_token_count": phase_cand,
+                    "thoughts_token_count": phase_th,
+                    "total_token_count": phase_tot,
+                    "model": model,
+                }
+            )
+
+    @classmethod
     def _merge_partial_exception_data(
+        cls,
         exc: BaseException,
         usage: dict[str, Any],
         tool_calls: list[dict[str, Any]],
         thoughts: list[str],
+        *,
+        model: str = "",
     ) -> None:
         partial_u = getattr(exc, "partial_usage", None)
         if isinstance(partial_u, dict):
@@ -3753,9 +4887,7 @@ class JobManager:
                 + usage["candidates_token_count"]
                 + usage["thoughts_token_count"],
             )
-            partial_reqs = partial_u.get("requests")
-            if isinstance(partial_reqs, list) and partial_reqs:
-                usage.setdefault("requests", []).extend(partial_reqs)
+            cls._append_phase_usage_requests(usage, partial_u, model)
             partial_max_req = int(partial_u.get("max_request_prompt_tokens") or 0)
             if partial_max_req > 0:
                 usage["max_request_prompt_tokens"] = max(
@@ -4095,20 +5227,6 @@ class JobManager:
             else ""
         )
         clean_checklist = [str(item).strip() for item in (checklist or []) if str(item).strip()]
-        worker_prompt = render_worker_prompt(
-            prompt,
-            plan=plan_steps,
-            acceptance=acceptance_cmds,
-            max_tool_calls=budget_calls,
-            max_total_tokens=budget_tokens,
-            preloaded_files=preloaded_pairs,
-            repo_map=repo_map_text,
-            focused_outline=focused_outline_text,
-            spec_files_inlined=spec_inlined,
-            context_files_inlined=ctx_inlined,
-            checklist=clean_checklist,
-            raw_user_prompt=raw_user_prompt_text,
-        )
 
         auth = resolve_auth_config(
             requested_project=project,
@@ -4141,6 +5259,40 @@ class JobManager:
                 spec_files=spec_files,
             )
 
+        baseline_probe: list[dict[str, Any]] = []
+        if (
+            acceptance_cmds
+            and not in_place
+            and not is_read_only_tool_set(enabled_tools, disabled_tools)
+            and env_flag("CC_AGY_BASELINE_ACCEPTANCE_PROBE") is not False
+        ):
+            per_probe_limit = min(15.0, max(0.3, float(timeout_seconds) * 0.4))
+            total_probe_limit = min(25.0, max(0.5, float(timeout_seconds) * 0.5))
+            baseline_probe = probe_baseline_acceptance(
+                acceptance_cmds,
+                wt_dir,
+                per_cmd_timeout=per_probe_limit,
+                total_timeout=total_probe_limit,
+                reset_tracked=True,
+            )
+
+        worker_prompt = render_worker_prompt(
+            prompt,
+            plan=plan_steps,
+            acceptance=acceptance_cmds,
+            max_tool_calls=budget_calls,
+            max_total_tokens=budget_tokens,
+            preloaded_files=preloaded_pairs,
+            repo_map=repo_map_text,
+            focused_outline=focused_outline_text,
+            spec_files_inlined=spec_inlined,
+            context_files_inlined=ctx_inlined,
+            checklist=clean_checklist,
+            raw_user_prompt=raw_user_prompt_text,
+            baseline_acceptance_probe=baseline_probe,
+            allowed_paths=validated_paths,
+        )
+
         with self._lock:
             if resolved_project:
                 self._raw_projects[job_id] = resolved_project
@@ -4148,6 +5300,8 @@ class JobManager:
                 self._raw_api_keys[job_id] = resolved_key
             sparse_init_count = self._sparse_worktrees.get(job_id)
 
+        spec_rel_list = [r for r, _ in spec_inlined]
+        ctx_rel_list = [r for r, _ in ctx_inlined]
         initial_receipt = {
             "job_id": job_id,
             "kind": "delegate",
@@ -4158,6 +5312,7 @@ class JobManager:
             "vertex_location": resolved_location,
             "reroute_note": reroute_note,
             "prompts": [prompt.strip()],
+            "prompt_sources": ["lead"],
             "allowed_paths": validated_paths,
             "enabled_tools": enabled_tools,
             "disabled_tools": disabled_tools,
@@ -4186,6 +5341,11 @@ class JobManager:
             "timeout_seconds": timeout_seconds,
             "budget": {"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
             "preloaded_files": preloaded_rel_paths,
+            **({"raw_user_prompt": raw_user_prompt_text} if raw_user_prompt_text else {}),
+            **({"checklist": clean_checklist} if clean_checklist else {}),
+            **({"spec_files": spec_rel_list} if spec_rel_list else {}),
+            **({"context_files": ctx_rel_list} if ctx_rel_list else {}),
+            **({"baseline_acceptance_probe": baseline_probe} if baseline_probe else {}),
             "error": None,
         }
         if sparse_init_count is not None:
@@ -4230,6 +5390,9 @@ class JobManager:
             max_tool_calls=budget_calls,
             max_total_tokens=budget_tokens,
             preloaded_files=preloaded_rel_paths,
+            prompt_sources=["lead"],
+            recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
+            baseline_acceptance_probe=baseline_probe,
         )
         with self._lock:
             self._futures[job_id] = fut
@@ -4363,17 +5526,22 @@ class JobManager:
             or is_strict_mode_enabled()
             or bool(os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip())
         )
+        with self._lock:
+            is_cancelled_now = (job_id in self._cancelled) or bool(receipt.get("cancelled"))
+        needs_turn1_escalation = (
+            worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+            or bool(receipt.get("vacuous_acceptance"))
+            or receipt.get("status") in ("checkpoint", "needs_input")
+        )
         if (
             self._is_bounded_lead_session()
             and allow_turn1_inplace_escalation
             and not in_place
+            and not is_cancelled_now
             and not receipt.get("escalated_from_model")
             and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is not None
-            and (
-                worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
-                or receipt.get("status") in ("checkpoint", "needs_input")
-            )
-            and receipt.get("status") not in ("cancelled", "interrupted")
+            and needs_turn1_escalation
+            and receipt.get("status") not in ("cancelled", "interrupted", "spec_conflict")
         ):
             acc_failures = [
                 f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
@@ -4402,6 +5570,7 @@ class JobManager:
                 auto_apply=auto_apply,
                 _wait_elapsed=wait_elapsed,
                 _wait_budget=wait_budget,
+                _prompt_source="plugin_escalation",
             )
         digest = self._digest_with_progress(receipt)
         return self._maybe_auto_apply_digest(
@@ -4890,6 +6059,16 @@ class JobManager:
             "diff_sha256": applied_prov["diff_sha256"],
             "acceptance_passed": receipt.get("acceptance_passed"),
             **({"real_acceptance_passed": True} if real_apply_pass else {}),
+            **(
+                {"contract_warnings": list(receipt["contract_warnings"])}
+                if receipt.get("contract_warnings")
+                else {}
+            ),
+            **(
+                {"baseline_acceptance_warnings": list(receipt["baseline_acceptance_warnings"])}
+                if receipt.get("baseline_acceptance_warnings")
+                else {}
+            ),
             "revert_hint": f"delegate_revert(job_id={safe_id!r}) restores these files to their pre-apply state.",
         }
 
@@ -5099,6 +6278,12 @@ class JobManager:
         if digest.get("missing_prompt_symbols"):
             digest["auto_apply_skipped"] = f"missing prompt symbols: {digest['missing_prompt_symbols']}"
             return digest
+        if digest.get("vacuous_acceptance"):
+            digest["auto_apply_skipped"] = "acceptance checks were vacuous (no modified files or 0 tests collected)"
+            return digest
+        if digest.get("status") == "spec_conflict":
+            digest["auto_apply_skipped"] = "worker reported a specification conflict requiring Lead resolution"
+            return digest
         if (
             digest.get("status") == "ok"
             and digest.get("files_changed")
@@ -5200,7 +6385,14 @@ class JobManager:
                         digest.pop("in_place", None)
                     if not digest.get("scope_violations"):
                         digest.pop("scope_violations", None)
-                if not has_worker_caveat:
+                if digest.get("contract_warnings"):
+                    digest["next_action"] = (
+                        f"Changes were applied, but contract_warnings flagged potential class-attribute shadowing. "
+                        f"Call get_diff(job_id={job_id!r}, focus_symbols=[...]) on the flagged class/attribute; "
+                        f"if unrequested by the task specification, fix it via a targeted delegate_start follow-up job "
+                        f"before finishing."
+                    )
+                elif not has_worker_caveat:
                     digest["next_action"] = (
                         "Applied after acceptance passed. Finish now in one concise sentence without host reads or pytest."
                     )
@@ -5227,6 +6419,7 @@ class JobManager:
         auto_apply: bool | None = None,
         _wait_elapsed: float = 0.0,
         _wait_budget: float | None = None,
+        _prompt_source: str = "lead",
     ) -> dict[str, Any]:
         """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
         safe_id = validate_job_id(job_id)
@@ -5370,8 +6563,14 @@ class JobManager:
             )
 
         prior_prompts = list(receipt.get("prompts") or [])
+        prior_sources = list(receipt.get("prompt_sources") or ["lead"] * len(prior_prompts))
+        if len(prior_sources) < len(prior_prompts):
+            prior_sources.extend(["lead"] * (len(prior_prompts) - len(prior_sources)))
+        elif len(prior_sources) > len(prior_prompts):
+            prior_sources = prior_sources[: len(prior_prompts)]
         clean_followup = follow_up_prompt.strip()
         recorded_prompts = prior_prompts + [clean_followup]
+        recorded_prompt_sources = prior_sources + [str(_prompt_source or "lead")]
 
         prior_inspected_files: list[str] = []
         wt_str_prefix = str(wt_dir).rstrip("/") + "/"
@@ -5399,10 +6598,11 @@ class JobManager:
         target_esc_model = self._resolve_escalation_target_model(model)
         prior_turn_needs_escalation = (
             worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+            or bool(receipt.get("vacuous_acceptance"))
             or receipt.get("status") in ("checkpoint", "needs_input", "scope_violation")
             or bool(receipt.get("missing_prompt_symbols"))
             or (isinstance(receipt.get("qa_review"), dict) and receipt["qa_review"].get("passed") is False)
-        )
+        ) and receipt.get("status") != "spec_conflict"
         if target_esc_model and prior_turn_needs_escalation:
             escalated_from = str(receipt.get("escalated_from_model") or model)
             model = target_esc_model
@@ -5457,6 +6657,48 @@ class JobManager:
             (budget.get("max_total_tokens") or 0) if "max_total_tokens" in budget else None,
             model=model,
         )
+        prior_calls_used = max(
+            int(receipt.get("tool_call_count") or 0),
+            len(receipt.get("tool_calls") or []),
+        )
+        prior_tokens_used = int((receipt.get("usage") or {}).get("total_token_count") or 0)
+        if not force_retry and _prompt_source != "lead" and (
+            (budget_tokens is not None and prior_tokens_used >= budget_tokens)
+            or (budget_calls is not None and prior_calls_used >= budget_calls)
+        ):
+            if receipt.get("status") not in ("ok", "error", "cancelled", "interrupted", "spec_conflict"):
+                receipt["status"] = "checkpoint"
+            receipt["stop_reason"] = (
+                "MAX_TOTAL_TOKENS_EXCEEDED"
+                if (budget_tokens is not None and prior_tokens_used >= budget_tokens)
+                else "MAX_TOOL_CALLS_EXCEEDED"
+            )
+            receipt["budget_exhausted"] = True
+            self.store.write_receipt(
+                safe_id,
+                receipt,
+                scrub=bool(receipt.get("scrub_receipt", False)),
+                workspace_root=str(self.workspace_root),
+            )
+            digest = self._digest_with_progress(receipt)
+            digest["continued"] = False
+            digest["budget_exhausted"] = True
+            return digest
+
+        phase_budget_calls: int | None = budget_calls
+        if budget_calls is not None:
+            rem_calls = budget_calls - prior_calls_used
+            if rem_calls > 0:
+                phase_budget_calls = rem_calls
+            else:
+                # Explicit Lead continuation on a same-model checkpoint grants another slice of `budget_calls`.
+                phase_budget_calls = budget_calls
+
+        phase_budget_tokens: int | None = budget_tokens
+        if budget_tokens is not None:
+            rem_tokens = budget_tokens - prior_tokens_used
+            phase_budget_tokens = rem_tokens if rem_tokens > 0 else budget_tokens
+
         use_repo_map = os.environ.get("CC_AGY_REPO_MAP", "1").strip().lower() not in ("0", "false", "no")
         repo_map_text = (
             build_repo_map(self.workspace_root, cache_dir=self.store.data_dir)
@@ -5476,15 +6718,54 @@ class JobManager:
             if use_repo_map and cont_focus_targets
             else ""
         )
+        stored_raw_user_prompt = str(receipt.get("raw_user_prompt") or "").strip()
+        if stored_raw_user_prompt and stored_raw_user_prompt in clean_followup:
+            stored_raw_user_prompt = ""
+        stored_checklist = [
+            str(item).strip()
+            for item in (receipt.get("checklist") or [])
+            if str(item).strip()
+        ]
+        stored_spec_paths = [str(p) for p in (receipt.get("spec_files") or []) if isinstance(p, str)]
+        cont_spec_inlined = (
+            _load_safe_workspace_files(self.workspace_root, stored_spec_paths, max_total_tokens=8000)
+            if stored_spec_paths
+            else []
+        )
+        stored_ctx_paths = [str(p) for p in (receipt.get("context_files") or []) if isinstance(p, str)]
+        cont_ctx_inlined: list[tuple[str, str]] = []
+        if stored_ctx_paths and (
+            _prompt_source == "plugin_escalation"
+            or escalated_from is not None
+            or not receipt.get("files_changed")
+        ):
+            ctx_root = wt_dir if wt_dir.exists() else self.workspace_root
+            spec_set_cont = {r for r, _ in cont_spec_inlined}
+            cont_ctx_inlined = _load_safe_workspace_files(
+                ctx_root,
+                [p for p in stored_ctx_paths if p not in spec_set_cont],
+                max_total_tokens=4000,
+            )
+        prior_baseline_probe = (
+            list(receipt.get("baseline_acceptance_probe"))
+            if isinstance(receipt.get("baseline_acceptance_probe"), list)
+            else []
+        )
         worker_prompts = [
             render_worker_prompt(
                 worker_prompts[0],
                 plan=plan_steps,
                 acceptance=acceptance_cmds,
-                max_tool_calls=budget_calls,
-                max_total_tokens=budget_tokens,
+                max_tool_calls=phase_budget_calls,
+                max_total_tokens=phase_budget_tokens,
                 repo_map=repo_map_text,
                 focused_outline=cont_focused_outline,
+                spec_files_inlined=cont_spec_inlined,
+                context_files_inlined=cont_ctx_inlined,
+                checklist=stored_checklist,
+                raw_user_prompt=stored_raw_user_prompt,
+                baseline_acceptance_probe=prior_baseline_probe,
+                allowed_paths=list(receipt.get("allowed_paths") or []),
             )
         ]
         with self._lock:
@@ -5563,10 +6844,30 @@ class JobManager:
                 }
             ]
         elif isinstance(prior_usage_snapshot.get("requests"), list):
-            prior_usage_snapshot["requests"] = [
+            tagged_prior_reqs = [
                 ({**r, "model": r.get("model") or prior_model} if isinstance(r, dict) else r)
                 for r in prior_usage_snapshot["requests"]
             ]
+            sum_pp = sum(int(r.get("prompt_token_count") or 0) for r in tagged_prior_reqs if isinstance(r, dict))
+            sum_pc = sum(int(r.get("cached_content_token_count") or 0) for r in tagged_prior_reqs if isinstance(r, dict))
+            sum_pcand = sum(int(r.get("candidates_token_count") or 0) for r in tagged_prior_reqs if isinstance(r, dict))
+            sum_pth = sum(int(r.get("thoughts_token_count") or 0) for r in tagged_prior_reqs if isinstance(r, dict))
+            rem_pp = max(0, int(prior_usage_snapshot.get("prompt_token_count") or 0) - sum_pp)
+            rem_pc = min(rem_pp, max(0, int(prior_usage_snapshot.get("cached_content_token_count") or 0) - sum_pc))
+            rem_pcand = max(0, int(prior_usage_snapshot.get("candidates_token_count") or 0) - sum_pcand)
+            rem_pth = max(0, int(prior_usage_snapshot.get("thoughts_token_count") or 0) - sum_pth)
+            if rem_pp > 0 or rem_pcand > 0 or rem_pth > 0:
+                tagged_prior_reqs.append(
+                    {
+                        "prompt_token_count": rem_pp,
+                        "cached_content_token_count": rem_pc,
+                        "candidates_token_count": rem_pcand,
+                        "thoughts_token_count": rem_pth,
+                        "total_token_count": rem_pp + rem_pcand + rem_pth,
+                        "model": prior_model,
+                    }
+                )
+            prior_usage_snapshot["requests"] = tagged_prior_reqs
         prior_tool_calls_snapshot = list(receipt.get("tool_calls") or [])
         prior_thinking = receipt.get("thinking_level")
         prior_preloaded = receipt.get("preloaded_files")
@@ -5611,9 +6912,12 @@ class JobManager:
             thinking_level=prior_thinking,
             plan=plan_steps,
             acceptance=acceptance_cmds,
-            max_tool_calls=budget_calls,
-            max_total_tokens=budget_tokens,
+            max_tool_calls=phase_budget_calls,
+            max_total_tokens=phase_budget_tokens,
             preloaded_files=prior_preloaded,
+            prompt_sources=recorded_prompt_sources,
+            recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
+            baseline_acceptance_probe=prior_baseline_probe,
         )
         with self._lock:
             self._futures[safe_id] = fut
@@ -5683,14 +6987,28 @@ class JobManager:
         return {rel: current.get(rel) for rel in extra_untracked}
 
     def delegate_cancel(self, job_id: str, *, cleanup_worktree: bool = True) -> dict[str, Any]:
-        """Cancel a job and clean up its worktree while preserving its cancelled receipt status."""
+        """Cancel a job, immediately terminate any active worker process, and clean up its worktree."""
         safe_id = validate_job_id(job_id)
         with self._lock:
             self._cancelled.add(safe_id)
+            self._wait_sliced_auto_apply.pop(safe_id, None)
+            cancel_fn = self._cancel_hooks.get(safe_id)
             fut = self._futures.get(safe_id)
             if fut is not None:
                 fut.cancel()
             still_running = fut is not None and not fut.done()
+
+        if callable(cancel_fn):
+            try:
+                cancel_fn()
+            except Exception:
+                pass
+        if still_running and fut is not None:
+            try:
+                fut.result(timeout=2.0)
+            except Exception:
+                pass
+            still_running = not fut.done()
 
         receipt = self.store.read_receipt(safe_id)
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
@@ -5767,12 +7085,20 @@ class JobManager:
                     digest["diff_preview"] = preview_txt
                     digest["diff_preview_complete"] = not was_trunc
             missing_syms = digest.get("missing_prompt_symbols") or []
-            missing_note = (
-                f" Note: prompt symbol(s) {missing_syms} were not found in the modified files; verify whether "
-                f"they are required and call delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if missing."
-                if missing_syms
-                else ""
-            )
+            contract_warns = digest.get("contract_warnings") or []
+            extra_notes: list[str] = []
+            if missing_syms:
+                extra_notes.append(
+                    f" Note: prompt symbol(s) {missing_syms} were not found in the modified files; verify whether "
+                    f"they are required and call delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if missing."
+                )
+            if contract_warns:
+                extra_notes.append(
+                    f" Note: contract_warnings flagged potential class-attribute shadowing — inspect with "
+                    f"get_diff(job_id={job_id!r}, focus_symbols=[...]) and fix via "
+                    f"delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if unrequested."
+                )
+            missing_note = "".join(extra_notes)
             if not digest.get("applied"):
                 if (
                     digest.get("status") == "ok"
@@ -5950,7 +7276,18 @@ class JobManager:
         return marked
 
     def shutdown(self, wait: bool = True) -> None:
-        """Shutdown the underlying thread pool executor."""
+        """Terminate any active worker sessions and shutdown the underlying thread pool executor."""
+        with self._lock:
+            self._shutting_down = True
+            hooks = list(self._cancel_hooks.values())
+            for fut in self._futures.values():
+                if not fut.done():
+                    fut.cancel()
+        for fn in hooks:
+            try:
+                fn()
+            except Exception:
+                pass
         self._executor.shutdown(wait=wait)
 
     @staticmethod
@@ -6051,10 +7388,20 @@ class JobManager:
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
         if receipt.get("escalated_from_model"):
             digest["escalated_from_model"] = receipt.get("escalated_from_model")
+        if receipt.get("vacuous_acceptance"):
+            digest["vacuous_acceptance"] = True
+        if receipt.get("spec_conflict"):
+            digest["spec_conflict"] = receipt.get("spec_conflict")
+        if receipt.get("budget_exhausted"):
+            digest["budget_exhausted"] = True
         if receipt.get("recovered_from_timeout"):
             digest["recovered_from_timeout"] = True
         if receipt.get("missing_prompt_symbols"):
             digest["missing_prompt_symbols"] = list(receipt.get("missing_prompt_symbols") or [])
+        if receipt.get("contract_warnings"):
+            digest["contract_warnings"] = list(receipt.get("contract_warnings") or [])
+        if receipt.get("baseline_acceptance_warnings"):
+            digest["baseline_acceptance_warnings"] = list(receipt.get("baseline_acceptance_warnings") or [])
         if receipt.get("applied"):
             digest["applied_files"] = list(receipt.get("applied_files") or receipt.get("files_changed") or [])
             prov = receipt.get("provenance") or {}

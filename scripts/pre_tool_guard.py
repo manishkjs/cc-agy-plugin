@@ -185,11 +185,119 @@ def _unwrap_markdown_code_line(line: str) -> tuple[str, bool]:
     return s, had_blockquote
 
 
-def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8) -> dict[str, Any]:
-    """Detect whether a delegation prompt dictates >= 9 consecutive lines of code.
+_INLINE_HEADER_CODE_RE = re.compile(
+    r"^\s*(?:for\s+.+\s+in\s+.+:|while\s+.+:|if\s+.+:|elif\s+.+:|else:|try:|except\b.*:|finally:|with\s+.+:)\s*\S+"
+)
+_LEADING_TARGET_LABEL_RE = re.compile(r"^\s*(?:in\s+)?[`'\"]?[\w\.\[\]\(\)/-]+[`'\"]?\s*:\s+", re.I)
 
-    Checks both fenced code blocks (``` or ~~~) and unfenced consecutive code-like
-    or 4-space indented code lines (including code wrapped in markdown blockquotes or list items).
+
+_PY_STR_PREFIXES = frozenset({"r", "b", "u", "f", "rb", "br", "fr", "rf"})
+
+
+def _has_closing_quote_on_line(text: str, start_idx: int, q: str) -> bool:
+    esc = False
+    for ch in text[start_idx:]:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == q:
+            return True
+    return False
+
+
+def _is_token_start_quote(text: str, idx: int, ch: str) -> bool:
+    if not _has_closing_quote_on_line(text, idx + 1, ch):
+        return False
+    if idx == 0:
+        return True
+    prev = text[idx - 1]
+    if not (prev.isalnum() or prev == "_"):
+        return True
+    if ch in ("'", '"'):
+        tok_start = idx - 1
+        while tok_start > 0 and (text[tok_start - 1].isalnum() or text[tok_start - 1] == "_"):
+            tok_start -= 1
+        if text[tok_start:idx].lower() in _PY_STR_PREFIXES:
+            return True
+    return False
+
+
+def _split_semicolon_outside_quotes(text: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for idx, ch in enumerate(text):
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            continue
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"') and _is_token_start_quote(text, idx, ch):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ";":
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _count_line_code_statements(line: str, unwrapped: str, is_indented_code: bool) -> int:
+    """Return how many consecutive code statements `line` contributes (`0` for prose, `>=2` for `;`-chained code)."""
+    if ";" in unwrapped:
+        cand = _LEADING_TARGET_LABEL_RE.sub("", unwrapped, count=1).strip()
+        if cand.endswith("."):
+            cand = cand[:-1].rstrip()
+        cand = cand.strip("`").strip()
+        raw_parts = _split_semicolon_outside_quotes(cand)
+        if len(raw_parts) >= 2:
+            expanded_stmts: list[str] = []
+            for idx_p, part in enumerate(raw_parts):
+                p_clean = part[:-1].rstrip() if (idx_p == len(raw_parts) - 1 and part.endswith(".")) else part
+                p_clean = p_clean.strip("`").strip()
+                m_hdr = re.match(
+                    r"^((?:for\s+.+\s+in\s+.+|while\s+.+|if\s+.+|elif\s+.+|else|try|except\b.*|finally|with\s+.+):)\s+(.+)$",
+                    p_clean,
+                )
+                if m_hdr:
+                    expanded_stmts.append(m_hdr.group(1))
+                    expanded_stmts.append(m_hdr.group(2))
+                else:
+                    expanded_stmts.append(p_clean)
+            matched = sum(
+                1
+                for st in expanded_stmts
+                if _CODE_LINE_RE.match(st) or _INLINE_HEADER_CODE_RE.match(st)
+            )
+            if matched >= 2 and matched >= (len(expanded_stmts) + 1) // 2:
+                return len(expanded_stmts)
+    if _CODE_LINE_RE.match(line) or _CODE_LINE_RE.match(unwrapped) or is_indented_code:
+        return 1
+    return 0
+
+
+def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8) -> dict[str, Any]:
+    """Detect whether a delegation prompt dictates >= 9 consecutive lines/statements of code.
+
+    Checks fenced code blocks (``` or ~~~), unfenced consecutive code-like or 4-space indented
+    code lines, and semicolon-packed multi-statement code lines in plan/checklist items, while
+    allowing concise 1-line inline API invariants (e.g. `self.records.clear()`).
     Interleaved comments inside a code run do not reset the consecutive code counter.
     """
     lines = prompt_text.splitlines()
@@ -220,7 +328,8 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
 
         if in_fence:
             if unwrapped_fence_check:
-                fence_run += 1
+                stmt_n = _count_line_code_statements(line, unwrapped_fence_check, True)
+                fence_run += max(1, stmt_n)
                 if fence_run > max_fence_run:
                     max_fence_run = fence_run
             continue
@@ -237,8 +346,9 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
             ((line.startswith("    ") or line.startswith("\t")) and not _PROSE_LIST_RE.match(line))
             or (had_blockquote and (unwrapped.startswith("    ") or unwrapped.startswith("\t")))
         )
-        if _CODE_LINE_RE.match(line) or _CODE_LINE_RE.match(unwrapped) or is_indented_code:
-            code_run += 1
+        stmt_count = _count_line_code_statements(line, unwrapped, is_indented_code)
+        if stmt_count > 0:
+            code_run += stmt_count
             if code_run > max_code_run:
                 max_code_run = code_run
         else:
@@ -404,9 +514,18 @@ def repair_dictated_prompt(
             ((line.startswith("    ") or line.startswith("\t")) and not _PROSE_LIST_RE.match(line))
             or (had_blockquote and (unwrapped.startswith("    ") or unwrapped.startswith("\t")))
         )
-        if _CODE_LINE_RE.match(line) or _CODE_LINE_RE.match(unwrapped) or is_indented_code:
-            unfenced_buf.append(line)
-            unfenced_code_count += 1
+        stmt_count = _count_line_code_statements(line, unwrapped, is_indented_code)
+        if stmt_count > 0:
+            if stmt_count > 1:
+                raw_semi = _LEADING_TARGET_LABEL_RE.sub("", unwrapped, count=1).strip()
+                if raw_semi.endswith("."):
+                    raw_semi = raw_semi[:-1].rstrip()
+                raw_semi = raw_semi.strip("`").strip()
+                expanded = [s.strip("`").strip() for s in _split_semicolon_outside_quotes(raw_semi)]
+                unfenced_buf.extend(expanded if len(expanded) > 1 else [line])
+            else:
+                unfenced_buf.append(line)
+            unfenced_code_count += stmt_count
         else:
             _flush_unfenced()
             out_lines.append(line)
@@ -680,6 +799,64 @@ _FORBIDDEN_INLINE_PYTHON_ATTRS: frozenset[str] = frozenset(
 )
 
 
+def _is_readonly_git_diff_command(command: str) -> bool:
+    """Return True if `command` is a single read-only `git diff` command without external helpers or arbitrary file reads."""
+    raw = (command or "").strip()
+    if not raw or any(sep in raw for sep in (";", "|", "&", "`", "$(", ">", "<", "\n")):
+        return False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return False
+    if len(tokens) < 2 or Path(tokens[0]).name != "git":
+        return False
+    idx = 1
+    while idx < len(tokens) and tokens[idx].startswith("-"):
+        tok_g = tokens[idx]
+        if tok_g in ("--no-pager", "-p", "--paginate"):
+            idx += 1
+        else:
+            return False
+    if idx >= len(tokens) or tokens[idx] != "diff":
+        return False
+    for tok in tokens[idx + 1 :]:
+        if tok == "--":
+            break
+        if (
+            tok in ("--output", "--ext-diff", "--textconv", "--no-index", "-x")
+            or tok.startswith(("--output=", "--ext-diff=", "--textconv"))
+        ):
+            return False
+    return True
+
+
+def _session_has_multifile_delegate_job(data_root: Path) -> bool:
+    """Return True when the current session has an applied delegate job touching >=2 files."""
+    try:
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime if marker.exists() else 0.0
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return False
+        for p in receipts_dir.glob("job-*.json"):
+            if p.name.endswith(".progress.jsonl") or p.stat().st_mtime < since:
+                continue
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
+                continue
+            if not rec.get("applied"):
+                continue
+            applied_files = rec.get("applied_files") or []
+            if isinstance(applied_files, list) and len(applied_files) >= 2:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
     """Extra strict-mode Lead reads granted once a worker job started in the current session exists.
 
@@ -721,6 +898,7 @@ def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
                     and rec.get("acceptance_passed") is True
                     and not rec.get("scope_violations")
                     and not rec.get("missing_prompt_symbols")
+                    and not rec.get("contract_warnings")
                 ):
                     acc_list = rec.get("acceptance_results")
                     has_real_pass = True
@@ -728,6 +906,8 @@ def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
                         has_real_pass = any(
                             isinstance(r, dict)
                             and r.get("passed") is True
+                            and not r.get("auto_discovered_default")
+                            and not r.get("auto_discovered_regression")
                             and not r.get("no_tests_collected")
                             and not r.get("runner_incompatible_skipped")
                             and not r.get("auto_import_smoke")
@@ -929,6 +1109,28 @@ def _expand_shell_vars_in_path(target: str, active_cwd: Path, ws_root: Path) -> 
     return s
 
 
+_DANGEROUS_GIT_CONFIG_SUBSTRS = (
+    "!",
+    "alias.",
+    "hookspath",
+    "fsmonitor",
+    "diff.external",
+    "pager",
+    "sshcommand",
+    "textconv",
+    "credential.",
+    "filter.",
+    "uploadpack",
+    "receivepack",
+    "editor",
+)
+
+
+def _is_dangerous_git_config_val(val: str) -> bool:
+    lower_v = val.lower()
+    return any(tok in lower_v for tok in _DANGEROUS_GIT_CONFIG_SUBSTRS)
+
+
 def _extract_git_subcommand_and_workdir(
     args: list[str],
     current_cwd: Path,
@@ -942,23 +1144,25 @@ def _extract_git_subcommand_and_workdir(
             idx += 1
             break
         if tok in _GIT_OPTS_WITH_VALUE:
+            if tok == "--config-env":
+                return None, [], eff_cwd, "Strict orchestrator mode blocked `git --config-env`."
             if idx + 1 < len(args):
                 val = args[idx + 1]
                 if tok == "-C":
                     eff_cwd = (eff_cwd / val).resolve()
                 elif tok == "-c":
-                    lower_v = val.lower()
-                    if "!" in val or "alias." in lower_v or "hookspath" in lower_v or "fsmonitor" in lower_v:
+                    if _is_dangerous_git_config_val(val):
                         return None, [], eff_cwd, f"Strict orchestrator mode blocked `git -c {val}`."
             idx += 2
             continue
         if any(tok.startswith(prefix + "=") for prefix in _GIT_OPTS_WITH_VALUE):
+            if tok.startswith("--config-env="):
+                return None, [], eff_cwd, f"Strict orchestrator mode blocked `git {tok}`."
             val = tok.split("=", 1)[1]
             if tok.startswith("-C="):
                 eff_cwd = (eff_cwd / val).resolve()
             elif tok.startswith("-c="):
-                lower_v = val.lower()
-                if "!" in val or "alias." in lower_v or "hookspath" in lower_v or "fsmonitor" in lower_v:
+                if _is_dangerous_git_config_val(val):
                     return None, [], eff_cwd, f"Strict orchestrator mode blocked `git {tok}`."
             idx += 1
             continue
@@ -968,8 +1172,7 @@ def _extract_git_subcommand_and_workdir(
             continue
         if tok.startswith("-c") and len(tok) > 2:
             val = tok[2:]
-            lower_v = val.lower()
-            if "!" in val or "alias." in lower_v or "hookspath" in lower_v or "fsmonitor" in lower_v:
+            if _is_dangerous_git_config_val(val):
                 return None, [], eff_cwd, f"Strict orchestrator mode blocked `git {tok}`."
             idx += 1
             continue
@@ -2257,8 +2460,23 @@ def _inspect_segment_tokens(
                     f"Use delegate_apply to apply verified worker diffs."
                 ),
             }, active_cwd
-        # Even in git diff/show/log, block --output=<file> targeting workspace/out_dir
-        for sarg in sub_args:
+        # Even in git diff/show/log, block external diff/textconv helpers and --output targeting workspace/out_dir
+        for s_idx, sarg in enumerate(sub_args):
+            if sarg == "--":
+                break
+            if sarg in ("--ext-diff", "--textconv") or sarg.startswith(("--ext-diff=", "--textconv=")):
+                return {
+                    "blocked": True,
+                    "reason": f"Strict orchestrator mode blocked `git {sub} {sarg}`.",
+                }, active_cwd
+            if sarg == "--output" and s_idx + 1 < len(sub_args):
+                out_t = sub_args[s_idx + 1]
+                cls = classify_path(out_t, ws_root, out_dir, cwd=git_cwd, env=env)
+                if cls in ("workspace", "out_dir"):
+                    return {
+                        "blocked": True,
+                        "reason": f"Strict orchestrator mode blocked `git {sub} --output {out_t}`.",
+                    }, active_cwd
             if sarg.startswith("--output="):
                 out_t = sarg.split("=", 1)[1]
                 cls = classify_path(out_t, ws_root, out_dir, cwd=git_cwd, env=env)
@@ -2781,12 +2999,14 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
     ws_root = resolve_project_root(cwd, env=source_env)
     out_dir = source_env.get("CC_AGY_DATA_DIR") or source_env.get("CLAUDE_PLUGIN_DATA")
 
-    # 1. Always lint delegation prompts (including follow_up_prompt) for >=9-line code dictation
+    # 1. Always lint delegation prompts (including follow_up_prompt, plan, and checklist) for >=9-line code dictation
     if tool_name.endswith(("delegate_start", "delegate_to_gemini", "delegate_continue")):
         plan_items = tool_input.get("plan") if isinstance(tool_input.get("plan"), list) else []
+        checklist_items = tool_input.get("checklist") if isinstance(tool_input.get("checklist"), list) else []
         prompt_text = "\n".join(
             [str(tool_input.get("prompt") or tool_input.get("follow_up_prompt") or "")]
             + [str(step) for step in plan_items]
+            + [str(item) for item in checklist_items]
         )
         lint = lint_delegation_prompt(prompt_text)
         if not lint["ok"]:
@@ -3044,7 +3264,41 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     current_reads = 0
                 file_targets = [t for t in bash_read_targets if t != "<workspace-search>"]
                 read_cost = max(1, len(file_targets))
-                if current_reads >= read_limit or (len(file_targets) > 1 and current_reads + read_cost > read_limit):
+                spotcheck_marker = data_root / ".lead_git_diff_spotcheck_used"
+                session_marker = data_root / ".lead_session_started"
+                cur_session_sig = ""
+                if session_marker.exists():
+                    try:
+                        cur_session_sig = session_marker.read_text(encoding="utf-8").strip() or str(
+                            session_marker.stat().st_mtime_ns
+                        )
+                    except OSError:
+                        cur_session_sig = ""
+                spotcheck_used_in_session = False
+                if spotcheck_marker.exists():
+                    try:
+                        prev_sig = spotcheck_marker.read_text(encoding="utf-8").strip()
+                        if not cur_session_sig:
+                            spotcheck_used_in_session = True
+                        elif prev_sig == cur_session_sig:
+                            spotcheck_used_in_session = True
+                        elif session_marker.exists() and spotcheck_marker.stat().st_mtime >= session_marker.stat().st_mtime and prev_sig == "1":
+                            spotcheck_used_in_session = True
+                    except OSError:
+                        spotcheck_used_in_session = True
+                allow_multifile_git_diff_spotcheck = (
+                    _is_readonly_git_diff_command(command)
+                    and not spotcheck_used_in_session
+                    and _session_has_multifile_delegate_job(data_root)
+                )
+                if allow_multifile_git_diff_spotcheck:
+                    try:
+                        data_root.mkdir(parents=True, exist_ok=True)
+                        spotcheck_marker.write_text(cur_session_sig or "1", encoding="utf-8")
+                    except OSError:
+                        pass
+                    read_cost = 0
+                elif current_reads >= read_limit or (len(file_targets) > 1 and current_reads + read_cost > read_limit):
                     reason_msg = (
                         f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
                         "delegation mode (including Bash file/diff inspection commands). Do NOT read more files on "

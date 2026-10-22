@@ -55,6 +55,7 @@ def record_user_prompt(payload: dict[str, Any], env: dict[str, str] | None = Non
             (store.data_dir / ".lead_read_count").write_text("0", encoding="utf-8")
             (store.data_dir / ".lead_read_files.json").write_text("[]", encoding="utf-8")
             (store.data_dir / ".lead_read_windows.json").write_text("{}", encoding="utf-8")
+            (store.data_dir / ".lead_git_diff_spotcheck_used").unlink(missing_ok=True)
         except OSError:
             pass
     return target

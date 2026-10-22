@@ -1319,7 +1319,11 @@ class MCPServer:
                 )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(prompt_str, plan_steps)
+            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(
+                prompt_str, plan_steps, checklist_items
+            )
+            if "checklist" in repair_meta:
+                checklist_items = repair_meta["checklist"]
             if in_place_b and auto_apply_arg is False:
                 raise InvalidParamsError(
                     "in_place=True cannot be combined with auto_apply=False because in_place edits "
@@ -1453,7 +1457,7 @@ class MCPServer:
                 )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            followup_str, _, repair_meta = self._maybe_repair_dictation(followup_str, None)
+            followup_str, _, repair_meta = self._maybe_repair_dictation(followup_str, None, None)
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 600.0)
             digest = self.job_manager.delegate_continue(
                 job_id=job_id_str,
@@ -1528,9 +1532,14 @@ class MCPServer:
                 auto_apply = parse_bool(args.get("auto_apply"), True)
                 in_place_b = parse_bool(args.get("in_place"), False)
                 preload_b = parse_bool(args.get("preload_files"), True)
+                dtg_checklist = _validate_optional_str_list(args.get("checklist"), "checklist")
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(prompt_str, plan_steps)
+            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(
+                prompt_str, plan_steps, dtg_checklist
+            )
+            if "checklist" in repair_meta:
+                dtg_checklist = repair_meta["checklist"]
             if in_place_b and not auto_apply:
                 raise InvalidParamsError(
                     "in_place=True cannot be combined with auto_apply=False because in_place edits "
@@ -1561,6 +1570,7 @@ class MCPServer:
                 max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
                 preload_files=preload_b,
                 auto_apply=False,
+                checklist=dtg_checklist,
             )
             if qa_review_model and qa_review_model.strip():
                 digest = self._maybe_run_qa_review(
@@ -1580,7 +1590,7 @@ class MCPServer:
                 auto_apply=auto_apply,
                 in_place=in_place_b,
             )
-            if digest.get("status") not in ("ok", "checkpoint", "needs_input"):
+            if digest.get("status") not in ("ok", "checkpoint", "needs_input", "spec_conflict"):
                 digest["is_error"] = True
             if repair_meta.get("repaired") and isinstance(digest, dict):
                 digest["dictation_repaired"] = True
@@ -1594,9 +1604,11 @@ class MCPServer:
         self,
         prompt_str: str,
         plan_steps: list[str] | None,
+        checklist_items: list[str] | None = None,
     ) -> tuple[str, list[str], dict[str, Any]]:
-        """Auto-repair dictated code blocks when CC_AGY_REPAIR_CODE_DICTATION is enabled."""
+        """Auto-repair dictated code blocks across prompt, plan, and checklist when CC_AGY_REPAIR_CODE_DICTATION is enabled."""
         resolved_plan = list(plan_steps or [])
+        resolved_checklist = list(checklist_items) if checklist_items is not None else None
         auto_repair = os.environ.get("CC_AGY_REPAIR_CODE_DICTATION", "").strip().lower() in (
             "1",
             "true",
@@ -1604,7 +1616,11 @@ class MCPServer:
             "on",
         )
         if not auto_repair:
-            return prompt_str, resolved_plan, {"repaired": False, "snippet_paths": []}
+            return (
+                prompt_str,
+                resolved_plan,
+                {"repaired": False, "snippet_paths": [], "checklist": resolved_checklist},
+            )
         from scripts.pre_tool_guard import lint_delegation_prompt, repair_dictated_prompt
 
         snippet_dir = self.store.data_dir / "dictated_snippets"
@@ -1612,26 +1628,40 @@ class MCPServer:
         repaired_any = bool(rep_prompt.get("repaired"))
         snippet_paths = list(rep_prompt.get("snippet_paths") or [])
         new_prompt = str(rep_prompt.get("prompt") or prompt_str)
-        new_plan: list[str] = []
-        for step in resolved_plan:
-            rep_step = repair_dictated_prompt(step, snippet_dir=snippet_dir)
-            if rep_step.get("repaired"):
-                repaired_any = True
-                for sp in rep_step.get("snippet_paths") or []:
-                    if sp not in snippet_paths:
-                        snippet_paths.append(sp)
-            new_plan.append(str(rep_step.get("prompt") or step))
-        if new_plan and not lint_delegation_prompt("\n".join([new_prompt, *new_plan]))["ok"]:
+
+        def _repair_items(items: list[str]) -> list[str]:
+            nonlocal repaired_any
+            repaired_list: list[str] = []
+            for item in items:
+                rep_item = repair_dictated_prompt(item, snippet_dir=snippet_dir)
+                if rep_item.get("repaired"):
+                    repaired_any = True
+                    for sp in rep_item.get("snippet_paths") or []:
+                        if sp not in snippet_paths:
+                            snippet_paths.append(sp)
+                repaired_list.append(str(rep_item.get("prompt") or item))
+            return repaired_list
+
+        new_plan = _repair_items(resolved_plan)
+        new_checklist = _repair_items(resolved_checklist) if resolved_checklist is not None else None
+
+        combined_parts = [new_prompt, *new_plan, *(new_checklist or [])]
+        if len(combined_parts) > 1 and not lint_delegation_prompt("\n".join(combined_parts))["ok"]:
             new_prompt = new_prompt.rstrip() + "\n[... behavioral specification boundary ...]"
             new_plan = [
                 s.rstrip() + "\n[... behavioral specification boundary ...]"
                 for s in new_plan
             ]
+            if new_checklist is not None:
+                new_checklist = [
+                    c.rstrip() + "\n[... behavioral specification boundary ...]"
+                    for c in new_checklist
+                ]
             repaired_any = True
         return (
             new_prompt,
             new_plan,
-            {"repaired": repaired_any, "snippet_paths": snippet_paths},
+            {"repaired": repaired_any, "snippet_paths": snippet_paths, "checklist": new_checklist},
         )
 
     def _maybe_run_qa_review(
@@ -1743,6 +1773,7 @@ class MCPServer:
                 project=req_project,
                 location=req_location,
                 auto_apply=False,
+                _prompt_source="plugin_qa_review",
             )
             resumed = cont_digest.get("continued", True) is not False
             digest = cont_digest

@@ -88,12 +88,12 @@ async def maybe_await(value: Any) -> Any:
 
 
 THINKING_LEVELS = ("MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH")
-PROGRESS_KINDS = ("milestone", "question", "blocker")
+PROGRESS_KINDS = ("milestone", "question", "blocker", "spec_conflict")
 _progress_lock = threading.Lock()
 
 
 def append_progress(progress_path: str | Path | None, kind: str, message: str) -> str:
-    """Append one worker -> lead signal (milestone / question / blocker) as a JSON line."""
+    """Append one worker -> lead signal (milestone / question / blocker / spec_conflict) as a JSON line."""
     if not progress_path:
         return "No progress channel is configured for this job."
     clean_kind = str(kind or "milestone").strip().lower()
@@ -104,6 +104,11 @@ def append_progress(progress_path: str | Path | None, kind: str, message: str) -
         Path(progress_path).parent.mkdir(parents=True, exist_ok=True)
         with open(progress_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
+    if clean_kind == "spec_conflict":
+        return (
+            "Specification conflict reported to the lead. Stop now: end your turn immediately with the "
+            "verified runtime output that contradicts the prompt/checklist so the lead can resolve it."
+        )
     if clean_kind in ("question", "blocker"):
         return (
             "Reported to the lead. Stop now: end your turn with a short summary of what is done and what "
@@ -126,12 +131,9 @@ def read_progress(progress_path: str | Path | None, limit: int = 8) -> list[dict
 
 
 WORKER_SYSTEM_PROMPT = (
-    "You are a headless software engineering worker inside an isolated repository copy with "
-    "Straitjacket (ctx-harness) tools. Implement or investigate the requested task using "
-    "the cached repository map, candidate files, and Straitjacket tools (run_command, ctx_get, ctx_search, "
-    "view_file, search_dir, list_dir, find_file, ctx_query). When output is bounded to an "
-    "evidence address (e.g. run:<id>#stdout or repo:<path>), inspect spans with ctx_get/ctx_search "
-    "instead of rerunning commands; keep edits within allowed_paths and finish with a summary under 250 words."
+    "Headless coding worker in an isolated repo copy with Straitjacket tools. "
+    "Use the repo map, candidate files, and tools; read bounded output refs (run:<id>#stdout) "
+    "via ctx_get/ctx_search instead of rerunning; keep edits in allowed_paths; reply <250 words."
 )
 
 
@@ -172,13 +174,13 @@ def build_worker_system_prompt(
         tool_list += ", report_to_lead"
     return (
         f"{WORKER_SYSTEM_PROMPT}\n"
-        f"- Workspace root (use exact absolute path for file tools): {ws_str}\n"
-        f"- Active tools ({eff_profile}): {tool_list}.\n"
-        "- Read & edit early: skip view_file on inlined files; batch view_file calls (1..260 lines, no re-reads) and edit within <=8 calls.\n"
-        "- Bounded thinking: never draft full code in thinking (<1,500 tokens/turn); emit create_file/edit_file directly.\n"
-        "- Direct verification: skip `python3 -c` / `node -e` probes; edit files, run Acceptance tests, and stop once green.\n"
-        "- Non-interactive: never ask the user; call report_to_lead(kind='question'|'blocker', ...) only if blocked.\n"
-        "- Hygiene: never read/edit .env*, .mcp.json, .netrc, *.pem, *.key, or .claude/settings*.json; never run git commit/reset/checkout/clean."
+        f"- Root: {ws_str}\n"
+        f"- Tools ({eff_profile}): {tool_list}.\n"
+        "- Edit early: skip view_file on inlined files; batch view_file (1..260 lines); emit edit_file/create_file (<1,500 thinking tokens/turn).\n"
+        "- Verify: skip `python3 -c`/`node -e` probes; run Acceptance tests and stop once green.\n"
+        "- Contracts: never shadow `Cls.attr` via `self.attr = ...` in `__init__` from `os.getcwd()`/`os.environ`/defaults unless passed by caller (keeps subclassing & `monkeypatch.setattr(Cls, 'attr', ...)` intact); never alter default paths for test `cwd` (use `tmp_path`/`monkeypatch`).\n"
+        "- Non-interactive: call report_to_lead(kind='spec_conflict'|'question'|'blocker', ...) only if blocked.\n"
+        "- Hygiene: never touch .env*, .mcp.json, .netrc, *.pem, *.key, .claude/settings*.json, or git commit/reset/checkout/clean."
     )
 
 
@@ -1755,8 +1757,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
         Args:
             kind: "milestone" for progress (e.g. tests now 40/42 passing), "question" when a requirement
-                is ambiguous, or "blocker" when you cannot proceed. Questions and blockers end your turn.
-            message: One or two sentences for the lead.
+                is ambiguous, "blocker" when you cannot proceed, or "spec_conflict" when a prompt/checklist
+                premise contradicts verified runtime/library behavior. Questions, blockers, and spec_conflict
+                signals end your turn immediately.
+            message: One or two sentences (with exact verified runtime output for spec_conflict) for the lead.
         """
         return append_progress(progress_path, kind, message)
 
@@ -1846,6 +1850,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         policies=agent_policies,
         capabilities=capabilities,
         save_dir=save_dir,
+        env={"CC_AGY_HARNESS_SAVE_DIR": str(save_dir)},
     )
     if is_api_key:
         cfg_kwargs["api_key"] = request["api_key"]
@@ -1901,6 +1906,16 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
     agent = ag.Agent(cfg)
     entered = False
+    abnormal_exit = False
+    pre_children = _direct_child_pids(os.getpid())
+    on_agent_ready = request.get("_on_agent_created")
+    if callable(on_agent_ready):
+        try:
+            on_agent_ready(agent, save_dir, pre_children)
+        except TypeError:
+            on_agent_ready(agent, save_dir)
+        except Exception:
+            pass
     try:
         agent_ref = await agent.__aenter__()
         entered = True
@@ -1980,16 +1995,9 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             + int(usage.get("candidates_token_count") or 0)
             + int(usage.get("thoughts_token_count") or 0),
         )
-        if not usage.get("requests") and sqlite_telemetry.get("requests"):
-            usage["requests"] = [
-                ({**r, "model": r.get("model") or resolved_model} if isinstance(r, dict) else r)
-                for r in sqlite_telemetry["requests"]
-            ]
-            usage["max_request_prompt_tokens"] = max(
-                int(usage.get("max_request_prompt_tokens") or 0),
-                int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
-            )
+        _reconcile_phase_usage_requests(usage, sqlite_telemetry, resolved_model)
     except (Exception, asyncio.CancelledError) as exc:
+        abnormal_exit = True
         # Attach partial usage and tool calls before closing the agent so the caller's finally
         # block records everything consumed prior to the failure or timeout without blocking.
         try:
@@ -2013,15 +2021,13 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 int(partial_usage.get(k) or 0),
                 int(sqlite_telemetry.get(k) or 0),
             )
-        if not usage.get("requests") and sqlite_telemetry.get("requests"):
-            usage["requests"] = [
-                ({**r, "model": r.get("model") or resolved_model} if isinstance(r, dict) else r)
-                for r in sqlite_telemetry["requests"]
-            ]
-            usage["max_request_prompt_tokens"] = max(
-                int(usage.get("max_request_prompt_tokens") or 0),
-                int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
-            )
+        usage["total_token_count"] = max(
+            int(usage.get("total_token_count") or 0),
+            int(usage.get("prompt_token_count") or 0)
+            + int(usage.get("candidates_token_count") or 0)
+            + int(usage.get("thoughts_token_count") or 0),
+        )
+        _reconcile_phase_usage_requests(usage, sqlite_telemetry, resolved_model)
         if not tool_calls_log and sqlite_telemetry.get("tool_calls"):
             tool_calls_log.extend(sqlite_telemetry["tool_calls"])
         if isinstance(exc, asyncio.CancelledError):
@@ -2041,11 +2047,16 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         setattr(exc, "partial_command_runs", list(sj_command_runs))
         raise
     finally:
+        if abnormal_exit:
+            # Kill localharness BEFORE agent.__aexit__ so LocalConnection.disconnect()'s
+            # synchronous process.wait(timeout=180) cannot block or leak an active wire session.
+            _force_terminate_agent_process(agent, save_dir, pre_child_pids=pre_children)
         if entered:
             try:
-                await asyncio.wait_for(agent.__aexit__(None, None, None), timeout=5.0)
+                await asyncio.wait_for(agent.__aexit__(None, None, None), timeout=3.0)
             except (Exception, asyncio.CancelledError):
                 pass
+        _force_terminate_agent_process(agent, save_dir, pre_child_pids=pre_children)
         shutil.rmtree(save_dir, ignore_errors=True)
         shutil.rmtree(Path(ws_str) / ".ctx-session-reads", ignore_errors=True)
 
@@ -2076,13 +2087,306 @@ async def resolve_stop_reason(resp: Any) -> str | None:
     return name
 
 
-def _run_coro_with_bounded_shutdown(coro: Any) -> Any:
-    """Run `coro` in an isolated event loop with bounded executor/task shutdown on timeout."""
+def _reconcile_phase_usage_requests(
+    usage: dict[str, Any],
+    sqlite_telemetry: dict[str, Any],
+    resolved_model: str,
+) -> None:
+    """Ensure `usage['requests']` captures all SQLite per-call entries and any unitemized phase remainder."""
+    sqlite_reqs = [
+        ({**r, "model": r.get("model") or resolved_model, "per_call": bool(r.get("per_call", True))})
+        for r in (sqlite_telemetry.get("requests") or [])
+        if isinstance(r, dict)
+    ]
+    cur_reqs = [
+        ({**r, "model": r.get("model") or resolved_model} if isinstance(r, dict) else r)
+        for r in (usage.get("requests") or [])
+    ]
+    sum_cur_p = sum(int(r.get("prompt_token_count") or 0) for r in cur_reqs if isinstance(r, dict))
+    sum_sql_p = sum(int(r.get("prompt_token_count") or 0) for r in sqlite_reqs)
+    if sqlite_reqs and (len(sqlite_reqs) > len(cur_reqs) or sum_sql_p > sum_cur_p):
+        cur_reqs = sqlite_reqs
+    if cur_reqs:
+        usage["requests"] = cur_reqs
+        usage["max_request_prompt_tokens"] = max(
+            int(usage.get("max_request_prompt_tokens") or 0),
+            int(sqlite_telemetry.get("max_request_prompt_tokens") or 0),
+            max((int(r.get("prompt_token_count") or 0) for r in cur_reqs if isinstance(r, dict)), default=0),
+        )
+        sum_p = sum(int(r.get("prompt_token_count") or 0) for r in cur_reqs if isinstance(r, dict))
+        sum_c = sum(int(r.get("cached_content_token_count") or 0) for r in cur_reqs if isinstance(r, dict))
+        sum_cand = sum(int(r.get("candidates_token_count") or 0) for r in cur_reqs if isinstance(r, dict))
+        sum_th = sum(int(r.get("thoughts_token_count") or 0) for r in cur_reqs if isinstance(r, dict))
+        rem_p = max(0, int(usage.get("prompt_token_count") or 0) - sum_p)
+        rem_c = min(rem_p, max(0, int(usage.get("cached_content_token_count") or 0) - sum_c))
+        rem_cand = max(0, int(usage.get("candidates_token_count") or 0) - sum_cand)
+        rem_th = max(0, int(usage.get("thoughts_token_count") or 0) - sum_th)
+        if rem_p > 0 or rem_cand > 0 or rem_th > 0:
+            usage["requests"].append(
+                {
+                    "prompt_token_count": rem_p,
+                    "cached_content_token_count": rem_c,
+                    "candidates_token_count": rem_cand,
+                    "thoughts_token_count": rem_th,
+                    "total_token_count": rem_p + rem_cand + rem_th,
+                    "model": resolved_model,
+                }
+            )
+
+
+def _read_proc_ppid_and_state(pid: int) -> tuple[int | None, str]:
+    """Return `(ppid, state_char)` from `/proc/<pid>/stat`, or `(None, '')` when unavailable."""
+    try:
+        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+        rparen = raw_stat.rfind(")")
+        if rparen < 0:
+            return None, ""
+        fields = raw_stat[rparen + 2 :].split()
+        if len(fields) < 2:
+            return None, ""
+        return int(fields[1]), fields[0]
+    except (OSError, ValueError):
+        return None, ""
+
+
+def _direct_child_pids(parent_pid: int) -> set[int]:
+    """Return direct live child PIDs of `parent_pid` via `/proc`."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+    out: set[int] = set()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        ppid, state = _read_proc_ppid_and_state(pid)
+        if ppid == parent_pid and state != "Z":
+            out.add(pid)
+    return out
+
+
+def _collect_descendant_pids(root_pids: set[int], *, exclude_pid: int | None = None) -> list[int]:
+    """Return all live descendant PIDs rooted at `root_pids` (BFS order, excluding `exclude_pid`)."""
+    if not root_pids:
+        return []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    children_by_ppid: dict[int, list[int]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == exclude_pid:
+            continue
+        ppid, state = _read_proc_ppid_and_state(pid)
+        if ppid is not None and state != "Z":
+            children_by_ppid.setdefault(ppid, []).append(pid)
+    descendants: list[int] = []
+    seen = set(root_pids)
+    frontier = list(root_pids)
+    while frontier:
+        cur = frontier.pop(0)
+        for ch_pid in children_by_ppid.get(cur, ()):
+            if ch_pid not in seen and ch_pid != exclude_pid:
+                seen.add(ch_pid)
+                descendants.append(ch_pid)
+                frontier.append(ch_pid)
+    return descendants
+
+
+def _pid_is_alive_non_zombie(pid: int) -> bool:
+    _, state = _read_proc_ppid_and_state(pid)
+    return bool(state and state != "Z")
+
+
+def _proc_matches_save_dir(entry: Path, save_token: str) -> bool:
+    """Match a `/proc/<pid>` entry by `CC_AGY_HARNESS_SAVE_DIR` in `environ`, `cmdline`, or open `fd` links."""
+    for fname in ("environ", "cmdline"):
+        try:
+            raw_txt = (entry / fname).read_bytes().decode("utf-8", errors="ignore")
+            if save_token in raw_txt:
+                return True
+        except OSError:
+            pass
+    fd_dir = entry / "fd"
+    try:
+        if fd_dir.is_dir():
+            for fd_entry in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd_entry)
+                    if target == save_token or target.startswith(save_token + "/"):
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def _force_terminate_agent_process(
+    agent: Any,
+    save_dir: str | None = None,
+    *,
+    pre_child_pids: set[int] | None = None,
+) -> int:
+    """Deterministically terminate `localharness` and its entire descendant process tree."""
+    my_pid = os.getpid()
+    popen_by_pid: dict[int, Any] = {}
+    root_pids: set[int] = set()
+    candidates: list[Any] = []
+    if agent is not None:
+        for conv_attr in ("_conversation", "conversation"):
+            conv = getattr(agent, conv_attr, None)
+            if conv is not None:
+                for conn_attr in ("connection", "_connection"):
+                    conn = getattr(conv, conn_attr, None)
+                    if conn is not None:
+                        candidates.append(getattr(conn, "_process", None))
+        for strat_attr in ("_strategy", "_connection_strategy"):
+            strat = getattr(agent, strat_attr, None)
+            if strat is not None:
+                for conn_attr in ("_connection", "connection"):
+                    conn = getattr(strat, conn_attr, None)
+                    if conn is not None:
+                        candidates.append(getattr(conn, "_process", None))
+        candidates.append(getattr(agent, "_process", None))
+
+    for proc in candidates:
+        if proc is None:
+            continue
+        try:
+            stdin = getattr(proc, "stdin", None)
+            if stdin is not None:
+                stdin.close()
+        except Exception:
+            pass
+        pid = getattr(proc, "pid", None)
+        if isinstance(pid, int) and pid != my_pid:
+            popen_by_pid[pid] = proc
+            if proc.poll() is None or _pid_is_alive_non_zombie(pid):
+                root_pids.add(pid)
+
+    proc_root = Path("/proc")
+    if save_dir and proc_root.is_dir():
+        save_token = str(save_dir).rstrip("/")
+        if save_token:
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid == my_pid or pid in root_pids:
+                    continue
+                if _proc_matches_save_dir(entry, save_token) and _pid_is_alive_non_zombie(pid):
+                    root_pids.add(pid)
+
+    if pre_child_pids is not None and save_dir and proc_root.is_dir():
+        save_token = str(save_dir).rstrip("/")
+        if save_token:
+            for pid in _direct_child_pids(my_pid) - pre_child_pids:
+                if pid == my_pid or pid in root_pids:
+                    continue
+                if _proc_matches_save_dir(proc_root / str(pid), save_token) and _pid_is_alive_non_zombie(pid):
+                    root_pids.add(pid)
+
+    if not root_pids:
+        return 0
+
+    descendants = _collect_descendant_pids(root_pids, exclude_pid=my_pid)
+    # Terminate leaves first alongside roots so children cannot outlive their parent.
+    ordered_pids = list(reversed(descendants)) + [p for p in root_pids if p not in descendants]
+    killed_pids: set[int] = set()
+
+    for pid in ordered_pids:
+        proc = popen_by_pid.get(pid)
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                killed_pids.add(pid)
+            else:
+                os.kill(pid, 15)
+                killed_pids.add(pid)
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + 0.3
+    while time.monotonic() < deadline:
+        for pid, proc in list(popen_by_pid.items()):
+            try:
+                proc.poll()
+            except Exception:
+                pass
+        if not any(_pid_is_alive_non_zombie(p) for p in ordered_pids):
+            break
+        time.sleep(0.02)
+
+    for pid in ordered_pids:
+        proc = popen_by_pid.get(pid)
+        if _pid_is_alive_non_zombie(pid):
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                else:
+                    os.kill(pid, 9)
+                killed_pids.add(pid)
+            except OSError:
+                pass
+        if proc is not None:
+            try:
+                proc.wait(timeout=0.3)
+            except Exception:
+                pass
+
+    return len(killed_pids)
+
+
+def _run_coro_with_bounded_shutdown(
+    coro: Any,
+    *,
+    register_cancel: Callable[[Callable[[], None] | None], None] | None = None,
+    agent_holder: list[Any] | None = None,
+    extra_cancel_hooks: list[Callable[[], None]] | None = None,
+) -> Any:
+    """Run `coro` in an isolated event loop with thread-safe cancellation and bounded shutdown."""
     loop = asyncio.new_event_loop()
+    finished_evt = threading.Event()
     try:
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
+        main_task = loop.create_task(coro)
+
+        if callable(register_cancel):
+            def _cancel_worker() -> None:
+                if finished_evt.is_set():
+                    return
+                try:
+                    loop.call_soon_threadsafe(main_task.cancel)
+                except RuntimeError:
+                    pass
+                for extra_fn in list(extra_cancel_hooks or []):
+                    try:
+                        extra_fn()
+                    except Exception:
+                        pass
+                if agent_holder:
+                    def _watchdog() -> None:
+                        if not finished_evt.wait(timeout=1.2) and agent_holder:
+                            ag_obj = agent_holder[0] if len(agent_holder) > 0 else None
+                            sv_dir = agent_holder[1] if len(agent_holder) > 1 else None
+                            pre_ch = agent_holder[2] if len(agent_holder) > 2 else None
+                            _force_terminate_agent_process(ag_obj, sv_dir, pre_child_pids=pre_ch)
+
+                    threading.Thread(target=_watchdog, daemon=True).start()
+
+            register_cancel(_cancel_worker)
+
+        return loop.run_until_complete(main_task)
     finally:
+        finished_evt.set()
+        if callable(register_cancel):
+            try:
+                register_cancel(None)
+            except Exception:
+                pass
         try:
             pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
             for task in pending:
@@ -2121,6 +2425,7 @@ def run_antigravity_worker(
     extra_tools: list[Any] | None = None,
     system_prompt: str | None = None,
     acceptance: list[str] | None = None,
+    register_cancel: Callable[[Callable[[], None] | None], None] | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     auth = resolve_auth_config(
@@ -2140,7 +2445,14 @@ def run_antigravity_worker(
         read_only=is_read_only_tool_set(enabled_tools, disabled_tools),
     )
 
-    req = {
+    agent_holder: list[Any] = [None, None, None]
+
+    def _on_agent_created(ag_obj: Any, sv_dir: str | None, pre_ch: set[int] | None = None) -> None:
+        agent_holder[0] = ag_obj
+        agent_holder[1] = sv_dir
+        agent_holder[2] = pre_ch
+
+    req: dict[str, Any] = {
         "prompts": list(prompts),
         "workspace_dir": str(Path(workspace_dir).resolve()),
         "model": model,
@@ -2161,12 +2473,40 @@ def run_antigravity_worker(
         "system_prompt": system_prompt,
         "acceptance": list(acceptance) if acceptance else [],
     }
+    extra_cancel_hooks: list[Callable[[], None]] = []
+    in_async_runner = [False]
+
+    def _register_backend_cancel(fn: Callable[[], None] | None) -> None:
+        if fn is None:
+            extra_cancel_hooks.clear()
+            if not in_async_runner[0] and callable(register_cancel):
+                register_cancel(None)
+            return
+        extra_cancel_hooks.append(fn)
+        if not in_async_runner[0] and callable(register_cancel):
+            register_cancel(fn)
+
+    if backend is None:
+        req["_on_agent_created"] = _on_agent_created
+    elif callable(register_cancel):
+        req["register_cancel"] = _register_backend_cancel
 
     active_backend = backend or _default_antigravity_backend
     started = time.time()
     result = active_backend(req)
     if inspect.isawaitable(result):
-        result = _run_coro_with_bounded_shutdown(result)
+        in_async_runner[0] = True
+        result = _run_coro_with_bounded_shutdown(
+            result,
+            register_cancel=register_cancel,
+            agent_holder=agent_holder,
+            extra_cancel_hooks=extra_cancel_hooks,
+        )
+    elif callable(register_cancel):
+        try:
+            register_cancel(None)
+        except Exception:
+            pass
     elapsed = round(max(0.0, time.time() - started), 3)
 
     containment_val = result.get("containment", "none")

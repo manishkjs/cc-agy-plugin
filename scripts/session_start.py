@@ -62,9 +62,12 @@ REVIEW_AFTER_APPLY_GUIDANCE = (
     "cc-agy-plugin delegation checklist:\n"
     + _CHECKLIST_STEP_1
     + "2. A job whose tests pass is applied to the workspace automatically. If applied is true, "
-    "acceptance_passed is true, and auto_apply_skipped is absent, finish immediately in one short sentence "
-    "without re-reading the changed files or re-running pytest on the host (only read the changed files and "
-    "run pytest if a numbered item was not covered by acceptance).\n"
+    "acceptance_passed is true, auto_apply_skipped is absent, and contract_warnings is empty, finish immediately "
+    "in one short sentence without re-reading the changed files or re-running pytest on the host (only read the "
+    "changed files and run pytest if a numbered item was not covered by acceptance). If contract_warnings is "
+    "non-empty in the worker digest, call get_diff(focus_symbols=[...]) on the flagged class/attribute; if the "
+    "worker shadowed an existing class/public attribute not requested by the spec, fix it via a targeted "
+    "delegate_start follow-up job before finishing.\n"
     "3. If any item is missing or wrong, start one follow-up job with delegate_start that names the exact "
     "items to fix (or delegate_revert if the result is wrong overall). Never delegate_continue a job that "
     "was applied.\n"
@@ -77,8 +80,10 @@ REVIEW_BEFORE_APPLY_GUIDANCE = (
     "cc-agy-plugin delegation checklist:\n"
     + _CHECKLIST_STEP_1
     + "2. When the worker returns, check each numbered item against get_diff (use focus_symbols) and the "
-    "worker's tests. Host pytest still runs the old code until you apply; to test the worker's version, "
-    "pass test commands as acceptance to delegate_continue.\n"
+    "worker's tests; if contract_warnings is non-empty in the worker digest, call get_diff(focus_symbols=[...]) "
+    "on the flagged class/attribute and fix any unrequested class/public attribute shadowing via "
+    "delegate_continue before applying. Host pytest still runs the old code until you apply; to test the "
+    "worker's version, pass test commands as acceptance to delegate_continue.\n"
     "3. If any item is missing or wrong, send one delegate_continue that names the exact items to fix.\n"
     "4. Apply only after every item is covered."
 )
@@ -164,6 +169,7 @@ def handle_session_start(
             (receipt_store.data_dir / ".lead_session_started").write_text(marker_payload, encoding="utf-8")
             (receipt_store.data_dir / ".lead_read_files.json").write_text("[]", encoding="utf-8")
             (receipt_store.data_dir / ".lead_read_windows.json").write_text("{}", encoding="utf-8")
+            (receipt_store.data_dir / ".lead_git_diff_spotcheck_used").unlink(missing_ok=True)
         except OSError:
             pass
     live_diff = capture_live_workspace_diff(ws_path, baseline_head_sha=head_sha)

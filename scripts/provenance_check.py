@@ -108,7 +108,12 @@ def verify_workspace_provenance(
             continue
 
         if r.get("kind") == "delegate":
-            for prompt_str in r.get("prompts") or []:
+            prompts_list = list(r.get("prompts") or [])
+            sources_list = list(r.get("prompt_sources") or [])
+            for idx, prompt_str in enumerate(prompts_list):
+                src = str(sources_list[idx]) if idx < len(sources_list) else "lead"
+                if src in ("plugin_escalation", "plugin_qa_review", "internal"):
+                    continue
                 lint = lint_delegation_prompt(str(prompt_str))
                 if not lint["ok"]:
                     dictation_violations.append(

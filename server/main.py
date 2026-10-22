@@ -78,10 +78,19 @@ from server.mcp_stdio import MCPServer, serve_stdio  # noqa: E402
 
 def main() -> int:
     server = MCPServer()
+    _shutting_down = False
 
     def _record_unfinished(*_args: object) -> None:
+        nonlocal _shutting_down
+        if _shutting_down:
+            return
+        _shutting_down = True
         try:
             server.job_manager.mark_running_interrupted()
+        except Exception:
+            pass
+        try:
+            server.job_manager.shutdown(wait=False)
         except Exception:
             pass
 
@@ -92,8 +101,8 @@ def main() -> int:
     atexit.register(_record_unfinished)
     signal.signal(signal.SIGTERM, _on_sigterm)
     serve_stdio(server)
-    # Record unfinished jobs right when stdin closes. The atexit hook alone is too late: Python joins
-    # ThreadPoolExecutor worker threads before atexit handlers run, so no future is still live by then.
+    # Record unfinished jobs and terminate active workers right when stdin closes. The atexit hook alone
+    # is too late: Python joins ThreadPoolExecutor worker threads before atexit handlers run.
     _record_unfinished()
     return 0
 

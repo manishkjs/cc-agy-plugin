@@ -154,7 +154,12 @@ def _inspect_receipt_apply_state(store: ReceiptStore, job_id: str | None) -> tup
     except Exception:
         return False, False
     summary_txt = str(rec.get("summary") or "")
-    has_caveat = bool(_BLOCKED_RE.search(summary_txt) or "?" in summary_txt or rec.get("status") != "ok")
+    has_caveat = bool(
+        _BLOCKED_RE.search(summary_txt)
+        or "?" in summary_txt
+        or rec.get("status") != "ok"
+        or bool(rec.get("contract_warnings"))
+    )
     if rec.get("acceptance_passed") is not True:
         return False, has_caveat
     acc_list = rec.get("acceptance_results")
@@ -222,7 +227,12 @@ def evaluate_post_tool_use(
 
     if resp_dict.get("applied") is not True or resp_dict.get("status", "ok") != "ok":
         return {}
-    if resp_dict.get("scope_violations") or resp_dict.get("missing_prompt_symbols") or resp_dict.get("has_worker_caveat"):
+    if (
+        resp_dict.get("scope_violations")
+        or resp_dict.get("missing_prompt_symbols")
+        or resp_dict.get("contract_warnings")
+        or resp_dict.get("has_worker_caveat")
+    ):
         return {}
 
     resp_summary = str(resp_dict.get("summary") or "")
