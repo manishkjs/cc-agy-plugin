@@ -45,29 +45,63 @@ def _close_genai_client(client: Any) -> None:
 
 
 def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
-    """Invoke Google AI Studio or Vertex AI via the official google-genai SDK."""
+    """Invoke Gemini Enterprise, Google AI Studio, or Vertex AI via the official google-genai SDK."""
     from google import genai
     from google.genai import types as genai_types
+    from google.oauth2.credentials import Credentials as OAuth2Credentials
 
     sanitize_placeholder_env()
     timeout_ms = int(request.get("timeout_ms") or 600_000)
     vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
+    ent_meta: dict[str, Any] = {}
     if request.get("api_key"):
         http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(api_key=request["api_key"], http_options=http_opts)
-    elif vertex_base_url:
-        gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+    elif request.get("auth_mode") == "gemini_enterprise":
+        from server.gemini_enterprise import prepare_enterprise_endpoint
+
+        ep = prepare_enterprise_endpoint(request)
+        ent_meta = {
+            "vertex_project": ep["project"],
+            "vertex_location": ep["location"],
+            "reroute_note": ep.get("reroute_note"),
+        }
         http_opts = genai_types.HttpOptions(
             timeout=timeout_ms,
-            base_url=vertex_base_url,
-            headers={"Authorization": f"Bearer {gateway_tok}"},
+            base_url=ep["base_url"],
+            headers=ep["headers"],
+            client_args={"follow_redirects": False},
         )
+        client = genai.Client(
+            vertexai=True,
+            project=ep["project"],
+            location=ep["location"],
+            credentials=OAuth2Credentials(token="proxy-local"),
+            http_options=http_opts,
+        )
+        if getattr(client, "_api_client", None) is not None:
+            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
+    elif vertex_base_url:
+        gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+        gw_http_kwargs: dict[str, Any] = {
+            "timeout": timeout_ms,
+            "base_url": vertex_base_url,
+            "headers": {"Authorization": f"Bearer {gateway_tok}"},
+        }
+        if vertex_base_url.startswith("http://") or "googleapis.com" not in vertex_base_url:
+            gw_http_kwargs["client_args"] = {"follow_redirects": False}
+        http_opts = genai_types.HttpOptions(**gw_http_kwargs)
         client = genai.Client(
             vertexai=True,
             project=request.get("project") or "custom-endpoint",
             location=request.get("location") or "global",
+            credentials=OAuth2Credentials(token=gateway_tok),
             http_options=http_opts,
         )
+        if (
+            vertex_base_url.startswith("http://") or "googleapis.com" not in vertex_base_url
+        ) and getattr(client, "_api_client", None) is not None:
+            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
     else:
         http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(
@@ -110,6 +144,7 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
         return {
             "text": getattr(response, "text", "") or "",
             "usage": usage,
+            **ent_meta,
         }
     finally:
         _close_genai_client(client)
@@ -202,6 +237,7 @@ def ask_gemini(
             "api_key": resolved_key,
             "project": resolved_project,
             "location": resolved_location,
+            "location_explicit": bool(auth.get("location_explicit")),
             "model": chosen_model,
             "prompt": full_prompt,
             "system_instruction": system_instruction,
@@ -210,6 +246,12 @@ def ask_gemini(
         if thinking_level:
             req_payload["thinking_level"] = thinking_level
         result = active_backend(req_payload)
+        if result.get("vertex_project"):
+            resolved_project = str(result["vertex_project"])
+        if result.get("vertex_location"):
+            resolved_location = str(result["vertex_location"])
+        if result.get("reroute_note") and not reroute_note:
+            reroute_note = str(result["reroute_note"])
         response_text = str(result.get("text") or "")
         if isinstance(result.get("usage"), dict):
             for k in usage:

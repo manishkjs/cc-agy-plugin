@@ -400,6 +400,14 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_VERTEX_BASE_URL_TOKEN",
         "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN",
         "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN",
+        "CC_AGY_AUTH_MODE",
+        "CLAUDE_PLUGIN_OPTION_AUTH_MODE",
+        "CC_AGY_USERCFG_AUTH_MODE",
+        "CC_AGY_GEMINI_ENTERPRISE",
+        "CC_AGY_ENTERPRISE_LOCATION",
+        "CC_AGY_ENTERPRISE_ACCESS_TOKEN",
+        "CC_AGY_ENTERPRISE_TIER",
+        "CC_AGY_BAIC_BASE_URL",
         "CC_AGY_MAX_DAILY_CENTS",
         "CLAUDE_PLUGIN_OPTION_MAX_DAILY_CENTS",
         "CC_AGY_USERCFG_MAX_DAILY_CENTS",
@@ -551,19 +559,95 @@ def resolve_vertex_project(
     )
 
 
+_GEMINI_ENTERPRISE_ALIASES: frozenset[str] = frozenset(
+    {"gemini_enterprise", "gemini-enterprise", "enterprise", "oauth_business", "oauth-business", "baic"}
+)
+_API_KEY_MODE_ALIASES: frozenset[str] = frozenset({"api_key", "api-key", "ai_studio", "aistudio"})
+_VERTEX_MODE_ALIASES: frozenset[str] = frozenset({"vertex", "vertex_ai", "vertex-ai", "gcp"})
+_GATEWAY_MODE_ALIASES: frozenset[str] = frozenset({"gateway", "proxy"})
+
+
+def resolve_configured_auth_mode(
+    requested_auth_mode: str | Mapping[str, str] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an explicit authentication mode override ('gemini_enterprise', 'api_key', 'vertex', 'gateway', or None for auto)."""
+    if isinstance(requested_auth_mode, Mapping) and env is None:
+        env = requested_auth_mode
+        requested_auth_mode = None
+    source_env = env if env is not None else os.environ
+    candidates = (
+        requested_auth_mode,
+        source_env.get("CC_AGY_AUTH_MODE"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_AUTH_MODE"),
+        source_env.get("CC_AGY_USERCFG_AUTH_MODE"),
+    )
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip().lower()
+        if not cleaned or cleaned.startswith("${") or cleaned in ("auto", "default", "none", "null"):
+            continue
+        if cleaned in _GEMINI_ENTERPRISE_ALIASES:
+            return "gemini_enterprise"
+        if cleaned in _API_KEY_MODE_ALIASES:
+            return "api_key"
+        if cleaned in _VERTEX_MODE_ALIASES:
+            return "vertex"
+        if cleaned in _GATEWAY_MODE_ALIASES:
+            return "gateway"
+        raise ValueError(
+            f"Unsupported auth_mode {raw!r}. Expected 'auto', 'gemini_enterprise', 'api_key', 'vertex', or 'gateway'."
+        )
+    if env_flag("CC_AGY_GEMINI_ENTERPRISE", source_env) is True:
+        return "gemini_enterprise"
+    return None
+
+
+def _resolve_explicit_project_only(
+    requested_project: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an explicit GCP project ID without synthesizing `'custom-endpoint'`."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_project,
+        source_env.get("GOOGLE_CLOUD_PROJECT"),
+        source_env.get("VERTEX_PROJECT"),
+        source_env.get("GCLOUD_PROJECT"),
+        source_env.get("CLOUD_ML_PROJECT_ID"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_PROJECT"),
+        source_env.get("CC_AGY_USERCFG_GOOGLE_CLOUD_PROJECT"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            cleaned = candidate.strip()
+            if (
+                cleaned
+                and not cleaned.startswith("${")
+                and cleaned not in ("<paying-project>", "custom-endpoint")
+            ):
+                return cleaned
+    return None
+
+
 def resolve_auth_config(
     requested_project: str | None = None,
     requested_location: str | None = None,
     requested_api_key: str | None = None,
     *,
+    requested_auth_mode: str | None = None,
     model: str = "gemini-2.5-flash",
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Resolve authentication credentials for Google AI Studio (API key) or Vertex AI.
+    """Resolve authentication credentials for Gemini Enterprise, Google AI Studio, or Vertex AI.
 
-    If an API key is provided directly or found via GEMINI_API_KEY / GOOGLE_API_KEY,
-    the auth mode is 'api_key' and Vertex project/ADC credentials are not required.
-    Otherwise, resolves the Vertex AI project and location (auth mode 'vertex').
+    Supports `auth_mode` values:
+    - `'gemini_enterprise'`: human user OAuth against Business AI Code (`businessaicode.googleapis.com`),
+      consuming included Gemini Enterprise Standard/Plus seat capacity.
+    - `'api_key'`: Google AI Studio (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
+    - `'vertex'`: Google Cloud Vertex AI (or custom Vertex-compatible AI gateway).
     """
     source_env = env if env is not None else os.environ
     resolved_key = resolve_api_key(requested_api_key, env=source_env)
@@ -575,6 +659,100 @@ def resolve_auth_config(
         cleaned_req_proj = requested_project.strip()
         if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
             explicit_project = cleaned_req_proj
+
+    if resolved_key and requested_api_key:
+        return {
+            "auth_mode": "api_key",
+            "api_key": resolved_key,
+            "project": None,
+            "location": None,
+            "reroute_note": None,
+        }
+
+    cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
+    if cfg_mode == "gemini_enterprise":
+        ent_proj = _resolve_explicit_project_only(requested_project, env=source_env)
+        req_loc_clean = (requested_location or "").strip().lower()
+        if req_loc_clean.startswith("${"):
+            req_loc_clean = ""
+        ent_env_loc = first_valid_env(source_env, "CC_AGY_ENTERPRISE_LOCATION", default="").lower()
+        usercfg_loc = first_valid_env(
+            source_env,
+            "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_LOCATION",
+            "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION",
+            default="",
+        ).lower()
+        shell_loc = first_valid_env(
+            source_env,
+            "GOOGLE_CLOUD_LOCATION",
+            "VERTEX_LOCATION",
+            default="",
+        ).lower()
+        if req_loc_clean or ent_env_loc:
+            ent_loc: str | None = req_loc_clean or ent_env_loc
+            # Multi-region BAIC jurisdictions (`global`, `us`, `eu`) are explicit constraints;
+            # regional Vertex strings containing `-` (e.g. `us-central1`) are treated as soft hints.
+            loc_explicit = "-" not in ent_loc
+        elif usercfg_loc and "-" not in usercfg_loc:
+            # Explicit BAIC jurisdiction set via `claude plugin install --config google_cloud_location=...`
+            ent_loc = usercfg_loc
+            loc_explicit = True
+        else:
+            ambient = shell_loc or usercfg_loc
+            ent_loc = ambient or None
+            loc_explicit = False
+        return {
+            "auth_mode": "gemini_enterprise",
+            "api_key": None,
+            "project": ent_proj,
+            "location": ent_loc,
+            "location_explicit": loc_explicit,
+            "reroute_note": None,
+        }
+
+    if cfg_mode == "api_key":
+        if not resolved_key:
+            raise ValueError(
+                "Missing Gemini API key for auth_mode='api_key'. Set userConfig.gemini_api_key or GEMINI_API_KEY."
+            )
+        return {
+            "auth_mode": "api_key",
+            "api_key": resolved_key,
+            "project": None,
+            "location": None,
+            "reroute_note": None,
+        }
+
+    if cfg_mode == "gateway":
+        if not resolve_vertex_base_url(env=source_env):
+            raise ValueError(
+                "Missing gateway URL for auth_mode='gateway'. "
+                "Set userConfig.vertex_base_url or CC_AGY_VERTEX_BASE_URL."
+            )
+        gw_proj = resolved_proj or "custom-endpoint"
+        resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
+        return {
+            "auth_mode": "vertex",
+            "api_key": None,
+            "project": gw_proj,
+            "location": resolved_loc,
+            "reroute_note": reroute_note,
+        }
+
+    if cfg_mode == "vertex":
+        if not resolved_proj:
+            raise ValueError(
+                "Missing Google Cloud project ID for auth_mode='vertex'. "
+                "Set userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT."
+            )
+        resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
+        return {
+            "auth_mode": "vertex",
+            "api_key": None,
+            "project": resolved_proj,
+            "location": resolved_loc,
+            "reroute_note": reroute_note,
+        }
 
     has_gateway = bool(resolve_vertex_base_url(env=source_env))
 
@@ -600,8 +778,9 @@ def resolve_auth_config(
 
     raise ValueError(
         "Missing credentials. Provide a Google AI Studio Gemini API key "
-        "(userConfig.gemini_api_key or GEMINI_API_KEY), or a Google Cloud project ID "
-        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT)."
+        "(userConfig.gemini_api_key or GEMINI_API_KEY), a Google Cloud project ID "
+        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT), or enable Gemini Enterprise "
+        "subscription mode (CC_AGY_AUTH_MODE=gemini_enterprise)."
     )
 
 

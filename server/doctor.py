@@ -95,7 +95,19 @@ def run_doctor(
         resolved_auth = resolve_auth_config(model=default_delegate_model, env=dict(active_env))
         auth_mode = str(resolved_auth.get("auth_mode") or "")
         adc_found: bool | None = None
-        if auth_mode == "vertex":
+        ent_cred_source: str | None = None
+        auth_ok = True
+        if auth_mode == "gemini_enterprise":
+            from server.gemini_enterprise import inspect_enterprise_credentials_offline
+
+            ent_check = inspect_enterprise_credentials_offline(active_env)
+            ent_cred_source = str(ent_check.get("credential_source") or "")
+            if not ent_check.get("ok"):
+                auth_ok = False
+                issues.append(str(ent_check.get("error") or "Gemini Enterprise sign-in is missing."))
+                if ent_check.get("remediation"):
+                    remediations.append(str(ent_check["remediation"]))
+        elif auth_mode == "vertex":
             adc_found = any(p.is_file() for p in _default_adc_candidates(active_env))
             if not adc_found and not custom_gateway:
                 warnings.append(
@@ -104,18 +116,20 @@ def run_doctor(
                 )
                 remediations.append("Run `gcloud auth application-default login` or set `GEMINI_API_KEY`.")
         auth_info = {
-            "ok": True,
+            "ok": auth_ok,
             "auth_mode": auth_mode,
             "api_key_configured": bool(resolved_auth.get("api_key")),
             "project": resolved_auth.get("project"),
             "location": resolved_auth.get("location"),
             "custom_vertex_gateway": custom_gateway,
             **({"adc_file_found": adc_found} if adc_found is not None else {}),
+            **({"enterprise_credential_source": ent_cred_source} if ent_cred_source is not None else {}),
         }
     except ValueError as exc:
         issues.append(str(exc))
         remediations.append(
-            "Export `GEMINI_API_KEY` (Google AI Studio) or `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
+            "Run `gcloud auth application-default login` + `CC_AGY_AUTH_MODE=gemini_enterprise` "
+            "(Gemini Enterprise seat), export `GEMINI_API_KEY` (AI Studio), or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
         )
         auth_info = {
             "ok": False,
@@ -127,21 +141,25 @@ def run_doctor(
             "error": str(exc),
         }
 
-    # 3. Python SDK availability
-    has_genai = _module_available("google.genai")
-    has_agy = _module_available("google.antigravity")
-    has_ctx = _module_available("ctx.sdk")
+    # 3. Python SDK availability (check both active interpreter and resolved MCP SDK venv)
+    from server.runtime_env import python_has_module, resolve_sdk_python
+
+    sdk_py = resolve_sdk_python(env=active_env)
+    has_genai = _module_available("google.genai") or python_has_module(sdk_py, "google.genai")
+    has_agy = _module_available("google.antigravity") or python_has_module(sdk_py, "google.antigravity")
+    has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")
     if not has_genai:
         issues.append("Python package `google-genai` is not installed.")
-        remediations.append('Install plugin dependencies: `python3 -m pip install -e ".[antigravity]"`')
+        remediations.append("Install plugin dependencies: `python3 -m server.install`")
     if not has_agy:
         issues.append("Python package `google-antigravity` is not installed.")
-        remediations.append('Install Antigravity SDK: `python3 -m pip install -e ".[antigravity]"`')
+        remediations.append("Install Antigravity SDK: `python3 -m server.install`")
     if not has_ctx:
         warnings.append(
             "Optional `ctx-harness` (Straitjacket) package is not installed; worker shell output containment will fall back to raw Antigravity tools."
         )
     sdk_info = {
+        "python_bin": sdk_py,
         "google_genai": has_genai,
         "google_antigravity": has_agy,
         "ctx_straitjacket": has_ctx,

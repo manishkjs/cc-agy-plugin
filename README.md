@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-259%20passing-1e8e3e)](tests/)
+[![Tests](https://img.shields.io/badge/tests-278%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Codex%20%7C%20Antigravity-f9ab00)](#quick-start)
 
@@ -45,53 +45,58 @@ Click the preview below to open the **3m 55s voiced 3D walkthrough** ([`assets/w
 
 ## Quick start
 
-Setup takes about a minute and works with **Claude Code**, **Codex**, or both. API keys stay in your shell environment and are never written into config files on disk.
+Setup takes about a minute in a normal terminal shell. The installer automatically creates an isolated Python environment at `~/.local/share/cc-agy-plugin/venv`, so you never hit `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, or macOS Homebrew, and secrets are never written to config files.
 
-### 1. Install the package
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
-python3 -m pip install -e ".[antigravity]"
 ```
 
-### 2. Connect to Gemini (pick one)
+### 2. Sign in or set a key (pick one)
 
 ```bash
-# Option A: Google AI Studio API key (fastest, no Google Cloud account needed)
+# Option A: Gemini Enterprise work subscription (uses your included monthly seat capacity)
+gcloud auth application-default login
+
+# Option B: Google AI Studio API key (fastest personal setup, pay-as-you-go)
 export GEMINI_API_KEY="your-key"
 
-# Option B: Google Cloud / Vertex AI
+# Option C: Google Cloud Vertex AI project (pay-as-you-go)
 gcloud auth application-default login
 export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-
-# Option C: Corporate AI gateway (takes priority over any personal GEMINI_API_KEY in your shell)
-export CC_AGY_VERTEX_BASE_URL="https://your-gateway.internal/vertex"
-export CC_AGY_VERTEX_BASE_URL_TOKEN="your-virtual-key"   # optional bearer token
 ```
+
+> [!TIP]
+> **Using a Gemini Enterprise Standard or Plus license?** Sign in with your human work email (`Option A`) and pass `--auth gemini-enterprise` in Step 3. API keys and Service Account JSON keys belong to a cloud project rather than a human seat, so Google always bills them pay-as-you-go instead of drawing from your included subscription capacity.
 
 ### 3. Register with Claude Code or Codex
 
-Run `cc-agy-install` (or `python3 -m server.install` if pip's script directory is not on your `PATH`) with no flags for a 4-question interactive wizard in plain English, or pass flags directly:
+Run **Path A** or **Path B** in a normal terminal shell (or run `python3 -m server.install` with no flags for a 4-question interactive wizard):
 
+**Path A: Claude Code**
 ```bash
-# Interactive 4-step wizard (asks which coding tool, connection, model preset, and optional daily cap)
-cc-agy-install
+# With a Gemini Enterprise subscription:
+python3 -m server.install --host claude --auth gemini-enterprise
 
-# Or non-interactive one-liners:
-cc-agy-install --host codex --max-daily-cents 500        # Codex + $5.00/day spend cap + routing skill
-cc-agy-install --host claude                             # Claude Code marketplace + plugin install
-cc-agy-install --host all --profile quality --dry-run    # preview both hosts with Argon-first routing
+# Or with an AI Studio API key / Vertex AI project:
+python3 -m server.install --host claude
+```
+If `claude` is already open in another terminal tab, run `/reload-plugins` inside that session (or restart with `claude --continue`), or prefix shell commands inside Claude Code with `!`.
+
+**Path B: OpenAI Codex**
+```bash
+# With a Gemini Enterprise subscription:
+python3 -m server.install --host codex --auth gemini-enterprise
+
+# Or with an AI Studio API key / Vertex AI project:
+python3 -m server.install --host codex
 ```
 
-- **What Codex setup configures:** Updates `~/.codex/config.toml` cleanly (with a backup), forwards credential variable names via `env_vars` without writing secrets to disk, sets a 30-minute MCP tool timeout so multi-minute worker runs finish, and installs the routing skill at `~/.codex/skills/cc-agy-plugin/SKILL.md`. On newer Codex releases with plugin marketplace support, you can also run:
-  ```bash
-  codex plugin marketplace add manishkjs/cc-agy-plugin --ref main
-  codex plugin add cc-agy-plugin@cc-agy
-  ```
-- **What Claude Code setup configures:** Registers the local plugin marketplace and installs `cc-agy-plugin`, prompting for settings through Claude Code's built-in `userConfig`. For a one-off session without installing globally, run:
-  ```bash
-  claude --plugin-dir /path/to/cc-agy-plugin
-  ```
+### 4. Verify your setup (free, 0 tokens)
+
+- **In Claude Code:** type `/cc-agy-plugin:doctor`
+- **In Codex:** start `codex` in your project and ask: `"Run doctor to verify my Gemini setup."`
 
 ## How to use it
 
@@ -128,6 +133,15 @@ Every worker digest reports a `verification` mode so you always know how changes
 
 ## Options
 
+### Gemini Enterprise subscription vs API keys and Service Accounts
+
+| How you connect | Uses included Enterprise seat? | How Google bills it | When to use |
+|:--|:--:|:--|:--|
+| **Gemini Enterprise sign-in** (`gcloud auth application-default login` + `--auth gemini-enterprise`) | **Yes** | Included in your monthly Gemini Enterprise Standard or Plus seat (`businessaicode.googleapis.com`) | Developers whose company assigns Gemini Enterprise seats to their work email. Automatically detects your licensed project and jurisdiction (`global`, `us`, or `eu`). |
+| **AI Studio API key** (`GEMINI_API_KEY`) | No | Pay-as-you-go per token on AI Studio | Individual developers without Google Cloud or an enterprise seat. |
+| **Vertex AI user or Service Account** (`GOOGLE_CLOUD_PROJECT` / `GOOGLE_APPLICATION_CREDENTIALS`) | No | Pay-as-you-go per token on your GCP billing account (`aiplatform.googleapis.com`) | Headless CI/CD pipelines, shared cloud workloads, or teams paying per token on GCP. |
+| **Corporate AI gateway** (`--base-url` / `CC_AGY_VERTEX_BASE_URL`) | Depends on gateway | Managed by your company's gateway (`LiteLLM`, `Portkey`, `Bifrost`, or Apigee) | Enterprises routing model traffic through a central proxy or virtual key. |
+
 ### Model and cost profiles (`--profile` or `CC_AGY_COST_PROFILE`)
 
 | Profile | How models are chosen | Best when |
@@ -140,15 +154,18 @@ Every worker digest reports a `verification` mode so you always know how changes
 
 | Option | CLI flag / Environment variable / `userConfig` | Default | What it controls |
 |:--|:--|:--|:--|
-| **Target coding tool** | `cc-agy-install --host codex\|claude\|all` | `all` | Registers the MCP server and routing skill for Codex, Claude Code, or both. |
+| **Target coding tool** | `python3 -m server.install --host codex\|claude\|all` | `all` | Registers the MCP server and routing skill for Codex, Claude Code, or both (forwards `--auth`, `--profile`, `--project`, `--location`, `--base-url`, `--max-daily-cents`, and `--strict` directly to both hosts). |
+| **Connection mode** | `--auth gemini-enterprise\|api-key\|vertex\|gateway\|auto`, `CC_AGY_AUTH_MODE`, or `userConfig.auth_mode` | `auto` | Set `gemini-enterprise` (`CC_AGY_AUTH_MODE=gemini_enterprise`) to consume your included Gemini Enterprise seat via human Google sign-in instead of pay-as-you-go billing. |
 | **AI Studio key** | `GEMINI_API_KEY` or `userConfig.gemini_api_key` | read from shell | Connects directly through Google AI Studio with no Google Cloud setup. |
-| **Google Cloud project** | `--project`, `GOOGLE_CLOUD_PROJECT`, or `userConfig.google_cloud_project` | read from shell | Connects through Google Cloud Vertex AI using Application Default Credentials (`gcloud auth application-default login`). |
+| **Google Cloud project** | `--project`, `GOOGLE_CLOUD_PROJECT`, or `userConfig.google_cloud_project` | auto-detected on Enterprise; required on Vertex | Optional on Gemini Enterprise (auto-selected from your active license, or used for license self-assignment); required for pay-as-you-go Vertex AI. |
 | **Corporate AI gateway** | `--base-url`, `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`), or `userConfig.vertex_base_url` | unset | Routes Gemini calls through a corporate proxy or AI gateway (with optional bearer token in `CC_AGY_VERTEX_BASE_URL_TOKEN` or `userConfig.vertex_base_url_token`). Takes priority over an ambient shell `GEMINI_API_KEY`. |
 | **Cost profile** | `--profile`, `CC_AGY_COST_PROFILE`, or `userConfig.cost_profile` | `balanced` | Selects `balanced`, `economy`, or `quality` model routing. |
 | **Daily spend cap** | `--max-daily-cents`, `CC_AGY_MAX_DAILY_CENTS`, or `userConfig.max_daily_cents` | unlimited | Optional workspace daily ceiling in US cents (for example `500` for \$5.00/day). Blocks new Gemini calls once UTC daily receipts reach the limit. |
-| **Vertex region** | `--location`, `GOOGLE_CLOUD_LOCATION`, or `userConfig.google_cloud_location` | `us-central1` | Preferred Vertex AI region; global-only models (`gemini-3.8-flash`, `gemini-4-argon`) route to `global` automatically. |
+| **Region / jurisdiction** | `--location`, `GOOGLE_CLOUD_LOCATION`, or `userConfig.google_cloud_location` | `us-central1` (`global`/`us`/`eu` on Enterprise) | Preferred Vertex AI region or Gemini Enterprise jurisdiction (`global`, `us`, or `eu`). |
+| **Managed SDK venv** | `CC_AGY_VENV_DIR`, `CC_AGY_PYTHON_BIN`, or `--no-bootstrap` | `~/.local/share/cc-agy-plugin/venv` | Isolated per-user Python environment used by both Codex and cached Claude Code installs (`~/.claude/plugins/cache/...`). |
+| **One-off or marketplace install** | `claude --plugin-dir /path/to/cc-agy-plugin` or `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main` | optional | Run in Claude Code for a single session without installing globally, or install via native Codex plugin marketplace. |
 | **Model overrides** | `CC_AGY_DEFAULT_DELEGATE_MODEL`, `CC_AGY_DEFAULT_ASK_MODEL` (or `model=` per call) | from `--profile` | Pins worker jobs or single-shot `ask_gemini` calls to a specific Gemini model ID. |
-| **Strict orchestrator mode** | `CC_AGY_STRICT_MODE=true` or `userConfig.strict_delegation_mode` | `false` | Claude Code hook mode that blocks direct host file edits so every modified line traces back to a signed worker receipt. |
+| **Strict orchestrator mode** | `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_delegation_mode` | `false` | Claude Code hook mode that blocks direct host file edits so every modified line traces back to a signed worker receipt. |
 | **Working copy mode** | `in_place=false` (isolated copy) vs `in_place=true` (live checkout) per job | `in_place=false` | Isolated copy keeps your checkout clean during runs; `in_place=true` edits your live folder directly when tests depend on large gitignored `.venv/` or `node_modules/` directories. |
 
 ## Benchmark results
@@ -172,7 +189,7 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, us
 | Item | Detail |
 |:--|:--|
 | **Version** | 0.3.0, Apache 2.0 |
-| **Quality** | 259 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
+| **Quality** | 278 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 | **Next** | Finish the full 33-task DeepSWE suite and publish per-pattern cost guidance |
 
@@ -224,10 +241,11 @@ Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` 
 
 `resolve_auth_config()` in `server/regions.py` selects credentials in this exact order:
 1. Explicit `api_key` argument on the tool call -> **Google AI Studio** (`auth_mode="api_key"`).
-2. Explicit `project` argument on the tool call -> **Vertex AI** (`auth_mode="vertex"`).
-3. Custom AI gateway base URL (`CC_AGY_VERTEX_BASE_URL`, `GOOGLE_VERTEX_BASE_URL`, or `userConfig.vertex_base_url`) -> **Vertex-compatible AI Gateway** (`auth_mode="vertex"`, defaulting `project` to `"custom-endpoint"` when no GCP project ID is set, and attaching `CC_AGY_VERTEX_BASE_URL_TOKEN` when configured). Takes priority over an ambient shell `GEMINI_API_KEY`.
-4. `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `userConfig.gemini_api_key` in the environment -> **Google AI Studio** (`auth_mode="api_key"`, even if `GOOGLE_CLOUD_PROJECT` is also exported in the shell).
-5. `GOOGLE_CLOUD_PROJECT`, `VERTEX_PROJECT`, `GCLOUD_PROJECT`, `CLOUD_ML_PROJECT_ID`, or `userConfig.google_cloud_project` in the environment -> **Vertex AI** (`auth_mode="vertex"`).
+2. Gemini Enterprise subscription mode (`CC_AGY_AUTH_MODE=gemini_enterprise`, `CC_AGY_GEMINI_ENTERPRISE=true`, or `userConfig.auth_mode="gemini_enterprise"`) -> **Gemini Enterprise Business AI Code** (`auth_mode="gemini_enterprise"`). Resolves human Google OAuth credentials (`gcloud auth application-default login`), looks up your active seat via `GET /v1beta:fetchLicenses` (or idempotent `:selfAssignLicense` when `--project` is passed), rejects Service Account keys with remediation instructions, and routes SDK requests through an authenticated `127.0.0.1` loopback proxy to `businessaicode.googleapis.com` (`global`, `us`, or `eu`).
+3. Explicit `project` argument on the tool call -> **Vertex AI** (`auth_mode="vertex"`).
+4. Custom AI gateway base URL (`CC_AGY_VERTEX_BASE_URL`, `GOOGLE_VERTEX_BASE_URL`, or `userConfig.vertex_base_url`) -> **Vertex-compatible AI Gateway** (`auth_mode="vertex"`, defaulting `project` to `"custom-endpoint"` when no GCP project ID is set, and attaching `CC_AGY_VERTEX_BASE_URL_TOKEN` when configured). Takes priority over an ambient shell `GEMINI_API_KEY`.
+5. `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `userConfig.gemini_api_key` in the environment -> **Google AI Studio** (`auth_mode="api_key"`, even if `GOOGLE_CLOUD_PROJECT` is also exported in the shell).
+6. `GOOGLE_CLOUD_PROJECT`, `VERTEX_PROJECT`, `GCLOUD_PROJECT`, `CLOUD_ML_PROJECT_ID`, or `userConfig.google_cloud_project` in the environment -> **Vertex AI** (`auth_mode="vertex"`).
 
 ### Cost profiles, quota handling, and overrides
 
@@ -348,8 +366,10 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 
 | Variable | Default | What it does |
 |---|---|---|
+| `CC_AGY_AUTH_MODE` | `auto` | Set `gemini_enterprise` (or `CC_AGY_GEMINI_ENTERPRISE=true`) to route calls through your included Gemini Enterprise seat (`businessaicode.googleapis.com`) using human Google sign-in. |
 | `CC_AGY_COST_PROFILE` | `balanced` | Preset controlling model routing and step-up: `economy` (Flash only), `balanced` (Flash first, Argon on retries/follow-ups), or `quality` (Argon first). |
 | `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | Optional daily workspace spend cap in US cents (for example `500` for \$5.00/day). Rejects new Gemini calls once UTC daily spend reaches the limit. |
+| `CC_AGY_VENV_DIR` / `CC_AGY_PYTHON_BIN` | `~/.local/share/cc-agy-plugin/venv` | Per-user virtualenv directory or explicit Python interpreter path used by the MCP server and installer on PEP 668 systems. |
 | `CC_AGY_VERTEX_BASE_URL` (alias `GOOGLE_VERTEX_BASE_URL`) | unset | Sends worker and `ask_gemini` calls to a custom Vertex-compatible endpoint, such as a corporate AI gateway. Takes priority over an ambient shell `GEMINI_API_KEY`. |
 | `CC_AGY_VERTEX_BASE_URL_TOKEN` | unset | Optional bearer token or virtual key sent to `CC_AGY_VERTEX_BASE_URL` (redacted from child shells and receipts). |
 | `CC_AGY_AUTO_APPLY_ON_PASS` | on in strict mode, off otherwise | Applies a finished worker diff automatically when the job is `ok`, changed files, passed checks, and has no scope violations. Set `0` to always apply manually. |
@@ -391,10 +411,12 @@ cc-agy-plugin/
 ├── plugins/cc-agy-plugin/    # Native Codex plugin bundle (.codex-plugin/plugin.json + skill)
 ├── .mcp.json                 # Long-lived stdio MCP server definition (30-minute / 1,800,000 ms timeout)
 ├── server/
-│   ├── main.py               # MCP stdio entry point
+│   ├── main.py               # MCP stdio entry point + managed venv re-exec
+│   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
+│   ├── gemini_enterprise.py  # Gemini Enterprise subscription OAuth, license lookup & loopback proxy
 │   ├── install.py            # Interactive 4-step wizard + Codex/Claude installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
-│   ├── regions.py            # Auth (API key / Vertex / AI gateway), region routing, pricing, daily cap
+│   ├── regions.py            # Auth (Enterprise / API key / Vertex / gateway), routing, pricing, daily cap
 │   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing
 │   ├── genai_ask.py          # Single-shot google-genai helper
 │   ├── agy_runner.py         # Antigravity SDK runner + Straitjacket (ctx.sdk) tool containment
@@ -423,14 +445,14 @@ cc-agy-plugin/
 │   ├── pre_tool_guard.py     # Strict mode PreToolUse guard + 9-line code dictation linter
 │   ├── post_tool_ledger.py   # PostToolUse MCP audit logger
 │   └── provenance_check.py   # Stop-hook git diff vs HMAC-receipt provenance verifier
-├── tests/                    # 259 automated unit, integration, portability, and guardrail tests
+├── tests/                    # 278 automated unit, integration, portability, and guardrail tests
 └── LICENSE                   # Apache License 2.0
 ```
 
 ### Running tests and validation
 
 ```bash
-pytest tests/ -q          # 259 automated tests
+pytest tests/ -q          # 278 automated tests
 bash scripts/validate.sh  # checks manifests, README badges, and clean-HOME Codex install
 ```
 

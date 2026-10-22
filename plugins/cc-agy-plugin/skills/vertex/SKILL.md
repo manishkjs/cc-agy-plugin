@@ -1,13 +1,13 @@
 ---
 name: vertex
-description: Route coding, multi-file edits, debugging, and second-opinion reviews from Codex or Claude Code to Gemini (AI Studio, Vertex AI, or an AI gateway) through the Antigravity SDK MCP server.
+description: Route coding, multi-file edits, debugging, and second-opinion reviews from Codex or Claude Code to Gemini (Gemini Enterprise subscription, AI Studio, Vertex AI, or an AI gateway) through the Antigravity SDK MCP server.
 ---
 
 # Gemini & Antigravity Delegation (`cc-agy-plugin`)
 
 Use the `agy` (Codex) or `vertex` (Claude Code) MCP tools to hand hands-on coding and investigation to Gemini (`gemini-3.8-flash` and `gemini-4-argon`) inside an isolated copy of the repository.
 
-If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor`) are not registered in Codex yet, ask the user to run `cc-agy-install --host codex` once from the plugin checkout.
+If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor`) are not registered in Codex yet, ask the user to run `python3 -m server.install --host codex` once from the plugin checkout (add `--auth gemini-enterprise` to use an included Gemini Enterprise seat via `gcloud auth application-default login`).
 
 ## Pick the right tool first
 

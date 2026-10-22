@@ -484,6 +484,7 @@ def test_delegate_start_inlines_spec_files_context_files_lead_reads_and_checklis
 
 
 def test_straitjacket_full_profile_default_and_view_file_dedup(tmp_path: Path) -> None:
+    pytest.importorskip("ctx.sdk")
     import asyncio
     from server.agy_runner import build_straitjacket_tools, resolve_containment_profile
 
@@ -1061,6 +1062,7 @@ def test_round7_straitjacket_budgets_and_post_acceptance_stop_guard(tmp_path: Pa
     import asyncio
     import json
     import sys
+    pytest.importorskip("ctx.sdk")
     from server.agy_runner import build_straitjacket_tools
 
     repo = tmp_path / "repo_sj_r7"

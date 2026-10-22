@@ -1277,6 +1277,8 @@ class TestCostControls(unittest.TestCase):
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_straitjacket_containment_prompt_and_receipt(self) -> None:
+        import pytest
+        pytest.importorskip("ctx.sdk")
         import asyncio
         from server.agy_runner import build_straitjacket_tools
 
@@ -1766,16 +1768,19 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             self.assertFalse(d_needs.get("is_error", False))
 
             # Straitjacket tool argument coercion and env scrubbing
-            with unittest.mock.patch.dict(os.environ, {"CC_AGY_DATA_DIR": str(shared_data), "GEMINI_API_KEY": "secret-key-val"}):
-                tools, _ = build_straitjacket_tools(repo1, timeout_seconds=10.0)
-                tmap = {f.__name__: f for f in tools}
-                out_none = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", None, None))
-                self.assertIn("error", out_none)
-                out_str = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", "abc", "5.0"))
-                self.assertIn("error", out_str)
-                out_cmd = json.loads(asyncio.run(tmap["run_command"]('printf "%s|%s" "$CC_AGY_DATA_DIR" "$GEMINI_API_KEY"', None, 0)))
-                self.assertEqual(out_cmd.get("command_exit_code"), 0)
-                self.assertEqual(out_cmd.get("stdout", "").strip(), "|")
+            from server.agy_runner import is_straitjacket_available
+
+            if is_straitjacket_available():
+                with unittest.mock.patch.dict(os.environ, {"CC_AGY_DATA_DIR": str(shared_data), "GEMINI_API_KEY": "secret-key-val"}):
+                    tools, _ = build_straitjacket_tools(repo1, timeout_seconds=10.0)
+                    tmap = {f.__name__: f for f in tools}
+                    out_none = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", None, None))
+                    self.assertIn("error", out_none)
+                    out_str = asyncio.run(tmap["ctx_get"]("run:deadbeef#stdout", "abc", "5.0"))
+                    self.assertIn("error", out_str)
+                    out_cmd = json.loads(asyncio.run(tmap["run_command"]('printf "%s|%s" "$CC_AGY_DATA_DIR" "$GEMINI_API_KEY"', None, 0)))
+                    self.assertEqual(out_cmd.get("command_exit_code"), 0)
+                    self.assertEqual(out_cmd.get("stdout", "").strip(), "|")
 
             jm.shutdown()
             jm_q.shutdown()
@@ -2275,6 +2280,8 @@ class TestGauntletRound1Regressions(unittest.TestCase):
     def test_disable_web_tools_and_timeout_containment_preservation(self) -> None:
         """Verifies CC_AGY_DISABLE_WEB_TOOLS / CC_AGY_STRICT_MODE blocks outbound network commands
         in Straitjacket run_command and preserves partial_containment on worker TimeoutError."""
+        import pytest
+        pytest.importorskip("ctx.sdk")
         from unittest import mock
         from server.agy_runner import build_straitjacket_tools
 

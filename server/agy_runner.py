@@ -1662,21 +1662,48 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         else None
     )
 
+    ent_meta: dict[str, Any] = {}
+    eff_project = request.get("project")
+    eff_location = request.get("location")
     if request.get("api_key"):
         endpoint = types.GeminiAPIEndpoint(
             api_key=request["api_key"],
             options=options,
         )
+    elif request.get("auth_mode") == "gemini_enterprise":
+        from server.gemini_enterprise import prepare_enterprise_endpoint
+
+        ep = prepare_enterprise_endpoint(request)
+        eff_project = ep["project"]
+        eff_location = ep["location"]
+        ent_meta = {
+            "vertex_project": eff_project,
+            "vertex_location": eff_location,
+            "reroute_note": ep.get("reroute_note"),
+        }
+        endpoint = types.VertexEndpoint(
+            project=eff_project,
+            location=eff_location,
+            base_url=ep["base_url"],
+            http_headers=ep["headers"],
+            api_key="proxy-local",
+            options=options,
+        )
     else:
         vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
+        if vertex_base_url:
+            eff_project = eff_project or "custom-endpoint"
+            eff_location = eff_location or "global"
         ep_kwargs: dict[str, Any] = {
-            "project": request["project"],
-            "location": request["location"],
+            "project": eff_project,
+            "location": eff_location,
             "options": options,
         }
         if vertex_base_url:
+            gw_tok = resolve_vertex_base_url_token() or "custom-endpoint"
             ep_kwargs["base_url"] = vertex_base_url
-            ep_kwargs["api_key"] = resolve_vertex_base_url_token() or "custom-endpoint"
+            ep_kwargs["api_key"] = gw_tok
+            ep_kwargs["http_headers"] = {"Authorization": f"Bearer {gw_tok}"}
         endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     resolved_model = str(request.get("model") or "")
@@ -1852,8 +1879,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     if is_api_key:
         cfg_kwargs["api_key"] = request["api_key"]
     else:
-        cfg_kwargs["project"] = request.get("project")
-        cfg_kwargs["location"] = request.get("location")
+        cfg_kwargs["project"] = eff_project
+        cfg_kwargs["location"] = eff_location
     if budget_cfg is not None:
         cfg_kwargs["budget_config"] = budget_cfg
     if compaction_threshold > 0 and hasattr(types, "CompactionConfig"):
@@ -2066,6 +2093,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "containment": containment_mode,
         "containment_warning": containment_warning,
         "command_runs": list(sj_command_runs),
+        **ent_meta,
     }
 
 
@@ -2232,22 +2260,28 @@ def _force_terminate_agent_process(
     popen_by_pid: dict[int, Any] = {}
     root_pids: set[int] = set()
     candidates: list[Any] = []
+    def _safe_attr(obj: Any, attr_name: str) -> Any:
+        try:
+            return getattr(obj, attr_name, None)
+        except Exception:
+            return None
+
     if agent is not None:
         for conv_attr in ("_conversation", "conversation"):
-            conv = getattr(agent, conv_attr, None)
-            if conv is not None:
+            conv = _safe_attr(agent, conv_attr)
+            if conv is not None and not callable(conv):
                 for conn_attr in ("connection", "_connection"):
-                    conn = getattr(conv, conn_attr, None)
-                    if conn is not None:
-                        candidates.append(getattr(conn, "_process", None))
+                    conn = _safe_attr(conv, conn_attr)
+                    if conn is not None and not callable(conn):
+                        candidates.append(_safe_attr(conn, "_process"))
         for strat_attr in ("_strategy", "_connection_strategy"):
-            strat = getattr(agent, strat_attr, None)
+            strat = _safe_attr(agent, strat_attr)
             if strat is not None:
                 for conn_attr in ("_connection", "connection"):
-                    conn = getattr(strat, conn_attr, None)
-                    if conn is not None:
-                        candidates.append(getattr(conn, "_process", None))
-        candidates.append(getattr(agent, "_process", None))
+                    conn = _safe_attr(strat, conn_attr)
+                    if conn is not None and not callable(conn):
+                        candidates.append(_safe_attr(conn, "_process"))
+        candidates.append(_safe_attr(agent, "_process"))
 
     for proc in candidates:
         if proc is None:
@@ -2410,6 +2444,7 @@ def run_antigravity_worker(
     project: str | None = None,
     location: str | None = None,
     api_key: str | None = None,
+    auth_mode: str | None = None,
     timeout_seconds: float = 300.0,
     enabled_tools: list[str] | None = None,
     disabled_tools: list[str] | None = None,
@@ -2425,17 +2460,18 @@ def run_antigravity_worker(
     register_cancel: Callable[[Callable[[], None] | None], None] | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
-    auth = resolve_auth_config(
+    resolved_auth = resolve_auth_config(
         requested_project=project,
         requested_location=location,
         requested_api_key=api_key,
+        requested_auth_mode=auth_mode,
         model=model,
     )
-    auth_mode = auth["auth_mode"]
-    resolved_key = auth.get("api_key")
-    resolved_project = auth.get("project")
-    resolved_location = auth.get("location")
-    reroute_note = auth.get("reroute_note")
+    eff_auth_mode = resolved_auth["auth_mode"]
+    resolved_key = resolved_auth.get("api_key")
+    resolved_project = resolved_auth.get("project")
+    resolved_location = resolved_auth.get("location")
+    reroute_note = resolved_auth.get("reroute_note")
     resolved_thinking = resolve_thinking_level(
         thinking_level,
         model=model,
@@ -2453,10 +2489,11 @@ def run_antigravity_worker(
         "prompts": list(prompts),
         "workspace_dir": str(Path(workspace_dir).resolve()),
         "model": model,
-        "auth_mode": auth_mode,
+        "auth_mode": eff_auth_mode,
         "api_key": resolved_key,
         "project": resolved_project,
         "location": resolved_location,
+        "location_explicit": bool(resolved_auth.get("location_explicit")),
         "reroute_note": reroute_note,
         "timeout_seconds": timeout_seconds,
         "enabled_tools": enabled_tools,
@@ -2514,6 +2551,13 @@ def run_antigravity_worker(
             "Straitjacket (ctx-harness) is not installed; worker executed without ctx shell containment."
         )
 
+    if result.get("vertex_project"):
+        resolved_project = str(result["vertex_project"])
+    if result.get("vertex_location"):
+        resolved_location = str(result["vertex_location"])
+    if result.get("reroute_note") and not reroute_note:
+        reroute_note = str(result["reroute_note"])
+
     return {
         "text": str(result.get("text") or ""),
         "usage": dict(result.get("usage") or {}),
@@ -2523,7 +2567,7 @@ def run_antigravity_worker(
         "containment": containment_val,
         "containment_warning": containment_warn,
         "command_runs": list(result.get("command_runs") or []),
-        "auth_mode": auth_mode,
+        "auth_mode": eff_auth_mode,
         "vertex_project": resolved_project,
         "vertex_location": resolved_location,
         "reroute_note": reroute_note,

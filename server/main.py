@@ -41,14 +41,19 @@ _sanitize_server_sys_path()
 
 
 def _maybe_reexec_into_sdk_venv() -> None:
-    """Re-exec into CC_AGY_PYTHON_BIN or sibling .venv/bin/python if google-antigravity is missing."""
+    """Re-exec into CC_AGY_PYTHON_BIN, managed user venv, or sibling .venv if google-antigravity is missing."""
     if os.environ.get("_CC_AGY_REEXEC") == "1":
         return
+    from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python
+
     explicit_py = (os.environ.get("CC_AGY_PYTHON_BIN") or "").strip()
     if explicit_py and not explicit_py.startswith("${") and Path(explicit_py).is_file():
         target = Path(explicit_py)
         try:
-            same = Path(sys.executable).resolve() == target.resolve() and os.path.abspath(sys.executable) == os.path.abspath(str(target))
+            same = (
+                Path(sys.executable).resolve() == target.resolve()
+                and os.path.abspath(sys.executable) == os.path.abspath(str(target))
+            )
         except OSError:
             same = False
         if not same:
@@ -56,25 +61,26 @@ def _maybe_reexec_into_sdk_venv() -> None:
             os.execv(str(target), [str(target), *sys.argv])
         return
 
-    if importlib.util.find_spec("google.antigravity") is not None:
+    if importlib.util.find_spec("google.antigravity") is not None and importlib.util.find_spec("google.genai") is not None:
         return
 
-    candidates = [
-        PLUGIN_ROOT / ".venv" / "bin" / "python",
-        PLUGIN_ROOT.parent / ".venv" / "bin" / "python",
-    ]
-    usable = [c for c in candidates if c.is_file() and os.access(c, os.X_OK)]
-    # Prefer a virtualenv that actually has the SDK installed; fall back to the first one that exists.
-    with_sdk = [c for c in usable if _venv_has_antigravity(c)]
-    for candidate in with_sdk or usable[:1]:
+    resolved = resolve_sdk_python(PLUGIN_ROOT)
+    if resolved != (sys.executable or "") and Path(resolved).is_file() and python_has_plugin_sdks(resolved):
         os.environ["_CC_AGY_REEXEC"] = "1"
-        os.execv(str(candidate), [str(candidate), *sys.argv])
+        os.execv(resolved, [resolved, *sys.argv])
 
-
-def _venv_has_antigravity(python_bin: Path) -> bool:
-    """True when the virtualenv owning `python_bin` has google-antigravity in site-packages."""
-    venv_dir = python_bin.parent.parent
-    return any(venv_dir.glob("lib/python3*/site-packages/google/antigravity/__init__.py"))
+    auto_boot = (os.environ.get("CC_AGY_AUTO_BOOTSTRAP") or "1").strip().lower()
+    if auto_boot not in ("0", "false", "no", "off") and "PYTEST_CURRENT_TEST" not in os.environ:
+        boot = ensure_sdk_venv(
+            PLUGIN_ROOT,
+            output_fn=lambda msg: sys.stderr.write(f"[cc-agy-plugin] {msg}\n"),
+        )
+        boot_py = str(boot.get("python_bin") or "")
+        if boot.get("ok") and boot_py and Path(boot_py).is_file():
+            os.environ["_CC_AGY_REEXEC"] = "1"
+            os.execv(boot_py, [boot_py, *sys.argv])
+        if boot.get("error"):
+            sys.stderr.write(f"[cc-agy-plugin] {boot['error']}\n")
 
 
 _maybe_reexec_into_sdk_venv()
@@ -82,6 +88,7 @@ _maybe_reexec_into_sdk_venv()
 import atexit  # noqa: E402
 import signal  # noqa: E402
 
+from server.gemini_enterprise import stop_enterprise_proxy  # noqa: E402
 from server.mcp_stdio import MCPServer, serve_stdio  # noqa: E402
 
 
@@ -100,6 +107,10 @@ def main() -> int:
             pass
         try:
             server.job_manager.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            stop_enterprise_proxy()
         except Exception:
             pass
 

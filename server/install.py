@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""One-command setup of cc-agy-plugin for Codex and Claude Code.
+"""One-command setup of cc-agy-plugin for Claude Code and Codex.
 
 Usage (from a clone of this repository):
 
-    python3 -m server.install --host codex                  # register the MCP server with Codex
-    python3 -m server.install --host claude                 # print/run the Claude Code plugin install
-    python3 -m server.install --host all --profile quality  # both hosts, Argon-first routing
+    python3 -m server.install --host claude --auth gemini-enterprise
+    python3 -m server.install --host codex  --auth gemini-enterprise
+    python3 -m server.install --host all --profile quality
 
-Only four settings exist: auth (a Gemini API key or a Google Cloud project, read from the environment),
-`--profile` (economy | balanced | quality), `--location` (Vertex region, optional) and `--strict`
-(Claude Code only, because Codex has no plugin hooks). API keys are never written to disk: Codex forwards
-them from your shell through `env_vars`, and Claude Code stores them through its own `userConfig` prompt.
+Automatically sets up a PEP 668-safe per-user Python virtualenv (`~/.local/share/cc-agy-plugin/venv`)
+when system Python does not already have `google-antigravity` and `google-genai`, and forwards
+non-secret configuration to Codex (`~/.codex/config.toml`) and Claude Code (`--config` / `userConfig`).
+API keys and OAuth tokens are never written into config files on disk.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,12 +27,18 @@ import time
 from typing import Any
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python  # noqa: E402
+
 SERVER_ENTRY = PLUGIN_ROOT / "server" / "main.py"
 CODEX_SKILL_SOURCE = PLUGIN_ROOT / "plugins" / "cc-agy-plugin" / "skills" / "vertex" / "SKILL.md"
 DEFAULT_SERVER_NAME = "agy"
 MARKETPLACE_NAME = "cc-agy"
 PLUGIN_NAME = "cc-agy-plugin"
 COST_PROFILES = ("economy", "balanced", "quality")
+AUTH_CHOICES = ("auto", "gemini-enterprise", "gemini_enterprise", "api-key", "api_key", "vertex", "gateway")
 
 # Forwarded from the user's shell into the Codex-launched MCP server, so secrets never land in config.toml.
 CODEX_FORWARDED_ENV_VARS = (
@@ -43,6 +48,10 @@ CODEX_FORWARDED_ENV_VARS = (
     "GOOGLE_CLOUD_LOCATION",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "CLOUDSDK_CONFIG",
+    "CC_AGY_AUTH_MODE",
+    "CC_AGY_GEMINI_ENTERPRISE",
+    "CC_AGY_ENTERPRISE_LOCATION",
+    "CC_AGY_ENTERPRISE_ACCESS_TOKEN",
     "CC_AGY_VERTEX_BASE_URL",
     "GOOGLE_VERTEX_BASE_URL",
     "CC_AGY_VERTEX_BASE_URL_TOKEN",
@@ -58,21 +67,22 @@ def _toml_str(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def _venv_has_antigravity(python_bin: Path) -> bool:
-    venv_dir = python_bin.parent.parent
-    return any(venv_dir.glob("lib/python3*/site-packages/google/antigravity/__init__.py"))
+def _normalize_auth_choice(raw: str | None) -> str:
+    val = (raw or "auto").strip().lower()
+    if val in ("gemini-enterprise", "gemini_enterprise", "enterprise", "oauth-business", "oauth_business"):
+        return "gemini_enterprise"
+    if val in ("api-key", "api_key", "ai_studio", "aistudio"):
+        return "api_key"
+    if val in ("vertex", "vertex-ai", "vertex_ai", "gcp"):
+        return "vertex"
+    if val in ("gateway", "proxy"):
+        return "gateway"
+    return "auto"
 
 
 def resolve_python_bin() -> str:
-    """Pick the interpreter that has google-antigravity: this one, else a plugin-adjacent virtualenv."""
-    if importlib.util.find_spec("google.antigravity") is not None and sys.executable:
-        return sys.executable
-    candidates = [PLUGIN_ROOT / ".venv" / "bin" / "python", PLUGIN_ROOT.parent / ".venv" / "bin" / "python"]
-    usable = [c for c in candidates if c.is_file() and os.access(c, os.X_OK)]
-    for cand in usable:
-        if _venv_has_antigravity(cand):
-            return str(cand)
-    return str(usable[0]) if usable else (sys.executable or "python3")
+    """Pick the interpreter that has google-antigravity: current, managed user venv, or .venv."""
+    return resolve_sdk_python(PLUGIN_ROOT)
 
 
 def build_codex_server_block(
@@ -80,6 +90,7 @@ def build_codex_server_block(
     name: str = DEFAULT_SERVER_NAME,
     python_bin: str | None = None,
     profile: str = "balanced",
+    auth_mode: str | None = None,
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
@@ -87,11 +98,19 @@ def build_codex_server_block(
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
     py = python_bin or resolve_python_bin()
+    norm_auth = _normalize_auth_choice(auth_mode)
     env: dict[str, str] = {"CC_AGY_COST_PROFILE": profile}
+    if norm_auth == "gemini_enterprise":
+        env["CC_AGY_AUTH_MODE"] = "gemini_enterprise"
+    elif norm_auth in ("api_key", "vertex", "gateway"):
+        env["CC_AGY_AUTH_MODE"] = norm_auth
     if project:
         env["GOOGLE_CLOUD_PROJECT"] = project
     if location:
-        env["GOOGLE_CLOUD_LOCATION"] = location
+        if norm_auth == "gemini_enterprise":
+            env["CC_AGY_ENTERPRISE_LOCATION"] = location
+        else:
+            env["GOOGLE_CLOUD_LOCATION"] = location
     if base_url:
         env["CC_AGY_VERTEX_BASE_URL"] = base_url
     if max_daily_cents is not None and max_daily_cents > 0:
@@ -134,12 +153,7 @@ def _has_server_entry(parsed: dict[str, Any] | None, name: str) -> bool:
 
 
 def upsert_codex_server_block(config_text: str, block: str, *, name: str = DEFAULT_SERVER_NAME) -> str:
-    """Replace any existing `[mcp_servers.<name>]` table (and its sub-tables) with `block`, or append it.
-
-    Every result is validated with tomllib (when available). If the existing entry is written in a form
-    the line-based rewrite cannot remove safely (dotted keys or an inline table), CodexConfigError is
-    raised and nothing is written.
-    """
+    """Replace any existing `[mcp_servers.<name>]` table (and its sub-tables) with `block`, or append it."""
     try:
         parsed_before = _parse_toml(config_text)
     except Exception as exc:
@@ -210,6 +224,7 @@ def install_codex(
     *,
     name: str,
     profile: str,
+    auth_mode: str | None = None,
     project: str | None,
     location: str | None,
     base_url: str | None = None,
@@ -222,6 +237,7 @@ def install_codex(
     block = build_codex_server_block(
         name=name,
         profile=profile,
+        auth_mode=auth_mode,
         project=project,
         location=location,
         base_url=base_url,
@@ -252,7 +268,6 @@ def install_codex(
     home.mkdir(parents=True, exist_ok=True)
     cfg_mode = (cfg.stat().st_mode & 0o777) if cfg.is_file() else 0o600
     if existing and existing != updated:
-        # The backup can hold other servers' tokens, so it is never more readable than owner-only.
         backup = cfg.with_name(f"config.toml.bak-{time.strftime('%Y%m%d-%H%M%S')}")
         _write_private(backup, existing, 0o600)
         result["backup_path"] = str(backup)
@@ -280,22 +295,102 @@ def install_codex(
     return result
 
 
-def claude_install_commands() -> list[list[str]]:
+def build_claude_user_config(
+    *,
+    profile: str | None = None,
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    max_daily_cents: float | None = None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Build non-secret Claude Code `userConfig` key/value pairs matching `.claude-plugin/plugin.json`."""
+    cfg: dict[str, Any] = {}
+    norm_auth = _normalize_auth_choice(auth_mode)
+    if norm_auth in ("gemini_enterprise", "api_key", "vertex", "gateway"):
+        cfg["auth_mode"] = norm_auth
+    if profile:
+        cfg["cost_profile"] = profile
+    if project:
+        cfg["google_cloud_project"] = project
+    if location:
+        cfg["google_cloud_location"] = location
+    if base_url:
+        cfg["vertex_base_url"] = base_url
+    if max_daily_cents is not None and max_daily_cents > 0:
+        cfg["max_daily_cents"] = f"{max_daily_cents:g}"
+    if strict:
+        cfg["strict_delegation_mode"] = True
+    return cfg
+
+
+def claude_install_commands(
+    *,
+    profile: str | None = None,
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    max_daily_cents: float | None = None,
+    strict: bool = False,
+) -> list[list[str]]:
+    cfg = build_claude_user_config(
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        max_daily_cents=max_daily_cents,
+        strict=strict,
+    )
+    install_cmd = ["claude", "plugin", "install", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"]
+    for key, val in cfg.items():
+        rendered = "true" if val is True else ("false" if val is False else str(val))
+        install_cmd.extend(["--config", f"{key}={rendered}"])
     return [
         ["claude", "plugin", "marketplace", "add", str(PLUGIN_ROOT)],
-        ["claude", "plugin", "install", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"],
+        install_cmd,
     ]
 
 
-def install_claude(*, dry_run: bool) -> dict[str, Any]:
-    cmds = claude_install_commands()
+def install_claude(
+    *,
+    dry_run: bool,
+    profile: str | None = None,
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    max_daily_cents: float | None = None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    user_cfg = build_claude_user_config(
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        max_daily_cents=max_daily_cents,
+        strict=strict,
+    )
+    cmds = claude_install_commands(
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        max_daily_cents=max_daily_cents,
+        strict=strict,
+    )
     result: dict[str, Any] = {
         "host": "claude",
         "commands": [" ".join(c) for c in cmds],
+        "user_config": user_cfg,
         "fallback": f"claude --plugin-dir {PLUGIN_ROOT}",
         "note": (
-            "Claude Code asks for gemini_api_key / google_cloud_project, cost_profile and "
-            "strict_delegation_mode when the plugin is enabled (userConfig)."
+            "If `claude` is already open in another tab, run `/reload-plugins` (or `claude --continue`) "
+            "and verify with `/cc-agy-plugin:doctor`."
         ),
     }
     claude_bin = shutil.which("claude")
@@ -303,9 +398,52 @@ def install_claude(*, dry_run: bool) -> dict[str, Any]:
         result["status"] = "dry_run" if dry_run else "claude_cli_not_found"
         return result
     outputs: list[dict[str, Any]] = []
-    for cmd in cmds:
+    for idx, cmd in enumerate(cmds):
         proc = subprocess.run([claude_bin, *cmd[1:]], capture_output=True, text=True, check=False, timeout=120)
-        outputs.append({"command": " ".join(cmd), "exit_code": proc.returncode, "output": (proc.stdout + proc.stderr).strip()[-400:]})
+        combined = (proc.stdout + proc.stderr).strip()
+        # Graceful fallback if an older Claude CLI does not accept `--config` on `plugin install`.
+        lower_out = combined.lower()
+        unknown_config_flag = "--config" in lower_out and any(
+            phrase in lower_out
+            for phrase in (
+                "unknown option",
+                "unrecognized option",
+                "unexpected argument",
+                "invalid option",
+                "no such option",
+            )
+        )
+        if idx == 1 and proc.returncode != 0 and "--config" in cmd and unknown_config_flag:
+            plain_install = ["plugin", "install", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"]
+            proc = subprocess.run(
+                [claude_bin, *plain_install], capture_output=True, text=True, check=False, timeout=120
+            )
+            outputs.append(
+                {
+                    "command": f"claude {' '.join(plain_install)}",
+                    "exit_code": proc.returncode,
+                    "output": (proc.stdout + proc.stderr).strip()[-400:],
+                }
+            )
+            if proc.returncode == 0 and user_cfg:
+                cfg_cmd = ["plugin", "configure", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}", "--values-stdin"]
+                cfg_proc = subprocess.run(
+                    [claude_bin, *cfg_cmd],
+                    input=json.dumps(user_cfg),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=60,
+                )
+                outputs.append(
+                    {
+                        "command": f"claude {' '.join(cfg_cmd)}",
+                        "exit_code": cfg_proc.returncode,
+                        "output": (cfg_proc.stdout + cfg_proc.stderr).strip()[-400:],
+                    }
+                )
+            break
+        outputs.append({"command": " ".join(cmd), "exit_code": proc.returncode, "output": combined[-400:]})
         if proc.returncode != 0:
             break
     result["runs"] = outputs
@@ -316,6 +454,7 @@ def install_claude(*, dry_run: bool) -> dict[str, Any]:
 def preflight(
     env: dict[str, str] | None = None,
     *,
+    auth_mode: str | None = None,
     project: str | None = None,
     base_url: str | None = None,
 ) -> dict[str, Any]:
@@ -325,34 +464,55 @@ def preflight(
     issues: list[str] = []
     if sys.version_info < (3, 10):
         issues.append(f"Python 3.10+ is required (found {sys.version.split()[0]}).")
-    if py_bin == (sys.executable or "python3"):
-        sdk_ok = importlib.util.find_spec("google.antigravity") is not None
-    else:
-        sdk_ok = subprocess.run(
-            [py_bin, "-c", "import google.antigravity"], capture_output=True, check=False, timeout=60
-        ).returncode == 0
+    sdk_ok = python_has_plugin_sdks(py_bin)
     if not sdk_ok:
-        issues.append(f'Antigravity SDK missing. Run: {py_bin} -m pip install -e "{PLUGIN_ROOT}[antigravity]"')
+        issues.append("Antigravity SDK missing. Run `python3 -m server.install` (without `--no-bootstrap`).")
     if not shutil.which("git"):
         issues.append("git is not on PATH (worker jobs run in git copies of your repository).")
+
+    norm_auth = _normalize_auth_choice(
+        auth_mode
+        or str(source.get("CC_AGY_AUTH_MODE") or "").strip()
+        or ("gemini_enterprise" if str(source.get("CC_AGY_GEMINI_ENTERPRISE") or "").strip().lower() in ("1", "true", "yes", "on") else "auto")
+    )
     has_key = any(str(source.get(k) or "").strip() for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
     has_gateway = bool(
         base_url
         or any(str(source.get(k) or "").strip() for k in ("CC_AGY_VERTEX_BASE_URL", "GOOGLE_VERTEX_BASE_URL"))
     )
     has_project = bool(project or str(source.get("GOOGLE_CLOUD_PROJECT") or "").strip())
-    if has_gateway:
-        auth = "gateway"
+
+    if norm_auth == "gemini_enterprise":
+        from server.gemini_enterprise import inspect_enterprise_credentials_offline
+
+        auth = "gemini_enterprise"
+        ent_check = inspect_enterprise_credentials_offline(source)
+        if not ent_check.get("ok"):
+            err = str(ent_check.get("error") or "No human Google sign-in found.")
+            rem = str(ent_check.get("remediation") or "")
+            issues.append(f"{err} {rem}".strip())
+    elif has_gateway or norm_auth == "gateway":
+        auth = "gateway" if has_gateway else "missing"
+        if not has_gateway:
+            issues.append("Pass `--base-url` or export `CC_AGY_VERTEX_BASE_URL` for gateway mode.")
+    elif norm_auth == "api_key":
+        auth = "api_key" if has_key else "missing"
+        if not has_key:
+            issues.append("Export `GEMINI_API_KEY` in your shell for API-key mode.")
+    elif norm_auth == "vertex":
+        auth = "vertex" if has_project else "missing"
+        if not has_project:
+            issues.append("Pass `--project` or export `GOOGLE_CLOUD_PROJECT` for Vertex AI mode.")
     elif has_key:
         auth = "api_key"
     elif has_project:
         auth = "vertex"
     else:
         auth = "missing"
-    if auth == "missing":
         issues.append(
-            "No credentials found. Export GEMINI_API_KEY (Google AI Studio), pass --project / export "
-            "GOOGLE_CLOUD_PROJECT (Vertex AI), or pass --base-url (AI gateway)."
+            "No credentials found. Pass `--auth gemini-enterprise` (with `gcloud auth application-default login`), "
+            "export `GEMINI_API_KEY` (AI Studio), pass `--project` / export `GOOGLE_CLOUD_PROJECT` (Vertex AI), "
+            "or pass `--base-url` (AI gateway)."
         )
     return {"python_bin": py_bin, "auth_mode": auth, "issues": issues, "ready": not issues}
 
@@ -373,17 +533,35 @@ def run_interactive_wizard(
 
     detected_proj = str(source.get("GOOGLE_CLOUD_PROJECT") or "").strip()
     detected_gw = str(source.get("CC_AGY_VERTEX_BASE_URL") or source.get("GOOGLE_VERTEX_BASE_URL") or "").strip()
+    detected_ent = _normalize_auth_choice(str(source.get("CC_AGY_AUTH_MODE") or "")) == "gemini_enterprise"
     has_key = any(str(source.get(k) or "").strip() for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
-    default_auth_label = "gateway" if detected_gw else ("api_key" if has_key else ("vertex" if detected_proj else "api_key"))
+    default_auth_label = (
+        "gemini-enterprise"
+        if detected_ent
+        else ("gateway" if detected_gw else ("api_key" if has_key else ("vertex" if detected_proj else "api_key")))
+    )
     auth_raw = str(
         input_fn(
-            f"2. Gemini connection [1=API key in shell, 2=Google Cloud project, 3=AI gateway URL] ({default_auth_label}): "
+            "2. Gemini connection [1=API key in shell, 2=Google Cloud project, 3=AI gateway URL, "
+            f"4=Gemini Enterprise subscription] ({default_auth_label}): "
         )
         or ""
     ).strip().lower()
+    auth_flag: str | None = None
     project: str | None = None
     base_url: str | None = None
-    if auth_raw in ("2", "vertex", "gcp") or (not auth_raw and default_auth_label == "vertex"):
+    if auth_raw in ("4", "gemini-enterprise", "gemini_enterprise", "enterprise") or (
+        not auth_raw and default_auth_label == "gemini-enterprise"
+    ):
+        auth_flag = "gemini-enterprise"
+        from server.gemini_enterprise import inspect_enterprise_credentials_offline
+
+        ent_status = inspect_enterprise_credentials_offline(source)
+        if not ent_status.get("ok"):
+            output_fn(
+                "   Tip: run `gcloud auth application-default login` with your Gemini Enterprise work email."
+            )
+    elif auth_raw in ("2", "vertex", "gcp") or (not auth_raw and default_auth_label == "vertex"):
         proj_prompt = f"   Google Cloud project ID ({detected_proj}): " if detected_proj else "   Google Cloud project ID: "
         entered_proj = str(input_fn(proj_prompt) or "").strip() or detected_proj
         if entered_proj:
@@ -413,6 +591,8 @@ def run_interactive_wizard(
 
     cap_raw = str(input_fn("4. Optional daily budget cap in cents, e.g. 500 for $5/day (Enter for none): ") or "").strip()
     built = ["--host", host, "--profile", profile]
+    if auth_flag:
+        built.extend(["--auth", auth_flag])
     if project:
         built.extend(["--project", project])
     if base_url:
@@ -433,13 +613,23 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="cc-agy-install", description="Set up cc-agy-plugin for Codex and/or Claude Code.")
     parser.add_argument("--host", choices=("codex", "claude", "all"), default="all")
+    parser.add_argument(
+        "--auth",
+        choices=AUTH_CHOICES,
+        default="auto",
+        help="Connection mode: 'gemini-enterprise' (included seat quota via Google sign-in), 'api-key', 'vertex', 'gateway', or 'auto'.",
+    )
     parser.add_argument("--profile", choices=COST_PROFILES, default="balanced",
                         help="economy: Flash only; balanced: Flash, escalating to Argon on failure; quality: Argon first.")
-    parser.add_argument("--project", default=None, help="Google Cloud project for Vertex AI (omit when using GEMINI_API_KEY).")
-    parser.add_argument("--location", default=None, help="Vertex AI region (optional; global-only models are routed automatically).")
+    parser.add_argument("--project", default=None, help="Google Cloud project ID (optional in gemini-enterprise mode; required for pay-as-you-go Vertex AI).")
+    parser.add_argument("--location", default=None, help="Region or jurisdiction (for example 'global', 'us', 'eu', or 'us-central1').")
     parser.add_argument("--base-url", default=None, help="Optional AI gateway base URL (sets CC_AGY_VERTEX_BASE_URL).")
     parser.add_argument("--max-daily-cents", type=float, default=None,
                         help="Optional daily spend limit in US cents (for example 500 for $5.00/day).")
+    parser.add_argument("--strict", action="store_true",
+                        help="Enable strict orchestrator mode in Claude Code userConfig.")
+    parser.add_argument("--no-bootstrap", action="store_true",
+                        help="Do not automatically create ~/.local/share/cc-agy-plugin/venv when SDKs are missing.")
     parser.add_argument("--name", default=DEFAULT_SERVER_NAME, help="Codex MCP server name (default: agy).")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing anything.")
@@ -453,8 +643,21 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(args.max_daily_cents) or args.max_daily_cents <= 0:
             parser.error("--max-daily-cents must be a finite number greater than 0")
 
+    bootstrap_info: dict[str, Any] | None = None
+    if not args.dry_run and not args.no_bootstrap:
+        bootstrap_info = ensure_sdk_venv(
+            PLUGIN_ROOT,
+            output_fn=None if args.json else print,
+        )
+
+    pre = preflight(auth_mode=args.auth, project=args.project, base_url=args.base_url)
+    if bootstrap_info and not bootstrap_info.get("ok") and bootstrap_info.get("error"):
+        pre["issues"].append(str(bootstrap_info["error"]))
+        pre["ready"] = False
+
     report: dict[str, Any] = {
-        "preflight": preflight(project=args.project, base_url=args.base_url),
+        "preflight": pre,
+        **({"bootstrap": bootstrap_info} if bootstrap_info is not None else {}),
         "hosts": [],
     }
     if args.host in ("codex", "all"):
@@ -462,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
             install_codex(
                 name=args.name,
                 profile=args.profile,
+                auth_mode=args.auth,
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
@@ -470,13 +674,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     if args.host in ("claude", "all"):
-        report["hosts"].append(install_claude(dry_run=args.dry_run))
+        report["hosts"].append(
+            install_claude(
+                dry_run=args.dry_run,
+                profile=args.profile,
+                auth_mode=args.auth,
+                project=args.project,
+                location=args.location,
+                base_url=args.base_url,
+                max_daily_cents=args.max_daily_cents,
+                strict=args.strict,
+            )
+        )
 
     if args.json:
         print(json.dumps(report, indent=2))
         return 0 if _report_ok(report) else 1
 
-    pre = report["preflight"]
     print(f"cc-agy-plugin at {PLUGIN_ROOT}")
     print(f"  python: {pre['python_bin']}  auth: {pre['auth_mode']}  profile: {args.profile}")
     for issue in pre["issues"]:
@@ -492,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ! codex mcp get failed: {host['codex_verify_error']}")
             if host["status"] == "dry_run":
                 print(host["block"])
-            print("  Next: run `codex` in your repository and ask it to use delegate_start.")
+            print('  Next: run `codex` in your repository and ask: "Run doctor to verify my Gemini setup."')
         else:
             print(f"\nClaude Code: {host['status']}")
             for cmd in host["commands"]:

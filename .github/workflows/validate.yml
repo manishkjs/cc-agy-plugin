@@ -23,7 +23,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install package and test runner
-        run: python -m pip install -e ".[antigravity,dev]"
+        run: |
+          python -m pip install -e ".[antigravity,dev]"
+          python -m pip install "git+https://github.com/vamsiramakrishnan/straitjacket.git@88b2af0511b426b9402010fc6568b20fbd9838c4"
 
       - name: Validate plugin manifests and documentation sync
         run: bash scripts/validate.sh

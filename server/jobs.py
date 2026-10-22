@@ -4517,6 +4517,7 @@ class JobManager:
                 project=project,
                 location=location,
                 api_key=api_key,
+                auth_mode=auth_mode,
                 timeout_seconds=timeout_seconds,
                 enabled_tools=enabled_tools,
                 disabled_tools=disabled_tools,
@@ -4529,6 +4530,14 @@ class JobManager:
                 acceptance=acceptance,
                 register_cancel=_register_cancel_hook,
             )
+            if worker_out.get("vertex_project"):
+                project = str(worker_out["vertex_project"])
+                with self._lock:
+                    self._raw_projects[job_id] = project
+            if worker_out.get("vertex_location"):
+                location = str(worker_out["vertex_location"])
+            if worker_out.get("reroute_note") and not reroute_note:
+                reroute_note = str(worker_out["reroute_note"])
 
             response_text = str(worker_out.get("text") or "")
             new_usage = worker_out.get("usage") or {}
@@ -5484,7 +5493,11 @@ class JobManager:
         auth_mode = auth["auth_mode"]
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
-        resolved_location = auth.get("location")
+        resolved_location = (
+            auth.get("location")
+            if (auth_mode != "gemini_enterprise" or auth.get("location_explicit"))
+            else None
+        )
         reroute_note = auth.get("reroute_note")
 
         job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -7063,17 +7076,30 @@ class JobManager:
                 )
         inherited_project = project
         if not inherited_project and prior_auth_mode != "api_key":
-            inherited_project = raw_proj or receipt.get("vertex_project")
+            rec_proj = receipt.get("vertex_project")
+            if rec_proj == "<paying-project>":
+                rec_proj = None
+            inherited_project = raw_proj or rec_proj
+        inherited_auth_mode = (
+            str(prior_auth_mode)
+            if prior_auth_mode in ("gemini_enterprise", "api_key", "vertex") and not project and not api_key
+            else None
+        )
         auth = resolve_auth_config(
             requested_project=inherited_project,
             requested_location=location or receipt.get("vertex_location"),
             requested_api_key=api_key or raw_key,
+            requested_auth_mode=inherited_auth_mode,
             model=model,
         )
         auth_mode = auth["auth_mode"]
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
-        resolved_location = auth.get("location")
+        resolved_location = (
+            auth.get("location")
+            if (auth_mode != "gemini_enterprise" or auth.get("location_explicit"))
+            else None
+        )
         reroute_note = auth.get("reroute_note")
 
         with self._lock:

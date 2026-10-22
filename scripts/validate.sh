@@ -73,7 +73,7 @@ trap 'rm -rf "$tmp_home"' EXIT
 install_json="$(
   cd "$root"
   CODEX_HOME="$tmp_home" GEMINI_API_KEY="test-key-not-written" \
-    python3 -m server.install --host codex --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --non-interactive --json || true
+    python3 -m server.install --host codex --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --no-bootstrap --non-interactive --json || true
 )"
 
 python3 - "$install_json" <<'PY'
@@ -92,5 +92,26 @@ if grep -q "test-key-not-written" "$tmp_home/config.toml"; then
   printf 'API key leaked into config.toml!\n' >&2
   exit 1
 fi
+
+ent_home="$(mktemp -d "${TMPDIR:-/tmp}/cc-agy-validate-ent.XXXXXX")"
+trap 'rm -rf "$tmp_home" "$ent_home"' EXIT
+
+ent_json="$(
+  cd "$root"
+  CODEX_HOME="$ent_home" CC_AGY_ENTERPRISE_ACCESS_TOKEN="tok-not-written" \
+    python3 -m server.install --host codex --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json || true
+)"
+
+python3 - "$ent_json" "$ent_home/config.toml" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+assert report["preflight"]["auth_mode"] == "gemini_enterprise", report["preflight"]
+cfg_text = Path(sys.argv[2]).read_text(encoding="utf-8")
+assert 'CC_AGY_AUTH_MODE = "gemini_enterprise"' in cfg_text, cfg_text
+assert "tok-not-written" not in cfg_text, "Enterprise access token leaked into config.toml!"
+PY
 
 printf 'Validation passed.\n'

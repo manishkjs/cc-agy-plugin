@@ -678,8 +678,15 @@ def probe_writers(settings: BatchSettings, auth: dict[str, Any], *, writer_facto
                                              max_output_tokens=64))
                 row.update(state="ready", cost_cents=round(reply.cost_cents, 4), answered=bool(reply.text.strip()))
         except WriterAuthError as exc:
-            fix = ("Check GEMINI_API_KEY / userConfig.gemini_api_key." if auth.get("api_key")
-                   else f"Run `gcloud auth application-default login` and enable Vertex AI on project {auth.get('project')!r}.")
+            if auth.get("api_key"):
+                fix = "Check GEMINI_API_KEY / userConfig.gemini_api_key."
+            elif auth.get("auth_mode") == "gemini_enterprise":
+                fix = (
+                    "Run `gcloud auth application-default login` with your Gemini Enterprise licensed "
+                    "work email (API keys and service accounts cannot use seat quota)."
+                )
+            else:
+                fix = f"Run `gcloud auth application-default login` and enable Vertex AI on project {auth.get('project')!r}."
             if name == "claude":
                 fix = "Run `claude` once to sign in, or set ANTHROPIC_API_KEY."
             row.update(state="fail", error=str(exc), fix=fix)

@@ -510,14 +510,43 @@ def make_genai_writer(
 
 
 def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) -> Any:
-    """Construct a google-genai Client honoring API keys, Vertex ADC, and custom Vertex gateways."""
+    """Construct a google-genai Client honoring Gemini Enterprise, API keys, Vertex ADC, and gateways."""
     from google import genai
     from google.genai import types as gt
+    from google.oauth2.credentials import Credentials as OAuth2Credentials
     from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
 
     if auth.get("api_key"):
         http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
         return genai.Client(api_key=auth["api_key"], **({"http_options": http_opts} if http_opts else {}))
+    if auth.get("auth_mode") == "gemini_enterprise":
+        from server.gemini_enterprise import EnterpriseAuthError, prepare_enterprise_endpoint
+
+        try:
+            ep = prepare_enterprise_endpoint(auth)
+        except EnterpriseAuthError as exc:
+            raise WriterAuthError(401, str(exc)) from exc
+        auth["project"] = ep["project"]
+        auth["location"] = ep["location"]
+        if ep.get("reroute_note") and not auth.get("reroute_note"):
+            auth["reroute_note"] = ep["reroute_note"]
+        opt_kwargs_ent: dict[str, Any] = {
+            "base_url": ep["base_url"],
+            "headers": ep["headers"],
+            "client_args": {"follow_redirects": False},
+        }
+        if timeout_ms:
+            opt_kwargs_ent["timeout"] = timeout_ms
+        client = genai.Client(
+            vertexai=True,
+            project=ep["project"],
+            location=ep["location"],
+            credentials=OAuth2Credentials(token="proxy-local"),
+            http_options=gt.HttpOptions(**opt_kwargs_ent),
+        )
+        if getattr(client, "_api_client", None) is not None:
+            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
+        return client
     base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
     if base_url:
         tok = resolve_vertex_base_url_token() or "custom-endpoint"
@@ -525,14 +554,22 @@ def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) 
             "base_url": base_url,
             "headers": {"Authorization": f"Bearer {tok}"},
         }
+        if base_url.startswith("http://") or "googleapis.com" not in base_url:
+            opt_kwargs["client_args"] = {"follow_redirects": False}
         if timeout_ms:
             opt_kwargs["timeout"] = timeout_ms
-        return genai.Client(
+        client = genai.Client(
             vertexai=True,
             project=auth.get("project") or "custom-endpoint",
             location=auth.get("location") or "global",
+            credentials=OAuth2Credentials(token=tok),
             http_options=gt.HttpOptions(**opt_kwargs),
         )
+        if (
+            base_url.startswith("http://") or "googleapis.com" not in base_url
+        ) and getattr(client, "_api_client", None) is not None:
+            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
+        return client
     http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
     return genai.Client(
         vertexai=True,
@@ -546,7 +583,7 @@ def create_shared_cache(
     auth: dict[str, Any], model: str, system: str, shared_text: str, *, ttl_seconds: int = 3600
 ) -> str | None:
     """Create a Gemini explicit context cache for text every task shares; None when not worth it or refused."""
-    if not shared_text.strip():
+    if not shared_text.strip() or auth.get("auth_mode") == "gemini_enterprise":
         return None
     try:
         from google.genai import types as gt
@@ -593,13 +630,46 @@ def make_agent_writer(
     def _write(req: WriterRequest) -> WriterReply:
         from google import antigravity as ag
         from google.antigravity import policy, types
+        from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
 
         options = types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, thinking_level))
-        endpoint = (
-            types.GeminiAPIEndpoint(api_key=auth["api_key"], options=options)
-            if auth.get("api_key")
-            else types.VertexEndpoint(project=auth.get("project"), location=auth.get("location"), options=options)
-        )
+        eff_proj = auth.get("project")
+        eff_loc = auth.get("location")
+        if auth.get("api_key"):
+            endpoint: Any = types.GeminiAPIEndpoint(api_key=auth["api_key"], options=options)
+        elif auth.get("auth_mode") == "gemini_enterprise":
+            from server.gemini_enterprise import EnterpriseAuthError, prepare_enterprise_endpoint
+
+            try:
+                ep = prepare_enterprise_endpoint(auth)
+            except EnterpriseAuthError as exc:
+                raise WriterAuthError(401, str(exc)) from exc
+            eff_proj = ep["project"]
+            eff_loc = ep["location"]
+            auth["project"] = eff_proj
+            auth["location"] = eff_loc
+            if ep.get("reroute_note") and not auth.get("reroute_note"):
+                auth["reroute_note"] = ep["reroute_note"]
+            endpoint = types.VertexEndpoint(
+                project=eff_proj,
+                location=eff_loc,
+                base_url=ep["base_url"],
+                http_headers=ep["headers"],
+                api_key="proxy-local",
+                options=options,
+            )
+        else:
+            gw_url = resolve_vertex_base_url(auth.get("base_url")) or ""
+            if gw_url:
+                eff_proj = eff_proj or "custom-endpoint"
+                eff_loc = eff_loc or "global"
+            ep_kw: dict[str, Any] = {"project": eff_proj, "location": eff_loc, "options": options}
+            if gw_url:
+                gw_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+                ep_kw["base_url"] = gw_url
+                ep_kw["api_key"] = gw_tok
+                ep_kw["http_headers"] = {"Authorization": f"Bearer {gw_tok}"}
+            endpoint = types.VertexEndpoint(**ep_kw)
         scratch = tempfile.mkdtemp(prefix="cc-agy-writer-")
         save_dir = tempfile.mkdtemp(prefix="cc-agy-writer-save-")
         ws_root = str(Path(workspace_dir).resolve()) if (read_budget > 0 and workspace_dir is not None) else scratch
@@ -664,8 +734,8 @@ def make_agent_writer(
         if auth.get("api_key"):
             cfg_kwargs["api_key"] = auth["api_key"]
         else:
-            cfg_kwargs["project"] = auth.get("project")
-            cfg_kwargs["location"] = auth.get("location")
+            cfg_kwargs["project"] = eff_proj
+            cfg_kwargs["location"] = eff_loc
 
         async def _run() -> WriterReply:
             from server.agy_runner import maybe_await, resolve_stop_reason, resolve_turn_usage

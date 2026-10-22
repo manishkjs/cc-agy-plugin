@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from server.agy_runner import WORKER_SYSTEM_PROMPT, build_worker_system_prompt
 from server.harness_validator import (
     autotrigger_skills,
@@ -269,6 +271,7 @@ def test_run_antigravity_worker_forwards_extra_tools_and_system_prompt(tmp_path:
 def test_straitjacket_run_command_preserves_pythonpath_and_blocks_root_find(
     tmp_path: Path, monkeypatch
 ) -> None:
+    pytest.importorskip("ctx.sdk")
     import asyncio
     from server.agy_runner import build_straitjacket_tools
 
@@ -298,6 +301,7 @@ def test_straitjacket_run_command_preserves_pythonpath_and_blocks_root_find(
 
 
 def test_straitjacket_lead_orchestrator_read_budget_cap(tmp_path: Path) -> None:
+    pytest.importorskip("ctx.sdk")
     import asyncio
     from server.agy_runner import build_straitjacket_tools
 
@@ -458,6 +462,7 @@ def test_dirty_worktree_continuation_on_checkpoint_and_failed_acceptance_plus_ne
 
 
 def test_straitjacket_view_file_enforces_minimum_250_line_window(tmp_path: Path) -> None:
+    pytest.importorskip("ctx.sdk")
     import asyncio
     from server.agy_runner import build_straitjacket_tools
 
