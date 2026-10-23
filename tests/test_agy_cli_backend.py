@@ -1433,6 +1433,20 @@ class TestExternalAgentFeedbackFixes:
         import asyncio
         import server.agy_runner as agy_runner
 
+        class _StubRunCommandConfig:
+            def __init__(self, *, enable_sandbox: bool = False, timeout_seconds: float | None = None):
+                self.enable_sandbox = enable_sandbox
+                self.timeout_seconds = timeout_seconds
+
+        class _StubTypes:
+            RunCommandConfig = _StubRunCommandConfig
+
+        cfg = agy_runner._build_default_run_command_config(_StubTypes, timeout_seconds=120.0)
+        assert cfg is not None
+        assert cfg.enable_sandbox is True
+
+        pytest.importorskip("ctx.sdk")
+
         # 1. Straitjacket shell guardrails block tab/full-path curl, git push, ssh, and antigravity-oauth-token reads
         ws = tmp_path / "ws"
         ws.mkdir()
@@ -1450,13 +1464,6 @@ class TestExternalAgentFeedbackFixes:
             res = json.loads(asyncio.run(run_cmd(blocked_cmd)))
             assert res["status"] == "error", (blocked_cmd, res)
             assert res["exit_code"] == 126, (blocked_cmd, res)
-
-        # 2. Fallback to built-in Antigravity tools enables RunCommandConfig(enable_sandbox=True)
-        from google.antigravity import types
-
-        cfg = agy_runner._build_default_run_command_config(types, timeout_seconds=120.0)
-        assert cfg is not None
-        assert cfg.enable_sandbox is True
 
 
 class TestNodeModulesAndContainmentFixes:
@@ -1531,6 +1538,7 @@ class TestNodeModulesAndContainmentFixes:
     def test_readonly_dts_access_pkg_manager_guard_tsbuildinfo_and_unconditional_containment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        pytest.importorskip("ctx.sdk")
         import asyncio
         import server.agy_runner as agy_runner
         from server.jobs import _is_ephemeral_build_or_test_artifact, link_host_node_modules_farm

@@ -2024,7 +2024,19 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     if request.get("auth_mode") == "gemini_enterprise":
         from server.agy_cli import run_agy_cli_worker
 
-        return await asyncio.to_thread(run_agy_cli_worker, request)
+        def _invoke_cli_preserving_exc() -> tuple[bool, Any]:
+            # CPython <3.12 `asyncio.futures._convert_future_exc` replaces any `TimeoutError`
+            # raised inside `run_in_executor` / `to_thread` with a bare `TimeoutError()`,
+            # stripping `.partial_usage` and `.partial_agy_conversation_*` attributes.
+            try:
+                return True, run_agy_cli_worker(request)
+            except BaseException as exc:
+                return False, exc
+
+        ok_cli, cli_payload = await asyncio.to_thread(_invoke_cli_preserving_exc)
+        if not ok_cli:
+            raise cli_payload
+        return cli_payload
 
     from google import antigravity as ag
     from google.antigravity import policy, types

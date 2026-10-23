@@ -1209,6 +1209,87 @@ def _run_stream_json_turn(
                 return True
         return False
 
+    def _process_ndjson_line(raw_line: bytes, *, allow_result: bool = True) -> str:
+        """Parse one NDJSON line; return `'result'`, `'budget'`, or `''`."""
+        nonlocal resolved_conv_id, auto_step_seq, got_result_frame, final_result_obj
+        line_str = raw_line.decode("utf-8", errors="replace").strip()
+        if not line_str or not line_str.startswith("{"):
+            return ""
+        try:
+            evt = json.loads(line_str)
+        except ValueError:
+            return ""
+        if not isinstance(evt, dict):
+            return ""
+
+        evt_kind = str(evt.get("event") or evt.get("type") or "").strip().lower()
+        if isinstance(evt.get("conversation_id"), str) and evt["conversation_id"]:
+            resolved_conv_id = evt["conversation_id"]
+
+        if evt_kind == "step_update":
+            su = evt.get("step_update")
+            if isinstance(su, dict):
+                if isinstance(su.get("conversation_id"), str) and su["conversation_id"]:
+                    resolved_conv_id = su["conversation_id"]
+                if isinstance(su.get("text_delta"), str) and su["text_delta"]:
+                    delta_text_parts.append(su["text_delta"])
+                raw_s_idx = su.get("step_index")
+                if isinstance(raw_s_idx, int) and not isinstance(raw_s_idx, bool) and raw_s_idx > 0:
+                    s_idx = raw_s_idx
+                else:
+                    s_idx = auto_step_seq
+                    auto_step_seq -= 1
+                if isinstance(su.get("usage"), dict):
+                    step_usages[s_idx] = convert_agy_usage_to_vertex(su["usage"])
+                t_info = su.get("tool_info")
+                t_name = str(
+                    (t_info.get("name") if isinstance(t_info, dict) else None)
+                    or su.get("tool_name")
+                    or ""
+                ).strip()
+                if t_name:
+                    params = t_info.get("parameters") if isinstance(t_info, dict) else None
+                    parsed_args = dict(params) if isinstance(params, dict) else {}
+                    if s_idx > 0 and (s_idx, t_name) in seen_step_tools:
+                        if parsed_args:
+                            step_tool_calls[seen_step_tools[(s_idx, t_name)]]["args"] = parsed_args
+                    else:
+                        step_tool_calls.append({"name": t_name, "args": parsed_args})
+                        if s_idx > 0:
+                            seen_step_tools[(s_idx, t_name)] = len(step_tool_calls) - 1
+                if allow_result and _check_live_budgets():
+                    return "budget"
+        elif evt_kind == "assistant":
+            msg = evt.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "thinking" and isinstance(block.get("thinking"), str):
+                        thoughts.append(block["thinking"])
+                    elif btype == "tool_use" and isinstance(block.get("name"), str):
+                        inp = block.get("input")
+                        fallback_tool_calls.append(
+                            {"name": block["name"], "args": dict(inp) if isinstance(inp, dict) else {}}
+                        )
+                    elif btype == "text" and isinstance(block.get("text"), str):
+                        assistant_text_parts.append(block["text"])
+                if allow_result and _check_live_budgets():
+                    return "budget"
+        elif evt_kind == "result" and allow_result:
+            got_result_frame = True
+            res_payload = evt.get("result")
+            if isinstance(res_payload, dict):
+                final_result_obj = res_payload
+                if isinstance(res_payload.get("conversation_id"), str) and res_payload["conversation_id"]:
+                    resolved_conv_id = res_payload["conversation_id"]
+            else:
+                final_result_obj = evt
+            return "result"
+        return ""
+
     try:
         while not cancelled_or_timed_out.is_set() and not budget_stop_reason:
             rem = deadline - time.monotonic()
@@ -1227,81 +1308,8 @@ def _run_stream_json_turn(
             if raw_line is None:
                 break
 
-            line_str = raw_line.decode("utf-8", errors="replace").strip()
-            if not line_str or not line_str.startswith("{"):
-                continue
-            try:
-                evt = json.loads(line_str)
-            except ValueError:
-                continue
-            if not isinstance(evt, dict):
-                continue
-
-            evt_kind = str(evt.get("event") or evt.get("type") or "").strip().lower()
-            if isinstance(evt.get("conversation_id"), str) and evt["conversation_id"]:
-                resolved_conv_id = evt["conversation_id"]
-
-            if evt_kind == "step_update":
-                su = evt.get("step_update")
-                if isinstance(su, dict):
-                    if isinstance(su.get("conversation_id"), str) and su["conversation_id"]:
-                        resolved_conv_id = su["conversation_id"]
-                    if isinstance(su.get("text_delta"), str) and su["text_delta"]:
-                        delta_text_parts.append(su["text_delta"])
-                    raw_s_idx = su.get("step_index")
-                    if isinstance(raw_s_idx, int) and not isinstance(raw_s_idx, bool) and raw_s_idx > 0:
-                        s_idx = raw_s_idx
-                    else:
-                        s_idx = auto_step_seq
-                        auto_step_seq -= 1
-                    if isinstance(su.get("usage"), dict):
-                        step_usages[s_idx] = convert_agy_usage_to_vertex(su["usage"])
-                    t_info = su.get("tool_info")
-                    t_name = str(
-                        (t_info.get("name") if isinstance(t_info, dict) else None)
-                        or su.get("tool_name")
-                        or ""
-                    ).strip()
-                    if t_name:
-                        params = t_info.get("parameters") if isinstance(t_info, dict) else None
-                        parsed_args = dict(params) if isinstance(params, dict) else {}
-                        if s_idx > 0 and (s_idx, t_name) in seen_step_tools:
-                            if parsed_args:
-                                step_tool_calls[seen_step_tools[(s_idx, t_name)]]["args"] = parsed_args
-                        else:
-                            step_tool_calls.append({"name": t_name, "args": parsed_args})
-                            if s_idx > 0:
-                                seen_step_tools[(s_idx, t_name)] = len(step_tool_calls) - 1
-                    if _check_live_budgets():
-                        break
-            elif evt_kind == "assistant":
-                msg = evt.get("message")
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        btype = block.get("type")
-                        if btype == "thinking" and isinstance(block.get("thinking"), str):
-                            thoughts.append(block["thinking"])
-                        elif btype == "tool_use" and isinstance(block.get("name"), str):
-                            inp = block.get("input")
-                            fallback_tool_calls.append(
-                                {"name": block["name"], "args": dict(inp) if isinstance(inp, dict) else {}}
-                            )
-                        elif btype == "text" and isinstance(block.get("text"), str):
-                            assistant_text_parts.append(block["text"])
-                    if _check_live_budgets():
-                        break
-            elif evt_kind == "result":
-                got_result_frame = True
-                res_payload = evt.get("result")
-                if isinstance(res_payload, dict):
-                    final_result_obj = res_payload
-                    if isinstance(res_payload.get("conversation_id"), str) and res_payload["conversation_id"]:
-                        resolved_conv_id = res_payload["conversation_id"]
-                else:
-                    final_result_obj = evt
+            action = _process_ndjson_line(raw_line, allow_result=True)
+            if action in ("result", "budget"):
                 # `result` is the terminal NDJSON frame; break immediately and give `agy` a
                 # graceful window to flush conversation state before cleaning up descendants.
                 break
@@ -1325,6 +1333,14 @@ def _run_stream_json_turn(
         t_out.join(timeout=0.3)
         t_err.join(timeout=0.3)
         _close_proc_pipes_safely(proc, stdout_thread=t_out, stderr_thread=t_err)
+
+    while True:
+        try:
+            rem_line = line_q.get_nowait()
+        except queue.Empty:
+            break
+        if rem_line is not None:
+            _process_ndjson_line(rem_line, allow_result=not timed_out_flag.is_set())
 
     stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
     tool_calls = step_tool_calls if step_tool_calls else fallback_tool_calls
