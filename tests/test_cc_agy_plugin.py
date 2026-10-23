@@ -777,14 +777,15 @@ class TestMCPStdioServer(unittest.TestCase):
 
             def worker_fn(req: dict[str, Any]) -> dict[str, Any]:
                 wt = Path(req["workspace_dir"])
-                saw_node_modules.append((wt / "node_modules").exists())
+                # Shallow node_modules farm is a real dir (not a raw directory symlink), torn down before diff collection
+                saw_node_modules.append(((wt / "node_modules").is_dir(), (wt / "node_modules").is_symlink()))
                 (wt / "prod.env").write_text("PORT=8080\n", encoding="utf-8")
                 return {"text": "created prod.env", "input_tokens": 5, "output_tokens": 5}
 
             jm = JobManager(workspace_root=repo_dir, store=store, worker_backend=worker_fn)
             res = jm.delegate_start("create prod.env", project="p", wait=True)
-            self.assertEqual(saw_node_modules, [False])
-            self.assertIn("prod.env", res["files_changed"])
+            self.assertEqual(saw_node_modules, [(True, False)])
+            self.assertEqual(res["files_changed"], ["prod.env"])
             applied = jm.delegate_apply(res["job_id"])
             self.assertTrue(applied["applied"])
             self.assertTrue((repo_dir / "prod.env").exists())

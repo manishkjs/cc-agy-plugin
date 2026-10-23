@@ -5,15 +5,15 @@ description: Route work from Claude Code to Gemini (Gemini Enterprise subscripti
 
 # Gemini & Antigravity Delegation Skill (`cc-agy-plugin`)
 
-Use the `vertex` MCP server tools to split work between two execution tiers using your **Gemini Enterprise subscription** (`CC_AGY_AUTH_MODE=gemini_enterprise` via `gcloud auth application-default login`, `auth_mode="gemini_enterprise"`), a **Google AI Studio API Key** (`GEMINI_API_KEY` / `api_key`, `auth_mode="api_key"`), **Google Cloud Vertex AI** (`GOOGLE_CLOUD_PROJECT` / `project`, `auth_mode="vertex"`), or a **Vertex-compatible AI Gateway** (`CC_AGY_VERTEX_BASE_URL`):
+Use the `vertex` MCP server tools to split work between two execution tiers using your **Gemini Enterprise subscription** (`CC_AGY_AUTH_MODE=gemini_enterprise` via the standalone Antigravity CLI `agy` Google sign-in, or auto-detected when signed into `agy` with no API key or GCP project set), a **Google AI Studio API Key** (`GEMINI_API_KEY` / `api_key`, `auth_mode="api_key"`), **Google Cloud Vertex AI** (`GOOGLE_CLOUD_PROJECT` / `project`, `auth_mode="vertex"`), or a **Vertex-compatible AI Gateway** (`CC_AGY_VERTEX_BASE_URL`):
 
 1. **Single-Shot Review Tier (`ask_gemini`)**:
-   - Calls Gemini directly via `google-genai` without loading the Antigravity SDK's built-in agent system prompt and tool declarations.
+   - Calls Gemini directly via `google-genai` (or `agy --output-format json --mode plan` on Gemini Enterprise seats) without loading an agent workspace copy.
    - Use for architecture reviews, root-cause hypotheses, and second opinions on diffs or specific `context_files`.
    - Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`, or override via `model=...` / `CC_AGY_DEFAULT_ASK_MODEL`).
 
 2. **Agentic Worker Tier (`delegate_start`, `delegate_result`, `get_diff`, `delegate_apply`, `delegate_revert`, `delegate_continue`, `delegate_cancel`, `delegate_to_gemini`, `cost_report`, `doctor`)**:
-   - Spawns `google.antigravity.Agent` with `vertex=False` (`GeminiAPIEndpoint`) in API-key mode or `vertex=True` (`VertexEndpoint`) in Gemini Enterprise subscription, Vertex AI, and AI Gateway modes.
+   - Routes automatically to the standalone Antigravity CLI (`agy --output-format stream-json`) on Gemini Enterprise subscriptions, or spawns `google.antigravity.Agent` (`GeminiAPIEndpoint` in API-key mode, `VertexEndpoint` in Vertex AI and AI Gateway modes).
    - Default model: `gemini-3.8-flash` under the default `balanced` cost profile, escalating automatically to `gemini-4-argon` on retries, failed checks, or overlapping follow-up fixes (`cost_profile="quality"` starts directly on `gemini-4-argon`; `cost_profile="economy"` stays on `gemini-3.8-flash`).
    - By default (`in_place=false`), runs inside a standalone git repository copy under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) initialized with `git init -b main`. When `CC_AGY_SPARSE_WORKTREE=1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>` is set on large monorepos, passing `allowed_paths` materializes a scoped sparse copy (including 2-hop local imports) so worktree setup stays fast without marking omitted files as deleted. Failed or timed-out runs leave your working tree untouched. Note: this provides git-level checkout isolation, not an OS container sandbox; worker commands execute with your user account's OS authority.
    - With `in_place=true`, edits your live working tree directly (requires a clean tracked tree, one `in_place` job at a time, and no `allowed_paths`), unwinds any worker commits or branch switches back to the baseline commit while keeping file edits on disk, and provides a shell-quoted `undo_hint`.

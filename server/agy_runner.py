@@ -13,11 +13,13 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from server.regions import (
     env_flag,
@@ -386,6 +388,10 @@ def _parse_proto_fields(buf: bytes) -> dict[int, int | bytes]:
     return out
 
 
+_MAX_CREDIBLE_STEP_INPUT_TOKENS = 20_000_000
+_MAX_CREDIBLE_STEP_OUTPUT_TOKENS = 5_000_000
+
+
 def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, Any]:
     """Extract per-call usage requests and tool calls from localharness SQLite DB in save_dir."""
     out: dict[str, Any] = {
@@ -400,15 +406,26 @@ def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, A
     }
     if not save_dir or not Path(save_dir).exists():
         return out
+    required_cols = {"idx", "step_type", "metadata", "step_payload"}
     for db_path in sorted(glob.glob(os.path.join(str(save_dir), "*.db"))):
+        conn = None
         try:
             conn = sqlite3.connect(db_path)
+            col_rows = conn.execute("PRAGMA table_info(steps)").fetchall()
+            col_names = {str(r[1]) for r in col_rows if len(r) > 1}
+            if not required_cols.issubset(col_names):
+                continue
             rows = conn.execute(
                 "SELECT idx, step_type, metadata, step_payload FROM steps ORDER BY idx"
             ).fetchall()
-            conn.close()
         except Exception:
             continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         for _idx, step_type, meta, payload in rows:
             if step_type == 15 and isinstance(meta, (bytes, bytearray)) and meta:
                 top = _parse_proto_fields(bytes(meta))
@@ -423,6 +440,19 @@ def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, A
                         cand_tok = int(u.get(3) or 0)
                     prompt_tok = uncached_in + cached_in
                     tot_tok = prompt_tok + cand_tok + thoughts_tok
+                    # Guard against protobuf field-number reuse (e.g. a 64-bit nanosecond epoch in tag 2)
+                    if (
+                        uncached_in < 0
+                        or cached_in < 0
+                        or cand_tok < 0
+                        or thoughts_tok < 0
+                        or uncached_in > _MAX_CREDIBLE_STEP_INPUT_TOKENS
+                        or cached_in > _MAX_CREDIBLE_STEP_INPUT_TOKENS
+                        or prompt_tok > _MAX_CREDIBLE_STEP_INPUT_TOKENS
+                        or cand_tok > _MAX_CREDIBLE_STEP_OUTPUT_TOKENS
+                        or thoughts_tok > _MAX_CREDIBLE_STEP_OUTPUT_TOKENS
+                    ):
+                        continue
                     if tot_tok > 0:
                         req_entry = {
                             "prompt_token_count": prompt_tok,
@@ -531,6 +561,7 @@ def _coerce_line_number(value: Any, default: int) -> int:
 _SECRET_BASENAMES = frozenset({
     ".env", ".netrc", ".npmrc", ".pypirc", ".mcp.json", ".hmac_key",
     "id_rsa", "id_ed25519", "id_ecdsa", "credentials.json",
+    "antigravity-oauth-token",
 })
 _EXTRA_CTX_DENY_GLOBS = (
     ".netrc", "**/.netrc",
@@ -540,6 +571,8 @@ _EXTRA_CTX_DENY_GLOBS = (
     ".hmac_key", "**/.hmac_key",
     "id_ecdsa*", "**/id_ecdsa*",
     "credentials.json", "**/credentials.json",
+    "antigravity-oauth-token", "**/antigravity-oauth-token",
+    ".gemini/antigravity-cli/**", "**/.gemini/antigravity-cli/**",
     "*.p12", "**/*.p12",
     "*.pfx", "**/*.pfx",
     ".claude/settings.local.json", "**/.claude/settings.local.json",
@@ -555,6 +588,9 @@ def build_straitjacket_tools(
     is_lead_orchestrator: bool = False,
     lead_read_limit: int = 12,
     acceptance_commands: list[str] | None = None,
+    host_workspace_root: str | Path | None = None,
+    nm_linked: bool = False,
+    isolated_worktree: bool = False,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -588,11 +624,23 @@ def build_straitjacket_tools(
     except ValueError:
         parsed_cmd_timeout = 600.0
     default_cmd_timeout = min(max(1.0, parsed_cmd_timeout), session_timeout)
-    extra_blocked_paths = tuple(
+    ws_resolved = Path(workspace_dir).resolve()
+    host_ws_resolved: Path | None = None
+    if host_workspace_root:
+        try:
+            cand_host = Path(host_workspace_root).resolve()
+            if cand_host != ws_resolved:
+                host_ws_resolved = cand_host
+        except Exception:
+            host_ws_resolved = None
+    extra_blocked_list = [
         p.strip()
         for p in os.environ.get("CC_AGY_BLOCKED_PATHS", "").split(",")
         if p.strip()
-    )
+    ]
+    if isolated_worktree and host_ws_resolved is not None:
+        extra_blocked_list.append(str(host_ws_resolved))
+    extra_blocked_paths = tuple(dict.fromkeys(extra_blocked_list))
     scrubbed_env: dict[str, str] = {
         "CC_AGY_DATA_DIR": "",
         "CC_AGY_OUT_DIR": "",
@@ -602,15 +650,20 @@ def build_straitjacket_tools(
         "GOOGLE_API_KEY": "",
         "CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY": "",
         "GOOGLE_APPLICATION_CREDENTIALS": "",
+        "ANTIGRAVITY_OAUTH_TOKEN": "",
+        "PWD": "",
+        "OLDPWD": "",
     }
     for env_k in list(os.environ.keys()):
         if env_k.startswith(("CC_AGY_", "CLAUDE_PLUGIN_")) or env_k in (
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
             "GOOGLE_APPLICATION_CREDENTIALS",
+            "ANTIGRAVITY_OAUTH_TOKEN",
+            "PWD",
+            "OLDPWD",
         ):
             scrubbed_env[env_k] = ""
-    ws_resolved = Path(workspace_dir).resolve()
     py_parts = [str(ws_resolved)]
     if (ws_resolved / "src").is_dir():
         py_parts.append(str(ws_resolved / "src"))
@@ -618,11 +671,21 @@ def build_straitjacket_tools(
     if existing_py:
         py_parts.append(existing_py)
     scrubbed_env["PYTHONPATH"] = ":".join(py_parts)
+    path_prefixes: list[str] = []
+    nm_bin = ws_resolved / "node_modules" / ".bin"
+    if nm_bin.is_dir():
+        nm_bin_resolved = str(nm_bin.resolve())
+        path_prefixes.append(nm_bin_resolved)
+        if str(nm_bin) != nm_bin_resolved:
+            path_prefixes.append(str(nm_bin))
     venv_bin = ws_resolved / ".venv" / "bin"
     if venv_bin.is_dir():
-        existing_path = (os.environ.get("PATH") or "").strip()
-        scrubbed_env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
+        path_prefixes.append(str(venv_bin))
         scrubbed_env["VIRTUAL_ENV"] = str(ws_resolved / ".venv")
+    if path_prefixes:
+        existing_path = (os.environ.get("PATH") or "").strip()
+        prefix_joined = ":".join(path_prefixes)
+        scrubbed_env["PATH"] = f"{prefix_joined}:{existing_path}" if existing_path else prefix_joined
     from dataclasses import replace as _dc_replace
     import hashlib as _hashlib
 
@@ -674,14 +737,16 @@ def build_straitjacket_tools(
         is_strict_mode_enabled() and env_flag("CC_AGY_DISABLE_WEB_TOOLS") is not False
     )
     import re as _re
+    _net_bin_re = _re.compile(
+        r"(?:^|[\s;|&`(]|/)(?:curl|wget|nc|ncat|netcat|ssh|scp|sftp|rsync)(?=$|[\s;|&`)])"
+    )
+    _git_net_re = _re.compile(
+        r"(?:^|[\s;|&`(])git(?:\s+-[^\s]+)*\s+(?:clone|fetch|push|pull|ls-remote)(?=$|[\s;|&`)])"
+    )
     _direct_network_tokens = (
-        "curl ",
-        "wget ",
         "urllib.request",
         "urllib.urlopen",
         "socket.create_connection",
-        "git clone ",
-        "git fetch ",
         "huggingface.co",
         "githubusercontent.com",
         "api.github.com",
@@ -695,11 +760,17 @@ def build_straitjacket_tools(
         ".cc-agy-worktrees-",
         ".cc-agy-data",
         ".hmac_key",
+        "antigravity-oauth-token",
+        ".gemini/antigravity-cli",
         "/google/",
-        "find / ",
     ) + extra_blocked_paths
+    _root_scan_re = _re.compile(
+        r"(?:^|[\s;|&`(])(?:find|grep|rg|ripgrep)\b[^\n;|&`]*?(?:^|\s)/(?:\s|$|[;|&)>])"
+    )
 
     def _is_outbound_network_command(raw_cmd: str) -> bool:
+        if _net_bin_re.search(raw_cmd) or _git_net_re.search(raw_cmd):
+            return True
         if any(tok in raw_cmd for tok in _direct_network_tokens):
             return True
         if ("MockTransport" in raw_cmd or "ASGITransport" in raw_cmd or "WSGITransport" in raw_cmd):
@@ -709,10 +780,153 @@ def build_straitjacket_tools(
                 return True
         return False
 
+    def _matches_abs_blocked(cand_p: Path) -> bool:
+        s_p = str(cand_p)
+        for bp in _plugin_internal_escape_tokens:
+            if not bp.startswith("/"):
+                continue
+            if bp.endswith("-"):
+                if s_p.startswith(bp):
+                    return True
+            else:
+                bp_c = bp.rstrip("/")
+                if bp_c and (s_p == bp_c or s_p.startswith(bp_c + "/")):
+                    return True
+        return False
+
     def _is_host_path_escape(raw_cmd: str) -> bool:
         scrubbed = raw_cmd.replace(str(ws_resolved), "__WS__")
         if any(tok in scrubbed for tok in _plugin_internal_escape_tokens):
             return True
+        if _root_scan_re.search(scrubbed):
+            return True
+        if ".." in scrubbed:
+            eff_cwd = ws_resolved
+            for seg_c in _re.split(r"(?:&&|\|\||;|\n|\|)", raw_cmd):
+                seg_s = seg_c.strip()
+                if not seg_s:
+                    continue
+                try:
+                    toks_c = shlex.split(seg_s, posix=True)
+                except ValueError:
+                    toks_c = seg_s.split()
+                if not toks_c:
+                    continue
+                if toks_c[0] == "cd" and len(toks_c) >= 2 and not toks_c[1].startswith("-"):
+                    try:
+                        next_cwd = (eff_cwd / toks_c[1]).resolve()
+                    except Exception:
+                        if isolated_worktree:
+                            return True
+                        continue
+                    if (isolated_worktree and not next_cwd.is_relative_to(ws_resolved)) or _matches_abs_blocked(next_cwd):
+                        return True
+                    eff_cwd = next_cwd
+                    continue
+                for tk in toks_c[1:]:
+                    if tk.startswith("-"):
+                        continue
+                    if tk == ".." or tk.startswith("../") or "/../" in tk or tk.endswith("/.."):
+                        try:
+                            cand_tk = (eff_cwd / tk).resolve()
+                            if (isolated_worktree and not cand_tk.is_relative_to(ws_resolved)) or _matches_abs_blocked(cand_tk):
+                                return True
+                        except Exception:
+                            if isolated_worktree:
+                                return True
+        return False
+
+    _pkg_mutating_subs = frozenset({
+        "install", "i", "ci", "add", "remove", "rm", "uninstall", "un",
+        "update", "up", "upgrade", "link", "unlink", "rebuild", "prune",
+        "dedupe", "clean-install", "install-clean",
+    })
+    _pkg_arg_flags = frozenset({"--filter", "-F", "-C", "--prefix", "--cwd", "--dir", "--workspace", "-w"})
+
+    def _touches_non_ephemeral_node_modules(arg_p: str) -> bool:
+        norm_p = arg_p.strip().replace("\\", "/").lstrip("./").rstrip("/")
+        if not norm_p:
+            return False
+        parts_p = [seg for seg in norm_p.split("/") if seg and seg != "."]
+        if "node_modules" not in parts_p:
+            return False
+        nm_idx = len(parts_p) - 1 - parts_p[::-1].index("node_modules")
+        tail_parts = parts_p[nm_idx + 1 :]
+        if tail_parts and tail_parts[0] in (".vite", ".vite-temp", ".cache", ".tmp", ".eslintcache", ".parcel-cache", ".turbo"):
+            return False
+        return True
+
+    _nm_redirect_re = _re.compile(r"(?:>>?|>\|)\s*['\"]?([^\s;|&'\"]+)")
+    _nm_script_write_tokens = (
+        "write_text",
+        "write_bytes",
+        "writeFileSync",
+        "writeFile",
+        "appendFileSync",
+        "rmSync",
+        "rmdirSync",
+        "unlinkSync",
+        "rmtree",
+        "shutil.move",
+    )
+
+    def _is_linked_node_modules_mutation(raw_cmd: str) -> bool:
+        for redir_m in _nm_redirect_re.finditer(raw_cmd):
+            if _touches_non_ephemeral_node_modules(redir_m.group(1)):
+                return True
+        if "node_modules" in raw_cmd and any(tok in raw_cmd for tok in _nm_script_write_tokens):
+            return True
+        for seg_m in _re.split(r"(?:&&|\|\||;|\n|\|)", raw_cmd):
+            seg_s = seg_m.strip()
+            if not seg_s:
+                continue
+            try:
+                toks_m = shlex.split(seg_s, posix=True)
+            except ValueError:
+                toks_m = seg_s.split()
+            i_m = 0
+            while i_m < len(toks_m):
+                tk0 = toks_m[i_m]
+                if "=" in tk0 and not tk0.startswith("-") and tk0.split("=", 1)[0].isidentifier():
+                    i_m += 1
+                    continue
+                if Path(tk0).name.lower() in ("env", "nohup", "time"):
+                    i_m += 1
+                    continue
+                break
+            if i_m >= len(toks_m):
+                continue
+            exe_m = Path(toks_m[i_m]).name.lower()
+            rest_m = toks_m[i_m + 1 :]
+            if exe_m in ("npm", "pnpm", "yarn", "bun"):
+                j_m = 0
+                sub_m = ""
+                while j_m < len(rest_m):
+                    rt = rest_m[j_m]
+                    if rt in _pkg_arg_flags and j_m + 1 < len(rest_m):
+                        j_m += 2
+                        continue
+                    if rt.startswith("-"):
+                        j_m += 1
+                        continue
+                    sub_m = rt.lower()
+                    break
+                if exe_m == "yarn" and not sub_m:
+                    return True
+                if sub_m in _pkg_mutating_subs:
+                    return True
+            elif exe_m in ("rm", "rmdir", "unlink", "mv", "chmod", "chown", "tee", "touch", "truncate"):
+                operands = [a for a in rest_m if not a.startswith("-")]
+                if any(_touches_non_ephemeral_node_modules(op) for op in operands):
+                    return True
+            elif exe_m == "sed" and any(a == "-i" or a.startswith("-i") for a in rest_m):
+                operands = [a for a in rest_m if not a.startswith("-")]
+                if any(_touches_non_ephemeral_node_modules(op) for op in operands):
+                    return True
+            elif exe_m in ("cp", "ln"):
+                operands = [a for a in rest_m if not a.startswith("-")]
+                if operands and _touches_non_ephemeral_node_modules(operands[-1]):
+                    return True
         return False
 
     import subprocess as _sp
@@ -728,7 +942,7 @@ def build_straitjacket_tools(
             if calls >= 3:
                 return (
                     f"{raw_output}\n"
-                    f"[Lead budget: {calls}/{lead_read_limit} read/search calls used — once you know the target files, "
+                    f"[Lead budget: {calls}/{lead_read_limit} read/search calls used: once you know the target files, "
                     "call delegate_start with a concise prompt (<500 words, no 'Wait:' self-debate); "
                     "the worker has full repository and test access.]"
                 )
@@ -758,13 +972,13 @@ def build_straitjacket_tools(
             return (
                 f"{raw_output}\n"
                 f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed, {calls} Straitjacket calls, "
-                "0 files modified in worktree — stop searching/reading and write your implementation with "
+                "0 files modified in worktree: stop searching/reading and write your implementation with "
                 "edit_file / create_file NOW so your edits are saved on disk before timeout.]"
             )
         if _straitjacket_state["has_edits"] and elapsed >= session_timeout * 0.75:
             return (
                 f"{raw_output}\n"
-                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed — finish your current edit, "
+                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed: finish your current edit, "
                 "run the targeted acceptance test, and conclude your turn before timeout.]"
             )
         return raw_output
@@ -808,31 +1022,44 @@ def build_straitjacket_tools(
                                     deleted_set.add(old_raw.decode("utf-8", errors="surrogateescape"))
             except Exception:
                 used_git_status = False
+        _ephemeral_hash_dirs = frozenset({
+            ".git",
+            ".ctx-session-reads",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".hypothesis",
+            "node_modules",
+            ".vite",
+            ".vite-temp",
+            ".next",
+            ".turbo",
+            ".cache",
+            ".parcel-cache",
+            ".eslintcache",
+        })
+
         def _is_ephemeral_cache_path(rel_path: str) -> bool:
             parts = rel_path.split("/")
-            if any(
-                seg in (
-                    ".git",
-                    ".ctx-session-reads",
-                    "__pycache__",
-                    ".pytest_cache",
-                    ".mypy_cache",
-                    ".ruff_cache",
-                    ".hypothesis",
-                )
-                for seg in parts
-            ):
+            if any(seg in _ephemeral_hash_dirs for seg in parts):
                 return True
-            return rel_path.endswith((".pyc", ".pyo"))
+            return rel_path.endswith((".pyc", ".pyo", ".tsbuildinfo"))
 
         deleted_set = {d for d in deleted_set if not _is_ephemeral_cache_path(d)}
         existing_files: list[str] | None = None
         if not used_git_status:
-            existing_files = [
-                rel_s
-                for p in ws_resolved.rglob("*")
-                if p.is_file() and not _is_ephemeral_cache_path(rel_s := p.relative_to(ws_resolved).as_posix())
-            ]
+            existing_files = []
+            for cur_r, walk_dirs, walk_files in os.walk(str(ws_resolved), topdown=True, followlinks=False):
+                walk_dirs[:] = [d for d in walk_dirs if d not in _ephemeral_hash_dirs]
+                cur_rp = Path(cur_r)
+                for wf in walk_files:
+                    fp_w = cur_rp / wf
+                    if fp_w.is_symlink() or not fp_w.is_file():
+                        continue
+                    rel_s = fp_w.relative_to(ws_resolved).as_posix()
+                    if not _is_ephemeral_cache_path(rel_s):
+                        existing_files.append(rel_s)
             if len(existing_files) <= 500:
                 hash_targets.update(existing_files)
         fhashes: dict[str, str] = {}
@@ -1271,29 +1498,39 @@ def build_straitjacket_tools(
                         "repository and local Python environment."
                     ),
                 })
+        if disable_web_tools or isolated_worktree:
             if _is_host_path_escape(cmd_str):
                 return json.dumps({
                     "status": "error",
                     "exit_code": 126,
                     "error": (
                         "PermissionDenied: Accessing host filesystem directories outside the isolated workspace "
-                        "is disabled in strict worker mode. All required task specifications are inside the "
+                        "is disabled in isolated worker mode. All required task specifications are inside the "
                         "current workspace directory; implement the solution directly."
                     ),
                 })
-            if working_directory:
-                try:
-                    cand_wd = (ws_resolved / str(working_directory)).resolve()
-                    if not cand_wd.is_relative_to(ws_resolved):
-                        return json.dumps({
-                            "status": "error",
-                            "exit_code": 126,
-                            "error": (
-                                "PermissionDenied: working_directory must stay within the isolated workspace."
-                            ),
-                        })
-                except Exception:
-                    pass
+        if working_directory:
+            try:
+                cand_wd = (ws_resolved / str(working_directory)).resolve()
+                if not cand_wd.is_relative_to(ws_resolved) or _matches_abs_blocked(cand_wd):
+                    return json.dumps({
+                        "status": "error",
+                        "exit_code": 126,
+                        "error": (
+                            "PermissionDenied: working_directory must stay within the isolated workspace."
+                        ),
+                    })
+            except Exception:
+                pass
+        if nm_linked and _is_linked_node_modules_mutation(cmd_str):
+            return json.dumps({
+                "status": "error",
+                "exit_code": 126,
+                "error": (
+                    "Host node_modules is already linked into this workspace; run your test or typecheck command "
+                    "directly without installing packages."
+                ),
+            })
         sc_msg = _check_post_acceptance_short_circuit(cmd_str)
         if sc_msg:
             return json.dumps({
@@ -1435,7 +1672,7 @@ def build_straitjacket_tools(
                 "error": (
                     f"LeadReadBudgetExceeded: Lead read/search limit ({lead_read_limit} calls) reached. Do NOT read more files "
                     "on the Lead orchestrator. Call delegate_start (with a concise prompt <500 words), delegate_continue, "
-                    "get_diff, or delegate_apply immediately — the worker has full repository and test access in its worktree."
+                    "get_diff, or delegate_apply immediately; the worker has full repository and test access in its worktree."
                 )
             })
         return None
@@ -1475,6 +1712,37 @@ def build_straitjacket_tools(
 
     _seen_view_spans: dict[tuple[str, str], list[tuple[int, int]]] = {}
 
+    def _resolve_linked_node_modules_path(raw_path: str) -> tuple[Path | None, str]:
+        """Allow read-only inspection of linked `host_ws_resolved/.../node_modules` without `..` escape."""
+        if not nm_linked or host_ws_resolved is None:
+            return None, ""
+        clean = str(raw_path or "").strip().replace("\\", "/")
+        while clean.startswith("./"):
+            clean = clean[2:]
+        clean = clean.strip("/")
+        if not clean or clean.lower().startswith("ws:") or os.path.isabs(str(raw_path or "").strip()):
+            return None, ""
+        rel_parts = Path(clean).parts
+        if ".." in rel_parts or "node_modules" not in rel_parts:
+            return None, ""
+        try:
+            cand = (ws_resolved / clean).resolve()
+            host_rel = cand.relative_to(host_ws_resolved)
+        except Exception:
+            return None, ""
+        if "node_modules" not in host_rel.parts:
+            return None, ""
+        bname = cand.name.lower()
+        parts_low = [p.lower() for p in host_rel.parts]
+        if (
+            bname in _SECRET_BASENAMES
+            or bname.startswith(".env.")
+            or bname.endswith((".pem", ".key", ".p12", ".pfx"))
+            or ".cc-agy-data" in parts_low
+        ):
+            return None, ""
+        return cand, Path(clean).as_posix()
+
     async def view_file(
         path: str,
         start_line: int = 1,
@@ -1485,11 +1753,30 @@ def build_straitjacket_tools(
         cap_err = _check_lead_read_cap()
         if cap_err:
             return cap_err
-        norm_rel, err = _normalize_safe_repo_path(path)
-        if err:
-            return json.dumps({"error": err, "path": str(path or "")})
         s_line = _coerce_line_number(start_line, 1)
         e_line = max(s_line, _coerce_line_number(end_line, 400))
+        norm_rel, err = _normalize_safe_repo_path(path)
+        if err:
+            nm_cand, nm_rel = _resolve_linked_node_modules_path(path)
+            if nm_cand is not None:
+                if not nm_cand.is_file():
+                    return json.dumps({"error": f"FileNotFoundError: {nm_rel}", "path": str(path or "")})
+                try:
+                    raw_lines = nm_cand.read_text(encoding="utf-8", errors="replace").splitlines()
+                    total_l = len(raw_lines)
+                    clamped_end = min(total_l, e_line, s_line + sj_max_inline_lines - 1)
+                    body_l = [
+                        f"L{ln_no}: {raw_lines[ln_no - 1]}"
+                        for ln_no in range(s_line, clamped_end + 1)
+                        if 1 <= ln_no <= total_l
+                    ]
+                    header_l = f"[ctx read repo:{nm_rel} L{s_line}:{max(s_line, clamped_end)} of {total_l}]"
+                    return _maybe_append_turn_budget_note(
+                        header_l + ("\n" + "\n".join(body_l) if body_l else "")
+                    )
+                except Exception as exc:
+                    return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
+            return json.dumps({"error": err, "path": str(path or "")})
         file_sha = ""
         try:
             target_f = ws_resolved / norm_rel
@@ -1562,6 +1849,49 @@ def build_straitjacket_tools(
             return cap_err
         norm_rel, err = _normalize_safe_repo_path(path)
         if err:
+            nm_cand, nm_rel = _resolve_linked_node_modules_path(path)
+            if nm_cand is not None and nm_cand.exists():
+                raw_pat = str(pattern or "")
+                try:
+                    rx = _re.compile(raw_pat)
+                except _re.error:
+                    rx = _re.compile(_re.escape(raw_pat))
+                hits: list[str] = []
+                scanned = 0
+                targets = [nm_cand] if nm_cand.is_file() else []
+                if nm_cand.is_dir():
+                    for sr, sdirs, sfiles in os.walk(str(nm_cand), topdown=True, followlinks=False):
+                        sdirs[:] = sorted(d for d in sdirs if not d.startswith("."))
+                        for sf in sorted(sfiles):
+                            targets.append(Path(sr) / sf)
+                            if len(targets) >= 500:
+                                break
+                        if len(targets) >= 500:
+                            break
+                for tf in targets:
+                    scanned += 1
+                    try:
+                        if tf.stat().st_size > 524288:
+                            continue
+                        raw_b = tf.read_bytes()
+                        if b"\x00" in raw_b[:2048]:
+                            continue
+                        rel_hit = (
+                            nm_rel
+                            if nm_cand.is_file()
+                            else f"{nm_rel}/{tf.relative_to(nm_cand).as_posix()}"
+                        )
+                        for lno, ltxt in enumerate(raw_b.decode("utf-8", errors="replace").splitlines(), 1):
+                            if rx.search(ltxt):
+                                hits.append(f"{rel_hit}:{lno}: {ltxt[:200]}")
+                                if len(hits) >= 80:
+                                    break
+                    except OSError:
+                        continue
+                    if len(hits) >= 80:
+                        break
+                summary = f"[ctx search repo:{nm_rel} ({scanned} files scanned, {len(hits)} hits)]"
+                return _maybe_append_turn_budget_note(summary + ("\n" + "\n".join(hits) if hits else ""))
             return json.dumps({"error": err, "path": str(path or "")})
         try:
             out = await session.search(f"repo:{norm_rel}", str(pattern or ""))
@@ -1576,6 +1906,18 @@ def build_straitjacket_tools(
             return cap_err
         norm_rel, err = _normalize_safe_repo_path(path)
         if err:
+            nm_cand, nm_rel = _resolve_linked_node_modules_path(path)
+            if nm_cand is not None and nm_cand.is_dir():
+                try:
+                    rows_l: list[str] = []
+                    for dent in sorted(os.scandir(nm_cand), key=lambda e: e.name)[:200]:
+                        suffix_kind = "/" if dent.is_dir(follow_symlinks=True) else f" ({dent.stat(follow_symlinks=True).st_size}B)"
+                        rows_l.append(f"{dent.name}{suffix_kind}")
+                    return _maybe_append_turn_budget_note(
+                        f"[ctx list repo:{nm_rel} ({len(rows_l)} entries)]\n" + "\n".join(rows_l)
+                    )
+                except Exception as exc:
+                    return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
             return json.dumps({"error": err, "path": str(path or "")})
         try:
             out = await session.retrieve("stats", ref=f"repo:{norm_rel}")
@@ -1623,6 +1965,32 @@ def build_straitjacket_tools(
     )
 
 
+def _build_default_run_command_config(
+    types_mod: Any,
+    *,
+    timeout_seconds: float | None = 300.0,
+) -> Any | None:
+    """Build `types.RunCommandConfig(enable_sandbox=True, ...)` for fallback built-in `RUN_COMMAND`."""
+    rc_cls = getattr(types_mod, "RunCommandConfig", None)
+    if rc_cls is None:
+        return None
+    enable_sb = env_flag("CC_AGY_BUILTIN_SANDBOX") is not False
+    rc_kwargs: dict[str, Any] = {"enable_sandbox": enable_sb}
+    if timeout_seconds is not None:
+        try:
+            t_val = max(1.0, float(timeout_seconds))
+            rc_kwargs["timeout_seconds"] = t_val
+        except (TypeError, ValueError):
+            pass
+    try:
+        return rc_cls(**rc_kwargs)
+    except TypeError:
+        try:
+            return rc_cls(enable_sandbox=enable_sb)
+        except Exception:
+            return None
+
+
 def resolve_worker_sdk_limits(
     request: dict[str, Any] | None = None,
     *,
@@ -1651,42 +2019,27 @@ def resolve_worker_sdk_limits(
 
 
 async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any]:
-    """Execute an agentic task inside `workspace_dir` using `google.antigravity`."""
+    """Execute an agentic task inside `workspace_dir` using `agy` CLI or `google.antigravity`."""
+    sanitize_placeholder_env()
+    if request.get("auth_mode") == "gemini_enterprise":
+        from server.agy_cli import run_agy_cli_worker
+
+        return await asyncio.to_thread(run_agy_cli_worker, request)
+
     from google import antigravity as ag
     from google.antigravity import policy, types
 
-    sanitize_placeholder_env()
     options = (
         types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
         if request.get("thinking_level")
         else None
     )
 
-    ent_meta: dict[str, Any] = {}
     eff_project = request.get("project")
     eff_location = request.get("location")
     if request.get("api_key"):
         endpoint = types.GeminiAPIEndpoint(
             api_key=request["api_key"],
-            options=options,
-        )
-    elif request.get("auth_mode") == "gemini_enterprise":
-        from server.gemini_enterprise import prepare_enterprise_endpoint
-
-        ep = prepare_enterprise_endpoint(request)
-        eff_project = ep["project"]
-        eff_location = ep["location"]
-        ent_meta = {
-            "vertex_project": eff_project,
-            "vertex_location": eff_location,
-            "reroute_note": ep.get("reroute_note"),
-        }
-        endpoint = types.VertexEndpoint(
-            project=eff_project,
-            location=eff_location,
-            base_url=ep["base_url"],
-            http_headers=ep["headers"],
-            api_key="proxy-local",
             options=options,
         )
     else:
@@ -1761,6 +2114,12 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     compaction_threshold, tool_max_tokens = resolve_worker_sdk_limits(request)
     if tool_max_tokens > 0 and hasattr(types, "ToolOutputTruncationConfig"):
         cap_kwargs["tool_output_truncation_config"] = types.ToolOutputTruncationConfig(max_tokens=tool_max_tokens)
+    default_rc_cfg = _build_default_run_command_config(
+        types,
+        timeout_seconds=float(request.get("timeout_seconds") or 300.0),
+    )
+    if default_rc_cfg is not None:
+        cap_kwargs["run_command_config"] = default_rc_cfg
 
     capabilities = types.CapabilitiesConfig(**cap_kwargs)
 
@@ -1815,6 +2174,9 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 profile=inferred_profile,
                 is_lead_orchestrator=is_lead_orch,
                 acceptance_commands=request.get("acceptance"),
+                host_workspace_root=request.get("host_workspace_root"),
+                nm_linked=bool(request.get("nm_linked")),
+                isolated_worktree=bool(request.get("isolated_worktree")),
             )
             for sj_fn in sj_tools:
                 if getattr(sj_fn, "__name__", "") == "run_command" and isinstance(getattr(sj_fn, "command_runs", None), list):
@@ -2002,6 +2364,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                     pass
             stop_reason = await resolve_stop_reason(resp)
         sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+        pub_tot = int(usage.get("total_token_count") or 0)
+        sql_tot = int(sqlite_telemetry.get("total_token_count") or 0)
+        if pub_tot > 0 and sql_tot > max(pub_tot * 4, pub_tot + 500_000):
+            sqlite_telemetry = {"requests": [], "tool_calls": sqlite_telemetry.get("tool_calls") or []}
         for k in (
             "prompt_token_count",
             "cached_content_token_count",
@@ -2033,6 +2399,13 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             pass
         partial_usage = extract_usage_from_session(agent_ref, resp)
         sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+        base_tot = max(
+            int(usage.get("total_token_count") or 0),
+            int(partial_usage.get("total_token_count") or 0),
+        )
+        sql_tot = int(sqlite_telemetry.get("total_token_count") or 0)
+        if base_tot > 0 and sql_tot > max(base_tot * 4, base_tot + 500_000):
+            sqlite_telemetry = {"requests": [], "tool_calls": sqlite_telemetry.get("tool_calls") or []}
         for k in (
             "prompt_token_count",
             "cached_content_token_count",
@@ -2093,7 +2466,6 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "containment": containment_mode,
         "containment_warning": containment_warning,
         "command_runs": list(sj_command_runs),
-        **ent_meta,
     }
 
 
@@ -2159,53 +2531,158 @@ def _reconcile_phase_usage_requests(
             )
 
 
-def _read_proc_ppid_and_state(pid: int) -> tuple[int | None, str]:
-    """Return `(ppid, state_char)` from `/proc/<pid>/stat`, or `(None, '')` when unavailable."""
+def _proc_fs_available() -> bool:
+    """Return True when a Linux-style `/proc` process table is mounted."""
+    return Path("/proc").is_dir()
+
+
+def _ps_process_table(*, include_args: bool = False) -> dict[int, tuple[int, str, str]]:
+    """Return `{pid: (ppid, state_str, args_str)}` via POSIX `ps` (used on macOS/BSD when `/proc` is absent)."""
+    table: dict[int, tuple[int, str, str]] = {}
+    fmt = "pid=,ppid=,state=,args=" if include_args else "pid=,ppid=,state="
     try:
-        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
-        rparen = raw_stat.rfind(")")
-        if rparen < 0:
+        res = subprocess.run(
+            ["ps", "-Ao", fmt],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0 if include_args else 3.0,
+            check=False,
+        )
+        if res.returncode != 0:
+            if include_args:
+                return _ps_process_table(include_args=False)
+            return table
+        for raw_ln in (res.stdout or "").splitlines():
+            parts = raw_ln.strip().split(None, 3 if include_args else 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid_v = int(parts[0])
+                ppid_v = int(parts[1])
+            except ValueError:
+                continue
+            state_v = parts[2]
+            args_v = parts[3] if (include_args and len(parts) > 3) else ""
+            table[pid_v] = (ppid_v, state_v, args_v)
+    except subprocess.TimeoutExpired:
+        if include_args:
+            return _ps_process_table(include_args=False)
+    except Exception:
+        pass
+    return table
+
+
+def _ps_pid_matches_save_dir(pid: int, save_token: str, ps_args: str = "") -> bool:
+    """Check whether `pid` references `save_token` in its command line or (`ps eww`) environment."""
+    if save_token and save_token in ps_args:
+        return True
+    try:
+        res = subprocess.run(
+            ["ps", "eww", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1.5,
+            check=False,
+        )
+        if res.returncode == 0 and save_token in (res.stdout or ""):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _read_proc_ppid_and_state(pid: int) -> tuple[int | None, str]:
+    """Return `(ppid, state_char)` from `/proc/<pid>/stat` (or `ps` on macOS/BSD)."""
+    if _proc_fs_available():
+        try:
+            raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+            rparen = raw_stat.rfind(")")
+            if rparen < 0:
+                return None, ""
+            fields = raw_stat[rparen + 2 :].split()
+            if len(fields) < 2:
+                return None, ""
+            return int(fields[1]), fields[0]
+        except (OSError, ValueError):
             return None, ""
-        fields = raw_stat[rparen + 2 :].split()
-        if len(fields) < 2:
-            return None, ""
-        return int(fields[1]), fields[0]
-    except (OSError, ValueError):
-        return None, ""
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "ppid=,state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode == 0:
+            for ln in (res.stdout or "").splitlines():
+                fields = ln.strip().split()
+                if len(fields) >= 2:
+                    return int(fields[0]), fields[1][0]
+    except Exception:
+        pass
+    return None, ""
 
 
 def _direct_child_pids(parent_pid: int) -> set[int]:
-    """Return direct live child PIDs of `parent_pid` via `/proc`."""
-    proc_root = Path("/proc")
-    if not proc_root.is_dir():
-        return set()
-    out: set[int] = set()
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        ppid, state = _read_proc_ppid_and_state(pid)
-        if ppid == parent_pid and state != "Z":
-            out.add(pid)
-    return out
+    """Return direct live child PIDs of `parent_pid` via `/proc` on Linux or `ps`/`pgrep` on macOS."""
+    if _proc_fs_available():
+        out: set[int] = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            ppid, state = _read_proc_ppid_and_state(pid)
+            if ppid == parent_pid and state != "Z":
+                out.add(pid)
+        return out
+    out_ps: set[int] = set()
+    ps_tab = _ps_process_table()
+    for pid, (ppid, state, _args) in ps_tab.items():
+        if ppid == parent_pid and not state.upper().startswith("Z"):
+            out_ps.add(pid)
+    if not out_ps:
+        try:
+            pg = subprocess.run(
+                ["pgrep", "-P", str(parent_pid)],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if pg.returncode == 0:
+                for tok in (pg.stdout or "").split():
+                    if tok.isdigit() and _pid_is_alive_non_zombie(int(tok)):
+                        out_ps.add(int(tok))
+        except Exception:
+            pass
+    return out_ps
 
 
 def _collect_descendant_pids(root_pids: set[int], *, exclude_pid: int | None = None) -> list[int]:
     """Return all live descendant PIDs rooted at `root_pids` (BFS order, excluding `exclude_pid`)."""
     if not root_pids:
         return []
-    proc_root = Path("/proc")
-    if not proc_root.is_dir():
-        return []
     children_by_ppid: dict[int, list[int]] = {}
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid == exclude_pid:
-            continue
-        ppid, state = _read_proc_ppid_and_state(pid)
-        if ppid is not None and state != "Z":
+    if _proc_fs_available():
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == exclude_pid:
+                continue
+            ppid, state = _read_proc_ppid_and_state(pid)
+            if ppid is not None and state != "Z":
+                children_by_ppid.setdefault(ppid, []).append(pid)
+    else:
+        for pid, (ppid, state, _args) in _ps_process_table().items():
+            if pid == exclude_pid or state.upper().startswith("Z"):
+                continue
             children_by_ppid.setdefault(ppid, []).append(pid)
     descendants: list[int] = []
     seen = set(root_pids)
@@ -2221,8 +2698,21 @@ def _collect_descendant_pids(root_pids: set[int], *, exclude_pid: int | None = N
 
 
 def _pid_is_alive_non_zombie(pid: int) -> bool:
-    _, state = _read_proc_ppid_and_state(pid)
-    return bool(state and state != "Z")
+    if _proc_fs_available():
+        _, state = _read_proc_ppid_and_state(pid)
+        return bool(state and state != "Z")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    _ppid, state = _read_proc_ppid_and_state(pid)
+    if state:
+        return not state.upper().startswith("Z")
+    return True
 
 
 def _proc_matches_save_dir(entry: Path, save_token: str) -> bool:
@@ -2298,27 +2788,48 @@ def _force_terminate_agent_process(
             if proc.poll() is None or _pid_is_alive_non_zombie(pid):
                 root_pids.add(pid)
 
+    has_proc = _proc_fs_available()
     proc_root = Path("/proc")
-    if save_dir and proc_root.is_dir():
-        save_token = str(save_dir).rstrip("/")
-        if save_token:
-            for entry in proc_root.iterdir():
-                if not entry.name.isdigit():
-                    continue
-                pid = int(entry.name)
-                if pid == my_pid or pid in root_pids:
-                    continue
-                if _proc_matches_save_dir(entry, save_token) and _pid_is_alive_non_zombie(pid):
-                    root_pids.add(pid)
-
-    if pre_child_pids is not None and save_dir and proc_root.is_dir():
-        save_token = str(save_dir).rstrip("/")
-        if save_token:
+    save_token = str(save_dir).rstrip("/") if save_dir else ""
+    if save_token and has_proc:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == my_pid or pid in root_pids:
+                continue
+            if _proc_matches_save_dir(entry, save_token) and _pid_is_alive_non_zombie(pid):
+                root_pids.add(pid)
+        if pre_child_pids is not None:
             for pid in _direct_child_pids(my_pid) - pre_child_pids:
                 if pid == my_pid or pid in root_pids:
                     continue
                 if _proc_matches_save_dir(proc_root / str(pid), save_token) and _pid_is_alive_non_zombie(pid):
                     root_pids.add(pid)
+    elif not has_proc:
+        ps_tab = _ps_process_table(include_args=bool(save_token))
+        if save_token:
+            for pid, (_ppid, state, args_s) in ps_tab.items():
+                if pid == my_pid or pid in root_pids or state.upper().startswith("Z"):
+                    continue
+                if save_token in args_s and _pid_is_alive_non_zombie(pid):
+                    root_pids.add(pid)
+        if pre_child_pids is not None:
+            new_children = {
+                pid
+                for pid in (_direct_child_pids(my_pid) - pre_child_pids)
+                if pid != my_pid and _pid_is_alive_non_zombie(pid)
+            }
+            for pid in new_children:
+                if pid in root_pids:
+                    continue
+                args_s = ps_tab.get(pid, (0, "", ""))[2]
+                if not save_token or _ps_pid_matches_save_dir(pid, save_token, args_s):
+                    root_pids.add(pid)
+            # Under macOS SIP where `ps eww` may omit child env vars, fall back to direct children
+            # spawned during this worker's lifetime when private SDK handles yielded no PID.
+            if not root_pids and new_children:
+                root_pids.update(new_children)
 
     if not root_pids:
         return 0
@@ -2335,7 +2846,7 @@ def _force_terminate_agent_process(
                 proc.terminate()
                 killed_pids.add(pid)
             else:
-                os.kill(pid, 15)
+                os.kill(pid, signal.SIGTERM)
                 killed_pids.add(pid)
         except OSError:
             pass
@@ -2358,7 +2869,7 @@ def _force_terminate_agent_process(
                 if proc is not None and proc.poll() is None:
                     proc.kill()
                 else:
-                    os.kill(pid, 9)
+                    os.kill(pid, signal.SIGKILL)
                 killed_pids.add(pid)
             except OSError:
                 pass
@@ -2457,7 +2968,14 @@ def run_antigravity_worker(
     extra_tools: list[Any] | None = None,
     system_prompt: str | None = None,
     acceptance: list[str] | None = None,
+    allowed_paths: list[str] | None = None,
+    agy_conversation_id: str | None = None,
+    agy_prior_conversation_usage: Mapping[str, Any] | None = None,
+    agy_prior_conversation_turns: int | None = None,
     register_cancel: Callable[[Callable[[], None] | None], None] | None = None,
+    host_workspace_root: str | Path | None = None,
+    nm_linked: bool = False,
+    isolated_worktree: bool = False,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     resolved_auth = resolve_auth_config(
@@ -2506,6 +3024,21 @@ def run_antigravity_worker(
         "extra_tools": list(extra_tools) if extra_tools else None,
         "system_prompt": system_prompt,
         "acceptance": list(acceptance) if acceptance else [],
+        "allowed_paths": list(allowed_paths) if allowed_paths else [],
+        "agy_conversation_id": agy_conversation_id,
+        "host_workspace_root": str(Path(host_workspace_root).resolve()) if host_workspace_root else None,
+        "nm_linked": bool(nm_linked),
+        "isolated_worktree": bool(isolated_worktree),
+        **(
+            {"agy_prior_conversation_usage": dict(agy_prior_conversation_usage)}
+            if isinstance(agy_prior_conversation_usage, Mapping)
+            else {}
+        ),
+        **(
+            {"agy_prior_conversation_turns": int(agy_prior_conversation_turns)}
+            if agy_prior_conversation_turns is not None
+            else {}
+        ),
     }
     extra_cancel_hooks: list[Callable[[], None]] = []
     in_async_runner = [False]
@@ -2522,7 +3055,7 @@ def run_antigravity_worker(
 
     if backend is None:
         req["_on_agent_created"] = _on_agent_created
-    elif callable(register_cancel):
+    if callable(register_cancel):
         req["register_cancel"] = _register_backend_cancel
 
     active_backend = backend or _default_antigravity_backend
@@ -2573,4 +3106,16 @@ def run_antigravity_worker(
         "reroute_note": reroute_note,
         "thinking_level": resolved_thinking,
         "duration_seconds": elapsed,
+        **({"agy_conversation_id": str(result["agy_conversation_id"])} if result.get("agy_conversation_id") else {}),
+        **(
+            {"agy_conversation_usage": dict(result["agy_conversation_usage"])}
+            if isinstance(result.get("agy_conversation_usage"), Mapping)
+            else {}
+        ),
+        **(
+            {"agy_conversation_turns": int(result["agy_conversation_turns"])}
+            if result.get("agy_conversation_turns")
+            else {}
+        ),
+        **({"usage_is_cumulative": True} if result.get("usage_is_cumulative") else {}),
     }

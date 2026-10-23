@@ -683,7 +683,7 @@ def test_opus_round1_regressions_tdd_false_pass_scoped_prompt_and_ast_edges(
             wait=True,
         )
         assert "## Original User Request (Verbatim" not in captured_scoped[0]
-        assert "## Background User Context (Reference Only — Scope Restricted to allowed_paths)" in captured_scoped[0]
+        assert "## Background User Context (Reference Only: Scope Restricted to allowed_paths)" in captured_scoped[0]
         assert "allowed_paths=['a.py']" in captured_scoped[0]
     finally:
         jm_scope.shutdown()

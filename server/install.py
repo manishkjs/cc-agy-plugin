@@ -38,7 +38,18 @@ DEFAULT_SERVER_NAME = "agy"
 MARKETPLACE_NAME = "cc-agy"
 PLUGIN_NAME = "cc-agy-plugin"
 COST_PROFILES = ("economy", "balanced", "quality")
-AUTH_CHOICES = ("auto", "gemini-enterprise", "gemini_enterprise", "api-key", "api_key", "vertex", "gateway")
+AUTH_CHOICES = (
+    "auto",
+    "gemini-enterprise",
+    "gemini_enterprise",
+    "agy-cli",
+    "agy_cli",
+    "agy",
+    "api-key",
+    "api_key",
+    "vertex",
+    "gateway",
+)
 
 # Forwarded from the user's shell into the Codex-launched MCP server, so secrets never land in config.toml.
 CODEX_FORWARDED_ENV_VARS = (
@@ -50,8 +61,9 @@ CODEX_FORWARDED_ENV_VARS = (
     "CLOUDSDK_CONFIG",
     "CC_AGY_AUTH_MODE",
     "CC_AGY_GEMINI_ENTERPRISE",
-    "CC_AGY_ENTERPRISE_LOCATION",
-    "CC_AGY_ENTERPRISE_ACCESS_TOKEN",
+    "CC_AGY_CLI_BIN",
+    "CC_AGY_CLI_CONFIG_DIR",
+    "ANTIGRAVITY_OAUTH_TOKEN",
     "CC_AGY_VERTEX_BASE_URL",
     "GOOGLE_VERTEX_BASE_URL",
     "CC_AGY_VERTEX_BASE_URL_TOKEN",
@@ -69,7 +81,16 @@ def _toml_str(value: str) -> str:
 
 def _normalize_auth_choice(raw: str | None) -> str:
     val = (raw or "auto").strip().lower()
-    if val in ("gemini-enterprise", "gemini_enterprise", "enterprise", "oauth-business", "oauth_business"):
+    if val in (
+        "gemini-enterprise",
+        "gemini_enterprise",
+        "enterprise",
+        "agy-cli",
+        "agy_cli",
+        "agy",
+        "oauth-business",
+        "oauth_business",
+    ):
         return "gemini_enterprise"
     if val in ("api-key", "api_key", "ai_studio", "aistudio"):
         return "api_key"
@@ -94,6 +115,7 @@ def build_codex_server_block(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
@@ -106,13 +128,12 @@ def build_codex_server_block(
         env["CC_AGY_AUTH_MODE"] = norm_auth
     if project:
         env["GOOGLE_CLOUD_PROJECT"] = project
-    if location:
-        if norm_auth == "gemini_enterprise":
-            env["CC_AGY_ENTERPRISE_LOCATION"] = location
-        else:
-            env["GOOGLE_CLOUD_LOCATION"] = location
+    if location and norm_auth != "gemini_enterprise":
+        env["GOOGLE_CLOUD_LOCATION"] = location
     if base_url:
         env["CC_AGY_VERTEX_BASE_URL"] = base_url
+    if agy_cli_path:
+        env["CC_AGY_CLI_BIN"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
         formatted = f"{max_daily_cents:g}"
         env["CC_AGY_MAX_DAILY_CENTS"] = formatted
@@ -228,6 +249,7 @@ def install_codex(
     project: str | None,
     location: str | None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     dry_run: bool,
     codex_home: Path | None = None,
@@ -241,6 +263,7 @@ def install_codex(
         project=project,
         location=location,
         base_url=base_url,
+        agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
     )
     existing = cfg.read_text(encoding="utf-8") if cfg.is_file() else ""
@@ -302,6 +325,7 @@ def build_claude_user_config(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -314,10 +338,12 @@ def build_claude_user_config(
         cfg["cost_profile"] = profile
     if project:
         cfg["google_cloud_project"] = project
-    if location:
+    if location and norm_auth != "gemini_enterprise":
         cfg["google_cloud_location"] = location
     if base_url:
         cfg["vertex_base_url"] = base_url
+    if agy_cli_path:
+        cfg["agy_cli_path"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
         cfg["max_daily_cents"] = f"{max_daily_cents:g}"
     if strict:
@@ -332,6 +358,7 @@ def claude_install_commands(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     strict: bool = False,
 ) -> list[list[str]]:
@@ -341,6 +368,7 @@ def claude_install_commands(
         project=project,
         location=location,
         base_url=base_url,
+        agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         strict=strict,
     )
@@ -362,6 +390,7 @@ def install_claude(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -371,6 +400,7 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         strict=strict,
     )
@@ -380,6 +410,7 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         strict=strict,
     )
@@ -457,64 +488,98 @@ def preflight(
     auth_mode: str | None = None,
     project: str | None = None,
     base_url: str | None = None,
+    agy_cli_path: str | None = None,
 ) -> dict[str, Any]:
-    """Zero-network readiness: Python, SDKs, git and credentials."""
-    source = env if env is not None else os.environ
+    """Zero-network readiness: Python, SDKs / `agy` CLI, git and credentials."""
+    from server.agy_cli import inspect_agy_cli_offline
+    from server.regions import (
+        _resolve_explicit_project_only,
+        _should_auto_detect_agy_cli,
+        resolve_api_key,
+        resolve_configured_auth_mode,
+        resolve_vertex_base_url,
+    )
+
+    source = dict(env if env is not None else os.environ)
+    if agy_cli_path:
+        source["CC_AGY_CLI_BIN"] = agy_cli_path
+    if base_url:
+        source["CC_AGY_VERTEX_BASE_URL"] = base_url
+
     py_bin = resolve_python_bin()
     issues: list[str] = []
     if sys.version_info < (3, 10):
         issues.append(f"Python 3.10+ is required (found {sys.version.split()[0]}).")
-    sdk_ok = python_has_plugin_sdks(py_bin)
-    if not sdk_ok:
-        issues.append("Antigravity SDK missing. Run `python3 -m server.install` (without `--no-bootstrap`).")
     if not shutil.which("git"):
         issues.append("git is not on PATH (worker jobs run in git copies of your repository).")
 
-    norm_auth = _normalize_auth_choice(
-        auth_mode
-        or str(source.get("CC_AGY_AUTH_MODE") or "").strip()
-        or ("gemini_enterprise" if str(source.get("CC_AGY_GEMINI_ENTERPRISE") or "").strip().lower() in ("1", "true", "yes", "on") else "auto")
-    )
-    has_key = any(str(source.get(k) or "").strip() for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
-    has_gateway = bool(
-        base_url
-        or any(str(source.get(k) or "").strip() for k in ("CC_AGY_VERTEX_BASE_URL", "GOOGLE_VERTEX_BASE_URL"))
-    )
-    has_project = bool(project or str(source.get("GOOGLE_CLOUD_PROJECT") or "").strip())
+    try:
+        cfg_mode = resolve_configured_auth_mode(auth_mode, env=source)
+    except ValueError:
+        cfg_mode = None
+    norm_auth = cfg_mode or _normalize_auth_choice(auth_mode)
 
+    resolved_key = resolve_api_key(env=source)
+    resolved_gateway = resolve_vertex_base_url(base_url, env=source)
+    explicit_proj_arg = _resolve_explicit_project_only(project, env={}) if project else None
+    resolved_proj = _resolve_explicit_project_only(project, env=source)
+
+    has_key = bool(resolved_key)
+    has_gateway = bool(resolved_gateway)
+    has_project = bool(resolved_proj or has_gateway)
+
+    agy_cli_status: dict[str, Any] | None = None
     if norm_auth == "gemini_enterprise":
-        from server.gemini_enterprise import inspect_enterprise_credentials_offline
-
         auth = "gemini_enterprise"
-        ent_check = inspect_enterprise_credentials_offline(source)
-        if not ent_check.get("ok"):
-            err = str(ent_check.get("error") or "No human Google sign-in found.")
-            rem = str(ent_check.get("remediation") or "")
+        agy_cli_status = inspect_agy_cli_offline(source)
+        if not agy_cli_status.get("ok"):
+            err = str(agy_cli_status.get("error") or "Antigravity CLI (`agy`) sign-in is missing.")
+            rem = str(agy_cli_status.get("remediation") or "")
             issues.append(f"{err} {rem}".strip())
-    elif has_gateway or norm_auth == "gateway":
-        auth = "gateway" if has_gateway else "missing"
-        if not has_gateway:
-            issues.append("Pass `--base-url` or export `CC_AGY_VERTEX_BASE_URL` for gateway mode.")
     elif norm_auth == "api_key":
         auth = "api_key" if has_key else "missing"
         if not has_key:
             issues.append("Export `GEMINI_API_KEY` in your shell for API-key mode.")
+    elif norm_auth == "gateway":
+        auth = "gateway" if has_gateway else "missing"
+        if not has_gateway:
+            issues.append("Pass `--base-url` or export `CC_AGY_VERTEX_BASE_URL` for gateway mode.")
     elif norm_auth == "vertex":
         auth = "vertex" if has_project else "missing"
         if not has_project:
             issues.append("Pass `--project` or export `GOOGLE_CLOUD_PROJECT` for Vertex AI mode.")
+    elif explicit_proj_arg:
+        auth = "vertex"
+    elif has_gateway:
+        auth = "gateway"
     elif has_key:
         auth = "api_key"
     elif has_project:
         auth = "vertex"
+    elif _should_auto_detect_agy_cli(env if not agy_cli_path else source, source) and inspect_agy_cli_offline(source).get("ok"):
+        auth = "gemini_enterprise"
+        agy_cli_status = inspect_agy_cli_offline(source)
     else:
         auth = "missing"
         issues.append(
-            "No credentials found. Pass `--auth gemini-enterprise` (with `gcloud auth application-default login`), "
-            "export `GEMINI_API_KEY` (AI Studio), pass `--project` / export `GOOGLE_CLOUD_PROJECT` (Vertex AI), "
-            "or pass `--base-url` (AI gateway)."
+            "No credentials found. Pass `--auth gemini-enterprise` (uses the standalone `agy` CLI with your "
+            "Google sign-in), export `GEMINI_API_KEY` (AI Studio), pass `--project` / export `GOOGLE_CLOUD_PROJECT` "
+            "(Vertex AI), or pass `--base-url` (AI gateway)."
         )
-    return {"python_bin": py_bin, "auth_mode": auth, "issues": issues, "ready": not issues}
+
+    sdk_ok = python_has_plugin_sdks(py_bin)
+    if not sdk_ok and auth != "gemini_enterprise":
+        issues.append("Antigravity SDK missing. Run `python3 -m server.install` (without `--no-bootstrap`).")
+
+    out: dict[str, Any] = {"python_bin": py_bin, "auth_mode": auth, "issues": issues, "ready": not issues}
+    if agy_cli_status is not None:
+        out["agy_cli"] = {
+            "binary_found": bool(agy_cli_status.get("binary_found")),
+            "agy_bin": agy_cli_status.get("agy_bin"),
+            "auth_configured": bool(agy_cli_status.get("auth_configured")),
+            "credential_source": agy_cli_status.get("credential_source"),
+        }
+    return out
 
 
 def run_interactive_wizard(
@@ -524,6 +589,8 @@ def run_interactive_wizard(
     env: dict[str, str] | None = None,
 ) -> list[str]:
     """Ask 4 plain-English setup questions when cc-agy-install runs with no flags in a terminal."""
+    from server.agy_cli import inspect_agy_cli_offline, managed_agy_bin_dir, MANAGED_CLI_BIN_NAME
+
     source = env if env is not None else os.environ
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
@@ -531,35 +598,44 @@ def run_interactive_wizard(
     host_map = {"": "all", "1": "all", "all": "all", "both": "all", "2": "codex", "codex": "codex", "3": "claude", "claude": "claude"}
     host = host_map.get(host_raw, "all")
 
+    from server.regions import _should_auto_detect_agy_cli
+
     detected_proj = str(source.get("GOOGLE_CLOUD_PROJECT") or "").strip()
     detected_gw = str(source.get("CC_AGY_VERTEX_BASE_URL") or source.get("GOOGLE_VERTEX_BASE_URL") or "").strip()
-    detected_ent = _normalize_auth_choice(str(source.get("CC_AGY_AUTH_MODE") or "")) == "gemini_enterprise"
+    explicit_ent = _normalize_auth_choice(str(source.get("CC_AGY_AUTH_MODE") or "")) == "gemini_enterprise"
+    auto_ent = _should_auto_detect_agy_cli(env, source) and bool(inspect_agy_cli_offline(source).get("ok"))
     has_key = any(str(source.get(k) or "").strip() for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
-    default_auth_label = (
-        "gemini-enterprise"
-        if detected_ent
-        else ("gateway" if detected_gw else ("api_key" if has_key else ("vertex" if detected_proj else "api_key")))
-    )
+    if explicit_ent:
+        default_auth_label = "gemini-enterprise"
+    elif detected_gw:
+        default_auth_label = "gateway"
+    elif has_key:
+        default_auth_label = "api_key"
+    elif detected_proj:
+        default_auth_label = "vertex"
+    elif auto_ent or env is None:
+        default_auth_label = "gemini-enterprise"
+    else:
+        default_auth_label = "api_key"
     auth_raw = str(
         input_fn(
             "2. Gemini connection [1=API key in shell, 2=Google Cloud project, 3=AI gateway URL, "
-            f"4=Gemini Enterprise subscription] ({default_auth_label}): "
+            f"4=Gemini Enterprise subscription (`agy` CLI)] ({default_auth_label}): "
         )
         or ""
     ).strip().lower()
     auth_flag: str | None = None
     project: str | None = None
     base_url: str | None = None
-    if auth_raw in ("4", "gemini-enterprise", "gemini_enterprise", "enterprise") or (
+    if auth_raw in ("4", "gemini-enterprise", "gemini_enterprise", "enterprise", "agy", "agy-cli", "agy_cli") or (
         not auth_raw and default_auth_label == "gemini-enterprise"
     ):
         auth_flag = "gemini-enterprise"
-        from server.gemini_enterprise import inspect_enterprise_credentials_offline
-
-        ent_status = inspect_enterprise_credentials_offline(source)
-        if not ent_status.get("ok"):
+        ent_status = inspect_agy_cli_offline(source)
+        if not ent_status.get("auth_configured"):
+            agy_hint = ent_status.get("agy_bin") or str(managed_agy_bin_dir(source) / MANAGED_CLI_BIN_NAME)
             output_fn(
-                "   Tip: run `gcloud auth application-default login` with your Gemini Enterprise work email."
+                f"   Tip: after setup installs `agy`, run `{agy_hint}` once in a terminal to sign in with your Google work account."
             )
     elif auth_raw in ("2", "vertex", "gcp") or (not auth_raw and default_auth_label == "vertex"):
         proj_prompt = f"   Google Cloud project ID ({detected_proj}): " if detected_proj else "   Google Cloud project ID: "
@@ -617,19 +693,22 @@ def main(argv: list[str] | None = None) -> int:
         "--auth",
         choices=AUTH_CHOICES,
         default="auto",
-        help="Connection mode: 'gemini-enterprise' (included seat quota via Google sign-in), 'api-key', 'vertex', 'gateway', or 'auto'.",
+        help="Connection mode: 'gemini-enterprise' / 'agy-cli' (included seat quota via standalone `agy` CLI), 'api-key', 'vertex', 'gateway', or 'auto'.",
     )
     parser.add_argument("--profile", choices=COST_PROFILES, default="balanced",
                         help="economy: Flash only; balanced: Flash, escalating to Argon on failure; quality: Argon first.")
-    parser.add_argument("--project", default=None, help="Google Cloud project ID (optional in gemini-enterprise mode; required for pay-as-you-go Vertex AI).")
-    parser.add_argument("--location", default=None, help="Region or jurisdiction (for example 'global', 'us', 'eu', or 'us-central1').")
+    parser.add_argument("--project", default=None, help="Google Cloud project ID (required for pay-as-you-go Vertex AI).")
+    parser.add_argument("--location", default=None, help="Vertex AI region (for example 'global' or 'us-central1').")
     parser.add_argument("--base-url", default=None, help="Optional AI gateway base URL (sets CC_AGY_VERTEX_BASE_URL).")
+    parser.add_argument("--agy-cli-path", default=None, help="Optional path to an external Antigravity CLI (`agy`) binary.")
+    parser.add_argument("--install-agy-cli", action="store_true",
+                        help="Download and verify the standalone Antigravity CLI (`agy`) into ~/.local/share/cc-agy-plugin/bin.")
     parser.add_argument("--max-daily-cents", type=float, default=None,
                         help="Optional daily spend limit in US cents (for example 500 for $5.00/day).")
     parser.add_argument("--strict", action="store_true",
                         help="Enable strict orchestrator mode in Claude Code userConfig.")
     parser.add_argument("--no-bootstrap", action="store_true",
-                        help="Do not automatically create ~/.local/share/cc-agy-plugin/venv when SDKs are missing.")
+                        help="Do not automatically install ~/.local/share/cc-agy-plugin/venv or standalone `agy` CLI.")
     parser.add_argument("--name", default=DEFAULT_SERVER_NAME, help="Codex MCP server name (default: agy).")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing anything.")
@@ -644,20 +723,45 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--max-daily-cents must be a finite number greater than 0")
 
     bootstrap_info: dict[str, Any] | None = None
+    agy_cli_bootstrap: dict[str, Any] | None = None
+    norm_requested_auth = _normalize_auth_choice(args.auth)
     if not args.dry_run and not args.no_bootstrap:
-        bootstrap_info = ensure_sdk_venv(
-            PLUGIN_ROOT,
-            output_fn=None if args.json else print,
-        )
+        if norm_requested_auth == "gemini_enterprise" or args.install_agy_cli:
+            from server.agy_cli import ensure_agy_cli_installed
 
-    pre = preflight(auth_mode=args.auth, project=args.project, base_url=args.base_url)
-    if bootstrap_info and not bootstrap_info.get("ok") and bootstrap_info.get("error"):
+            boot_env = dict(os.environ)
+            if args.agy_cli_path:
+                boot_env["CC_AGY_CLI_BIN"] = args.agy_cli_path
+            agy_cli_bootstrap = ensure_agy_cli_installed(
+                PLUGIN_ROOT,
+                env=boot_env,
+                output_fn=None if args.json else print,
+            )
+        if norm_requested_auth != "gemini_enterprise":
+            bootstrap_info = ensure_sdk_venv(
+                PLUGIN_ROOT,
+                output_fn=None if args.json else print,
+            )
+
+    pre = preflight(
+        auth_mode=args.auth,
+        project=args.project,
+        base_url=args.base_url,
+        agy_cli_path=args.agy_cli_path,
+    )
+    if bootstrap_info and not bootstrap_info.get("ok") and bootstrap_info.get("error") and pre.get("auth_mode") != "gemini_enterprise":
         pre["issues"].append(str(bootstrap_info["error"]))
+        pre["ready"] = False
+    if agy_cli_bootstrap and not agy_cli_bootstrap.get("ok") and agy_cli_bootstrap.get("error"):
+        err_str = str(agy_cli_bootstrap["error"])
+        if err_str not in pre["issues"]:
+            pre["issues"].append(err_str)
         pre["ready"] = False
 
     report: dict[str, Any] = {
         "preflight": pre,
         **({"bootstrap": bootstrap_info} if bootstrap_info is not None else {}),
+        **({"agy_cli_bootstrap": agy_cli_bootstrap} if agy_cli_bootstrap is not None else {}),
         "hosts": [],
     }
     if args.host in ("codex", "all"):
@@ -669,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 dry_run=args.dry_run,
             )
@@ -682,6 +787,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 strict=args.strict,
             )

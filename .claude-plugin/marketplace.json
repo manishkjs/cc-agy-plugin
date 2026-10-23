@@ -7,7 +7,7 @@
     {
       "name": "cc-agy-plugin",
       "source": "./",
-      "description": "Delegate coding, review and research tasks to Gemini (gemini-3.8-flash and gemini-4-argon) through the Google Antigravity SDK, with isolated worker copies, test-gated diffs and signed receipts.",
+      "description": "Delegate coding, review and research tasks to Gemini (gemini-3.8-flash and gemini-4-argon) via your Gemini Enterprise subscription (`agy` CLI), Google AI Studio, or Vertex AI (`google-antigravity` SDK), with isolated worker copies, test-gated diffs and signed receipts.",
       "version": "0.3.0"
     }
   ]

@@ -1,7 +1,7 @@
 {
   "name": "cc-agy-plugin",
   "version": "0.3.0",
-  "description": "Delegate coding, batch edits, and reviews to Gemini via the Google Antigravity SDK with isolated git copies and signed receipts.",
+  "description": "Delegate coding, batch edits, and reviews to Gemini via your Gemini Enterprise subscription (agy CLI), Google AI Studio, or Vertex AI (Antigravity SDK) with isolated git copies and signed receipts.",
   "author": {
     "name": "Manish Kumar",
     "url": "https://github.com/manishkjs"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "CC Agy Plugin",
     "shortDescription": "Run Gemini coding workers safely in isolated git copies with signed receipts.",
-    "longDescription": "Delegate multi-file edits, debugging, and code reviews from Codex to Google AI Studio or Vertex AI Gemini models (gemini-3.8-flash and gemini-4-argon) via the Google Antigravity SDK.",
+    "longDescription": "Delegate multi-file edits, debugging, and code reviews from Codex to Gemini models (gemini-3.8-flash and gemini-4-argon) via your Gemini Enterprise subscription (`agy` CLI), Google AI Studio, or Vertex AI (`google-antigravity` SDK).",
     "developerName": "Manish Kumar",
     "category": "Productivity",
     "capabilities": [

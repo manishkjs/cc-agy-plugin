@@ -249,11 +249,12 @@ def test_host_node_modules_linked_only_for_plugin_checks(tmp_path: Path, monkeyp
     _commit_all(repo)
     (repo / "node_modules" / "dep").mkdir(parents=True)
     (repo / "node_modules" / "dep" / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
-    seen_by_worker: list[bool] = []
+    seen_by_worker: list[tuple[bool, bool]] = []
 
     def worker(req: dict[str, Any]) -> dict[str, Any]:
         wt = Path(req["workspace_dir"])
-        seen_by_worker.append((wt / "node_modules").exists())
+        nm_dir = wt / "node_modules"
+        seen_by_worker.append((nm_dir.is_dir(), nm_dir.is_symlink()))
         (wt / "index.txt").write_text("v2\n", encoding="utf-8")
         return {"text": "done", "usage": {"prompt_token_count": 1, "candidates_token_count": 1, "total_token_count": 2}}
 
@@ -261,9 +262,12 @@ def test_host_node_modules_linked_only_for_plugin_checks(tmp_path: Path, monkeyp
     jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
     try:
         digest = jm.delegate_start("Bump index.", project="p", wait=True, acceptance=["test -f node_modules/dep/index.js"])
+        # Also verify CC_AGY_LINK_NODE_MODULES=0 disables linking during worker execution
+        monkeypatch.setenv("CC_AGY_LINK_NODE_MODULES", "0")
+        _ = jm.delegate_start("Bump index disabled link.", project="p", wait=True)
     finally:
         jm.shutdown(wait=True)
-    assert seen_by_worker == [False]
+    assert seen_by_worker == [(True, False), (False, False)]
     assert digest["acceptance_passed"] is True
     assert digest["files_changed"] == ["index.txt"]
     assert not digest.get("scope_violations")

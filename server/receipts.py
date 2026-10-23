@@ -309,7 +309,7 @@ def _redact_obj_values(obj: Any, secrets: list[str], *, parent_key: str = "") ->
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if k in ("api_key", "CC_AGY_ENTERPRISE_ACCESS_TOKEN"):
+            if k in ("api_key", "ANTIGRAVITY_OAUTH_TOKEN", "CC_AGY_ENTERPRISE_ACCESS_TOKEN"):
                 out[k] = "<api-key>"
             else:
                 out[k] = _redact_obj_values(v, secrets, parent_key=str(k))
@@ -343,6 +343,7 @@ def redact_api_keys(
         os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN"),
+        os.environ.get("ANTIGRAVITY_OAUTH_TOKEN"),
         os.environ.get("CC_AGY_ENTERPRISE_ACCESS_TOKEN"),
     ):
         if isinstance(candidate, str):

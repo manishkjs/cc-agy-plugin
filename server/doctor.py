@@ -88,23 +88,39 @@ def run_doctor(
         issues.append(f"MCP tool catalog failed to load: {type(exc).__name__}: {exc}")
         mcp_info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    # 2. Authentication configuration (never expose raw API key values)
+    # 2. Authentication configuration (never expose raw API key or OAuth token values)
     custom_gateway = bool(resolve_vertex_base_url(env=active_env))
     auth_info: dict[str, Any]
+    agy_cli_info: dict[str, Any] | None = None
+    active_auth_mode: str | None = None
+    cli_detected_unsigned = False
+    except_agy_cli_info: dict[str, Any] | None = None
     try:
-        resolved_auth = resolve_auth_config(model=default_delegate_model, env=dict(active_env))
+        resolved_auth = resolve_auth_config(
+            model=default_delegate_model,
+            env=dict(env) if env is not None else None,
+        )
         auth_mode = str(resolved_auth.get("auth_mode") or "")
+        active_auth_mode = auth_mode
         adc_found: bool | None = None
         ent_cred_source: str | None = None
         auth_ok = True
         if auth_mode == "gemini_enterprise":
-            from server.gemini_enterprise import inspect_enterprise_credentials_offline
+            from server.agy_cli import inspect_agy_cli_offline
 
-            ent_check = inspect_enterprise_credentials_offline(active_env)
-            ent_cred_source = str(ent_check.get("credential_source") or "")
+            ent_check = inspect_agy_cli_offline(active_env)
+            ent_cred_source = str(ent_check.get("credential_source") or "") or None
+            agy_cli_info = {
+                "binary_found": bool(ent_check.get("binary_found")),
+                "agy_bin": ent_check.get("agy_bin"),
+                "managed_bin_path": ent_check.get("managed_bin_path"),
+                "auth_configured": bool(ent_check.get("auth_configured")),
+                "credential_source": ent_cred_source,
+                "config_dir": ent_check.get("config_dir"),
+            }
             if not ent_check.get("ok"):
                 auth_ok = False
-                issues.append(str(ent_check.get("error") or "Gemini Enterprise sign-in is missing."))
+                issues.append(str(ent_check.get("error") or "Gemini Enterprise `agy` CLI sign-in is missing."))
                 if ent_check.get("remediation"):
                     remediations.append(str(ent_check["remediation"]))
         elif auth_mode == "vertex":
@@ -124,13 +140,36 @@ def run_doctor(
             "custom_vertex_gateway": custom_gateway,
             **({"adc_file_found": adc_found} if adc_found is not None else {}),
             **({"enterprise_credential_source": ent_cred_source} if ent_cred_source is not None else {}),
+            **({"agy_cli": agy_cli_info} if agy_cli_info is not None else {}),
         }
     except ValueError as exc:
         issues.append(str(exc))
-        remediations.append(
-            "Run `gcloud auth application-default login` + `CC_AGY_AUTH_MODE=gemini_enterprise` "
-            "(Gemini Enterprise seat), export `GEMINI_API_KEY` (AI Studio), or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
-        )
+        try:
+            from server.agy_cli import inspect_agy_cli_offline
+            from server.regions import _should_auto_detect_agy_cli, resolve_configured_auth_mode
+
+            cfg_mode = resolve_configured_auth_mode(env=active_env)
+            if cfg_mode in (None, "gemini_enterprise") and _should_auto_detect_agy_cli(env, active_env):
+                ent_probe = inspect_agy_cli_offline(active_env)
+                if ent_probe.get("binary_found"):
+                    cli_detected_unsigned = True
+                    except_agy_cli_info = {
+                        "ok": False,
+                        "binary_found": True,
+                        "agy_bin": ent_probe.get("agy_bin"),
+                        "auth_configured": False,
+                        "credential_source": None,
+                        "config_dir": ent_probe.get("config_dir"),
+                    }
+                    if ent_probe.get("remediation"):
+                        remediations.append(str(ent_probe["remediation"]))
+        except Exception:
+            pass
+        if not cli_detected_unsigned:
+            remediations.append(
+                "Run `python3 -m server.install --auth gemini-enterprise` and sign in with `agy` "
+                "(Gemini Enterprise seat), export `GEMINI_API_KEY` (AI Studio), or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
+            )
         auth_info = {
             "ok": False,
             "auth_mode": None,
@@ -139,6 +178,7 @@ def run_doctor(
             "location": None,
             "custom_vertex_gateway": custom_gateway,
             "error": str(exc),
+            **({"agy_cli": except_agy_cli_info} if except_agy_cli_info is not None else {}),
         }
 
     # 3. Python SDK availability (check both active interpreter and resolved MCP SDK venv)
@@ -148,13 +188,24 @@ def run_doctor(
     has_genai = _module_available("google.genai") or python_has_module(sdk_py, "google.genai")
     has_agy = _module_available("google.antigravity") or python_has_module(sdk_py, "google.antigravity")
     has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")
+    cli_only_enterprise = (active_auth_mode == "gemini_enterprise") or cli_detected_unsigned
     if not has_genai:
-        issues.append("Python package `google-genai` is not installed.")
-        remediations.append("Install plugin dependencies: `python3 -m server.install`")
+        if cli_only_enterprise:
+            warnings.append(
+                "Optional Python package `google-genai` is not installed (not required in `gemini_enterprise` CLI mode)."
+            )
+        else:
+            issues.append("Python package `google-genai` is not installed.")
+            remediations.append("Install plugin dependencies: `python3 -m server.install`")
     if not has_agy:
-        issues.append("Python package `google-antigravity` is not installed.")
-        remediations.append("Install Antigravity SDK: `python3 -m server.install`")
-    if not has_ctx:
+        if cli_only_enterprise:
+            warnings.append(
+                "Optional Python package `google-antigravity` is not installed (not required in `gemini_enterprise` CLI mode)."
+            )
+        else:
+            issues.append("Python package `google-antigravity` is not installed.")
+            remediations.append("Install Antigravity SDK: `python3 -m server.install`")
+    if not has_ctx and not cli_only_enterprise:
         warnings.append(
             "Optional `ctx-harness` (Straitjacket) package is not installed; worker shell output containment will fall back to raw Antigravity tools."
         )

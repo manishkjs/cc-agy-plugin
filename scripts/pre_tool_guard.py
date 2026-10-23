@@ -292,46 +292,296 @@ def _count_line_code_statements(line: str, unwrapped: str, is_indented_code: boo
     return 0
 
 
+_DATA_FENCE_LANGS = frozenset(
+    {
+        "json",
+        "jsonc",
+        "json5",
+        "yaml",
+        "yml",
+        "toml",
+        "xml",
+        "html",
+        "csv",
+        "tsv",
+        "ini",
+        "env",
+        "dotenv",
+        "graphql",
+        "gql",
+        "proto",
+        "protobuf",
+    }
+)
+_SQL_FENCE_LANGS = frozenset({"sql", "ddl", "postgres", "postgresql", "mysql", "sqlite"})
+
+_IMPERATIVE_CODE_GUARD_RE = re.compile(
+    r"^\s*(?:"
+    r"def\s+\w+\s*\(|"
+    r"async\s+def\s+\w+\s*\(|"
+    r"class\s+\w+[:\(]|"
+    r"import\s+[\w\.]+|"
+    r"from\s+[\w\.]+\s+import\s+|"
+    r"return\b|yield\b|raise\b|assert\b|"
+    r"if\s+.+:\s*$|elif\s+.+:\s*$|else:\s*$|"
+    r"for\s+.+\s+in\s+.+:\s*$|while\s+.+:\s*$|"
+    r"try:\s*$|except\b.*:\s*$|finally:\s*$|with\s+.+:\s*$|"
+    r"(?:const|let|var|function|func|fn|impl)\s+\w+|"
+    r"export\s+(?:default\s+)?(?:function|class|const)\s+"
+    r")"
+)
+_JSON_STRUCT_OR_KV_RE = re.compile(
+    r'^\s*(?:[\{\}\[\]],?|"(?:\\.|[^"\\])*"\s*:.*|"(?:\\.|[^"\\])*"\s*,?|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*,?|(?:true|false|null)\s*,?|//.*|\.\.\.)\s*$'
+)
+_YAML_KV_OR_ITEM_RE = re.compile(
+    r"""^\s*(?:---\s*$|\.\.\.\s*$|#.*|-\s+\S.*|-\s*$|[A-Za-z0-9_."'/+-]+\s*:(?:\s+.*|\s*$))$"""
+)
+_SQL_DDL_START_RE = re.compile(
+    r"\b(?:CREATE\s+(?:TEMP(?:ORARY)?\s+)?(?:UNIQUE\s+)?(?:TABLE|INDEX|VIEW|SCHEMA|TYPE|DOMAIN)\b|ALTER\s+TABLE\b)",
+    re.I,
+)
+_SQL_PROCEDURAL_RE = re.compile(
+    r"\b(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER)\b|LANGUAGE\s+plpgsql\b|DECLARE\b|\bBEGIN\b|\bLOOP\b)",
+    re.I,
+)
+_PY_TB_HEADER_RE = re.compile(
+    r"^\s*(?:Traceback \(most recent call last\):|During handling of the above exception.*:|The above exception was the direct cause.*:)\s*$"
+)
+_PY_TB_FRAME_RE = re.compile(r'^\s*File "[^"]+", line \d+(?:, in \S+)?\s*$')
+_PY_TB_CARET_RE = re.compile(r"^\s*[\^~]+\s*$")
+_PY_TB_EXC_RE = re.compile(
+    r"^\s*[A-Za-z_][\w\.]*(?:Error|Exception|Warning|Exit|Interrupt|Fault|Failure)(?::.*|\s*)$"
+)
+_JS_GO_TB_FRAME_RE = re.compile(
+    r"^\s*(?:at\s+\S+.*\(.*:\d+:\d+\)|at\s+[^\s()]+:\d+:\d+|goroutine\s+\d+\s+\[.*?\]:|\S+\.go:\d+\b)"
+)
+
+
+def _is_traceback_lines(raw_lines: list[str]) -> bool:
+    """Return True if `raw_lines` form a Python/JS/Go stack trace rather than dictated source code."""
+    non_empty = [
+        _BLOCKQUOTE_PREFIX_RE.sub("", ln.strip(), count=1).strip()
+        for ln in raw_lines
+        if _BLOCKQUOTE_PREFIX_RE.sub("", ln.strip(), count=1).strip()
+    ]
+    if not non_empty:
+        return False
+    frame_hits = sum(
+        1 for ln in non_empty if _PY_TB_FRAME_RE.match(ln) or _JS_GO_TB_FRAME_RE.match(ln)
+    )
+    if frame_hits == 0:
+        return False
+    echo_budget = 0
+    unaccounted = 0
+    for ln in non_empty:
+        if _PY_TB_HEADER_RE.match(ln):
+            echo_budget = 0
+            continue
+        if _PY_TB_FRAME_RE.match(ln) or _JS_GO_TB_FRAME_RE.match(ln):
+            echo_budget = 1
+            continue
+        if _PY_TB_CARET_RE.match(ln) or _PY_TB_EXC_RE.match(ln):
+            continue
+        if echo_budget > 0:
+            echo_budget -= 1
+            continue
+        unaccounted += 1
+    return unaccounted <= 1
+
+
+def _is_declarative_fence_block(fence_lang: str, raw_lines: list[str]) -> bool:
+    """Return True if a fenced block is declarative data/schema or a stack trace (with zero smuggled code)."""
+    if _is_traceback_lines(raw_lines):
+        return True
+    cleaned = [_BLOCKQUOTE_PREFIX_RE.sub("", ln, count=1) for ln in raw_lines]
+    non_empty = [ln for ln in cleaned if ln.strip()]
+    if not non_empty:
+        return True
+    if any(_IMPERATIVE_CODE_GUARD_RE.match(ln) for ln in non_empty):
+        return False
+    joined = "\n".join(cleaned).strip()
+    if joined.startswith(("{", "[")):
+        try:
+            json.loads(joined)
+            return True
+        except Exception:
+            pass
+    lang = fence_lang.lower().strip()
+    if lang in ("json", "jsonc", "json5"):
+        return all(_JSON_STRUCT_OR_KV_RE.match(ln) for ln in non_empty)
+    if lang in ("yaml", "yml"):
+        return all(_YAML_KV_OR_ITEM_RE.match(ln) for ln in non_empty)
+    if lang in _DATA_FENCE_LANGS:
+        return True
+    if lang in _SQL_FENCE_LANGS:
+        return bool(_SQL_DDL_START_RE.search(joined)) and not bool(_SQL_PROCEDURAL_RE.search(joined))
+    return False
+
+
+def _find_unfenced_declarative_line_indices(lines: list[str]) -> set[int]:
+    """Identify line indices belonging to valid unfenced JSON fixtures or stack traces."""
+    exempt: set[int] = set()
+    in_fence = False
+    fence_marker = ""
+    unfenced_indices: list[int] = []
+    for idx, line in enumerate(lines):
+        ufc = _BLOCKQUOTE_PREFIX_RE.sub("", line.strip(), count=1).strip()
+        if ufc.startswith("```") or ufc.startswith("~~~"):
+            mk = ufc[:3]
+            if in_fence and mk == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            elif not in_fence:
+                in_fence = True
+                fence_marker = mk
+            continue
+        if not in_fence:
+            unfenced_indices.append(idx)
+
+    # 1. Unfenced JSON object/array blocks
+    pos = 0
+    while pos < len(unfenced_indices):
+        line_idx = unfenced_indices[pos]
+        raw_s = _BLOCKQUOTE_PREFIX_RE.sub("", lines[line_idx], count=1).strip()
+        if raw_s.startswith(("{", "[")):
+            depth = 0
+            in_str = False
+            esc = False
+            block_idxs: list[int] = []
+            valid_scan = True
+            for scan_pos in range(pos, len(unfenced_indices)):
+                s_idx = unfenced_indices[scan_pos]
+                if block_idxs and s_idx != block_idxs[-1] + 1:
+                    valid_scan = False
+                    break
+                s_line = _BLOCKQUOTE_PREFIX_RE.sub("", lines[s_idx], count=1)
+                if _IMPERATIVE_CODE_GUARD_RE.match(s_line):
+                    valid_scan = False
+                    break
+                block_idxs.append(s_idx)
+                for ch in s_line:
+                    if esc:
+                        esc = False
+                        continue
+                    if ch == "\\" and in_str:
+                        esc = True
+                        continue
+                    if ch == '"':
+                        in_str = not in_str
+                        continue
+                    if not in_str:
+                        if ch in ("{", "["):
+                            depth += 1
+                        elif ch in ("}", "]"):
+                            depth -= 1
+                if depth == 0 and block_idxs:
+                    break
+            if valid_scan and depth == 0 and len(block_idxs) >= 2:
+                candidate_txt = "\n".join(_BLOCKQUOTE_PREFIX_RE.sub("", lines[k], count=1) for k in block_idxs)
+                non_empty_b = [ln for ln in candidate_txt.splitlines() if ln.strip()]
+                parsed_ok = False
+                try:
+                    json.loads(candidate_txt)
+                    parsed_ok = True
+                except Exception:
+                    parsed_ok = all(_JSON_STRUCT_OR_KV_RE.match(ln) for ln in non_empty_b)
+                if parsed_ok:
+                    exempt.update(block_idxs)
+                    pos += len(block_idxs)
+                    continue
+        pos += 1
+
+    # 2. Unfenced stack trace lines
+    in_tb = False
+    echo_budget = 0
+    for line_idx in unfenced_indices:
+        unwrapped, _ = _unwrap_markdown_code_line(lines[line_idx])
+        stripped_u = unwrapped.strip()
+        if not stripped_u:
+            in_tb = False
+            echo_budget = 0
+            continue
+        if _PY_TB_HEADER_RE.match(stripped_u):
+            in_tb = True
+            echo_budget = 0
+            exempt.add(line_idx)
+            continue
+        if _PY_TB_FRAME_RE.match(stripped_u) or _JS_GO_TB_FRAME_RE.match(stripped_u):
+            in_tb = True
+            echo_budget = 1
+            exempt.add(line_idx)
+            continue
+        if in_tb and _PY_TB_CARET_RE.match(stripped_u):
+            exempt.add(line_idx)
+            continue
+        if in_tb and echo_budget > 0:
+            echo_budget -= 1
+            exempt.add(line_idx)
+            continue
+        if in_tb and _PY_TB_EXC_RE.match(stripped_u):
+            exempt.add(line_idx)
+            in_tb = False
+            echo_budget = 0
+            continue
+        in_tb = False
+        echo_budget = 0
+
+    return exempt
+
+
 def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8) -> dict[str, Any]:
     """Detect whether a delegation prompt dictates >= 9 consecutive lines/statements of code.
 
     Checks fenced code blocks (``` or ~~~), unfenced consecutive code-like or 4-space indented
     code lines, and semicolon-packed multi-statement code lines in plan/checklist items, while
-    allowing concise 1-line inline API invariants (e.g. `self.records.clear()`).
+    allowing concise 1-line inline API invariants (e.g. `self.records.clear()`), declarative
+    JSON/YAML/SQL-DDL schemas, and runtime stack traces.
     Interleaved comments inside a code run do not reset the consecutive code counter.
     """
     lines = prompt_text.splitlines()
+    exempt_unfenced = _find_unfenced_declarative_line_indices(lines)
     in_fence = False
     fence_marker = ""
+    fence_lang = ""
+    fence_lines: list[str] = []
     fence_run = 0
     max_fence_run = 0
     code_run = 0
     max_code_run = 0
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         unwrapped_fence_check = _BLOCKQUOTE_PREFIX_RE.sub("", stripped, count=1).strip()
         if unwrapped_fence_check.startswith("```") or unwrapped_fence_check.startswith("~~~"):
             marker = unwrapped_fence_check[:3]
             if in_fence and marker == fence_marker:
-                if fence_run > max_fence_run:
-                    max_fence_run = fence_run
+                if not _is_declarative_fence_block(fence_lang, fence_lines):
+                    if fence_run > max_fence_run:
+                        max_fence_run = fence_run
                 fence_run = 0
+                fence_lines = []
+                fence_lang = ""
                 in_fence = False
                 fence_marker = ""
                 continue
             elif not in_fence:
                 in_fence = True
                 fence_marker = marker
+                info = unwrapped_fence_check[3:].strip()
+                fence_lang = info.split()[0].lower() if info else ""
+                fence_lines = []
                 fence_run = 0
                 continue
 
         if in_fence:
+            fence_lines.append(line)
             if unwrapped_fence_check:
                 stmt_n = _count_line_code_statements(line, unwrapped_fence_check, True)
                 fence_run += max(1, stmt_n)
-                if fence_run > max_fence_run:
-                    max_fence_run = fence_run
+            continue
+
+        if idx in exempt_unfenced:
+            code_run = 0
             continue
 
         if stripped == "" or unwrapped_fence_check == "":
@@ -354,7 +604,7 @@ def lint_delegation_prompt(prompt_text: str, max_consecutive_code_lines: int = 8
         else:
             code_run = 0
 
-    if in_fence and fence_run > max_fence_run:
+    if in_fence and not _is_declarative_fence_block(fence_lang, fence_lines) and fence_run > max_fence_run:
         max_fence_run = fence_run
 
     worst_run = max(max_fence_run, max_code_run)
@@ -424,11 +674,13 @@ def repair_dictated_prompt(
         }
 
     lines = prompt_text.splitlines()
+    exempt_unfenced = _find_unfenced_declarative_line_indices(lines)
     out_lines: list[str] = []
     snippet_paths: list[str] = []
 
     in_fence = False
     fence_marker = ""
+    fence_lang = ""
     fence_open_line = ""
     fence_body: list[str] = []
     fence_nonempty = 0
@@ -454,13 +706,15 @@ def repair_dictated_prompt(
         unfenced_buf = []
         unfenced_code_count = 0
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         unwrapped_fence_check = _BLOCKQUOTE_PREFIX_RE.sub("", stripped, count=1).strip()
         if unwrapped_fence_check.startswith("```") or unwrapped_fence_check.startswith("~~~"):
             marker = unwrapped_fence_check[:3]
             if in_fence and marker == fence_marker:
-                if fence_nonempty > max_consecutive_code_lines:
+                if fence_nonempty > max_consecutive_code_lines and not _is_declarative_fence_block(
+                    fence_lang, fence_body
+                ):
                     collapsed = _collapse_code_lines_run(
                         fence_body,
                         max_consecutive_code_lines=max_consecutive_code_lines,
@@ -476,6 +730,7 @@ def repair_dictated_prompt(
                     out_lines.append(line)
                 in_fence = False
                 fence_marker = ""
+                fence_lang = ""
                 fence_open_line = ""
                 fence_body = []
                 fence_nonempty = 0
@@ -484,6 +739,8 @@ def repair_dictated_prompt(
                 _flush_unfenced()
                 in_fence = True
                 fence_marker = marker
+                info = unwrapped_fence_check[3:].strip()
+                fence_lang = info.split()[0].lower() if info else ""
                 fence_open_line = line
                 fence_body = []
                 fence_nonempty = 0
@@ -493,6 +750,11 @@ def repair_dictated_prompt(
             fence_body.append(line)
             if unwrapped_fence_check:
                 fence_nonempty += 1
+            continue
+
+        if idx in exempt_unfenced:
+            _flush_unfenced()
+            out_lines.append(line)
             continue
 
         if stripped == "" or unwrapped_fence_check == "":
@@ -3118,7 +3380,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
                         "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
                         "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
-                        "immediately — the worker has full repository and test access in its worktree."
+                        "immediately; the worker has full repository and test access in its worktree."
                     )
                     if tool_name == "Read" and tool_input.get("file_path"):
                         try:
@@ -3304,7 +3566,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         "delegation mode (including Bash file/diff inspection commands). Do NOT read more files on "
                         "the Lead orchestrator. Call delegate_start (with wait=true and a concise prompt <500 words; "
                         "preload_files=true and auto_apply=true are enabled automatically), delegate_continue, "
-                        "get_diff, or delegate_apply immediately — the worker has full repository and test access."
+                        "get_diff, or delegate_apply immediately; the worker has full repository and test access."
                     )
                     if file_targets:
                         try:

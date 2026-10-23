@@ -40,6 +40,13 @@ def _sanitize_server_sys_path() -> None:
 _sanitize_server_sys_path()
 
 
+def _safe_has_spec(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
 def _maybe_reexec_into_sdk_venv() -> None:
     """Re-exec into CC_AGY_PYTHON_BIN, managed user venv, or sibling .venv if google-antigravity is missing."""
     if os.environ.get("_CC_AGY_REEXEC") == "1":
@@ -61,7 +68,37 @@ def _maybe_reexec_into_sdk_venv() -> None:
             os.execv(str(target), [str(target), *sys.argv])
         return
 
-    if importlib.util.find_spec("google.antigravity") is not None and importlib.util.find_spec("google.genai") is not None:
+    # When running on a Gemini Enterprise subscription via the standalone `agy` CLI,
+    # the MCP server uses pure Python stdlib and does not need PyPI SDK wheels on startup.
+    try:
+        from server.regions import resolve_auth_config
+
+        if resolve_auth_config().get("auth_mode") == "gemini_enterprise":
+            return
+    except Exception:
+        try:
+            from server.agy_cli import inspect_agy_cli_offline
+            from server.regions import (
+                _resolve_explicit_project_only,
+                _should_auto_detect_agy_cli,
+                resolve_api_key,
+                resolve_configured_auth_mode,
+                resolve_vertex_base_url,
+            )
+
+            if (
+                resolve_configured_auth_mode() in (None, "gemini_enterprise")
+                and not resolve_api_key()
+                and not _resolve_explicit_project_only()
+                and not resolve_vertex_base_url()
+                and _should_auto_detect_agy_cli(None, os.environ)
+                and inspect_agy_cli_offline().get("binary_found")
+            ):
+                return
+        except Exception:
+            pass
+
+    if _safe_has_spec("google.antigravity") and _safe_has_spec("google.genai"):
         return
 
     resolved = resolve_sdk_python(PLUGIN_ROOT)
@@ -88,7 +125,6 @@ _maybe_reexec_into_sdk_venv()
 import atexit  # noqa: E402
 import signal  # noqa: E402
 
-from server.gemini_enterprise import stop_enterprise_proxy  # noqa: E402
 from server.mcp_stdio import MCPServer, serve_stdio  # noqa: E402
 
 
@@ -107,10 +143,6 @@ def main() -> int:
             pass
         try:
             server.job_manager.shutdown(wait=False)
-        except Exception:
-            pass
-        try:
-            stop_enterprise_proxy()
         except Exception:
             pass
 

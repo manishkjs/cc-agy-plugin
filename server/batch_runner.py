@@ -457,20 +457,30 @@ class FileBatchRunner:
             if self.progress is not None:
                 self.progress(done, len(plan.tasks), f"{task.task_id}: {state}")
 
-        try:
-            run_task_graph(list(plan.tasks), run_one, max_parallel=settings.max_parallel, on_settle=on_settle,
-                           warm_first=bool(cache_name) or settings.claude_writer, stop=self.stop)
-        finally:
-            if cache_name:
-                self.cache_cleanup(auth, cache_name)
+        from server.jobs import link_host_node_modules_farm, unlink_host_node_modules_farm
 
-        acceptance_cmds = list(plan.acceptance) + list(extra_acceptance or [])
-        acceptance_results: list[dict[str, Any]] = []
-        any_done = any(r.state in DONE_STATES for r in records.values())
-        if acceptance_cmds and any_done and not auth_error:
-            acceptance_results = [r.as_dict() for r in run_commands(
-                acceptance_cmds, wt, timeout=max(settings.check_timeout, 600.0), stop_on_failure=False, log_dir=log_dir)]
-        acceptance_passed = all(r["passed"] for r in acceptance_results) if acceptance_results else None
+        nm_links = (
+            link_host_node_modules_farm(self.root, wt)
+            if os.environ.get("CC_AGY_LINK_NODE_MODULES", "1").strip().lower() not in ("0", "false", "no", "off")
+            else []
+        )
+        try:
+            try:
+                run_task_graph(list(plan.tasks), run_one, max_parallel=settings.max_parallel, on_settle=on_settle,
+                               warm_first=bool(cache_name) or settings.claude_writer, stop=self.stop)
+            finally:
+                if cache_name:
+                    self.cache_cleanup(auth, cache_name)
+
+            acceptance_cmds = list(plan.acceptance) + list(extra_acceptance or [])
+            acceptance_results: list[dict[str, Any]] = []
+            any_done = any(r.state in DONE_STATES for r in records.values())
+            if acceptance_cmds and any_done and not auth_error:
+                acceptance_results = [r.as_dict() for r in run_commands(
+                    acceptance_cmds, wt, timeout=max(settings.check_timeout, 600.0), stop_on_failure=False, log_dir=log_dir)]
+            acceptance_passed = all(r["passed"] for r in acceptance_results) if acceptance_results else None
+        finally:
+            unlink_host_node_modules_farm(nm_links)
 
         return self._finish(
             job_id=job_id, wt=wt, baseline_sha=baseline_sha, baseline_hashes=baseline_hashes, plan=plan,
@@ -682,8 +692,8 @@ def probe_writers(settings: BatchSettings, auth: dict[str, Any], *, writer_facto
                 fix = "Check GEMINI_API_KEY / userConfig.gemini_api_key."
             elif auth.get("auth_mode") == "gemini_enterprise":
                 fix = (
-                    "Run `gcloud auth application-default login` with your Gemini Enterprise licensed "
-                    "work email (API keys and service accounts cannot use seat quota)."
+                    "Run `~/.local/share/cc-agy-plugin/bin/agy` once in a terminal to sign in with your "
+                    "Gemini Enterprise Google account (or set `ANTIGRAVITY_OAUTH_TOKEN`)."
                 )
             else:
                 fix = f"Run `gcloud auth application-default login` and enable Vertex AI on project {auth.get('project')!r}."
@@ -691,7 +701,16 @@ def probe_writers(settings: BatchSettings, auth: dict[str, Any], *, writer_facto
                 fix = "Run `claude` once to sign in, or set ANTHROPIC_API_KEY."
             row.update(state="fail", error=str(exc), fix=fix)
         except WriterConfigError as exc:
-            row.update(state="fail", error=str(exc), fix="Check the `claude` CLI (2.1+) and that `claude -p` runs in a terminal.")
+            if name == "claude":
+                cfg_fix = "Check the `claude` CLI (2.1+) and that `claude -p` runs in a terminal."
+            elif auth.get("auth_mode") == "gemini_enterprise":
+                cfg_fix = (
+                    "Run `python3 -m server.install --auth gemini-enterprise` "
+                    "(or `bash scripts/install_agy_cli.sh`) to install the external `agy` CLI."
+                )
+            else:
+                cfg_fix = str(exc)
+            row.update(state="fail", error=str(exc), fix=cfg_fix)
         except WriterTransportError as exc:
             row.update(state="warn", error=str(exc), fix="Vendor busy or rate limited; batches will wait and retry.")
         except Exception as exc:  # noqa: BLE001 - report anything else as a failed probe with its type

@@ -45,42 +45,22 @@ def _close_genai_client(client: Any) -> None:
 
 
 def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
-    """Invoke Gemini Enterprise, Google AI Studio, or Vertex AI via the official google-genai SDK."""
+    """Invoke Gemini Enterprise (`agy` CLI), Google AI Studio, or Vertex AI."""
+    sanitize_placeholder_env()
+    if request.get("auth_mode") == "gemini_enterprise":
+        from server.agy_cli import run_agy_cli_ask
+
+        return run_agy_cli_ask(request)
+
     from google import genai
     from google.genai import types as genai_types
     from google.oauth2.credentials import Credentials as OAuth2Credentials
 
-    sanitize_placeholder_env()
     timeout_ms = int(request.get("timeout_ms") or 600_000)
     vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
-    ent_meta: dict[str, Any] = {}
     if request.get("api_key"):
         http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(api_key=request["api_key"], http_options=http_opts)
-    elif request.get("auth_mode") == "gemini_enterprise":
-        from server.gemini_enterprise import prepare_enterprise_endpoint
-
-        ep = prepare_enterprise_endpoint(request)
-        ent_meta = {
-            "vertex_project": ep["project"],
-            "vertex_location": ep["location"],
-            "reroute_note": ep.get("reroute_note"),
-        }
-        http_opts = genai_types.HttpOptions(
-            timeout=timeout_ms,
-            base_url=ep["base_url"],
-            headers=ep["headers"],
-            client_args={"follow_redirects": False},
-        )
-        client = genai.Client(
-            vertexai=True,
-            project=ep["project"],
-            location=ep["location"],
-            credentials=OAuth2Credentials(token="proxy-local"),
-            http_options=http_opts,
-        )
-        if getattr(client, "_api_client", None) is not None:
-            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
     elif vertex_base_url:
         gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
         gw_http_kwargs: dict[str, Any] = {
@@ -144,7 +124,6 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
         return {
             "text": getattr(response, "text", "") or "",
             "usage": usage,
-            **ent_meta,
         }
     finally:
         _close_genai_client(client)

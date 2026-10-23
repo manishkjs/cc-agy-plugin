@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-278%20passing-1e8e3e)](tests/)
+[![Tests](https://img.shields.io/badge/tests-296%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Codex%20%7C%20Antigravity-f9ab00)](#quick-start)
 
@@ -16,7 +16,7 @@
 
 ## Why use it
 
-You already work inside **Claude Code** or **Codex**. Installing `cc-agy-plugin` connects your coding agent to **Gemini 3.8 Flash** and **Gemini 4 Argon** through the Google Antigravity SDK without changing how you type prompts or review diffs.
+You already work inside **Claude Code** or **Codex**. Installing `cc-agy-plugin` connects your coding agent to **Gemini 3.8 Flash** and **Gemini 4 Argon** without changing how you type prompts or review diffs. Based on how you connect, the plugin automatically uses the standalone **Antigravity CLI (`agy`)** for included **Gemini Enterprise** seats or the **Google Antigravity Python SDK** for **AI Studio** and **Vertex AI**.
 
 Your main agent stays in charge of planning and code review. When files need to be written, refactored, or debugged, it hands a short brief to a Gemini worker inside a separate git copy of your repo. The plugin checks that your code compiles and passes tests, merges only verified changes back into your workspace, and writes a signed cost receipt with a one-call undo.
 
@@ -45,7 +45,7 @@ Click the preview below to open the **3m 55s voiced 3D walkthrough** ([`assets/w
 
 ## Quick start
 
-Setup takes about a minute in a normal terminal shell. The installer automatically creates an isolated Python environment at `~/.local/share/cc-agy-plugin/venv`, so you never hit `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, or macOS Homebrew, and secrets are never written to config files.
+Setup takes about a minute in a normal terminal shell. The installer automatically sets up either the standalone Antigravity CLI (`~/.local/share/cc-agy-plugin/bin/agy`) for Gemini Enterprise seats or an isolated Python environment (`~/.local/share/cc-agy-plugin/venv`) for AI Studio and Vertex AI, so you never hit `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, or macOS Homebrew, and secrets are never written to config files.
 
 ### 1. Clone the repository
 
@@ -53,47 +53,38 @@ Setup takes about a minute in a normal terminal shell. The installer automatical
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
 ```
 
-### 2. Sign in or set a key (pick one)
+### 2. Install for Claude Code or Codex (pick your connection)
 
+Run one of the commands below in a normal terminal shell (or run `python3 -m server.install` with no flags for a 4-question interactive wizard):
+
+**Option A: Gemini Enterprise work subscription (uses your included monthly seat)**
 ```bash
-# Option A: Gemini Enterprise work subscription (uses your included monthly seat capacity)
-gcloud auth application-default login
+# Install for Claude Code (or pass --host codex) and download ~/.local/share/cc-agy-plugin/bin/agy:
+python3 -m server.install --host claude --auth gemini-enterprise
 
-# Option B: Google AI Studio API key (fastest personal setup, pay-as-you-go)
+# Sign in once in a terminal with your work Google account (then type /exit or Ctrl+C):
+~/.local/share/cc-agy-plugin/bin/agy
+```
+
+**Option B: Google AI Studio API key (fastest personal setup, pay-as-you-go)**
+```bash
 export GEMINI_API_KEY="your-key"
+python3 -m server.install --host claude   # or --host codex
+```
 
-# Option C: Google Cloud Vertex AI project (pay-as-you-go)
+**Option C: Google Cloud Vertex AI project (pay-as-you-go)**
+```bash
 gcloud auth application-default login
 export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
+python3 -m server.install --host claude   # or --host codex
 ```
 
 > [!TIP]
-> **Using a Gemini Enterprise Standard or Plus license?** Sign in with your human work email (`Option A`) and pass `--auth gemini-enterprise` in Step 3. API keys and Service Account JSON keys belong to a cloud project rather than a human seat, so Google always bills them pay-as-you-go instead of drawing from your included subscription capacity.
+> **Automatic SDK vs CLI routing:** You only deploy the plugin once. Google's Cloud Code server guardrail permits Gemini Enterprise business OAuth seats on the standalone Antigravity CLI (`agy`) while rejecting direct SDK traffic (`"The Antigravity SDK is not available on an enterprise account. Use a Vertex AI API key instead."`). When you pass `--auth gemini-enterprise` (or leave `--auth auto` with `agy` signed in and no API key or GCP project set), the plugin runs workers, `ask_gemini`, and batch writers through `agy`. When an AI Studio key, Vertex AI project, or corporate gateway URL is set, the plugin uses the Python SDK automatically.
 
-### 3. Register with Claude Code or Codex
-
-Run **Path A** or **Path B** in a normal terminal shell (or run `python3 -m server.install` with no flags for a 4-question interactive wizard):
-
-**Path A: Claude Code**
-```bash
-# With a Gemini Enterprise subscription:
-python3 -m server.install --host claude --auth gemini-enterprise
-
-# Or with an AI Studio API key / Vertex AI project:
-python3 -m server.install --host claude
-```
 If `claude` is already open in another terminal tab, run `/reload-plugins` inside that session (or restart with `claude --continue`), or prefix shell commands inside Claude Code with `!`.
 
-**Path B: OpenAI Codex**
-```bash
-# With a Gemini Enterprise subscription:
-python3 -m server.install --host codex --auth gemini-enterprise
-
-# Or with an AI Studio API key / Vertex AI project:
-python3 -m server.install --host codex
-```
-
-### 4. Verify your setup (free, 0 tokens)
+### 3. Verify your setup (free, 0 tokens)
 
 - **In Claude Code:** type `/cc-agy-plugin:doctor`
 - **In Codex:** start `codex` in your project and ask: `"Run doctor to verify my Gemini setup."`
@@ -135,12 +126,12 @@ Every worker digest reports a `verification` mode so you always know how changes
 
 ### Gemini Enterprise subscription vs API keys and Service Accounts
 
-| How you connect | Uses included Enterprise seat? | How Google bills it | When to use |
-|:--|:--:|:--|:--|
-| **Gemini Enterprise sign-in** (`gcloud auth application-default login` + `--auth gemini-enterprise`) | **Yes** | Included in your monthly Gemini Enterprise Standard or Plus seat (`businessaicode.googleapis.com`) | Developers whose company assigns Gemini Enterprise seats to their work email. Automatically detects your licensed project and jurisdiction (`global`, `us`, or `eu`). |
-| **AI Studio API key** (`GEMINI_API_KEY`) | No | Pay-as-you-go per token on AI Studio | Individual developers without Google Cloud or an enterprise seat. |
-| **Vertex AI user or Service Account** (`GOOGLE_CLOUD_PROJECT` / `GOOGLE_APPLICATION_CREDENTIALS`) | No | Pay-as-you-go per token on your GCP billing account (`aiplatform.googleapis.com`) | Headless CI/CD pipelines, shared cloud workloads, or teams paying per token on GCP. |
-| **Corporate AI gateway** (`--base-url` / `CC_AGY_VERTEX_BASE_URL`) | Depends on gateway | Managed by your company's gateway (`LiteLLM`, `Portkey`, `Bifrost`, or Apigee) | Enterprises routing model traffic through a central proxy or virtual key. |
+| How you connect | Backend used | Uses included Enterprise seat? | How Google bills it | When to use |
+|:--|:--:|:--:|:--|:--|
+| **Gemini Enterprise sign-in** (`--auth gemini-enterprise` + one-time `agy` sign-in) | Standalone `agy` CLI | **Yes** | Included in your monthly Gemini Enterprise Standard or Plus seat | Developers whose company assigns Gemini Enterprise seats to their work email. Installer downloads and SHA-512 verifies `~/.local/share/cc-agy-plugin/bin/agy`. |
+| **AI Studio API key** (`GEMINI_API_KEY`) | Python SDK (`google-antigravity` + `google-genai`) | No | Pay-as-you-go per token on AI Studio | Individual developers without Google Cloud or an enterprise seat. |
+| **Vertex AI user or Service Account** (`GOOGLE_CLOUD_PROJECT` / `GOOGLE_APPLICATION_CREDENTIALS`) | Python SDK (`google-antigravity` + `google-genai`) | No | Pay-as-you-go per token on your GCP billing account (`aiplatform.googleapis.com`) | Headless CI/CD pipelines, shared cloud workloads, or teams paying per token on GCP. |
+| **Corporate AI gateway** (`--base-url` / `CC_AGY_VERTEX_BASE_URL`) | Python SDK (`google-antigravity` + `google-genai`) | Depends on gateway | Managed by your company's gateway (`LiteLLM`, `Portkey`, `Bifrost`, or Apigee) | Enterprises routing model traffic through a central proxy or virtual key. |
 
 ### Model and cost profiles (`--profile` or `CC_AGY_COST_PROFILE`)
 
@@ -154,14 +145,15 @@ Every worker digest reports a `verification` mode so you always know how changes
 
 | Option | CLI flag / Environment variable / `userConfig` | Default | What it controls |
 |:--|:--|:--|:--|
-| **Target coding tool** | `python3 -m server.install --host codex\|claude\|all` | `all` | Registers the MCP server and routing skill for Codex, Claude Code, or both (forwards `--auth`, `--profile`, `--project`, `--location`, `--base-url`, `--max-daily-cents`, and `--strict` directly to both hosts). |
-| **Connection mode** | `--auth gemini-enterprise\|api-key\|vertex\|gateway\|auto`, `CC_AGY_AUTH_MODE`, or `userConfig.auth_mode` | `auto` | Set `gemini-enterprise` (`CC_AGY_AUTH_MODE=gemini_enterprise`) to consume your included Gemini Enterprise seat via human Google sign-in instead of pay-as-you-go billing. |
+| **Target coding tool** | `python3 -m server.install --host codex\|claude\|all` | `all` | Registers the MCP server and routing skill for Codex, Claude Code, or both (forwards `--auth`, `--agy-cli-path`, `--profile`, `--project`, `--location`, `--base-url`, `--max-daily-cents`, and `--strict` directly to both hosts). |
+| **Connection mode** | `--auth gemini-enterprise\|agy-cli\|api-key\|vertex\|gateway\|auto`, `CC_AGY_AUTH_MODE`, or `userConfig.auth_mode` | `auto` | Set `gemini-enterprise` (`CC_AGY_AUTH_MODE=gemini_enterprise`) to use your included Gemini Enterprise seat through the standalone `agy` CLI. In `auto` mode, falls back to signed-in `agy` when no API key, Vertex project, or gateway is set. |
+| **Antigravity CLI path** | `--agy-cli-path`, `--install-agy-cli`, `CC_AGY_CLI_BIN`, or `userConfig.agy_cli_path` | `~/.local/share/cc-agy-plugin/bin/agy` (or `agy` on `PATH`) | Path to the external Antigravity CLI binary used in `gemini_enterprise` mode (automatically skips Google-internal `jetski` builds). |
 | **AI Studio key** | `GEMINI_API_KEY` or `userConfig.gemini_api_key` | read from shell | Connects directly through Google AI Studio with no Google Cloud setup. |
-| **Google Cloud project** | `--project`, `GOOGLE_CLOUD_PROJECT`, or `userConfig.google_cloud_project` | auto-detected on Enterprise; required on Vertex | Optional on Gemini Enterprise (auto-selected from your active license, or used for license self-assignment); required for pay-as-you-go Vertex AI. |
+| **Google Cloud project** | `--project`, `GOOGLE_CLOUD_PROJECT`, or `userConfig.google_cloud_project` | unset (required on Vertex) | Required for pay-as-you-go Vertex AI (`aiplatform.googleapis.com`); not required for Gemini Enterprise `agy` CLI mode. |
 | **Corporate AI gateway** | `--base-url`, `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`), or `userConfig.vertex_base_url` | unset | Routes Gemini calls through a corporate proxy or AI gateway (with optional bearer token in `CC_AGY_VERTEX_BASE_URL_TOKEN` or `userConfig.vertex_base_url_token`). Takes priority over an ambient shell `GEMINI_API_KEY`. |
 | **Cost profile** | `--profile`, `CC_AGY_COST_PROFILE`, or `userConfig.cost_profile` | `balanced` | Selects `balanced`, `economy`, or `quality` model routing. |
 | **Daily spend cap** | `--max-daily-cents`, `CC_AGY_MAX_DAILY_CENTS`, or `userConfig.max_daily_cents` | unlimited | Optional workspace daily ceiling in US cents (for example `500` for \$5.00/day). Blocks new Gemini calls once UTC daily receipts reach the limit. |
-| **Region / jurisdiction** | `--location`, `GOOGLE_CLOUD_LOCATION`, or `userConfig.google_cloud_location` | `us-central1` (`global`/`us`/`eu` on Enterprise) | Preferred Vertex AI region or Gemini Enterprise jurisdiction (`global`, `us`, or `eu`). |
+| **Vertex AI region** | `--location`, `GOOGLE_CLOUD_LOCATION`, or `userConfig.google_cloud_location` | `us-central1` | Preferred Vertex AI region (global-only models such as `gemini-3.8-flash` and `gemini-4-argon` route to `global` automatically). |
 | **Managed SDK venv** | `CC_AGY_VENV_DIR`, `CC_AGY_PYTHON_BIN`, or `--no-bootstrap` | `~/.local/share/cc-agy-plugin/venv` | Isolated per-user Python environment used by both Codex and cached Claude Code installs (`~/.claude/plugins/cache/...`). |
 | **One-off or marketplace install** | `claude --plugin-dir /path/to/cc-agy-plugin` or `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main` | optional | Run in Claude Code for a single session without installing globally, or install via native Codex plugin marketplace. |
 | **Model overrides** | `CC_AGY_DEFAULT_DELEGATE_MODEL`, `CC_AGY_DEFAULT_ASK_MODEL` (or `model=` per call) | from `--profile` | Pins worker jobs or single-shot `ask_gemini` calls to a specific Gemini model ID. |
@@ -182,14 +174,14 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, us
 - **Most tasks solved:** Claude Code with the plugin solved **12 of 16** tasks because the lead agent reviews the worker's diff and sends targeted follow-up instructions when an edge case is missed.
 
 > [!NOTE]
-> These are early numbers covering 16 of the 33 tasks in the DeepSWE v1.1 suite, one run each.
+> These early numbers cover 16 of the 33 tasks in the DeepSWE v1.1 suite at one run per setup (`n=1`). On a 16-task single-run sample, a 1-to-2 task pass-rate difference (`10/16` vs `11/16` vs `12/16`) sits within normal run-to-run variance, whereas the 24% lower spend and 25% turn reduction come structurally from moving file exploration and test loops onto Flash.
 
 ## Status
 
 | Item | Detail |
 |:--|:--|
 | **Version** | 0.3.0, Apache 2.0 |
-| **Quality** | 278 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
+| **Quality** | 296 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 | **Next** | Finish the full 33-task DeepSWE suite and publish per-pattern cost guidance |
 
@@ -204,17 +196,17 @@ Internals, rate cards, and full tool documentation for engineers. Click any sect
 
 ![Technical architecture](assets/architecture.svg)
 
-`cc-agy-plugin` connects Claude Code, Codex, and MCP clients to the Google Antigravity SDK so a single workspace can combine a lead planner/reviewer with Gemini workers under git worktree isolation and cryptographic diff provenance:
+`cc-agy-plugin` connects Claude Code, Codex, and MCP clients to the standalone Antigravity CLI (`agy`) or Google Antigravity Python SDK so a single workspace can combine a lead planner/reviewer with Gemini workers under git worktree isolation and cryptographic diff provenance:
 
 1. **Your lead agent plans and reviews**:
    - Reads the user prompt, inspects key interfaces, and writes a short outcome-only task brief with ordered `plan` steps and read-only `acceptance` checks (`pytest`, `ruff`, `mypy`, `go test`, `vitest`).
    - Reviews the token-paginated git diff returned by the worker and decides whether to merge it (`delegate_apply`) or send follow-up instructions (`delegate_continue`).
-2. **Google Antigravity SDK + Gemini executes in an isolated copy**:
+2. **Antigravity (`agy` CLI or Python SDK) + Gemini executes in an isolated copy**:
    - Spins up a headless Antigravity agent inside a standalone git repository copy (or `in_place` when requested).
    - **Straitjacket (`ctx-harness`) shell containment** intercepts noisy test and build outputs (>400 lines or >6,000 tokens), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite does not flood the worker's context window.
 3. **Your working tree stays clean until verified (Git-Level Isolation)**:
    - In the default isolated mode (`in_place=false`), the worker edits a standalone copy of tracked files under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`), so failed or timed-out runs leave uncommitted files in your checkout untouched. Changes are only merged when `delegate_apply` verifies baseline SHA-256 hashes (using a 3-way merge when needed) and records an HMAC-SHA256 signed receipt.
-   - *Security note*: Isolated copies provide git-level checkout isolation, not an OS container or VM sandbox. Worker shell commands run with your local user account's OS permissions; HMAC receipts and child-env scrubbing enforce workflow provenance and prevent accidental secret leakage, not isolation against a hostile local process running as the same OS user. The plugin snapshots and restores host `.git/hooks` and `.git/config` around every run.
+   - *Security note*: Isolated copies provide git-level checkout isolation, not an OS container or VM sandbox. Worker shell commands run with your local user account's OS permissions; HMAC receipts and child-env scrubbing enforce workflow provenance and prevent accidental secret leakage, not isolation against a hostile local process running as the same OS user. The plugin snapshots and restores host `.git/hooks` and `.git/config` around every run. For TypeScript and Node workspaces, isolated worktrees populate `node_modules` using copy-on-write clones or bounded package copies (`<= 10,000` entries and `<= 128 MiB`), skip host symlinks during `--dangerously-skip-permissions` `agy` CLI worker runs on oversized non-CoW trees, and verify host `node_modules` metadata after shallow-symlink SDK runs.
 
 ### Configured rate card
 
@@ -240,12 +232,13 @@ Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` 
 ### Authentication precedence
 
 `resolve_auth_config()` in `server/regions.py` selects credentials in this exact order:
-1. Explicit `api_key` argument on the tool call -> **Google AI Studio** (`auth_mode="api_key"`).
-2. Gemini Enterprise subscription mode (`CC_AGY_AUTH_MODE=gemini_enterprise`, `CC_AGY_GEMINI_ENTERPRISE=true`, or `userConfig.auth_mode="gemini_enterprise"`) -> **Gemini Enterprise Business AI Code** (`auth_mode="gemini_enterprise"`). Resolves human Google OAuth credentials (`gcloud auth application-default login`), looks up your active seat via `GET /v1beta:fetchLicenses` (or idempotent `:selfAssignLicense` when `--project` is passed), rejects Service Account keys with remediation instructions, and routes SDK requests through an authenticated `127.0.0.1` loopback proxy to `businessaicode.googleapis.com` (`global`, `us`, or `eu`).
-3. Explicit `project` argument on the tool call -> **Vertex AI** (`auth_mode="vertex"`).
+1. Explicit `api_key` argument on the tool call -> **Google AI Studio** (`auth_mode="api_key"`, Python SDK).
+2. Gemini Enterprise subscription mode (`CC_AGY_AUTH_MODE=gemini_enterprise`, `--auth gemini-enterprise` / `agy-cli`, `CC_AGY_GEMINI_ENTERPRISE=true`, or `userConfig.auth_mode="gemini_enterprise"`) -> **Standalone Antigravity CLI (`agy`)** (`auth_mode="gemini_enterprise"`). Locates or installs the external `agy` binary (`~/.local/share/cc-agy-plugin/bin/agy`, skipping Google-internal `jetski` builds), verifies local Google sign-in (`~/.gemini/antigravity-cli/antigravity-oauth-token`, `cache/onboarding.json`, or `ANTIGRAVITY_OAUTH_TOKEN`), and runs headless `agy` subprocesses (`--output-format stream-json` for workers, `--output-format json --mode plan` for `ask_gemini` and structured batch writers).
+3. Explicit `project` argument on the tool call -> **Vertex AI** (`auth_mode="vertex"`, Python SDK).
 4. Custom AI gateway base URL (`CC_AGY_VERTEX_BASE_URL`, `GOOGLE_VERTEX_BASE_URL`, or `userConfig.vertex_base_url`) -> **Vertex-compatible AI Gateway** (`auth_mode="vertex"`, defaulting `project` to `"custom-endpoint"` when no GCP project ID is set, and attaching `CC_AGY_VERTEX_BASE_URL_TOKEN` when configured). Takes priority over an ambient shell `GEMINI_API_KEY`.
 5. `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `userConfig.gemini_api_key` in the environment -> **Google AI Studio** (`auth_mode="api_key"`, even if `GOOGLE_CLOUD_PROJECT` is also exported in the shell).
 6. `GOOGLE_CLOUD_PROJECT`, `VERTEX_PROJECT`, `GCLOUD_PROJECT`, `CLOUD_ML_PROJECT_ID`, or `userConfig.google_cloud_project` in the environment -> **Vertex AI** (`auth_mode="vertex"`).
+7. Automatic `agy` CLI fallback (`auto` mode when none of 1 to 6 are set) -> **Standalone Antigravity CLI (`agy`)** (`auth_mode="gemini_enterprise"`) when an external `agy` binary and local Google sign-in are present.
 
 ### Cost profiles, quota handling, and overrides
 
@@ -270,7 +263,7 @@ Set `userConfig.cost_profile` in Claude Code, `--profile` in `cc-agy-install`, o
    - An 8-worker thread pool dispatches `tools/call` requests concurrently (up to 8 simultaneous in-flight tool calls) so `delegate_status`, `ping`, and `delegate_cancel` can respond while a worker job is running.
 3. **Isolated copy snapshot and worker execution (`server/jobs.py`, `server/agy_runner.py`)**:
    - `JobManager` copies tracked and non-ignored files (`git ls-files -co --exclude-standard -z`) into a standalone git repository under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) and creates a baseline commit (`git init -b main`).
-   - `run_antigravity_worker()` launches `google.antigravity.Agent` with per-turn safety caps (default: `40` tool calls on Flash, `100` on Argon/Pro, and `5,000,000` total tokens) and Straitjacket's bounded shell tools (`run_command`, `ctx_get`, `ctx_search`). If `ctx-harness` is not installed, the worker falls back to standard Antigravity tools and surfaces `containment: "none"` with a `containment_warning` in the job digest.
+   - `run_antigravity_worker()` launches either the standalone `agy` CLI (`--output-format stream-json` in `gemini_enterprise` mode) or `google.antigravity.Agent` (on API key, Vertex AI, or gateway paths) with per-turn safety caps (default: `40` tool calls on Flash, `100` on Argon/Pro, and `5,000,000` total tokens). On the Python SDK path, `types.BudgetConfig` enforces caps inside the harness and Straitjacket (`ctx-harness`) provides bounded shell tools (`run_command`, `ctx_get`, `ctx_search`), falling back to standard Antigravity tools with `containment: "none"` when `ctx-harness` is absent. On the `agy` CLI path, the plugin monitors streamed `step_update` tool and token counters directly (terminating the worker process group cleanly on `MAX_TOOL_CALLS_EXCEEDED` or `MAX_TOTAL_TOKENS_EXCEEDED`), scrubs plugin and cloud secrets from the child environment, and reports `containment: "agy_cli"`.
 4. **Acceptance checks, compile smoke checks, and token-bounded diffs**:
    - When the worker finishes, the plugin executes any explicit or auto-discovered `acceptance` commands (`verification: "acceptance_tests"`), or falls back to fast read-only compile/syntax smoke checks (`verification: "smoke_only"`), cleans up untracked test artifacts, and returns pass/fail counts with a 600-token output tail.
    - The lead agent inspects changes via `get_diff` (paginated at `4,000` tokens per page, up to `8,000` max, so large diffs never exceed MCP token limits) and merges verified work with `delegate_apply`.
@@ -287,7 +280,7 @@ Set `userConfig.cost_profile` in Claude Code, `--profile` in `cc-agy-install`, o
 
 | Tool | Purpose |
 |---|---|
-| `ask_gemini` | Fast single-shot query via `google-genai` (without loading the Antigravity SDK's agent prompt and tool declarations). Best for code reviews, architecture checks, and second opinions. Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`). |
+| `ask_gemini` | Fast single-shot query via `google-genai` (or `agy --mode plan` in `gemini_enterprise` mode) without spinning up a workspace copy. Best for code reviews, architecture checks, and second opinions. Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`). |
 | `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, `api_key`, and `project`. Default model: `gemini-3.8-flash` (auto-escalating to `gemini-4-argon` on retries). |
 | `delegate_result` | Wait for a background job to finish (default `240s` wait cap so Claude Code's 5-minute prompt cache stays warm) and return its compact digest. |
 | `delegate_status` | Inspect live progress signals (`report_to_lead`), token usage, and USD/cents cost for a single `job_id`, or omit `job_id` to list recent jobs and cumulative totals for the active workspace. |
@@ -366,7 +359,8 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CC_AGY_AUTH_MODE` | `auto` | Set `gemini_enterprise` (or `CC_AGY_GEMINI_ENTERPRISE=true`) to route calls through your included Gemini Enterprise seat (`businessaicode.googleapis.com`) using human Google sign-in. |
+| `CC_AGY_AUTH_MODE` | `auto` | Set `gemini_enterprise` (or `agy_cli` / `CC_AGY_GEMINI_ENTERPRISE=true`) to route calls through your included Gemini Enterprise seat via the standalone `agy` CLI. |
+| `CC_AGY_CLI_BIN` / `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | Optional path override for the external `agy` binary or its OAuth state directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
 | `CC_AGY_COST_PROFILE` | `balanced` | Preset controlling model routing and step-up: `economy` (Flash only), `balanced` (Flash first, Argon on retries/follow-ups), or `quality` (Argon first). |
 | `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | Optional daily workspace spend cap in US cents (for example `500` for \$5.00/day). Rejects new Gemini calls once UTC daily spend reaches the limit. |
 | `CC_AGY_VENV_DIR` / `CC_AGY_PYTHON_BIN` | `~/.local/share/cc-agy-plugin/venv` | Per-user virtualenv directory or explicit Python interpreter path used by the MCP server and installer on PEP 668 systems. |
@@ -413,13 +407,13 @@ cc-agy-plugin/
 ├── server/
 │   ├── main.py               # MCP stdio entry point + managed venv re-exec
 │   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
-│   ├── gemini_enterprise.py  # Gemini Enterprise subscription OAuth, license lookup & loopback proxy
+│   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
 │   ├── install.py            # Interactive 4-step wizard + Codex/Claude installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
-│   ├── regions.py            # Auth (Enterprise / API key / Vertex / gateway), routing, pricing, daily cap
+│   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / gateway), routing, pricing, daily cap
 │   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing
-│   ├── genai_ask.py          # Single-shot google-genai helper
-│   ├── agy_runner.py         # Antigravity SDK runner + Straitjacket (ctx.sdk) tool containment
+│   ├── genai_ask.py          # Single-shot google-genai / `agy` plan-mode helper
+│   ├── agy_runner.py         # Antigravity SDK / `agy` CLI worker runner + Straitjacket containment
 │   ├── jobs.py               # Isolated repo copy, acceptance + smoke checks, 3-way apply, salvage
 │   ├── repo_map.py           # Commit-keyed repository map ("scout cache") for worker prompts
 │   ├── review_bundle.py      # File-backed review evidence bundle and symbol-level diff slicer
@@ -439,20 +433,21 @@ cc-agy-plugin/
 ├── commands/                 # /cc-agy-plugin:{delegate,doctor,jobs,cost} slash commands
 ├── hooks/hooks.json          # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
 ├── scripts/
+│   ├── install_agy_cli.sh    # SHA-512 verified standalone Antigravity CLI (`agy`) installer
 │   ├── validate.sh           # Manifest, badge, test-count, and dry-run installer validator
 │   ├── session_start.py      # SessionStart hook: records the per-session baseline and --doctor CLI
 │   ├── user_prompt_submit.py # UserPromptSubmit hook: records prompt timestamp and resets read budgets
 │   ├── pre_tool_guard.py     # Strict mode PreToolUse guard + 9-line code dictation linter
 │   ├── post_tool_ledger.py   # PostToolUse MCP audit logger
 │   └── provenance_check.py   # Stop-hook git diff vs HMAC-receipt provenance verifier
-├── tests/                    # 278 automated unit, integration, portability, and guardrail tests
+├── tests/                    # 296 automated unit, integration, portability, and guardrail tests
 └── LICENSE                   # Apache License 2.0
 ```
 
 ### Running tests and validation
 
 ```bash
-pytest tests/ -q          # 278 automated tests
+pytest tests/ -q          # 296 automated tests
 bash scripts/validate.sh  # checks manifests, README badges, and clean-HOME Codex install
 ```
 

@@ -3,7 +3,23 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Mapping
+
+
+def _real_account_home() -> Path | None:
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except Exception:
+        try:
+            return Path.home().resolve()
+        except Exception:
+            return None
+
+
+_REAL_ACCOUNT_HOME: Path | None = _real_account_home()
 
 # Vertex models that return 404 NOT_FOUND on regional endpoints (such as
 # asia-south1 or europe-west4) and require the "global" Vertex endpoint.
@@ -404,10 +420,13 @@ def sanitize_placeholder_env() -> None:
         "CLAUDE_PLUGIN_OPTION_AUTH_MODE",
         "CC_AGY_USERCFG_AUTH_MODE",
         "CC_AGY_GEMINI_ENTERPRISE",
-        "CC_AGY_ENTERPRISE_LOCATION",
+        "CC_AGY_CLI_BIN",
+        "CLAUDE_PLUGIN_OPTION_AGY_CLI_PATH",
+        "CC_AGY_USERCFG_AGY_CLI_PATH",
+        "CC_AGY_CLI_CONFIG_DIR",
+        "CC_AGY_CLI_INSTALL_DIR",
+        "ANTIGRAVITY_OAUTH_TOKEN",
         "CC_AGY_ENTERPRISE_ACCESS_TOKEN",
-        "CC_AGY_ENTERPRISE_TIER",
-        "CC_AGY_BAIC_BASE_URL",
         "CC_AGY_MAX_DAILY_CENTS",
         "CLAUDE_PLUGIN_OPTION_MAX_DAILY_CENTS",
         "CC_AGY_USERCFG_MAX_DAILY_CENTS",
@@ -560,7 +579,16 @@ def resolve_vertex_project(
 
 
 _GEMINI_ENTERPRISE_ALIASES: frozenset[str] = frozenset(
-    {"gemini_enterprise", "gemini-enterprise", "enterprise", "oauth_business", "oauth-business", "baic"}
+    {
+        "gemini_enterprise",
+        "gemini-enterprise",
+        "enterprise",
+        "agy_cli",
+        "agy-cli",
+        "agy",
+        "oauth_business",
+        "oauth-business",
+    }
 )
 _API_KEY_MODE_ALIASES: frozenset[str] = frozenset({"api_key", "api-key", "ai_studio", "aistudio"})
 _VERTEX_MODE_ALIASES: frozenset[str] = frozenset({"vertex", "vertex_ai", "vertex-ai", "gcp"})
@@ -632,6 +660,46 @@ def _resolve_explicit_project_only(
     return None
 
 
+def _should_auto_detect_agy_cli(
+    explicit_env: Mapping[str, str] | None,
+    source_env: Mapping[str, str],
+) -> bool:
+    flag = env_flag("CC_AGY_AUTO_DETECT_AGY_CLI", source_env)
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    if first_valid_env(
+        source_env,
+        "CC_AGY_CLI_BIN",
+        "CLAUDE_PLUGIN_OPTION_AGY_CLI_PATH",
+        "CC_AGY_USERCFG_AGY_CLI_PATH",
+        "CC_AGY_CLI_CONFIG_DIR",
+        "CC_AGY_CLI_INSTALL_DIR",
+        default="",
+    ):
+        return True
+    if explicit_env is not None:
+        explicit_home = first_valid_env(explicit_env, "HOME", "USERPROFILE", default="")
+        if explicit_home and _REAL_ACCOUNT_HOME is not None:
+            try:
+                if Path(explicit_home).expanduser().resolve() != _REAL_ACCOUNT_HOME:
+                    return True
+            except OSError:
+                pass
+        return False
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        env_home = first_valid_env(source_env, "HOME", "USERPROFILE", default="")
+        if env_home and _REAL_ACCOUNT_HOME is not None:
+            try:
+                if Path(env_home).expanduser().resolve() != _REAL_ACCOUNT_HOME:
+                    return True
+            except OSError:
+                pass
+        return False
+    return True
+
+
 def resolve_auth_config(
     requested_project: str | None = None,
     requested_location: str | None = None,
@@ -641,10 +709,10 @@ def resolve_auth_config(
     model: str = "gemini-2.5-flash",
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Resolve authentication credentials for Gemini Enterprise, Google AI Studio, or Vertex AI.
+    """Resolve authentication credentials for Gemini Enterprise (`agy` CLI), AI Studio, or Vertex AI.
 
     Supports `auth_mode` values:
-    - `'gemini_enterprise'`: human user OAuth against Business AI Code (`businessaicode.googleapis.com`),
+    - `'gemini_enterprise'`: standalone Antigravity CLI (`agy`) backed by human Google sign-in,
       consuming included Gemini Enterprise Standard/Plus seat capacity.
     - `'api_key'`: Google AI Studio (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
     - `'vertex'`: Google Cloud Vertex AI (or custom Vertex-compatible AI gateway).
@@ -675,38 +743,12 @@ def resolve_auth_config(
         req_loc_clean = (requested_location or "").strip().lower()
         if req_loc_clean.startswith("${"):
             req_loc_clean = ""
-        ent_env_loc = first_valid_env(source_env, "CC_AGY_ENTERPRISE_LOCATION", default="").lower()
-        usercfg_loc = first_valid_env(
-            source_env,
-            "CLAUDE_PLUGIN_OPTION_GOOGLE_CLOUD_LOCATION",
-            "CC_AGY_USERCFG_GOOGLE_CLOUD_LOCATION",
-            default="",
-        ).lower()
-        shell_loc = first_valid_env(
-            source_env,
-            "GOOGLE_CLOUD_LOCATION",
-            "VERTEX_LOCATION",
-            default="",
-        ).lower()
-        if req_loc_clean or ent_env_loc:
-            ent_loc: str | None = req_loc_clean or ent_env_loc
-            # Multi-region BAIC jurisdictions (`global`, `us`, `eu`) are explicit constraints;
-            # regional Vertex strings containing `-` (e.g. `us-central1`) are treated as soft hints.
-            loc_explicit = "-" not in ent_loc
-        elif usercfg_loc and "-" not in usercfg_loc:
-            # Explicit BAIC jurisdiction set via `claude plugin install --config google_cloud_location=...`
-            ent_loc = usercfg_loc
-            loc_explicit = True
-        else:
-            ambient = shell_loc or usercfg_loc
-            ent_loc = ambient or None
-            loc_explicit = False
+        ent_loc = req_loc_clean or None
         return {
             "auth_mode": "gemini_enterprise",
             "api_key": None,
             "project": ent_proj,
             "location": ent_loc,
-            "location_explicit": loc_explicit,
             "reroute_note": None,
         }
 
@@ -776,11 +818,23 @@ def resolve_auth_config(
             "reroute_note": reroute_note,
         }
 
+    if _should_auto_detect_agy_cli(env, source_env):
+        from server.agy_cli import inspect_agy_cli_offline
+
+        if inspect_agy_cli_offline(source_env).get("ok"):
+            return {
+                "auth_mode": "gemini_enterprise",
+                "api_key": None,
+                "project": None,
+                "location": None,
+                "reroute_note": None,
+            }
+
     raise ValueError(
         "Missing credentials. Provide a Google AI Studio Gemini API key "
         "(userConfig.gemini_api_key or GEMINI_API_KEY), a Google Cloud project ID "
-        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT), or enable Gemini Enterprise "
-        "subscription mode (CC_AGY_AUTH_MODE=gemini_enterprise)."
+        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT), or sign in with the "
+        "Antigravity CLI (`agy`) for Gemini Enterprise seat quota (CC_AGY_AUTH_MODE=gemini_enterprise)."
     )
 
 

@@ -73,12 +73,12 @@ def python_has_plugin_sdks(python_bin: str | Path) -> bool:
 
 
 def candidate_sdk_pythons(
-    plugin_root: Path | None = None,
+    plugin_root: str | Path | None = None,
     *,
     env: Mapping[str, str] | None = None,
 ) -> list[Path]:
     """Ordered virtualenv interpreter candidates consulted when system `python3` lacks SDKs."""
-    root = (plugin_root or DEFAULT_PLUGIN_ROOT).resolve()
+    root = Path(plugin_root).resolve() if plugin_root is not None else DEFAULT_PLUGIN_ROOT.resolve()
     managed_py = venv_python_path(managed_venv_dir(env))
     local_venv_py = venv_python_path(root / ".venv")
     parent_venv_py = venv_python_path(root.parent / ".venv")

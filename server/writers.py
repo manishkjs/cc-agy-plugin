@@ -445,6 +445,78 @@ def render_task_prompt(
     return "\n\n".join(parts)
 
 
+def make_agy_cli_writer(
+    auth: dict[str, Any],
+    model: str,
+    *,
+    thinking_level: str = "LOW",
+    timeout_seconds: float = 300.0,
+    read_budget: int = 0,
+    workspace_dir: Path | None = None,
+) -> Writer:
+    """Writer backed by standalone Antigravity CLI (`agy --output-format json --mode plan`) for Gemini Enterprise."""
+    from server.agy_cli import is_agy_auth_error, run_agy_cli_structured_writer
+    from server.regions import estimate_cost_usd
+
+    def _write(req: WriterRequest) -> WriterReply:
+        sys_inst = req.system + ("\n\n" + req.shared_prefix if req.shared_prefix else "")
+        try:
+            text_out, usage = run_agy_cli_structured_writer(
+                prompt=req.prompt,
+                system_instruction=sys_inst,
+                model=model,
+                thinking_level=thinking_level,
+                json_schema=ANSWER_SCHEMA,
+                timeout_seconds=timeout_seconds,
+                read_budget=read_budget,
+                workspace_dir=workspace_dir,
+            )
+        except TimeoutError as exc:
+            raise WriterTransportError(None, f"TimeoutError: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            low = msg.lower()
+            if (
+                "not installed" in low
+                or "cc_agy_cli_bin" in low
+                or "internal `jetski` binary" in low
+                or "skipped internal" in low
+            ):
+                raise WriterConfigError(msg) from exc
+            if any(
+                tok in low
+                for tok in (
+                    "429",
+                    "503",
+                    "502",
+                    "504",
+                    "529",
+                    "resource_exhausted",
+                    "quota",
+                    "rate limit",
+                    "overloaded",
+                    "unavailable",
+                )
+            ):
+                raise WriterTransportError(429, msg) from exc
+            if is_agy_auth_error(msg):
+                raise WriterAuthError(401, msg) from exc
+            raise
+
+        cost = estimate_cost_usd(model, usage, single_request=(read_budget <= 0))
+        return WriterReply(
+            text=text_out,
+            cut_off=False,
+            usage=usage,
+            cost_cents=float(cost.get("total_cost_cents") or 0.0),
+            model=model,
+            pricing_known=bool(cost.get("pricing_known", True)),
+            diagnostics="" if text_out.strip() else "empty_agy_cli_output",
+        )
+
+    return _write
+
+
 def make_genai_writer(
     auth: dict[str, Any],
     model: str,
@@ -453,7 +525,15 @@ def make_genai_writer(
     cached_content: str | None = None,
     timeout_ms: int = 300_000,
 ) -> Writer:
-    """Writer on google-genai ``generate_content`` with a response schema (API key or Vertex)."""
+    """Writer on google-genai ``generate_content`` with a response schema (or `agy` CLI on Gemini Enterprise)."""
+    if auth.get("auth_mode") == "gemini_enterprise":
+        return make_agy_cli_writer(
+            auth,
+            model,
+            thinking_level=thinking_level,
+            timeout_seconds=max(5.0, float(timeout_ms) / 1000.0),
+            read_budget=0,
+        )
     from server.regions import estimate_cost_usd
 
     def _write(req: WriterRequest) -> WriterReply:
@@ -510,7 +590,7 @@ def make_genai_writer(
 
 
 def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) -> Any:
-    """Construct a google-genai Client honoring Gemini Enterprise, API keys, Vertex ADC, and gateways."""
+    """Construct a google-genai Client honoring API keys, Vertex ADC, and gateways."""
     from google import genai
     from google.genai import types as gt
     from google.oauth2.credentials import Credentials as OAuth2Credentials
@@ -519,34 +599,6 @@ def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) 
     if auth.get("api_key"):
         http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
         return genai.Client(api_key=auth["api_key"], **({"http_options": http_opts} if http_opts else {}))
-    if auth.get("auth_mode") == "gemini_enterprise":
-        from server.gemini_enterprise import EnterpriseAuthError, prepare_enterprise_endpoint
-
-        try:
-            ep = prepare_enterprise_endpoint(auth)
-        except EnterpriseAuthError as exc:
-            raise WriterAuthError(401, str(exc)) from exc
-        auth["project"] = ep["project"]
-        auth["location"] = ep["location"]
-        if ep.get("reroute_note") and not auth.get("reroute_note"):
-            auth["reroute_note"] = ep["reroute_note"]
-        opt_kwargs_ent: dict[str, Any] = {
-            "base_url": ep["base_url"],
-            "headers": ep["headers"],
-            "client_args": {"follow_redirects": False},
-        }
-        if timeout_ms:
-            opt_kwargs_ent["timeout"] = timeout_ms
-        client = genai.Client(
-            vertexai=True,
-            project=ep["project"],
-            location=ep["location"],
-            credentials=OAuth2Credentials(token="proxy-local"),
-            http_options=gt.HttpOptions(**opt_kwargs_ent),
-        )
-        if getattr(client, "_api_client", None) is not None:
-            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
-        return client
     base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
     if base_url:
         tok = resolve_vertex_base_url_token() or "custom-endpoint"
@@ -625,6 +677,15 @@ def make_agent_writer(
     """Writer on the Antigravity SDK, stripped to a writer: no subagents, FINISH only (or up to
     ``read_budget`` read-only lookups when ``read_budget > 0``), a short custom system prompt instead
     of the default agent preamble, structured FINISH output."""
+    if auth.get("auth_mode") == "gemini_enterprise":
+        return make_agy_cli_writer(
+            auth,
+            model,
+            thinking_level=thinking_level,
+            timeout_seconds=timeout_seconds,
+            read_budget=read_budget,
+            workspace_dir=workspace_dir,
+        )
     from server.regions import estimate_cost_usd
 
     def _write(req: WriterRequest) -> WriterReply:
@@ -637,27 +698,6 @@ def make_agent_writer(
         eff_loc = auth.get("location")
         if auth.get("api_key"):
             endpoint: Any = types.GeminiAPIEndpoint(api_key=auth["api_key"], options=options)
-        elif auth.get("auth_mode") == "gemini_enterprise":
-            from server.gemini_enterprise import EnterpriseAuthError, prepare_enterprise_endpoint
-
-            try:
-                ep = prepare_enterprise_endpoint(auth)
-            except EnterpriseAuthError as exc:
-                raise WriterAuthError(401, str(exc)) from exc
-            eff_proj = ep["project"]
-            eff_loc = ep["location"]
-            auth["project"] = eff_proj
-            auth["location"] = eff_loc
-            if ep.get("reroute_note") and not auth.get("reroute_note"):
-                auth["reroute_note"] = ep["reroute_note"]
-            endpoint = types.VertexEndpoint(
-                project=eff_proj,
-                location=eff_loc,
-                base_url=ep["base_url"],
-                http_headers=ep["headers"],
-                api_key="proxy-local",
-                options=options,
-            )
         else:
             gw_url = resolve_vertex_base_url(auth.get("base_url")) or ""
             if gw_url:

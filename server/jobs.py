@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -270,6 +271,9 @@ _EPHEMERAL_CACHE_DIRS: frozenset[str] = frozenset(
         ".pytype",
         ".eggs",
         "node_modules",
+        ".vite",
+        ".vite-temp",
+        ".eslintcache",
         ".tox",
         ".nox",
         ".venv",
@@ -290,7 +294,395 @@ _EPHEMERAL_CACHE_SUFFIXES: tuple[str, ...] = (
     ".egg-info",
     ".coverage",
     ".DS_Store",
+    ".tsbuildinfo",
 )
+
+_NM_TRANSIENT_CACHE_ENTRIES: frozenset[str] = frozenset(
+    {
+        ".vite",
+        ".vite-temp",
+        ".cache",
+        ".tmp",
+        ".eslintcache",
+        ".parcel-cache",
+        ".turbo",
+        ".package-lock.json",
+        ".modules.yaml",
+        ".yarn-state.yml",
+        ".pnp.cjs",
+        ".pnp.loader.mjs",
+        ".cc-agy-sparse-ws",
+        ".cc-agy-ext-store",
+    }
+)
+
+_NM_COPY_MAX_FILES: int = 10000
+_NM_COPY_MAX_BYTES: int = 128 * 1024 * 1024
+
+_NM_WALK_PRUNE_DIRS: frozenset[str] = frozenset(
+    {
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".cache",
+        ".parcel-cache",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".worktrees",
+        ".cc-agy-data",
+        ".cc-agy-review",
+        ".ctx-session-reads",
+    }
+)
+
+
+def _workspace_internal_symlink_rel(link_path: Path, host_resolved: Path) -> Path | None:
+    """If `link_path` is a symlink resolving inside `host_resolved` outside `node_modules`, return its host-relative path."""
+    if not link_path.is_symlink():
+        return None
+    try:
+        raw_target = os.readlink(link_path)
+        resolved = (link_path.parent / raw_target).resolve()
+        rel_to_host = resolved.relative_to(host_resolved)
+    except (OSError, ValueError):
+        return None
+    if "node_modules" in rel_to_host.parts:
+        return None
+    return rel_to_host
+
+
+def _probe_nm_within_copy_budget(
+    root_path: Path,
+    *,
+    max_files: int | None = None,
+    max_bytes: int | None = None,
+) -> bool:
+    """Return True when `root_path` is small enough to materialize isolated copies in a worktree."""
+    limit_files = _NM_COPY_MAX_FILES if max_files is None else max_files
+    limit_bytes = _NM_COPY_MAX_BYTES if max_bytes is None else max_bytes
+    if limit_files <= 0 or limit_bytes <= 0:
+        return False
+    files_seen = 0
+    bytes_seen = 0
+    root_str = str(root_path)
+    try:
+        for cur_r, sub_dirs, file_names in os.walk(root_str, topdown=True, followlinks=False):
+            if cur_r == root_str:
+                sub_dirs[:] = [d for d in sub_dirs if d not in _NM_TRANSIENT_CACHE_ENTRIES]
+            files_seen += len(file_names) + len(sub_dirs)
+            if files_seen > limit_files:
+                return False
+            for fn in file_names:
+                try:
+                    st = os.lstat(os.path.join(cur_r, fn))
+                    bytes_seen += int(st.st_size)
+                    if bytes_seen > limit_bytes:
+                        return False
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    return True
+
+
+def _try_cow_clone_dir(src_dir: Path, dst_dir: Path) -> bool:
+    """Attempt an O(1) copy-on-write clone (`cp -cR` on APFS, `cp -a --reflink=always` on Btrfs/XFS)."""
+    if os.name != "posix":
+        return False
+    cmd = (
+        ["cp", "-cR", str(src_dir), str(dst_dir)]
+        if sys.platform == "darwin"
+        else ["cp", "-a", "--reflink=always", str(src_dir), str(dst_dir)]
+    )
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=5.0, check=False)
+        if res.returncode == 0 and dst_dir.exists():
+            return True
+    except Exception:
+        pass
+    shutil.rmtree(dst_dir, ignore_errors=True)
+    return False
+
+
+def _fs_supports_cow_between(src_dir: Path, dst_dir: Path) -> bool:
+    """Probe whether O(1) CoW cloning works from `src_dir` into `dst_dir`."""
+    if os.name != "posix":
+        return False
+    probe_src: Path | None = None
+    try:
+        for entry in os.scandir(src_dir):
+            if entry.name in _NM_TRANSIENT_CACHE_ENTRIES:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                probe_src = Path(entry.path)
+                break
+    except OSError:
+        return False
+    if probe_src is None:
+        return False
+    probe_dst = dst_dir / ".cc-agy-cow-probe"
+    ok = _try_cow_clone_dir(probe_src, probe_dst)
+    try:
+        probe_dst.unlink(missing_ok=True)
+    except OSError:
+        shutil.rmtree(probe_dst, ignore_errors=True)
+    return ok
+
+
+def _copy_isolated_pkg_entry(src_path: Path, dst_path: Path, *, try_cow: bool = True) -> bool:
+    """Materialize an isolated copy of `src_path` at `dst_path` (CoW clone when supported)."""
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if src_path.is_dir() and not src_path.is_symlink():
+        if try_cow and _try_cow_clone_dir(src_path, dst_path):
+            return True
+        shutil.copytree(src_path, dst_path, symlinks=True, ignore_dangling_symlinks=True)
+        return True
+    if src_path.is_file() and not src_path.is_symlink():
+        shutil.copy2(src_path, dst_path)
+        return True
+    return False
+
+
+def _snapshot_host_nm_metadata(
+    host_root: Path,
+    *,
+    max_entries: int = 150000,
+) -> dict[str, tuple[int, int, int]] | None:
+    """Snapshot `{rel_path: (st_mode, st_size, st_mtime_ns)}` across `host_root/**/node_modules`."""
+    if not host_root.is_dir():
+        return {}
+    host_resolved = host_root.resolve()
+    snap: dict[str, tuple[int, int, int]] = {}
+    for cur_root, dirs, _files in os.walk(str(host_resolved), topdown=True, followlinks=False):
+        cur_path = Path(cur_root)
+        has_nm = "node_modules" in dirs
+        dirs[:] = sorted(
+            d for d in dirs if d not in _NM_WALK_PRUNE_DIRS and not d.startswith(".cc-agy-")
+        )
+        if not has_nm:
+            continue
+        host_nm = cur_path / "node_modules"
+        if host_nm.is_symlink() or not host_nm.is_dir():
+            continue
+        nm_str = str(host_nm)
+        for nm_r, nm_dirs, nm_files in os.walk(nm_str, topdown=True, followlinks=False):
+            if nm_r == nm_str:
+                nm_dirs[:] = sorted(d for d in nm_dirs if d not in _NM_TRANSIENT_CACHE_ENTRIES)
+            else:
+                nm_dirs.sort()
+            for name in (*nm_dirs, *sorted(nm_files)):
+                full_p = os.path.join(nm_r, name)
+                try:
+                    st = os.lstat(full_p)
+                    rel_k = os.path.relpath(full_p, str(host_resolved))
+                    snap[rel_k] = (int(st.st_mode), int(st.st_size), int(st.st_mtime_ns))
+                except OSError:
+                    continue
+                if len(snap) > max_entries:
+                    return None
+    return snap
+
+
+def _verify_host_nm_metadata_unchanged(
+    host_root: Path,
+    snapshot: dict[str, tuple[int, int, int]] | None,
+) -> bool:
+    """Return True when `host_root/**/node_modules` matches `snapshot` byte-size/mode/mtime."""
+    if snapshot is None:
+        return True
+    after = _snapshot_host_nm_metadata(host_root, max_entries=max(150000, len(snapshot) + 100))
+    if after is None:
+        return False
+    return after == snapshot
+
+
+def _nm_links_contain_host_symlinks(created_dirs: list[Path], host_root: Path) -> bool:
+    """Return True if any entry inside `created_dirs` is a symlink resolving into `host_root`."""
+    if not created_dirs or not host_root.is_dir():
+        return False
+    host_resolved = host_root.resolve()
+    for nm_dir in created_dirs:
+        if not nm_dir.is_dir():
+            continue
+        try:
+            for entry in os.scandir(nm_dir):
+                if entry.name.startswith(".cc-agy-"):
+                    continue
+                ep = Path(entry.path)
+                if ep.is_symlink():
+                    try:
+                        if ep.resolve().is_relative_to(host_resolved):
+                            return True
+                    except OSError:
+                        continue
+                elif entry.name.startswith("@") and entry.is_dir(follow_symlinks=False):
+                    for sub in os.scandir(ep):
+                        sp = Path(sub.path)
+                        if sp.is_symlink():
+                            try:
+                                if sp.resolve().is_relative_to(host_resolved):
+                                    return True
+                            except OSError:
+                                continue
+        except OSError:
+            continue
+    return False
+
+
+def link_host_node_modules_farm(
+    host_root: Path,
+    wt_dir: Path,
+    *,
+    allow_shallow_symlinks: bool = True,
+) -> list[Path]:
+    """Populate isolated `node_modules` directories in `wt_dir` from `host_root`.
+
+    Uses O(1) CoW clones (`cp -cR` / `cp --reflink=always`) or bounded isolated package copies
+    (`<= 10,000` entries and `<= 128 MiB`) so worker writes or `rm -rf` inside `wt_dir/node_modules`
+    cannot touch `host_root`. On oversized non-CoW trees, skips linking when
+    `allow_shallow_symlinks=False` (`agy` CLI `--dangerously-skip-permissions` workers) or falls
+    back to shallow package symlinks guarded by Straitjacket + post-run host integrity checks.
+    """
+    if not host_root.is_dir() or not wt_dir.is_dir():
+        return []
+    host_resolved = host_root.resolve()
+    wt_resolved = wt_dir.resolve()
+    if host_resolved == wt_resolved:
+        return []
+
+    created_dirs: list[Path] = []
+    for cur_root, dirs, _files in os.walk(str(host_resolved), topdown=True, followlinks=False):
+        cur_path = Path(cur_root)
+        has_nm = "node_modules" in dirs
+        dirs[:] = sorted(
+            d for d in dirs if d not in _NM_WALK_PRUNE_DIRS and not d.startswith(".cc-agy-")
+        )
+        if not has_nm:
+            continue
+        host_nm = cur_path / "node_modules"
+        if host_nm.is_symlink() or not host_nm.is_dir():
+            continue
+        try:
+            rel_parent = cur_path.relative_to(host_resolved)
+        except ValueError:
+            continue
+        wt_parent = wt_resolved if rel_parent == Path(".") else (wt_resolved / rel_parent)
+        wt_nm = wt_parent / "node_modules"
+        if not wt_parent.is_dir() or wt_nm.exists() or wt_nm.is_symlink():
+            continue
+
+        within_budget = _probe_nm_within_copy_budget(host_nm)
+        try:
+            wt_nm.mkdir(parents=False, exist_ok=False)
+        except OSError:
+            continue
+        fs_cow = _fs_supports_cow_between(host_nm, wt_nm)
+        isolate_copies = within_budget or fs_cow
+        if not isolate_copies and not allow_shallow_symlinks:
+            shutil.rmtree(wt_nm, ignore_errors=True)
+            continue
+
+        created_dirs.append(wt_nm)
+        host_nm_resolved = host_nm.resolve()
+
+        def _populate_entry(src_p: Path, dst_p: Path, dst_parent: Path) -> None:
+            ws_rel = _workspace_internal_symlink_rel(src_p, host_resolved)
+            if ws_rel is not None:
+                wt_target = wt_resolved / ws_rel
+                if wt_target.exists() or wt_target.is_symlink():
+                    os.symlink(os.path.relpath(wt_target, dst_parent), str(dst_p))
+                    return
+                resolved_ws_pkg = src_p.resolve()
+                if resolved_ws_pkg.exists() and (isolate_copies or _probe_nm_within_copy_budget(resolved_ws_pkg)):
+                    sparse_copy = wt_nm / ".cc-agy-sparse-ws" / ws_rel
+                    if not sparse_copy.exists():
+                        _copy_isolated_pkg_entry(resolved_ws_pkg, sparse_copy, try_cow=fs_cow)
+                    os.symlink(os.path.relpath(sparse_copy, dst_parent), str(dst_p))
+                    return
+                if allow_shallow_symlinks and resolved_ws_pkg.exists():
+                    os.symlink(str(resolved_ws_pkg), str(dst_p))
+                return
+
+            if src_p.is_symlink():
+                raw_target = os.readlink(src_p)
+                resolved_target = (src_p.parent / raw_target).resolve()
+                if resolved_target.is_relative_to(host_nm_resolved):
+                    if isolate_copies:
+                        rel_inside_nm = resolved_target.relative_to(host_nm_resolved)
+                        os.symlink(os.path.relpath(wt_nm / rel_inside_nm, dst_parent), str(dst_p))
+                    elif allow_shallow_symlinks:
+                        os.symlink(str(src_p), str(dst_p))
+                    return
+                if resolved_target.exists() and (isolate_copies or _probe_nm_within_copy_budget(resolved_target)):
+                    ext_copy = wt_nm / ".cc-agy-ext-store" / dst_p.relative_to(wt_nm)
+                    if not ext_copy.exists():
+                        _copy_isolated_pkg_entry(resolved_target, ext_copy, try_cow=fs_cow)
+                    os.symlink(os.path.relpath(ext_copy, dst_parent), str(dst_p))
+                    return
+                if allow_shallow_symlinks:
+                    os.symlink(str(src_p), str(dst_p))
+                return
+
+            if isolate_copies:
+                _copy_isolated_pkg_entry(src_p, dst_p, try_cow=fs_cow)
+            elif allow_shallow_symlinks:
+                os.symlink(str(src_p), str(dst_p))
+
+        try:
+            entries = sorted(os.scandir(host_nm), key=lambda e: e.name)
+        except OSError:
+            continue
+
+        for entry in entries:
+            name = entry.name
+            if name in _NM_TRANSIENT_CACHE_ENTRIES:
+                continue
+            entry_path = Path(entry.path)
+            if name.startswith("@") and entry.is_dir(follow_symlinks=False):
+                wt_scope = wt_nm / name
+                try:
+                    wt_scope.mkdir(parents=False, exist_ok=True)
+                    sub_entries = sorted(os.scandir(entry_path), key=lambda e: e.name)
+                except OSError:
+                    continue
+                for sub in sub_entries:
+                    if sub.name in _NM_TRANSIENT_CACHE_ENTRIES:
+                        continue
+                    try:
+                        _populate_entry(Path(sub.path), wt_scope / sub.name, wt_scope)
+                    except OSError:
+                        continue
+                continue
+
+            try:
+                _populate_entry(entry_path, wt_nm / name, wt_nm)
+            except OSError:
+                continue
+
+    return created_dirs
+
+
+def unlink_host_node_modules_farm(created_dirs: list[Path] | Path | None) -> None:
+    """Remove shallow `node_modules` farm directories created in a worktree without touching host files."""
+    if created_dirs is None:
+        return
+    items = [created_dirs] if isinstance(created_dirs, Path) else list(created_dirs)
+    for d in sorted(items, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if d.is_symlink():
+                d.unlink(missing_ok=True)
+            elif d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
 _IGNORED_BUILD_OUTPUT_DIRS: frozenset[str] = frozenset(
     {
@@ -793,7 +1185,7 @@ def render_worker_prompt(
     if progress_channel:
         static_parts.append(
             "## Reporting\nUse the report_to_lead tool only when blocked (kind=\"question\" if a requirement is "
-            "ambiguous; kind=\"blocker\" if you cannot proceed — questions and blockers end your turn) or "
+            "ambiguous; kind=\"blocker\" if you cannot proceed; questions and blockers end your turn) or "
             "kind=\"milestone\" between distinct plan steps on multi-step plans. Once your implementation and "
             "tests pass, finish your turn directly with a short summary instead of calling report_to_lead."
         )
@@ -814,7 +1206,7 @@ def render_worker_prompt(
     if raw_user_prompt and raw_user_prompt.strip():
         if allowed_paths:
             dynamic_parts.append(
-                "## Background User Context (Reference Only — Scope Restricted to allowed_paths)\n"
+                "## Background User Context (Reference Only: Scope Restricted to allowed_paths)\n"
                 f"Scope restriction: implement ONLY the Lead's brief above and modify ONLY files within "
                 f"`allowed_paths={list(allowed_paths)}`. Ignore any parts of this background request that "
                 "target other files/directories or ask to run multiple workers:\n"
@@ -822,7 +1214,7 @@ def render_worker_prompt(
             )
         else:
             dynamic_parts.append(
-                "## Original User Request (Verbatim — Do Not Omit Any Requirement)\n"
+                "## Original User Request (Verbatim: Do Not Omit Any Requirement)\n"
                 + raw_user_prompt.strip()
             )
     if spec_files_inlined:
@@ -831,12 +1223,12 @@ def render_worker_prompt(
         if full_specs:
             spec_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in full_specs]
             dynamic_parts.append(
-                "## Task Specification Files (Verbatim — Do Not Re-Read)\n" + "\n\n".join(spec_blocks)
+                "## Task Specification Files (Verbatim: Do Not Re-Read)\n" + "\n\n".join(spec_blocks)
             )
         if trunc_specs:
             tspec_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in trunc_specs]
             dynamic_parts.append(
-                "## Partially Inlined Specification Files (Truncated to Token Budget — Use view_file for Omitted Lines)\n"
+                "## Partially Inlined Specification Files (Truncated to Token Budget: Use view_file for Omitted Lines)\n"
                 + "\n\n".join(tspec_blocks)
             )
     if checklist:
@@ -860,13 +1252,13 @@ def render_worker_prompt(
         if full_ctx:
             ctx_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in full_ctx]
             dynamic_parts.append(
-                "## Pre-Read Context Files (Already Inlined — Do Not Call view_file on These Again; Edit Directly)\n"
+                "## Pre-Read Context Files (Already Inlined: Do Not Call view_file on These Again; Edit Directly)\n"
                 + "\n\n".join(ctx_blocks)
             )
         if trunc_ctx:
             tctx_blocks = [f"### `{rel}`\n```\n{content.rstrip()}\n```" for rel, content in trunc_ctx]
             dynamic_parts.append(
-                "## Partially Inlined Context Files (Truncated to Token Budget — Use view_file with start_line/end_line for Omitted Lines)\n"
+                "## Partially Inlined Context Files (Truncated to Token Budget: Use view_file with start_line/end_line for Omitted Lines)\n"
                 + "\n\n".join(tctx_blocks)
             )
     if plan:
@@ -889,7 +1281,7 @@ def render_worker_prompt(
                 cwd_hint = (
                     f" Note: existing tests under `{p_cwd}` pass (`rc=0`) on HEAD when run with "
                     f"`working_directory={p_cwd!r}`. Verify `{p_cwd}` with `working_directory={p_cwd!r}` and run "
-                    f"your new/modified tests (e.g. `--ignore={p_cwd}`), then stop once both pass — post-worker "
+                    f"your new/modified tests (e.g. `--ignore={p_cwd}`), then stop once both pass; post-worker "
                     f"acceptance automatically accounts for this pre-existing HEAD `cwd` quirk."
                 )
             baseline_notes.append(
@@ -1077,7 +1469,7 @@ def _parse_test_counts(output: str) -> dict[str, int]:
 
 
 def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Return an environment dict that prepends cwd (and cwd/src) to PYTHONPATH and cwd/.venv/bin to PATH."""
+    """Return an environment dict that prepends cwd (and cwd/src) to PYTHONPATH and node_modules/.bin + .venv/bin to PATH."""
     env = dict(os.environ if base_env is None else base_env)
     cwd_resolved = cwd.resolve()
     py_parts = [str(cwd_resolved)]
@@ -1088,12 +1480,22 @@ def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -
     if existing_py:
         py_parts.append(existing_py)
     env["PYTHONPATH"] = ":".join(py_parts)
+    path_prefixes: list[str] = []
+    nm_bin = cwd_resolved / "node_modules" / ".bin"
+    if nm_bin.is_dir():
+        nm_bin_resolved = str(nm_bin.resolve())
+        path_prefixes.append(nm_bin_resolved)
+        if str(nm_bin) != nm_bin_resolved:
+            path_prefixes.append(str(nm_bin))
     venv_dir = cwd_resolved / ".venv"
     venv_bin = venv_dir / "bin"
     if venv_bin.is_dir():
-        existing_path = (env.get("PATH") or "").strip()
-        env["PATH"] = f"{venv_bin}:{existing_path}" if existing_path else str(venv_bin)
+        path_prefixes.append(str(venv_bin))
         env["VIRTUAL_ENV"] = str(venv_dir)
+    if path_prefixes:
+        existing_path = (env.get("PATH") or "").strip()
+        prefix_joined = ":".join(path_prefixes)
+        env["PATH"] = f"{prefix_joined}:{existing_path}" if existing_path else prefix_joined
     return env
 
 
@@ -1625,7 +2027,7 @@ def evaluate_post_worker_baseline_failures(
                         )
                         continue
 
-        # Case 2: Non-subdir clean-HEAD failures remain failing — NEVER flip `passed` to True
+        # Case 2: Non-subdir clean-HEAD failures remain failing: NEVER flip `passed` to True
         # (an unfixed TDD acceptance test must never auto-apply even if the worker also added
         # unrelated passing tests). Record an informational diagnostic for the Lead only.
         base_nodes = [str(n) for n in (probe.get("failing_nodes") or []) if n]
@@ -4127,13 +4529,20 @@ class JobManager:
 
         symlink_escapes: list[str] = []
         wt_resolved = wt_dir.resolve()
-        for p in list(wt_dir.rglob("*")):
-            if ".git" in p.parts:
-                continue
-            rel = str(p.relative_to(wt_dir))
-            if _is_ephemeral_build_or_test_artifact(rel, root=wt_dir):
-                continue
-            if p.is_symlink():
+        for cur_root, dirs, files in os.walk(str(wt_dir), topdown=True, followlinks=False):
+            dirs[:] = [
+                d
+                for d in dirs
+                if d != ".git" and d not in _EPHEMERAL_CACHE_DIRS and not d.endswith(".egg-info")
+            ]
+            cur_path = Path(cur_root)
+            for name in list(dirs) + list(files):
+                p = cur_path / name
+                if not p.is_symlink():
+                    continue
+                rel = str(p.relative_to(wt_dir))
+                if _is_ephemeral_build_or_test_artifact(rel, root=wt_dir):
+                    continue
                 try:
                     link_target = (p.parent / os.readlink(p)).resolve()
                     if not link_target.is_relative_to(wt_resolved):
@@ -4209,28 +4618,25 @@ class JobManager:
                 files.append(esc)
         return diff_text, files, symlink_escapes
 
-    def _link_host_node_modules_for_checks(self, wt_dir: Path) -> Path | None:
-        """Symlink the host's node_modules into an isolated copy for plugin-run checks; returns the link."""
+    def _link_host_node_modules_for_checks(
+        self,
+        wt_dir: Path,
+        *,
+        allow_shallow_symlinks: bool = True,
+    ) -> list[Path]:
+        """Populate isolated `node_modules` in `wt_dir` from `self.workspace_root`."""
         if env_flag("CC_AGY_LINK_NODE_MODULES") is False:
-            return None
-        host_nm = self.workspace_root / "node_modules"
-        link = wt_dir / "node_modules"
-        if not host_nm.is_dir() or not wt_dir.is_dir() or link.exists() or link.is_symlink():
-            return None
-        try:
-            os.symlink(str(host_nm.resolve()), str(link))
-        except OSError:
-            return None
-        return link
+            return []
+        return link_host_node_modules_farm(
+            self.workspace_root,
+            wt_dir,
+            allow_shallow_symlinks=allow_shallow_symlinks,
+        )
 
     @staticmethod
-    def _unlink_checks_node_modules(link: Path | None) -> None:
-        """Remove a link created by _link_host_node_modules_for_checks (never the host directory itself)."""
-        if link is not None and link.is_symlink():
-            try:
-                link.unlink()
-            except OSError:
-                pass
+    def _unlink_checks_node_modules(links: list[Path] | Path | None) -> None:
+        """Remove shallow `node_modules` farm directories created in a worktree (never the host directory itself)."""
+        unlink_host_node_modules_farm(links)
 
     def _cleanup_worktree(self, wt_dir: Path) -> None:
         if not wt_dir.exists():
@@ -4426,6 +4832,9 @@ class JobManager:
         prompt_sources: list[str] | None = None,
         recorded_budget: dict[str, int | None] | None = None,
         baseline_acceptance_probe: list[dict[str, Any]] | None = None,
+        agy_conversation_id: str | None = None,
+        agy_prior_conversation_usage: dict[str, Any] | None = None,
+        agy_prior_conversation_turns: int | None = None,
     ) -> dict[str, Any]:
         token_keys = (
             "prompt_token_count",
@@ -4466,6 +4875,15 @@ class JobManager:
         config_snap = _snapshot_directory_tree(host_git_dir / "config")
         orig_branch, pre_branches = self._snapshot_branches() if in_place else (None, [])
         worker_out: dict[str, Any] = {}
+        active_agy_conv_id: str | None = agy_conversation_id
+        active_agy_conv_usage: dict[str, int] | None = (
+            {k: int(agy_prior_conversation_usage.get(k) or 0) for k in token_keys}
+            if isinstance(agy_prior_conversation_usage, dict)
+            else None
+        )
+        active_agy_conv_turns: int | None = (
+            int(agy_prior_conversation_turns) if agy_prior_conversation_turns else None
+        )
         workspace_dir_accessed = False
 
         class _TrackedReq(dict[str, Any]):
@@ -4503,12 +4921,27 @@ class JobManager:
                 except Exception:
                     pass
 
+        worker_nm_links: list[Path] = []
+        host_nm_snap: dict[str, tuple[int, int, int]] | None = None
         try:
             with self._lock:
                 if job_id in self._cancelled:
                     status = "cancelled"
                     error_msg = "Job cancelled before execution."
                     raise RuntimeError(error_msg)
+
+            if not in_place:
+                allow_shallow = not (
+                    auth_mode == "gemini_enterprise"
+                    and not is_read_only_tool_set(enabled_tools, disabled_tools)
+                    and env_flag("CC_AGY_CLI_LINK_NODE_MODULES") is not True
+                )
+                worker_nm_links = self._link_host_node_modules_for_checks(
+                    wt_dir,
+                    allow_shallow_symlinks=allow_shallow,
+                )
+                if _nm_links_contain_host_symlinks(worker_nm_links, self.workspace_root):
+                    host_nm_snap = _snapshot_host_nm_metadata(self.workspace_root)
 
             worker_out = run_antigravity_worker(
                 prompts=worker_prompts,
@@ -4528,8 +4961,23 @@ class JobManager:
                 max_total_tokens=max_total_tokens,
                 progress_path=progress_path,
                 acceptance=acceptance,
+                allowed_paths=allowed_paths,
+                agy_conversation_id=agy_conversation_id,
+                agy_prior_conversation_usage=agy_prior_conversation_usage,
+                agy_prior_conversation_turns=agy_prior_conversation_turns,
                 register_cancel=_register_cancel_hook,
+                host_workspace_root=self.workspace_root,
+                nm_linked=bool(worker_nm_links),
+                isolated_worktree=(not in_place),
             )
+            if worker_out.get("agy_conversation_id"):
+                active_agy_conv_id = str(worker_out["agy_conversation_id"])
+            if isinstance(worker_out.get("agy_conversation_usage"), dict):
+                active_agy_conv_usage = {
+                    k: int(worker_out["agy_conversation_usage"].get(k) or 0) for k in token_keys
+                }
+            if worker_out.get("agy_conversation_turns"):
+                active_agy_conv_turns = int(worker_out["agy_conversation_turns"])
             if worker_out.get("vertex_project"):
                 project = str(worker_out["vertex_project"])
                 with self._lock:
@@ -4540,7 +4988,19 @@ class JobManager:
                 reroute_note = str(worker_out["reroute_note"])
 
             response_text = str(worker_out.get("text") or "")
-            new_usage = worker_out.get("usage") or {}
+            raw_new_usage = worker_out.get("usage") or {}
+            if worker_out.get("usage_is_cumulative") and prior_usage:
+                new_usage = {
+                    k: max(0, int(raw_new_usage.get(k) or 0) - int((prior_usage or {}).get(k) or 0))
+                    for k in token_keys
+                }
+                new_usage["total_token_count"] = (
+                    new_usage["prompt_token_count"]
+                    + new_usage["candidates_token_count"]
+                    + new_usage["thoughts_token_count"]
+                )
+            else:
+                new_usage = raw_new_usage
             for k in token_keys:
                 usage[k] += int(new_usage.get(k) or 0)
             usage["total_token_count"] = max(
@@ -4595,6 +5055,14 @@ class JobManager:
                 worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
             if getattr(exc, "partial_command_runs", None):
                 worker_out["command_runs"] = getattr(exc, "partial_command_runs")
+            if getattr(exc, "partial_agy_conversation_id", None):
+                active_agy_conv_id = str(getattr(exc, "partial_agy_conversation_id"))
+            if isinstance(getattr(exc, "partial_agy_conversation_usage", None), dict):
+                active_agy_conv_usage = {
+                    k: int(getattr(exc, "partial_agy_conversation_usage").get(k) or 0) for k in token_keys
+                }
+            if getattr(exc, "partial_agy_conversation_turns", None):
+                active_agy_conv_turns = int(getattr(exc, "partial_agy_conversation_turns"))
         except Exception as exc:
             with self._lock:
                 is_canc = job_id in self._cancelled
@@ -4611,13 +5079,29 @@ class JobManager:
                 worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
             if getattr(exc, "partial_command_runs", None):
                 worker_out["command_runs"] = getattr(exc, "partial_command_runs")
+            if getattr(exc, "partial_agy_conversation_id", None):
+                active_agy_conv_id = str(getattr(exc, "partial_agy_conversation_id"))
+            if isinstance(getattr(exc, "partial_agy_conversation_usage", None), dict):
+                active_agy_conv_usage = {
+                    k: int(getattr(exc, "partial_agy_conversation_usage").get(k) or 0) for k in token_keys
+                }
+            if getattr(exc, "partial_agy_conversation_turns", None):
+                active_agy_conv_turns = int(getattr(exc, "partial_agy_conversation_turns"))
         finally:
+            self._unlink_checks_node_modules(worker_nm_links)
             try:
                 hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
                 config_tampered = _restore_directory_tree(host_git_dir / "config", config_snap)
+                nm_tampered = (
+                    host_nm_snap is not None
+                    and not _verify_host_nm_metadata_unchanged(self.workspace_root, host_nm_snap)
+                )
                 if hooks_tampered or config_tampered:
                     status = "security_violation"
                     error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
+                elif nm_tampered:
+                    status = "security_violation"
+                    error_msg = "Worker modified host node_modules during isolated execution."
 
                 if in_place:
                     diff_text, files_changed, symlink_escapes, in_place_notes = self._finalize_in_place(
@@ -4956,6 +5440,17 @@ class JobManager:
                 **({"baseline_acceptance_warnings": baseline_acceptance_warnings} if baseline_acceptance_warnings else {}),
                 "external_worktree_tamper": external_tamper,
                 "preloaded_files": list(preloaded_files or []),
+                **({"agy_conversation_id": active_agy_conv_id} if active_agy_conv_id else {}),
+                **(
+                    {"agy_conversation_usage": dict(active_agy_conv_usage)}
+                    if isinstance(active_agy_conv_usage, dict)
+                    else {}
+                ),
+                **(
+                    {"agy_conversation_turns": int(active_agy_conv_turns)}
+                    if active_agy_conv_turns
+                    else {}
+                ),
                 **(
                     {"recovered_from_timeout": True, "timeout_note": timeout_note}
                     if recovered_from_timeout
@@ -5493,11 +5988,7 @@ class JobManager:
         auth_mode = auth["auth_mode"]
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
-        resolved_location = (
-            auth.get("location")
-            if (auth_mode != "gemini_enterprise" or auth.get("location_explicit"))
-            else None
-        )
+        resolved_location = auth.get("location")
         reroute_note = auth.get("reroute_note")
 
         job_id = f"job-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -7047,23 +7538,6 @@ class JobManager:
             if isinstance(receipt.get("baseline_acceptance_probe"), list)
             else []
         )
-        worker_prompts = [
-            render_worker_prompt(
-                worker_prompts[0],
-                plan=plan_steps,
-                acceptance=acceptance_cmds,
-                max_tool_calls=phase_budget_calls,
-                max_total_tokens=phase_budget_tokens,
-                repo_map=repo_map_text,
-                focused_outline=cont_focused_outline,
-                spec_files_inlined=cont_spec_inlined,
-                context_files_inlined=cont_ctx_inlined,
-                checklist=stored_checklist,
-                raw_user_prompt=stored_raw_user_prompt,
-                baseline_acceptance_probe=prior_baseline_probe,
-                allowed_paths=list(receipt.get("allowed_paths") or []),
-            )
-        ]
         with self._lock:
             raw_proj = self._raw_projects.get(safe_id)
             raw_key = self._raw_api_keys.get(safe_id)
@@ -7095,12 +7569,38 @@ class JobManager:
         auth_mode = auth["auth_mode"]
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
-        resolved_location = (
-            auth.get("location")
-            if (auth_mode != "gemini_enterprise" or auth.get("location_explicit"))
-            else None
-        )
+        resolved_location = auth.get("location")
         reroute_note = auth.get("reroute_note")
+
+        resumed_agy_conv_id: str | None = None
+        prior_agy_conv_usage: dict[str, Any] | None = None
+        prior_agy_conv_turns: int | None = None
+        if auth_mode == "gemini_enterprise" and receipt.get("agy_conversation_id"):
+            resumed_agy_conv_id = str(receipt["agy_conversation_id"]).strip() or None
+            if resumed_agy_conv_id:
+                if isinstance(receipt.get("agy_conversation_usage"), dict):
+                    prior_agy_conv_usage = dict(receipt["agy_conversation_usage"])
+                elif isinstance(receipt.get("usage"), dict):
+                    prior_agy_conv_usage = dict(receipt["usage"])
+                prior_agy_conv_turns = int(receipt.get("agy_conversation_turns") or max(1, len(prior_prompts)))
+
+        worker_prompts = [
+            render_worker_prompt(
+                clean_followup if resumed_agy_conv_id else worker_prompts[0],
+                plan=[] if resumed_agy_conv_id else plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=phase_budget_calls,
+                max_total_tokens=phase_budget_tokens,
+                repo_map="" if resumed_agy_conv_id else repo_map_text,
+                focused_outline=cont_focused_outline,
+                spec_files_inlined=[] if resumed_agy_conv_id else cont_spec_inlined,
+                context_files_inlined=cont_ctx_inlined if not resumed_agy_conv_id else [],
+                checklist=[] if resumed_agy_conv_id else stored_checklist,
+                raw_user_prompt="" if resumed_agy_conv_id else stored_raw_user_prompt,
+                baseline_acceptance_probe=prior_baseline_probe,
+                allowed_paths=list(receipt.get("allowed_paths") or []),
+            )
+        ]
 
         with self._lock:
             if resolved_project:
@@ -7227,6 +7727,9 @@ class JobManager:
             prompt_sources=recorded_prompt_sources,
             recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
             baseline_acceptance_probe=prior_baseline_probe,
+            agy_conversation_id=resumed_agy_conv_id,
+            agy_prior_conversation_usage=prior_agy_conv_usage,
+            agy_prior_conversation_turns=prior_agy_conv_turns,
         )
         with self._lock:
             self._futures[safe_id] = fut
@@ -7403,7 +7906,7 @@ class JobManager:
                 )
             if contract_warns:
                 extra_notes.append(
-                    f" Note: contract_warnings flagged potential class-attribute shadowing — inspect with "
+                    f" Note: contract_warnings flagged potential class-attribute shadowing: inspect with "
                     f"get_diff(job_id={job_id!r}, focus_symbols=[...]) and fix via "
                     f"delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if unrequested."
                 )
@@ -7460,21 +7963,21 @@ class JobManager:
                     if digest.get("acceptance_passed") is True:
                         digest["next_action"] = (
                             f"Worker timed out after modifying {len(digest.get('files_changed') or [])} file(s) and passing "
-                            f"acceptance checks. Do NOT read or grep repository files yourself — immediately call "
+                            f"acceptance checks. Do NOT read or grep repository files yourself; immediately call "
                             f"delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if any task item or unit test is "
                             f"still missing, or call delegate_apply(job_id={job_id!r}, allow_scope_violations=True) now.{missing_note}"
                         )
                     else:
                         digest["next_action"] = (
                             f"Worker timed out mid-implementation with {len(digest.get('files_changed') or [])} modified "
-                            f"file(s) preserved in its worktree. Do NOT read or grep repository files yourself — "
+                            f"file(s) preserved in its worktree. Do NOT read or grep repository files yourself; "
                             f"immediately call delegate_continue(job_id={job_id!r}, follow_up_prompt=...) so the worker "
                             f"can finish the remaining edits and run acceptance tests.{missing_note}"
                         )
         elif job_id and digest.get("status") in ("timeout", "checkpoint", "needs_input") and not digest.get("applied"):
             digest["next_action"] = (
                 f"Worker stopped with status={digest.get('status')!r} before modifying files. Do NOT read or grep "
-                f"repository files yourself — immediately call delegate_continue(job_id={job_id!r}, "
+                f"repository files yourself; immediately call delegate_continue(job_id={job_id!r}, "
                 "follow_up_prompt=...) instructing the worker to apply its changes directly with edit_file/create_file."
             )
         return digest
