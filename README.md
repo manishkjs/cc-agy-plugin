@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-296%20passing-1e8e3e)](tests/)
+[![Tests](https://img.shields.io/badge/tests-297%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Codex%20%7C%20Antigravity-f9ab00)](#quick-start)
 
@@ -181,7 +181,7 @@ Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, us
 | Item | Detail |
 |:--|:--|
 | **Version** | 0.3.0, Apache 2.0 |
-| **Quality** | 296 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
+| **Quality** | 297 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 | **Next** | Finish the full 33-task DeepSWE suite and publish per-pattern cost guidance |
 

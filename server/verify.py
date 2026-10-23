@@ -71,6 +71,7 @@ def scrubbed_env(cwd: Path) -> dict[str, str]:
     }
     for key in SECRET_ENV_KEYS:
         env[key] = ""
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     return _build_workdir_exec_env(cwd, env)
 
 

@@ -1499,6 +1499,44 @@ def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -
     return env
 
 
+def _invalidate_python_bytecode_for_paths(root: Path, rel_paths: list[str] | tuple[str, ...]) -> None:
+    """Delete stale `__pycache__/<stem>.*.pyc` bytecode for modified `.py` files inside `root`.
+
+    CPython PEP 552 `.pyc` headers compare 32-bit integer `int(st_mtime)` seconds and `st_size`, so
+    two edits within the same wall-clock second that keep the same byte length (`a * b` -> `a + b`)
+    would otherwise execute stale bytecode from an earlier turn.
+    """
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        return
+    for raw_rel in rel_paths:
+        norm = str(raw_rel or "").replace("\\", "/").strip("/")
+        if not norm.endswith(".py"):
+            continue
+        src = root / norm
+        try:
+            resolved_src = src.resolve()
+        except OSError:
+            continue
+        if not resolved_src.is_relative_to(resolved_root):
+            continue
+        stem = resolved_src.stem
+        pycache = resolved_src.parent / "__pycache__"
+        if pycache.is_dir() and not pycache.is_symlink():
+            for pyc in pycache.glob(f"{stem}.*.pyc"):
+                try:
+                    pyc.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        legacy_pyc = resolved_src.with_suffix(".pyc")
+        if legacy_pyc.is_file() and not legacy_pyc.is_symlink():
+            try:
+                legacy_pyc.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> list[dict[str, Any]]:
     """Run acceptance checks with a hard timeout (whole process group is killed), then delete any new
     untracked files the checks themselves created (e.g. caches or TLS key logs), so they never land in
@@ -1506,6 +1544,7 @@ def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> 
     limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(DEFAULT_ACCEPTANCE_TIMEOUT)))
     before = set(_snapshot_untracked_hashes(cwd))
     exec_env = _build_workdir_exec_env(cwd)
+    exec_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     results: list[dict[str, Any]] = []
     for cmd in cmds:
         started = time.time()
@@ -5156,6 +5195,8 @@ class JobManager:
                 vacuous_acceptance = True
                 effective_acceptance = []
             if effective_acceptance and runnable_acc_status:
+                if not in_place and files_changed:
+                    _invalidate_python_bytecode_for_paths(target_acc_cwd, files_changed)
                 try:
                     reused_acc = (
                         self._try_reuse_worker_acceptance(

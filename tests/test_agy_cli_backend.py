@@ -1845,7 +1845,7 @@ elif turn_n == 2:
             "usage": {{"input_tokens": 1500, "output_tokens": 300}},
         }},
     }}), flush=True)
-    time.sleep(5.0)
+    time.sleep(15.0)
 else:
     print(json.dumps({{
         "event": "result",
@@ -1873,7 +1873,7 @@ else:
             r2 = jm.delegate_continue(
                 job_id=jid,
                 follow_up_prompt="Continue step 2.",
-                timeout_seconds=0.6,
+                timeout_seconds=2.5,
                 wait=True,
             )
             assert r2["status"] == "timeout"
@@ -1991,6 +1991,40 @@ else:
         (host / "node_modules" / "pkg_a" / "index.js").write_text("tampered\n", encoding="utf-8")
         assert jobs_mod._verify_host_nm_metadata_unchanged(host, snap) is False
         jobs_mod.unlink_host_node_modules_farm(sdk_links)
+
+    def test_run_acceptance_prevents_same_second_pyc_bytecode_collision(self, tmp_path: Path):
+        """Regression test: when global gitignore hides `__pycache__/` and Turn 2 rewrites a `.py` file
+        in the same integer second with the same byte length (`a * b` -> `a + b`), `run_acceptance`
+        must not execute stale PEP 552 `.pyc` bytecode from Turn 1."""
+        import server.jobs as jobs_mod
+
+        repo = _init_git_repo(tmp_path / "repo")
+        global_ign = tmp_path / "global_gitignore"
+        global_ign.write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
+        global_cfg = tmp_path / "gitconfig"
+        global_cfg.write_text(f"[core]\n\texcludesfile = {global_ign}\n", encoding="utf-8")
+
+        fixed_sec = 1_700_000_000
+        pytest_cmd = f"{sys.executable} -m pytest -q"
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_cfg)}, clear=False):
+            (repo / "app.py").write_text("def add(a, b):\n    return a * b\n", encoding="utf-8")
+            os.utime(repo / "app.py", (fixed_sec + 0.1, fixed_sec + 0.1))
+            # Also simulate a worker-compiled .pyc from Turn 1 inside __pycache__
+            subprocess.run([sys.executable, "-m", "py_compile", "app.py"], cwd=str(repo), check=True)
+            assert any((repo / "__pycache__").glob("app.*.pyc"))
+
+            res1 = jobs_mod.run_acceptance([pytest_cmd], repo)
+            assert res1[0]["passed"] is False
+
+            # Rewrite app.py in the exact same integer second with identical 32-byte length
+            (repo / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            os.utime(repo / "app.py", (fixed_sec + 0.8, fixed_sec + 0.8))
+            jobs_mod._invalidate_python_bytecode_for_paths(repo, ["app.py"])
+
+            res2 = jobs_mod.run_acceptance([pytest_cmd], repo)
+            assert res2[0]["passed"] is True, res2
+
 
 
 
