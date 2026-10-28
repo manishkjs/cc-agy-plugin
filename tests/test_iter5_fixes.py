@@ -362,7 +362,7 @@ def test_fix4_escalation_subtracts_phase1_tool_calls_and_tokens_from_phase2_budg
             return {
                 "text": "hit flash cap",
                 "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
-                "tool_calls": [{"name": "view_file", "args": {"path": "app.py"}} for _ in range(40)],
+                "tool_calls": [{"name": "view_file", "args": {"path": "app.py"}} for _ in range(55)],
                 "usage": {
                     "prompt_token_count": 2_200_000,
                     "candidates_token_count": 150_000,
@@ -391,9 +391,9 @@ def test_fix4_escalation_subtracts_phase1_tool_calls_and_tokens_from_phase2_budg
             auto_apply=False,
         )
         assert len(seen_reqs) == 2
-        assert seen_reqs[0]["max_tool_calls"] == 40
+        assert seen_reqs[0]["max_tool_calls"] == 55
         assert seen_reqs[0]["max_total_tokens"] == 5_000_000
-        # Phase 2 Argon receives ONLY the remaining cumulative budget: 100 - 40 = 60 calls, 5M - 2.35M = 2.65M tokens
+        # Phase 2 Argon receives max(60 floor, 100 - 55) = 60 calls, and 5M - 2.35M = 2.65M tokens
         assert seen_reqs[1]["max_tool_calls"] == 60
         assert seen_reqs[1]["max_total_tokens"] == 2_650_000
         # Job receipt preserves the cumulative job ceiling (100 / 5,000,000)

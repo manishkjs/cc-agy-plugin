@@ -20,6 +20,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 
 from server.regions import is_strict_mode_enabled  # noqa: E402  (shared strict-mode check, re-exported)
+from server.regions import resolve_cost_profile  # noqa: E402
 
 
 def resolve_project_root(
@@ -1119,12 +1120,204 @@ def _session_has_multifile_delegate_job(data_root: Path) -> bool:
     return False
 
 
+def _receipt_owner_pid_is_alive(rec: dict[str, Any]) -> bool:
+    """Return False when `owner_instance_id` (`<pid>-<hex>` or `inst-<pid>-<hex>`) points to a dead local PID."""
+    owner_id = str(rec.get("owner_instance_id") or "").strip()
+    if not owner_id or "-" not in owner_id:
+        return True
+    parts = owner_id.split("-")
+    pid_str = parts[1] if parts[0] == "inst" and len(parts) >= 3 else parts[0]
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def _session_has_live_running_delegate_job(data_root: Path) -> bool:
+    """Return True when the current session has an active `running` delegate receipt owned by a live PID."""
+    try:
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime if marker.exists() else 0.0
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return False
+        for p in receipts_dir.glob("job-*.json"):
+            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
+                continue
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
+                continue
+            if rec.get("status") == "running" and _receipt_owner_pid_is_alive(rec):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _session_has_terminal_delegate_job(data_root: Path) -> bool:
+    """Return True when the current session has at least one completed (non-running, non-cancelled) delegate job."""
+    try:
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime if marker.exists() else 0.0
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return False
+        for p in receipts_dir.glob("job-*.json"):
+            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
+                continue
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
+                continue
+            if rec.get("status") not in ("running", "cancelled") and not rec.get("cancelled"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _session_has_lead_escalated_job(data_root: Path, ws_root: Path | None = None) -> bool:
+    """Return True when any completed/stopped delegate receipt in the current session has `escalate_to_lead=True`
+    and no worker job is actively running."""
+    if _session_has_live_running_delegate_job(data_root):
+        return False
+    try:
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime - 1.0 if marker.exists() else 0.0
+        if ws_root is not None:
+            from server.receipts import ReceiptStore
+
+            store = ReceiptStore(data_root, workspace_root=ws_root)
+            for r_esc in store.list_receipts(workspace_root=ws_root):
+                if r_esc.get("kind", "delegate") != "delegate":
+                    continue
+                if r_esc.get("status") in ("running", "cancelled") or r_esc.get("cancelled"):
+                    continue
+                if r_esc.get("external_worktree_tamper") or not store.verify_receipt_signature(r_esc):
+                    continue
+                rec_ts = float(
+                    r_esc.get("updated_at_epoch")
+                    or r_esc.get("finished_at_epoch")
+                    or r_esc.get("started_at_epoch")
+                    or 0.0
+                )
+                if rec_ts < since:
+                    continue
+                esc_info = r_esc.get("escalation")
+                if r_esc.get("escalate_to_lead") is True or (
+                    isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True
+                ):
+                    return True
+            return False
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return False
+        fallback_store = ReceiptStore(data_root)
+        for p in receipts_dir.glob("job-*.json"):
+            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
+                continue
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
+                continue
+            if (
+                rec.get("status") in ("running", "cancelled")
+                or rec.get("cancelled")
+                or rec.get("external_worktree_tamper")
+                or not fallback_store.verify_receipt_signature(rec)
+            ):
+                continue
+            esc_info = rec.get("escalation")
+            if rec.get("escalate_to_lead") is True or (
+                isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_verified_applied_receipt(rec: dict[str, Any]) -> bool:
+    if (
+        rec.get("status") != "ok"
+        or rec.get("applied") is not True
+        or rec.get("reverted")
+        or rec.get("acceptance_passed") is not True
+        or rec.get("vacuous_acceptance")
+        or rec.get("test_only_diff")
+        or rec.get("scope_violations")
+        or rec.get("missing_prompt_symbols")
+        or rec.get("contract_warnings")
+        or rec.get("stub_mutation_warnings")
+    ):
+        return False
+    acc_list = rec.get("acceptance_results")
+    if not isinstance(acc_list, list) or not acc_list:
+        return False
+    return any(
+        isinstance(r, dict)
+        and r.get("passed") is True
+        and not r.get("compile_smoke")
+        and (
+            not r.get("auto_discovered_default")
+            or int((r.get("counts") or {}).get("passed") or 0) > 0
+        )
+        and not r.get("auto_discovered_regression")
+        and not r.get("no_tests_collected")
+        and not r.get("runner_incompatible_skipped")
+        and not r.get("auto_import_smoke")
+        for r in acc_list
+    )
+
+
+_UNLIMITED_READ_VALUES = ("off", "none", "unlimited", "disabled")
+
+
+def resolve_lead_read_limit(env: dict[str, str]) -> int | None:
+    """Return the strict-mode Lead read/search budget before review bonuses, or None for no cap.
+
+    `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`): a non-negative integer is the number of
+    reads allowed (`0` means none before delegating); a negative number or `off` removes the cap. When
+    unset or invalid, all profiles default to 2 (so Economy allows up to 2 lightweight Glob/Grep/Read
+    scouting calls when entrypoints or test paths are uncertain, while pre-delegation Bash remains blocked).
+    """
+    default = 2
+    raw = str(env.get("CC_AGY_LEAD_READ_LIMIT") or env.get("CC_AGY_MAX_LEAD_READS") or "").strip().lower()
+    if not raw or raw.startswith("${"):
+        return default
+    if raw in _UNLIMITED_READ_VALUES:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return None if value < 0 else value
+
+
 def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
     """Extra strict-mode Lead reads granted once a worker job started in the current session exists.
 
     When a job auto-applied cleanly with passing acceptance checks and no missing symbols (and
-    `CC_AGY_LEAD_REVIEW_READ_LIMIT` was not explicitly overridden), returns 0 so the Lead finishes
-    immediately instead of re-reading already-verified files.
+    `CC_AGY_LEAD_REVIEW_READ_LIMIT` was not explicitly overridden), returns 0 greedily and stickily across
+    subsequent 0-edit follow-up jobs so the Lead finishes immediately instead of re-reading verified files.
     """
     raw_override = (env.get("CC_AGY_LEAD_REVIEW_READ_LIMIT") or "").strip()
     try:
@@ -1147,41 +1340,212 @@ def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
             return 0
         json_receipts = [
             p for p in session_files
-            if p.name.endswith(".json") and not p.name.endswith(".progress.jsonl")
+            if p.name.endswith(".json") and not p.name.endswith((".progress.jsonl", ".live.json"))
         ]
-        if json_receipts and not raw_override:
-            latest_json = max(json_receipts, key=lambda p: p.stat().st_mtime)
-            try:
-                rec = json.loads(latest_json.read_text(encoding="utf-8"))
-                if (
-                    isinstance(rec, dict)
-                    and rec.get("status") == "ok"
-                    and rec.get("applied") is True
-                    and rec.get("acceptance_passed") is True
-                    and not rec.get("scope_violations")
-                    and not rec.get("missing_prompt_symbols")
-                    and not rec.get("contract_warnings")
-                ):
-                    acc_list = rec.get("acceptance_results")
-                    has_real_pass = True
-                    if isinstance(acc_list, list) and acc_list:
-                        has_real_pass = any(
-                            isinstance(r, dict)
-                            and r.get("passed") is True
-                            and not r.get("auto_discovered_default")
-                            and not r.get("auto_discovered_regression")
-                            and not r.get("no_tests_collected")
-                            and not r.get("runner_incompatible_skipped")
-                            and not r.get("auto_import_smoke")
-                            for r in acc_list
-                        )
-                    if has_real_pass:
-                        return 0
-            except Exception:
-                pass
+        if json_receipts:
+            parsed_recs: list[tuple[int, dict[str, Any]]] = []
+            for jp in json_receipts:
+                try:
+                    rec_obj = json.loads(jp.read_text(encoding="utf-8"))
+                    if isinstance(rec_obj, dict):
+                        parsed_recs.append((jp.stat().st_mtime_ns, rec_obj))
+                except Exception:
+                    continue
+            if not parsed_recs:
+                return 0
+            if any(
+                r.get("status") == "running" and _receipt_owner_pid_is_alive(r)
+                for _mt, r in parsed_recs
+            ):
+                return 0
+            terminal_recs = [
+                (mt, r)
+                for mt, r in parsed_recs
+                if r.get("status") not in ("running", "cancelled") and not r.get("cancelled")
+            ]
+            if not terminal_recs:
+                return 0
+            if not raw_override:
+                ordered_recs = sorted(
+                    terminal_recs,
+                    key=lambda item: (float(item[1].get("started_at_epoch") or 0.0), item[0]),
+                )
+                sticky_verified_applied = False
+                for _mt, rec in ordered_recs:
+                    if _is_verified_applied_receipt(rec):
+                        sticky_verified_applied = True
+                    elif rec.get("reverted") or bool(rec.get("files_changed")):
+                        sticky_verified_applied = False
+                if sticky_verified_applied:
+                    return 0
         return bonus
     except OSError:
         return 0
+
+
+_CMD_HEAD_PREFIX_RE = (
+    r"(?:^|[;&|`(\n])\s*(?:(?:&&|\|\|)\s*)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:(?:"
+    r"env(?:\s+(?:-[A-Za-z0-9]+|--[A-Za-z0-9-]+(?:=\S+)?|-C\s+\S+|-u\s+\S+|[A-Za-z_][A-Za-z0-9_]*=\S*))*"
+    r"|sudo(?:\s+(?:-[A-Za-z0-9]+|--[A-Za-z0-9-]+(?:=\S+)?|-u\s+\S+))*"
+    r"|command|exec|time|nohup|nice(?:\s+-n\s+\S+)?"
+    r"|xargs(?:\s+(?:-[A-Za-z0-9]+(?:\s+\S+)?|--[A-Za-z0-9-]+(?:=\S+)?))*"
+    r"|watch(?:\s+(?:-[A-Za-z0-9]+(?:\s+\S+)?|--[A-Za-z0-9-]+(?:=\S+)?))*"
+    r"|timeout(?:\s+(?:-[A-Za-z0-9]+|--[A-Za-z0-9-]+(?:=\S+)?))?\s+\S+"
+    r"|uv\s+run(?:\s+(?:--[A-Za-z0-9-]+(?:\s+\S+|=[^\s]+)?|-[A-Za-z0-9]+))*"
+    r"|poetry\s+run|pipenv\s+run|pdm\s+run|hatch\s+run"
+    r"|(?:pnpm|npm|yarn)(?:\s+(?:--filter(?:=\S+|\s+\S+)|-F\s+\S+|-C\s+\S+|--prefix(?:=\S+|\s+\S+)|--cwd(?:=\S+|\s+\S+)))*\s+exec"
+    r"|npx(?:\s+-[A-Za-z0-9-]+)*|bunx|pnpx|bun\s+x|yarn(?:\s+--cwd\s+\S+)?\s+dlx"
+    r")\s+)*"
+)
+_HOST_TEST_RUNNER_RE = re.compile(
+    _CMD_HEAD_PREFIX_RE
+    + r"(?:"
+    r"(?:\S*/)?(?:pytest|py\.test|vitest|jest|tox|nox)(?=$|[\s;|&'\")`])"
+    r"|(?:\S*/)?python[0-9.]*(?:\s+(?:-[XWO]\s+\S+|-[A-Za-z0-9]+|--[A-Za-z0-9-]+(?:=\S+)?))*\s+-m\s+(?:pytest|unittest)(?=$|[\s;|&'\")`])"
+    r"|(?:pnpm|npm|yarn|bun)(?:\s+(?:--filter(?:=\S+|\s+\S+)|-F\s+\S+|-C\s+\S+|--prefix(?:=\S+|\s+\S+)|--cwd(?:=\S+|\s+\S+)|workspace\s+\S+|-[A-Za-z0-9-]+|--[A-Za-z0-9-]+=\S+))*\s+(?:(?:run|run-script)\s+test(?::[A-Za-z0-9_.:-]+)?|test(?::[A-Za-z0-9_.:-]+)?|t)(?=$|[\s;|&'\")`])"
+    r"|hatch\s+run\s+(?:[A-Za-z0-9_.-]+:)?test(?=$|[\s;|&'\")`])"
+    r"|go(?:\s+(?:-C\s+\S+|--C\s+\S+|-C=\S+|--C=\S+))*\s+test(?=$|[\s;|&'\")`])"
+    r"|cargo(?:\s+\+\S+)?\s+test(?=$|[\s;|&'\")`])"
+    r"|deno\s+test(?=$|[\s;|&'\")`])"
+    r"|make(?:\s+-[A-Za-z0-9]+(?:\s+\S+)?)?\s+test(?=$|[\s;|&'\")`])"
+    r"|node\s+--test(?=$|[\s;|&'\")`])"
+    r"|(?:node|nodejs|bun)\s+(?:\./)?(?:[A-Za-z0-9_.-]+/){0,3}(?:node_modules/(?:\.pnpm/[^/]+/node_modules/)?(?:vitest/(?:vitest\.mjs|dist/cli\.c?m?js)|jest/bin/jest\.c?m?js|mocha/bin/(?:mocha|_mocha)(?:\.c?m?js)?|ava/entrypoints/cli\.mjs|tap/bin/run\.c?m?js|uvu/bin\.c?m?js|tape/bin/tape|jasmine/bin/jasmine\.c?m?js)|node_modules/\.bin/(?:vitest|jest|mocha|ava|tap|uvu|tape|jasmine))(?=$|[\s;|&'\")`])"
+    r")"
+)
+_NODE_TEST_ENTRYPOINT_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+/){0,3}"
+    r"(?:"
+    r"node_modules/(?:\.pnpm/[^/]+/node_modules/)?"
+    r"(?:"
+    r"vitest/(?:vitest\.mjs|dist/cli\.c?m?js)"
+    r"|jest/bin/jest\.c?m?js"
+    r"|mocha/bin/(?:mocha|_mocha)(?:\.c?m?js)?"
+    r"|ava/entrypoints/cli\.mjs"
+    r"|tap/bin/run\.c?m?js"
+    r"|uvu/bin\.c?m?js"
+    r"|tape/bin/tape"
+    r"|jasmine/bin/jasmine\.c?m?js"
+    r")"
+    r"|node_modules/\.bin/(?:vitest|jest|mocha|ava|tap|uvu|tape|jasmine)"
+    r")$"
+)
+_NODE_TSC_ENTRYPOINT_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+/){0,3}"
+    r"(?:"
+    r"node_modules/(?:\.pnpm/[^/]+/node_modules/)?typescript/(?:lib|bin)/tsc\.c?m?js"
+    r"|node_modules/\.bin/tsc"
+    r")$"
+)
+_NODE_MUTATING_TEST_FLAGS = {
+    "-u",
+    "--u",
+    "--update",
+    "--updateSnapshot",
+    "--update-snapshot",
+    "--ci=false",
+    "--init",
+    "--build",
+    "-b",
+    "--outFile",
+    "--outDir",
+    "--declarationDir",
+}
+_NODE_MUTATING_TEST_FLAG_PREFIXES = (
+    "-u=",
+    "--u=",
+    "--update=",
+    "--updateSnapshot=",
+    "--update-snapshot=",
+    "--outFile=",
+    "--outDir=",
+    "--declarationDir=",
+)
+_SHELL_C_INNER_RE = re.compile(
+    r"(?:^|[;&|`(\n])\s*(?:(?:&&|\|\|)\s*)?(?:\S*/)?(?:ba|z|da|k)?sh\b[^;&|\n]*?\s-[A-Za-z]*c\s+(['\"])(.*?)\1",
+    re.DOTALL,
+)
+_WHICH_SUBSHELL_RE = re.compile(
+    r"\"?\$\(\s*(?:which|command\s+-v)\s+([A-Za-z0-9_./-]+)\s*\)\"?|`\s*(?:which|command\s+-v)\s+([A-Za-z0-9_./-]+)\s*`"
+)
+_QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
+
+
+def _command_invokes_host_test_runner(command: str, _depth: int = 0) -> bool:
+    if not command:
+        return False
+    if _depth < 3:
+        for m in _SHELL_C_INNER_RE.finditer(command):
+            if _command_invokes_host_test_runner(m.group(2), _depth + 1):
+                return True
+    expanded = _WHICH_SUBSHELL_RE.sub(lambda m: m.group(1) or m.group(2) or "", command)
+    masked = _QUOTED_SPAN_RE.sub("__QUOTED_ARG__", expanded)
+    return bool(_HOST_TEST_RUNNER_RE.search(masked))
+
+
+def _check_strict_bash_test_runner_guard(
+    command: str,
+    ws_root: Path,
+    out_dir: Path | str | None,
+    env: dict[str, str],
+) -> str | None:
+    """Prevent Lead host test-suite runs while a worker job is running or in Economy/zero-read mode."""
+    if not _command_invokes_host_test_runner(command):
+        return None
+    try:
+        try:
+            from server.receipts import ReceiptStore
+
+            data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
+        except Exception:
+            data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+        marker = data_root / ".lead_session_started"
+        since = marker.stat().st_mtime if marker.exists() else 0.0
+        receipts_dir = data_root / "receipts"
+        parsed: list[tuple[int, dict[str, Any]]] = []
+        if receipts_dir.is_dir():
+            for jp in receipts_dir.glob("job-*.json"):
+                if jp.name.endswith(".live.json") or jp.stat().st_mtime < since:
+                    continue
+                try:
+                    obj = json.loads(jp.read_text(encoding="utf-8"))
+                    if isinstance(obj, dict) and obj.get("job_id"):
+                        parsed.append((jp.stat().st_mtime_ns, obj))
+                except Exception:
+                    continue
+        for _mt, rec in parsed:
+            if rec.get("status") == "running" and _receipt_owner_pid_is_alive(rec):
+                jid = str(rec.get("job_id") or "")
+                return (
+                    f"Strict orchestrator mode: delegated worker job {jid!r} is still running in its isolated "
+                    f"worktree. Do NOT run test suites on the un-applied host workspace; call "
+                    f"delegate_result(job_id={jid!r}, wait=true) to wait for the worker."
+                )
+        if resolve_cost_profile(env) != "economy" and resolve_lead_read_limit(env) != 0:
+            return None
+        if _session_has_lead_escalated_job(data_root, ws_root):
+            return None
+        terminal = [
+            (mt, r)
+            for mt, r in parsed
+            if r.get("status") not in ("running", "cancelled") and not r.get("cancelled")
+        ]
+        any_applied = any(bool(r.get("applied")) for _mt, r in terminal)
+        if not terminal or not any_applied:
+            return (
+                "Economy strict mode: no worker diff has been applied to the host workspace yet (host is still "
+                "at clean HEAD, and running tests on the host can write untracked test artifacts that conflict "
+                "with delegate_apply). Delegate test execution and fixes via delegate_start or delegate_continue."
+            )
+        if _lead_review_read_bonus(data_root, env) == 0:
+            return (
+                "Economy strict mode: worker changes were already verified by the acceptance test suite and "
+                "applied cleanly. Finish your response directly without re-running tests on the host."
+            )
+    except Exception:
+        return None
+    return None
 
 
 def _is_workspace_python_package(root_mod: str, ws_root: Path | tuple[Path, ...] | None) -> bool:
@@ -2377,36 +2741,61 @@ def _inspect_segment_tokens(
         return {"blocked": False, "reason": None}, active_cwd
 
     if binary == "go":
-        go_non_flags = [a for a in args if not a.startswith("-")]
-        go_sub = go_non_flags[0] if go_non_flags else ""
+        idx_g = 0
+        go_sub = ""
+        while idx_g < len(args):
+            ga = args[idx_g]
+            if ga in ("-C", "--C") and idx_g + 1 < len(args):
+                c_dir = _expand_shell_vars_in_path(args[idx_g + 1], active_cwd, ws_root)
+                c_cand = Path(c_dir)
+                active_cwd = (active_cwd / c_cand).resolve() if not c_cand.is_absolute() else c_cand.resolve()
+                idx_g += 2
+                continue
+            if ga.startswith(("-C=", "--C=")):
+                c_dir = _expand_shell_vars_in_path(ga.split("=", 1)[1], active_cwd, ws_root)
+                c_cand = Path(c_dir)
+                active_cwd = (active_cwd / c_cand).resolve() if not c_cand.is_absolute() else c_cand.resolve()
+                idx_g += 1
+                continue
+            if ga.startswith("-"):
+                idx_g += 1
+                continue
+            go_sub = ga
+            break
         if go_sub in ("fmt", "generate", "get", "install", "clean", "mod", "work"):
             return {
                 "blocked": True,
                 "reason": f"Strict orchestrator mode blocked mutating `go {go_sub}` command.",
             }, active_cwd
         if go_sub in ("test", "build"):
+            go_sub_args = args[idx_g + 1 :]
             if go_sub == "test" and any(
                 a in ("-update", "--update", "-golden", "--golden", "-u")
                 or a.startswith(("-update=", "--update=", "-golden=", "--golden="))
-                for a in args
+                for a in go_sub_args
             ):
                 return {
                     "blocked": True,
                     "reason": "Strict orchestrator mode blocked `go test` golden/snapshot update flag.",
                 }, active_cwd
-            for i_g, garg in enumerate(args):
+            has_explicit_go_out = False
+            for i_g, garg in enumerate(go_sub_args):
                 out_dest: str | None = None
-                if garg in ("-o", "-coverprofile") and i_g + 1 < len(args):
-                    out_dest = args[i_g + 1]
-                elif garg.startswith(("-o=", "-coverprofile=")):
+                if garg in ("-o", "--o", "-coverprofile", "--coverprofile") and i_g + 1 < len(go_sub_args):
+                    out_dest = go_sub_args[i_g + 1]
+                    if garg in ("-o", "--o"):
+                        has_explicit_go_out = True
+                elif garg.startswith(("-o=", "--o=", "-coverprofile=", "--coverprofile=")):
                     out_dest = garg.split("=", 1)[1]
+                    if garg.startswith(("-o=", "--o=")):
+                        has_explicit_go_out = True
                 if out_dest and out_dest != "/dev/null":
                     if classify_path(out_dest, ws_root, out_dir, cwd=active_cwd, env=env) in ("workspace", "out_dir"):
                         return {
                             "blocked": True,
                             "reason": f"Strict orchestrator mode blocked `go {go_sub}` writing output into workspace ({out_dest!r}).",
                         }, active_cwd
-            if go_sub == "build" and not any(a == "-o" or a.startswith("-o=") for a in args):
+            if go_sub == "build" and not has_explicit_go_out:
                 return {
                     "blocked": True,
                     "reason": "Strict orchestrator mode blocked `go build` without `-o /dev/null` or `-o /tmp/...` (use `go test` or `go vet`).",
@@ -2630,7 +3019,31 @@ def _inspect_segment_tokens(
                 if script_inside_ws
                 else ""
             )
-            is_allowed_test_runner = (
+            norm_script_arg = script_arg.replace("\\", "/")
+            while norm_script_arg.startswith("./"):
+                norm_script_arg = norm_script_arg[2:]
+            if script_inside_ws and script_rel:
+                norm_script_arg = script_rel
+            tail_args = args[1:]
+            has_node_mutating_flag = any(
+                a in _NODE_MUTATING_TEST_FLAGS or a.startswith(_NODE_MUTATING_TEST_FLAG_PREFIXES)
+                for a in tail_args
+            )
+            is_js_node_test_runner = (
+                binary in ("node", "nodejs", "bun")
+                and not any(ch in script_arg for ch in ("$", "`", "~"))
+                and ".." not in script_cand.parts
+                and (script_inside_ws or not script_cand.is_absolute())
+                and not has_node_mutating_flag
+                and (
+                    bool(_NODE_TEST_ENTRYPOINT_RE.match(norm_script_arg))
+                    or (
+                        bool(_NODE_TSC_ENTRYPOINT_RE.match(norm_script_arg))
+                        and "--noEmit" in tail_args
+                    )
+                )
+            )
+            is_allowed_test_runner = is_js_node_test_runner or (
                 script_cls == "workspace"
                 and script_inside_ws
                 and (
@@ -3348,103 +3761,129 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         ),
                     }
                 }
-        raw_limit = (
-            source_env.get("CC_AGY_LEAD_READ_LIMIT")
-            or source_env.get("CC_AGY_MAX_LEAD_READS")
-            or "2"
-        ).strip()
-        if raw_limit:
+        read_limit = resolve_lead_read_limit(source_env)
+        if read_limit is not None:
             try:
-                read_limit = int(raw_limit)
-            except ValueError:
-                read_limit = 0
-            if read_limit > 0:
-                try:
-                    from server.receipts import ReceiptStore
+                from server.receipts import ReceiptStore
 
-                    data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
-                except Exception:
-                    data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
-                counter_path = data_root / ".lead_read_count"
-                # Once a worker job from this session exists, the Lead gets extra reads to check the
-                # result against the task. Without them a Lead that spent its planning reads has to
-                # accept the worker's result unchecked.
-                read_limit += _lead_review_read_bonus(data_root, source_env)
-                try:
-                    current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
-                except Exception:
-                    current_reads = 0
-                if current_reads >= read_limit:
-                    reason_msg = (
-                        f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
-                        "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
-                        "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
-                        "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
-                        "immediately; the worker has full repository and test access in its worktree."
-                    )
-                    if tool_name == "Read" and tool_input.get("file_path"):
-                        try:
-                            from server.repo_map import build_focused_file_outline
-
-                            req_p = Path(str(tool_input["file_path"]))
-                            res_p = (Path(cwd).resolve() / req_p).resolve() if not req_p.is_absolute() else req_p.resolve()
-                            if res_p.is_relative_to(ws_root) and res_p.is_file():
-                                rel_p = str(res_p.relative_to(ws_root))
-                                outline = build_focused_file_outline(ws_root, [rel_p], max_tokens=450)
-                                if outline:
-                                    reason_msg += (
-                                        "\n\nFocused File Outline (auto-attached so you can call delegate_start immediately):\n"
-                                        + outline
-                                    )
-                        except Exception:
-                            pass
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": reason_msg,
-                        }
+                data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
+            except Exception:
+                data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+            if resolve_cost_profile(source_env) == "economy" and _session_has_live_running_delegate_job(data_root):
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Still running: a delegated worker job is actively running. Do NOT call {tool_name} on "
+                            "host files while it runs; poll with delegate_result(job_id=..., wait=true) instead."
+                        ),
                     }
+                }
+            if _session_has_lead_escalated_job(data_root, ws_root):
+                return {}
+            counter_path = data_root / ".lead_read_count"
+            # Once a worker job from this session exists, the Lead gets extra reads to check the
+            # result against the task. Without them a Lead that spent its planning reads has to
+            # accept the worker's result unchecked.
+            read_limit += _lead_review_read_bonus(data_root, source_env)
+            try:
+                current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
+            except Exception:
+                current_reads = 0
+            read_unit_cost = 1
+            if (
+                tool_name == "Read"
+                and resolve_cost_profile(source_env) == "economy"
+                and not _session_has_terminal_delegate_job(data_root)
+            ):
+                raw_lim_chk = tool_input.get("limit")
                 try:
-                    data_root.mkdir(parents=True, exist_ok=True)
-                    counter_path.write_text(str(current_reads + 1), encoding="utf-8")
-                    if tool_name == "Read":
-                        raw_fp = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
-                        if raw_fp:
-                            cand_fp = Path(raw_fp).expanduser()
-                            res_fp = (Path(cwd).resolve() / cand_fp).resolve() if not cand_fp.is_absolute() else cand_fp.resolve()
-                            if res_fp.is_relative_to(ws_root) and res_fp.is_file():
-                                rel_fp = res_fp.relative_to(ws_root).as_posix()
-                                read_files_path = data_root / ".lead_read_files.json"
-                                existing_list: list[str] = []
-                                if read_files_path.exists():
-                                    try:
-                                        parsed_rf = json.loads(read_files_path.read_text(encoding="utf-8"))
-                                        if isinstance(parsed_rf, list):
-                                            existing_list = [str(x) for x in parsed_rf if isinstance(x, str)]
-                                    except Exception:
-                                        existing_list = []
-                                if rel_fp not in existing_list:
-                                    existing_list.append(rel_fp)
-                                    read_files_path.write_text(json.dumps(existing_list), encoding="utf-8")
-                                raw_off = tool_input.get("offset")
-                                raw_lim = tool_input.get("limit")
-                                if raw_off is not None or raw_lim is not None:
-                                    try:
-                                        w_off = max(1, int(raw_off)) if raw_off is not None else 1
-                                        w_lim = max(50, int(raw_lim)) if raw_lim is not None else 250
-                                        rw_path = data_root / ".lead_read_windows.json"
-                                        existing_wins: dict[str, list[int]] = {}
-                                        if rw_path.exists():
-                                            parsed_rw = json.loads(rw_path.read_text(encoding="utf-8"))
-                                            if isinstance(parsed_rw, dict):
-                                                existing_wins = parsed_rw
-                                        existing_wins[rel_fp] = [w_off, w_lim]
-                                        rw_path.write_text(json.dumps(existing_wins), encoding="utf-8")
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
+                    lim_int = int(raw_lim_chk) if raw_lim_chk is not None else 999999
+                except (ValueError, TypeError):
+                    lim_int = 999999
+                if lim_int > 150 and tool_input.get("file_path"):
+                    try:
+                        req_c = Path(str(tool_input["file_path"])).expanduser()
+                        res_c = (Path(cwd).resolve() / req_c).resolve() if not req_c.is_absolute() else req_c.resolve()
+                        if res_c.is_relative_to(ws_root) and res_c.is_file():
+                            with open(res_c, "rb") as fh_c:
+                                line_cnt = sum(1 for _ in fh_c)
+                            if line_cnt > 150:
+                                read_unit_cost = 2
+                    except Exception:
+                        pass
+            if current_reads >= read_limit or current_reads + read_unit_cost > read_limit:
+                reason_msg = (
+                    f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
+                    "delegation mode. Do NOT read more files on the Lead orchestrator. Call delegate_start "
+                    "(with wait=true and a concise prompt <500 words; preload_files=true and auto_apply=true "
+                    "are enabled automatically), delegate_continue, get_diff, or delegate_apply "
+                    "immediately; the worker has full repository and test access in its worktree."
+                )
+                if tool_name == "Read" and tool_input.get("file_path"):
+                    try:
+                        from server.repo_map import build_focused_file_outline
+
+                        req_p = Path(str(tool_input["file_path"]))
+                        res_p = (Path(cwd).resolve() / req_p).resolve() if not req_p.is_absolute() else req_p.resolve()
+                        if res_p.is_relative_to(ws_root) and res_p.is_file():
+                            rel_p = str(res_p.relative_to(ws_root))
+                            outline = build_focused_file_outline(ws_root, [rel_p], max_tokens=450)
+                            if outline:
+                                reason_msg += (
+                                    "\n\nFocused File Outline (auto-attached so you can call delegate_start immediately):\n"
+                                    + outline
+                                )
+                    except Exception:
+                        pass
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason_msg,
+                    }
+                }
+            try:
+                data_root.mkdir(parents=True, exist_ok=True)
+                counter_path.write_text(str(current_reads + read_unit_cost), encoding="utf-8")
+                if tool_name == "Read":
+                    raw_fp = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
+                    if raw_fp:
+                        cand_fp = Path(raw_fp).expanduser()
+                        res_fp = (Path(cwd).resolve() / cand_fp).resolve() if not cand_fp.is_absolute() else cand_fp.resolve()
+                        if res_fp.is_relative_to(ws_root) and res_fp.is_file():
+                            rel_fp = res_fp.relative_to(ws_root).as_posix()
+                            read_files_path = data_root / ".lead_read_files.json"
+                            existing_list: list[str] = []
+                            if read_files_path.exists():
+                                try:
+                                    parsed_rf = json.loads(read_files_path.read_text(encoding="utf-8"))
+                                    if isinstance(parsed_rf, list):
+                                        existing_list = [str(x) for x in parsed_rf if isinstance(x, str)]
+                                except Exception:
+                                    existing_list = []
+                            if rel_fp not in existing_list:
+                                existing_list.append(rel_fp)
+                                read_files_path.write_text(json.dumps(existing_list), encoding="utf-8")
+                            raw_off = tool_input.get("offset")
+                            raw_lim = tool_input.get("limit")
+                            if raw_off is not None or raw_lim is not None:
+                                try:
+                                    w_off = max(1, int(raw_off)) if raw_off is not None else 1
+                                    w_lim = max(50, int(raw_lim)) if raw_lim is not None else 250
+                                    rw_path = data_root / ".lead_read_windows.json"
+                                    existing_wins: dict[str, list[int]] = {}
+                                    if rw_path.exists():
+                                        parsed_rw = json.loads(rw_path.read_text(encoding="utf-8"))
+                                        if isinstance(parsed_rw, dict):
+                                            existing_wins = parsed_rw
+                                    existing_wins[rel_fp] = [w_off, w_lim]
+                                    rw_path.write_text(json.dumps(existing_wins), encoding="utf-8")
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
 
     # 2b. Block direct Edit / Write / MultiEdit / NotebookEdit on workspace, out_dir (receipts), and PLUGIN_ROOT
     if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
@@ -3471,6 +3910,70 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
             classification = classify_path(
                 str(file_path), ws_root, out_dir, cwd=cwd, env=source_env
             )
+            if classification == "workspace" and tool_name in ("Edit", "Write"):
+                try:
+                    from server.jobs import _is_test_file_path, _matches_allowed_paths
+                    from server.receipts import ReceiptStore
+
+                    store_esc = ReceiptStore(out_dir or None, workspace_root=ws_root)
+                    rel_edit = res_edit.relative_to(ws_root).as_posix()
+                    if (
+                        rel_edit
+                        and not rel_edit.startswith((".git/", ".cc-agy-data/", ".worktrees/"))
+                        and not res_edit.is_symlink()
+                        and _session_has_lead_escalated_job(store_esc.data_dir, ws_root)
+                    ):
+                        marker_esc = store_esc.data_dir / ".lead_session_started"
+                        since_esc = marker_esc.stat().st_mtime - 1.0 if marker_esc.exists() else 0.0
+                        esc_cnt_path = store_esc.data_dir / ".lead_escalated_edit_count"
+                        try:
+                            cur_esc_edits = (
+                                int(esc_cnt_path.read_text(encoding="utf-8").strip())
+                                if esc_cnt_path.exists()
+                                else 0
+                            )
+                        except Exception:
+                            cur_esc_edits = 0
+                        if cur_esc_edits < 3:
+                            authorized_esc = False
+                            for r_esc in store_esc.list_receipts(workspace_root=ws_root):
+                                if r_esc.get("kind", "delegate") != "delegate":
+                                    continue
+                                if r_esc.get("status") in ("running", "cancelled") or r_esc.get("cancelled"):
+                                    continue
+                                if r_esc.get("external_worktree_tamper") or not store_esc.verify_receipt_signature(r_esc):
+                                    continue
+                                rec_ts = float(
+                                    r_esc.get("updated_at_epoch")
+                                    or r_esc.get("finished_at_epoch")
+                                    or r_esc.get("started_at_epoch")
+                                    or 0.0
+                                )
+                                if rec_ts < since_esc:
+                                    continue
+                                esc_info = r_esc.get("escalation")
+                                if not (
+                                    r_esc.get("escalate_to_lead") is True
+                                    or (isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True)
+                                ):
+                                    continue
+                                if r_esc.get("reverted"):
+                                    continue
+                                r_allowed = list(r_esc.get("allowed_paths") or [])
+                                r_applied_files = set(r_esc.get("applied_files") or []) | set(r_esc.get("files_changed") or [])
+                                if (
+                                    rel_edit in r_applied_files
+                                    or not r_allowed
+                                    or _matches_allowed_paths(rel_edit, r_allowed)
+                                    or _is_test_file_path(rel_edit)
+                                ):
+                                    authorized_esc = True
+                                    break
+                            if authorized_esc:
+                                esc_cnt_path.write_text(str(cur_esc_edits + 1), encoding="utf-8")
+                                return {}
+                except Exception:
+                    pass
             if classification in ("workspace", "out_dir"):
                 return {
                     "hookSpecificOutput": {
@@ -3498,26 +4001,47 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     "permissionDecisionReason": verdict["reason"],
                 }
             }
+        test_guard_reason = _check_strict_bash_test_runner_guard(
+            command, ws_root, out_dir, source_env
+        )
+        if test_guard_reason:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": test_guard_reason,
+                }
+            }
         bash_read_targets = detect_bash_workspace_read(
             command, ws_root, out_dir, cwd=cwd, env=source_env
         )
         if bash_read_targets:
-            raw_limit = (
-                source_env.get("CC_AGY_LEAD_READ_LIMIT")
-                or source_env.get("CC_AGY_MAX_LEAD_READS")
-                or "2"
-            ).strip()
-            try:
-                read_limit = int(raw_limit) if raw_limit else 0
-            except ValueError:
-                read_limit = 0
-            if read_limit > 0:
+            read_limit = resolve_lead_read_limit(source_env)
+            if read_limit is not None:
                 try:
                     from server.receipts import ReceiptStore
 
                     data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
                 except Exception:
                     data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+                if _session_has_lead_escalated_job(data_root, ws_root):
+                    return {}
+                if (
+                    resolve_cost_profile(source_env) == "economy"
+                    and read_limit > 0
+                    and not _session_has_terminal_delegate_job(data_root)
+                ):
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": (
+                                "Economy strict mode: pre-delegation Bash file/search inspection is disabled so "
+                                "Turn 1 stays fast and clean. Use Glob, Grep, or bounded Read(limit=120) "
+                                f"(up to {read_limit} calls) if target paths are uncertain, or call delegate_start directly."
+                            ),
+                        }
+                    }
                 counter_path = data_root / ".lead_read_count"
                 read_limit += _lead_review_read_bonus(data_root, source_env)
                 try:
@@ -3525,7 +4049,27 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 except Exception:
                     current_reads = 0
                 file_targets = [t for t in bash_read_targets if t != "<workspace-search>"]
-                read_cost = max(1, len(file_targets))
+                span_cost = 1
+                for sed_m in re.finditer(r"\bsed\b[^;|&\n]*?['\"]?(\d+)\s*,\s*(\d+)\s*p", command):
+                    try:
+                        s_lo, s_hi = int(sed_m.group(1)), int(sed_m.group(2))
+                        if s_hi >= s_lo:
+                            span_cost = max(span_cost, (s_hi - s_lo + 120) // 120)
+                    except ValueError:
+                        pass
+                if re.search(r"(?:^|[\s;|&`(])cat\b", command) and file_targets:
+                    cat_lines = 0
+                    for rel_ft in file_targets[:4]:
+                        fp_cat = ws_root / rel_ft
+                        if fp_cat.is_file():
+                            try:
+                                with open(fp_cat, "rb") as fh_cat:
+                                    cat_lines += sum(1 for _ in fh_cat)
+                            except OSError:
+                                pass
+                    if cat_lines > 120:
+                        span_cost = max(span_cost, min(6, (cat_lines + 119) // 120))
+                read_cost = max(1, len(file_targets), span_cost)
                 spotcheck_marker = data_root / ".lead_git_diff_spotcheck_used"
                 session_marker = data_root / ".lead_session_started"
                 cur_session_sig = ""
@@ -3560,7 +4104,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     except OSError:
                         pass
                     read_cost = 0
-                elif current_reads >= read_limit or (len(file_targets) > 1 and current_reads + read_cost > read_limit):
+                elif current_reads >= read_limit or current_reads + read_cost > read_limit:
                     reason_msg = (
                         f"LeadReadBudgetExceeded: Lead read/search limit ({read_limit} calls) reached in strict "
                         "delegation mode (including Bash file/diff inspection commands). Do NOT read more files on "

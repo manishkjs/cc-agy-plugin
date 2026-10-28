@@ -651,7 +651,7 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
         call_idx = len(seen_reqs)
         (wt / "app.py").write_text(f"def compute(x: int) -> int:\n    return x + {call_idx}\n", encoding="utf-8")
         if call_idx == 2:
-            # Simulate hitting the 40-tool-call Flash checkpoint on Turn 2
+            # Simulate hitting the 75-tool-call Flash checkpoint on Turn 2
             return {
                 "text": "checkpoint reached",
                 "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
@@ -676,7 +676,7 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
 
     jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
     try:
-        # Turn 1 of new session must NOT escalate despite job-old-session on disk, and uses 40 max_tool_calls for Flash
+        # Turn 1 of new session must NOT escalate despite job-old-session on disk, and uses 55 max_tool_calls for Flash
         d1 = jm.delegate_start(
             "Phase 1: update compute",
             model="gemini-3.8-flash",
@@ -686,7 +686,7 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
         )
         assert d1["model"] == "gemini-3.8-flash"
         assert "escalated_from_model" not in d1
-        assert seen_reqs[0]["max_tool_calls"] == 40
+        assert seen_reqs[0]["max_tool_calls"] == 55
 
         # Turn 2 via delegate_continue after a passing Turn 1 (status="ok") stays on Flash!
         d2 = jm.delegate_continue(
@@ -1608,3 +1608,1342 @@ def test_round7_verified_timeout_promotion_and_dedup_prompt_and_compact_core_sch
         assert not d_fail.get("recovered_from_timeout")
     finally:
         jm.shutdown()
+
+
+def test_balanced_inplace_escalation_uses_40_flash_calls_and_passes_flash_summary_to_argon(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """In balanced mode, Flash starts with 40 max_tool_calls and, after hitting the 40-call cap,
+    escalates in-place to Argon with 60 max_tool_calls plus Flash's diagnostic summary."""
+    repo = tmp_path / "repo_bal_esc"
+    _init_repo(repo)
+    (repo / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return 0\n", encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import calc\ndef test_add():\n    assert calc.add(2, 3) == 5\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init calc"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.delenv("CC_AGY_FLASH_MAX_TOOL_CALLS", raising=False)
+    monkeypatch.delenv("CC_AGY_MAX_TOOL_CALLS", raising=False)
+
+    seen_reqs: list[dict[str, object]] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen_reqs) == 1:
+            (wt / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a - b\n", encoding="utf-8")
+            return {
+                "text": "Updated calc.py subtraction path, sign edge case still failing.",
+                "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(55)],
+                "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+            }
+        (wt / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+        return {
+            "text": "Fixed sign bug in add().",
+            "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(5)],
+            "usage": {"prompt_token_count": 200, "candidates_token_count": 30, "total_token_count": 230},
+        }
+
+    store = ReceiptStore(tmp_path / "data_bal_esc", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d = jm.delegate_start(
+            "Implement add(a, b) in calc.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(seen_reqs) == 2
+        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
+        assert seen_reqs[0]["max_tool_calls"] == 55
+        assert seen_reqs[1]["model"] == "gemini-4-argon"
+        assert seen_reqs[1]["max_tool_calls"] == 60
+        argon_prompt = "\n".join(str(p) for p in (seen_reqs[1].get("prompts") or []))
+        assert "Prior Flash diagnostic summary:" in argon_prompt
+        assert "sign edge case still failing" in argon_prompt
+        assert "rather than weakening test inputs or altering pre-existing test expectations" in argon_prompt
+        assert d["model"] == "gemini-4-argon"
+        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["acceptance_passed"] is True
+        assert d.get("applied") is True
+    finally:
+        jm.shutdown()
+
+
+def test_balanced_inplace_escalation_skips_compiler_cli_config_error_when_test_runner_passed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When Flash passes a real test runner (e.g. pytest/vitest) and the only failing acceptance
+    command is a compiler CLI flag/help error (e.g. TS5042), balanced must NOT waste an Argon turn."""
+    repo = tmp_path / "repo_bal_cli_cfg"
+    _init_repo(repo)
+    (repo / "mod.py").write_text("VALUE = 0\n", encoding="utf-8")
+    (repo / "test_mod.py").write_text("import mod\ndef test_val():\n    assert mod.VALUE == 42\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init mod"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+
+    seen_models: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen_models.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "mod.py").write_text("VALUE = 42\n", encoding="utf-8")
+        return {
+            "text": "Set VALUE = 42 and verified pytest.",
+            "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+        }
+
+    store = ReceiptStore(tmp_path / "data_bal_cli_cfg", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d = jm.delegate_start(
+            "Set VALUE = 42 in mod.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=[
+                "python3 -m pytest -q test_mod.py",
+                "python3 -c 'import sys; print(\"error TS5042: Option project cannot be mixed with source files on a command line.\"); sys.exit(1)'",
+            ],
+            wait=True,
+            auto_apply=False,
+        )
+        assert seen_models == ["gemini-3.8-flash"]
+        assert d["model"] == "gemini-3.8-flash"
+        assert "escalated_from_model" not in d
+    finally:
+        jm.shutdown()
+
+
+def test_balanced_inplace_escalation_respects_session_deadline_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When CC_AGY_SESSION_DEADLINE_SECONDS leaves < 120s worker budget, balanced skips
+    automatic Argon escalation instead of starting a turn that will time out."""
+    repo = tmp_path / "repo_bal_deadline"
+    _init_repo(repo)
+    (repo / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return 0\n", encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import calc\ndef test_mul():\n    assert calc.mul(3, 4) == 12\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init mul"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    # 200s deadline - 120s default reserve = 80s remaining worker budget (< 120s threshold)
+    monkeypatch.setenv("CC_AGY_SESSION_DEADLINE_SECONDS", "200")
+
+    seen_models: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen_models.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+        return {
+            "text": "Partial attempt.",
+            "usage": {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120},
+        }
+
+    store = ReceiptStore(tmp_path / "data_bal_deadline", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d = jm.delegate_start(
+            "Implement mul(a, b) in calc.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        assert seen_models == ["gemini-3.8-flash"]
+        assert d["model"] == "gemini-3.8-flash"
+        assert "escalated_from_model" not in d
+    finally:
+        jm.shutdown()
+
+
+def test_turn3_delegate_continue_honors_cumulative_max_tool_calls_after_75_to_60_escalation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When CC_AGY_FLASH_MAX_TOOL_CALLS=75 -> Turn 2 Argon (60-call slice, cumulative 135),
+    Turn 3 delegate_continue uses cumulative_max_tool_calls (135) rather than 100 across both
+    sub-100 (75+15=90 -> 45 remaining) and over-100 (75+30=105 -> 30 remaining) usages."""
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_FLASH_MAX_TOOL_CALLS", "75")
+    monkeypatch.delenv("CC_AGY_MAX_TOOL_CALLS", raising=False)
+
+    for turn2_calls, expected_turn3_calls in ((15, 45), (30, 30)):
+        repo = tmp_path / f"repo_turn3_cum_{turn2_calls}"
+        _init_repo(repo)
+        (repo / "calc.py").write_text("def sub(a: int, b: int) -> int:\n    return 0\n", encoding="utf-8")
+        (repo / "test_calc.py").write_text(
+            "import calc\ndef test_sub():\n    assert calc.sub(5, 2) == 3\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-qm", "init sub"], cwd=str(repo), check=True)
+
+        seen_reqs: list[dict[str, object]] = []
+
+        def worker(req: dict[str, object], _t2: int = turn2_calls) -> dict[str, object]:
+            seen_reqs.append(dict(req))
+            wt = Path(str(req["workspace_dir"]))
+            idx = len(seen_reqs)
+            if idx == 1:
+                (wt / "calc.py").write_text("def sub(a: int, b: int) -> int:\n    return -1\n", encoding="utf-8")
+                return {
+                    "text": "Flash hit 75 cap",
+                    "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                    "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(75)],
+                    "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110},
+                }
+            if idx == 2:
+                (wt / "calc.py").write_text("def sub(a: int, b: int) -> int:\n    return b - a\n", encoding="utf-8")
+                return {
+                    "text": "Argon partial attempt",
+                    "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(_t2)],
+                    "usage": {"prompt_token_count": 200, "candidates_token_count": 20, "total_token_count": 220},
+                }
+            (wt / "calc.py").write_text("def sub(a: int, b: int) -> int:\n    return a - b\n", encoding="utf-8")
+            return {
+                "text": "Argon fixed order",
+                "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(4)],
+                "usage": {"prompt_token_count": 150, "candidates_token_count": 15, "total_token_count": 165},
+            }
+
+        store = ReceiptStore(tmp_path / f"data_turn3_cum_{turn2_calls}", workspace_root=repo)
+        jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+        try:
+            d12 = jm.delegate_start(
+                "Implement sub(a, b) in calc.py",
+                model="gemini-3.8-flash",
+                project="p",
+                acceptance=["python3 -m pytest -q test_calc.py"],
+                wait=True,
+                auto_apply=False,
+            )
+            assert len(seen_reqs) == 2
+            assert seen_reqs[0]["max_tool_calls"] == 75
+            assert seen_reqs[1]["max_tool_calls"] == 60
+            assert d12["acceptance_passed"] is False
+
+            d3 = jm.delegate_continue(
+                d12["job_id"],
+                "Fix argument order in sub(a, b)",
+                project="p",
+                wait=True,
+                auto_apply=False,
+            )
+            assert len(seen_reqs) == 3
+            assert seen_reqs[2]["max_tool_calls"] == expected_turn3_calls
+            assert d3["acceptance_passed"] is True
+        finally:
+            jm.shutdown()
+
+
+def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg_stays_on_flash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Explicit caller max_tool_calls=75 is strictly honored (not wiped on escalation),
+    legacy non-explicit 40 upgrades to Argon 100, and delegate_continue skips Argon escalation
+    on compiler-CLI-config-only failures."""
+    repo = tmp_path / "repo_explicit_75"
+    _init_repo(repo)
+    (repo / "mod.py").write_text("VALUE = 0\n", encoding="utf-8")
+    (repo / "test_mod.py").write_text("import mod\ndef test_v():\n    assert mod.VALUE == 7\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init mod"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+
+    seen_reqs: list[dict[str, object]] = []
+
+    def cap_worker(req: dict[str, object]) -> dict[str, object]:
+        seen_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return {
+            "text": "capped",
+            "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+            "tool_calls": [{"name": "view_file", "args": {"path": "mod.py"}} for _ in range(75)],
+            "usage": {"prompt_token_count": 50, "candidates_token_count": 10, "total_token_count": 60},
+        }
+
+    # 1. Explicit max_tool_calls=75 stops at 75 without granting 60 extra Argon calls
+    store1 = ReceiptStore(tmp_path / "data_explicit_75_1", workspace_root=repo)
+    jm1 = JobManager(workspace_root=repo, store=store1, worker_backend=cap_worker)
+    try:
+        d_exp = jm1.delegate_start(
+            "Set VALUE = 7",
+            model="gemini-3.8-flash",
+            project="p",
+            max_tool_calls=75,
+            acceptance=["python3 -m pytest -q test_mod.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        assert len(seen_reqs) == 1
+        assert d_exp.get("budget_exhausted") is True
+    finally:
+        jm1.shutdown()
+
+    # 2. Legacy receipt with budget.max_tool_calls=40 and no explicit_max_tool_calls upgrades to Argon 100
+    def cap40_worker(req: dict[str, object]) -> dict[str, object]:
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return {
+            "text": "capped 40",
+            "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+            "tool_calls": [{"name": "view_file", "args": {"path": "mod.py"}} for _ in range(40)],
+            "usage": {"prompt_token_count": 50, "candidates_token_count": 10, "total_token_count": 60},
+        }
+
+    store2 = ReceiptStore(tmp_path / "data_explicit_75_2", workspace_root=repo)
+    jm2 = JobManager(workspace_root=repo, store=store2, worker_backend=cap40_worker)
+    try:
+        d_leg = jm2.delegate_start(
+            "Set VALUE = 7 legacy",
+            model="gemini-3.8-flash",
+            project="p",
+            max_tool_calls=40,
+            acceptance=["python3 -m pytest -q test_mod.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        leg_rec = store2.read_receipt(d_leg["job_id"])
+        assert leg_rec is not None
+        leg_rec.pop("explicit_max_tool_calls", None)
+        leg_rec.pop("budget_exhausted", None)
+        store2.write_receipt(d_leg["job_id"], leg_rec)
+
+        leg_reqs: list[dict[str, object]] = []
+
+        def ok_worker(req: dict[str, object]) -> dict[str, object]:
+            leg_reqs.append(dict(req))
+            wt = Path(str(req["workspace_dir"]))
+            (wt / "mod.py").write_text("VALUE = 7\n", encoding="utf-8")
+            return {
+                "text": "updated mod.py",
+                "usage": {"prompt_token_count": 50, "candidates_token_count": 10, "total_token_count": 60},
+            }
+
+        jm2.worker_backend = ok_worker
+        d_leg2 = jm2.delegate_continue(
+            d_leg["job_id"],
+            "Finish setting VALUE = 7",
+            project="p",
+            wait=True,
+            auto_apply=False,
+        )
+        assert len(leg_reqs) == 1
+        assert leg_reqs[0]["model"] == "gemini-4-argon"
+        assert leg_reqs[0]["max_tool_calls"] == 60
+        assert d_leg2["budget"]["max_tool_calls"] == 100
+        assert d_leg2["acceptance_passed"] is True
+    finally:
+        jm2.shutdown()
+
+    # 3. Compiler-CLI-config-only failure (with baseline probe disabled so acceptance_passed=False)
+    # stays on Flash across BOTH delegate_start AND delegate_continue.
+    monkeypatch.setenv("CC_AGY_BASELINE_ACCEPTANCE_PROBE", "0")
+    cli_models: list[str] = []
+
+    def flash_cli_worker(req: dict[str, object]) -> dict[str, object]:
+        cli_models.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "mod.py").write_text("VALUE = 7\n", encoding="utf-8")
+        return {
+            "text": "updated mod.py cleanly",
+            "usage": {"prompt_token_count": 50, "candidates_token_count": 10, "total_token_count": 60},
+        }
+
+    store3 = ReceiptStore(tmp_path / "data_explicit_75_3", workspace_root=repo)
+    jm3 = JobManager(workspace_root=repo, store=store3, worker_backend=flash_cli_worker)
+    try:
+        d_cli = jm3.delegate_start(
+            "Set VALUE = 7 cleanly",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=[
+                "python3 -m pytest -q test_mod.py",
+                "python3 -c 'import sys; print(\"error TS5042: Option project cannot be mixed with source files on a command line.\"); sys.exit(1)'",
+            ],
+            wait=True,
+            auto_apply=False,
+        )
+        assert cli_models == ["gemini-3.8-flash"]
+        assert d_cli["acceptance_passed"] is False
+
+        d_cli2 = jm3.delegate_continue(
+            d_cli["job_id"],
+            "Run clean pytest acceptance only",
+            project="p",
+            acceptance=["python3 -m pytest -q test_mod.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        assert cli_models == ["gemini-3.8-flash", "gemini-3.8-flash"]
+        assert d_cli2["model"] == "gemini-3.8-flash"
+        assert "escalated_from_model" not in d_cli2
+        assert d_cli2["acceptance_passed"] is True
+    finally:
+        jm3.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Round 7 (Balanced v8 + Carbon-G High) Tests: [B7-1], [R7-1], [R7-2], Carbon-G
+# ---------------------------------------------------------------------------
+
+
+def test_b7_1_flash_max_total_tokens_exceeded_escalates_cleanly_while_explicit_token_cap_stops(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[B7-1]: Non-explicit MAX_TOTAL_TOKENS_EXCEEDED on Flash escalates to Argon with a 2.5M token
+    floor (and updates cumulative_max_total_tokens), while an explicit caller max_total_tokens is honored."""
+    repo = tmp_path / "repo_b7_1_tok"
+    _init_repo(repo)
+    (repo / "calc.py").write_text("def inc(x: int) -> int:\n    return x\n", encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import calc\ndef test_inc():\n    assert calc.inc(4) == 5\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init inc"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+
+    seen_reqs: list[dict[str, object]] = []
+
+    def tok_worker(req: dict[str, object]) -> dict[str, object]:
+        seen_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen_reqs) == 1:
+            (wt / "calc.py").write_text("def inc(x: int) -> int:\n    return x + 2\n", encoding="utf-8")
+            return {
+                "text": "Flash hit 5M token cap",
+                "stop_reason": "MAX_TOTAL_TOKENS_EXCEEDED",
+                "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(35)],
+                "usage": {
+                    "prompt_token_count": 5_900_000,
+                    "candidates_token_count": 93_060,
+                    "total_token_count": 5_993_060,
+                },
+            }
+        (wt / "calc.py").write_text("def inc(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+        return {
+            "text": "Argon fixed inc()",
+            "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(4)],
+            "usage": {
+                "prompt_token_count": 400_000,
+                "candidates_token_count": 10_000,
+                "total_token_count": 410_000,
+            },
+        }
+
+    store1 = ReceiptStore(tmp_path / "data_b7_1_1", workspace_root=repo)
+    jm1 = JobManager(workspace_root=repo, store=store1, worker_backend=tok_worker)
+    try:
+        d = jm1.delegate_start(
+            "Make inc(x) return x + 1",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        assert len(seen_reqs) == 2
+        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
+        assert seen_reqs[1]["model"] == "gemini-4-argon"
+        assert seen_reqs[1]["max_tool_calls"] == 65
+        assert seen_reqs[1]["max_total_tokens"] == 2_500_000
+        assert d["model"] == "gemini-4-argon"
+        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["acceptance_passed"] is True
+        raw_rec = store1.read_receipt(d["job_id"])
+        assert raw_rec is not None
+        assert raw_rec["cumulative_max_total_tokens"] == 8_493_060
+    finally:
+        jm1.shutdown()
+
+    # Explicit max_total_tokens=1000 stops without granting extra Argon tokens
+    exp_reqs: list[dict[str, object]] = []
+
+    def exp_tok_worker(req: dict[str, object]) -> dict[str, object]:
+        exp_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "calc.py").write_text("def inc(x: int) -> int:\n    return x + 2\n", encoding="utf-8")
+        return {
+            "text": "hit explicit 1000 cap",
+            "stop_reason": "MAX_TOTAL_TOKENS_EXCEEDED",
+            "usage": {"prompt_token_count": 1200, "candidates_token_count": 50, "total_token_count": 1250},
+        }
+
+    store2 = ReceiptStore(tmp_path / "data_b7_1_2", workspace_root=repo)
+    jm2 = JobManager(workspace_root=repo, store=store2, worker_backend=exp_tok_worker)
+    try:
+        d_exp = jm2.delegate_start(
+            "Make inc(x) return x + 1 explicit",
+            model="gemini-3.8-flash",
+            project="p",
+            max_total_tokens=1000,
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=False,
+        )
+        assert len(exp_reqs) == 1
+        assert d_exp.get("budget_exhausted") is True
+    finally:
+        jm2.shutdown()
+
+
+def test_r7_1_balanced_pre_apply_qa_pass_and_needs_fixes_escalation_with_blended_cost(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[R7-1]: CC_AGY_BALANCED_QA_REVIEW=1 runs a 1-shot pre-apply QA audit on un-escalated Flash passes:
+    - VERDICT: PASS merges QA usage onto job-*.json, writes zero ask-*.json files, and auto-applies.
+    - VERDICT: NEEDS_FIXES merges QA usage, escalates via plugin_qa_review to Argon, fixes the bug, and auto-applies."""
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+
+    # 1. VERDICT: PASS
+    repo1 = tmp_path / "repo_qa_pass"
+    _init_repo(repo1)
+    (repo1 / "fmt.py").write_text("def greet(name: str) -> str:\n    return ''\n", encoding="utf-8")
+    (repo1 / "test_fmt.py").write_text(
+        "import fmt\ndef test_g():\n    assert fmt.greet('Ada') == 'Hello, Ada!'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo1), check=True)
+    subprocess.run(["git", "commit", "-qm", "init fmt"], cwd=str(repo1), check=True)
+
+    qa_calls_1: list[dict[str, object]] = []
+
+    def ask_pass(req: dict[str, object]) -> dict[str, object]:
+        qa_calls_1.append(dict(req))
+        return {
+            "text": "VERDICT: PASS\nAll requirements satisfied.",
+            "usage": {
+                "prompt_token_count": 2000,
+                "cached_content_token_count": 0,
+                "candidates_token_count": 50,
+                "thoughts_token_count": 100,
+                "total_token_count": 2150,
+            },
+        }
+
+    def flash_ok_worker(req: dict[str, object]) -> dict[str, object]:
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "fmt.py").write_text(
+            "def greet(name: str) -> str:\n    return f'Hello, {name}!'\n", encoding="utf-8"
+        )
+        return {
+            "text": "Implemented greet()",
+            "usage": {"prompt_token_count": 1000, "candidates_token_count": 100, "total_token_count": 1100},
+        }
+
+    store1 = ReceiptStore(tmp_path / "data_qa_pass", workspace_root=repo1)
+    jm1 = JobManager(workspace_root=repo1, store=store1, worker_backend=flash_ok_worker, ask_backend=ask_pass)
+    try:
+        d1 = jm1.delegate_start(
+            "Implement greet(name) returning 'Hello, <name>!'",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_fmt.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(qa_calls_1) == 1
+        assert qa_calls_1[0]["model"] == "gemini-4-argon"
+        assert d1["model"] == "gemini-3.8-flash"
+        assert d1["applied"] is True
+        assert d1["qa_review"]["verdict"] == "PASS"
+        assert d1["qa_review"]["resumed"] is False
+        raw1 = store1.read_receipt(d1["job_id"])
+        assert raw1 is not None
+        assert raw1["usage"]["prompt_token_count"] == 3000
+        assert list((tmp_path / "data_qa_pass").rglob("ask-*.json")) == []
+    finally:
+        jm1.shutdown()
+
+    # 2. VERDICT: NEEDS_FIXES -> escalates to Argon and fixes hidden requirement
+    repo2 = tmp_path / "repo_qa_fail"
+    _init_repo(repo2)
+    (repo2 / "fmt.py").write_text("def greet(name: str) -> str:\n    return ''\n", encoding="utf-8")
+    (repo2 / "test_fmt.py").write_text(
+        "import fmt\ndef test_g():\n    assert fmt.greet('Ada').startswith('Hello, Ada')\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo2), check=True)
+    subprocess.run(["git", "commit", "-qm", "init fmt2"], cwd=str(repo2), check=True)
+
+    qa_calls_2: list[dict[str, object]] = []
+    worker_reqs_2: list[dict[str, object]] = []
+
+    def ask_fail(req: dict[str, object]) -> dict[str, object]:
+        qa_calls_2.append(dict(req))
+        return {
+            "text": "VERDICT: NEEDS_FIXES\n- [fmt.py]: Missing trailing exclamation mark required by spec.",
+            "usage": {
+                "prompt_token_count": 2000,
+                "cached_content_token_count": 0,
+                "candidates_token_count": 60,
+                "thoughts_token_count": 140,
+                "total_token_count": 2200,
+            },
+        }
+
+    def flash_then_argon_worker(req: dict[str, object]) -> dict[str, object]:
+        worker_reqs_2.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(worker_reqs_2) == 1:
+            (wt / "fmt.py").write_text(
+                "def greet(name: str) -> str:\n    return f'Hello, {name}'\n", encoding="utf-8"
+            )
+            return {
+                "text": "Implemented greet without bang",
+                "usage": {"prompt_token_count": 1000, "candidates_token_count": 100, "total_token_count": 1100},
+            }
+        (wt / "fmt.py").write_text(
+            "def greet(name: str) -> str:\n    return f'Hello, {name}!'\n", encoding="utf-8"
+        )
+        return {
+            "text": "Added trailing exclamation mark",
+            "usage": {"prompt_token_count": 1500, "candidates_token_count": 80, "total_token_count": 1580},
+        }
+
+    store2 = ReceiptStore(tmp_path / "data_qa_fail", workspace_root=repo2)
+    jm2 = JobManager(
+        workspace_root=repo2,
+        store=store2,
+        worker_backend=flash_then_argon_worker,
+        ask_backend=ask_fail,
+    )
+    try:
+        d2 = jm2.delegate_start(
+            "Implement greet(name) returning exact string 'Hello, <name>!' with trailing exclamation mark.",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_fmt.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(qa_calls_2) == 1
+        assert len(worker_reqs_2) == 2
+        assert worker_reqs_2[0]["model"] == "gemini-3.8-flash"
+        assert worker_reqs_2[1]["model"] == "gemini-4-argon"
+        assert d2["model"] == "gemini-4-argon"
+        assert d2["escalated_from_model"] == "gemini-3.8-flash"
+        assert d2["applied"] is True
+        assert (repo2 / "fmt.py").read_text(encoding="utf-8").strip().endswith("return f'Hello, {name}!'")
+        raw2 = store2.read_receipt(d2["job_id"])
+        assert raw2 is not None
+        assert raw2["prompt_sources"] == ["lead", "plugin_qa_review"]
+        assert raw2["usage"]["prompt_token_count"] == 4500
+        assert list((tmp_path / "data_qa_fail").rglob("ask-*.json")) == []
+    finally:
+        jm2.shutdown()
+
+
+def test_r7_2_existing_test_expectations_modified_triggers_balanced_escalation_not_pure_additions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[R7-2]: Modifying assertions across >=2 pre-existing test functions flags
+    ExistingTestExpectationsModified and triggers Turn-1 escalation in balanced, while pure '+' test additions do not."""
+    from server.jobs import detect_existing_test_stub_mutations
+
+    repo_mut = tmp_path / "repo_r7_2_mut"
+    _init_repo(repo_mut)
+    (repo_mut / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_mut / "tests" / "test_api.py").write_text(
+        "def test_alpha():\n    assert run_alpha() == 'strict_a'\n\n"
+        "def test_beta():\n    assert run_beta() == 'strict_b'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo_mut), check=True)
+    subprocess.run(["git", "commit", "-qm", "init tests"], cwd=str(repo_mut), check=True)
+
+    mutated_diff = (
+        "diff --git a/tests/test_api.py b/tests/test_api.py\n"
+        "--- a/tests/test_api.py\n"
+        "+++ b/tests/test_api.py\n"
+        "@@ -1,2 +1,2 @@ def test_alpha():\n"
+        "-    assert run_alpha() == 'strict_a'\n"
+        "+    assert run_alpha() == 'weak_a'\n"
+        "@@ -4,2 +4,2 @@ def test_beta():\n"
+        "-    assert run_beta() == 'strict_b'\n"
+        "+    assert run_beta() == 'weak_b'\n"
+    )
+    warns = detect_existing_test_stub_mutations(repo_mut, mutated_diff, ["tests/test_api.py"])
+    assert any("ExistingTestExpectationsModified" in w for w in warns)
+
+    pure_addition_diff = (
+        "diff --git a/tests/test_api.py b/tests/test_api.py\n"
+        "--- a/tests/test_api.py\n"
+        "+++ b/tests/test_api.py\n"
+        "@@ -5,0 +6,3 @@\n"
+        "+def test_gamma():\n"
+        "+    assert run_gamma() == 'ok'\n"
+    )
+    assert detect_existing_test_stub_mutations(repo_mut, pure_addition_diff, ["tests/test_api.py"]) == []
+
+
+def test_carbon_g_high_pricing_thinking_level_and_escalation_upgrade_from_flash_low(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CC_AGY_FORCE_WORKER_THINKING_LEVEL=LOW takes strict top precedence (even on -high suffixes) and
+    controls QA review thinking level; when unforced, -high/-medium/-low suffixes resolve to HIGH/MEDIUM/LOW."""
+    from server.agy_runner import resolve_thinking_level
+    from server.regions import estimate_cost_usd
+
+    monkeypatch.setenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "LOW")
+    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-low", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-high", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-medium", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="bon-experiment-arm-226", read_only=False) == "LOW"
+
+    monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
+    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-low", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-high", read_only=False) == "HIGH"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-medium", read_only=False) == "MEDIUM"
+
+    for m_name in ("gemini-4-carbon-low", "gemini-4-carbon-high"):
+        cost = estimate_cost_usd(
+            m_name,
+            {"prompt_token_count": 1_000_000, "cached_content_token_count": 500_000, "candidates_token_count": 100_000},
+            single_request=False,
+        )
+        # 500k uncached * $2/1M ($1.00) + 500k cached * $0.20/1M ($0.10) + 100k out * $12/1M ($1.20) = $2.30
+        assert abs(float(cost["total_cost_usd"]) - 2.30) < 1e-6
+
+    repo = tmp_path / "repo_carbon_esc"
+    _init_repo(repo)
+    (repo / "app.py").write_text("VAL = 0\n", encoding="utf-8")
+    (repo / "test_app.py").write_text("import app\ndef test_v():\n    assert app.VAL == 9\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon-high")
+
+    seen_reqs: list[dict[str, object]] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen_reqs) == 1:
+            (wt / "app.py").write_text("VAL = 1\n", encoding="utf-8")
+            return {
+                "text": "wrong val",
+                "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110},
+            }
+        (wt / "app.py").write_text("VAL = 9\n", encoding="utf-8")
+        return {
+            "text": "fixed val",
+            "usage": {"prompt_token_count": 200, "candidates_token_count": 20, "total_token_count": 220},
+        }
+
+    store = ReceiptStore(tmp_path / "data_carbon_esc", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d = jm.delegate_start(
+            "Set VAL = 9 in app.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(seen_reqs) == 2
+        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
+        assert seen_reqs[0]["thinking_level"] == "LOW"
+        assert seen_reqs[1]["model"] == "gemini-4-carbon-high"
+        assert seen_reqs[1]["thinking_level"] == "HIGH"
+        assert d["model"] == "gemini-4-carbon-high"
+        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["applied"] is True
+    finally:
+        jm.shutdown()
+
+    # Also verify forced LOW thinking across both QA review and Carbon-G escalation:
+    repo_low = tmp_path / "repo_carbon_low"
+    _init_repo(repo_low)
+    (repo_low / "app.py").write_text("VAL = 0\n", encoding="utf-8")
+    (repo_low / "test_app.py").write_text("import app\ndef test_v():\n    assert app.VAL == 9\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo_low), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app low"], cwd=str(repo_low), check=True)
+
+    monkeypatch.setenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "LOW")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon-low")
+
+    seen_low_workers: list[dict[str, object]] = []
+    seen_qa: list[dict[str, object]] = []
+
+    def worker_low(req: dict[str, object]) -> dict[str, object]:
+        seen_low_workers.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text("VAL = 9\n", encoding="utf-8")
+        return {
+            "text": "updated val",
+            "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110},
+        }
+
+    def ask_qa_low(req: dict[str, object]) -> dict[str, object]:
+        seen_qa.append(dict(req))
+        return {
+            "text": "VERDICT: NEEDS_FIXES\nISSUES:\n- edge case missing\n",
+            "usage": {"prompt_token_count": 120, "candidates_token_count": 15, "total_token_count": 135},
+        }
+
+    store_low = ReceiptStore(tmp_path / "data_carbon_low", workspace_root=repo_low)
+    jm_low = JobManager(workspace_root=repo_low, store=store_low, worker_backend=worker_low, ask_backend=ask_qa_low)
+    try:
+        d_low = jm_low.delegate_start(
+            "Set VAL = 9 in app.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(seen_qa) == 1
+        assert seen_qa[0]["model"] == "gemini-4-carbon-low"
+        assert seen_qa[0]["thinking_level"] == "LOW"
+        assert len(seen_low_workers) == 2
+        assert seen_low_workers[1]["model"] == "gemini-4-carbon-low"
+        assert seen_low_workers[1]["thinking_level"] == "LOW"
+        assert d_low["applied"] is True
+    finally:
+        jm_low.shutdown()
+
+
+def test_r7_r2_explicit_max_tool_calls_still_escalates_on_default_token_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[R7-R2 / B7-1]: Passing explicit max_tool_calls=60 (without explicit max_total_tokens) still allows
+    Turn-1 Flash -> Argon escalation when Flash hits default MAX_TOTAL_TOKENS_EXCEEDED with <60 tool calls."""
+    repo = tmp_path / "repo_r7_r2_tok"
+    _init_repo(repo)
+    (repo / "calc.py").write_text("def inc(x: int) -> int:\n    return x\n", encoding="utf-8")
+    (repo / "test_calc.py").write_text(
+        "import calc\ndef test_inc():\n    assert calc.inc(1) == 2\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init calc"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+
+    seen: list[dict[str, object]] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen) == 1:
+            (wt / "calc.py").write_text("def inc(x: int) -> int:\n    return x + 0\n", encoding="utf-8")
+            return {
+                "text": "token cap",
+                "stop_reason": "MAX_TOTAL_TOKENS_EXCEEDED",
+                "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(35)],
+                "usage": {"prompt_token_count": 5_100_000, "candidates_token_count": 100_000, "total_token_count": 5_200_000},
+            }
+        (wt / "calc.py").write_text("def inc(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+        return {
+            "text": "done",
+            "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(5)],
+            "usage": {"prompt_token_count": 100_000, "candidates_token_count": 5_000, "total_token_count": 105_000},
+        }
+
+    store = ReceiptStore(tmp_path / "data_r7_r2_tok", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
+    try:
+        d = jm.delegate_start(
+            "Make inc(x) return x + 1",
+            model="gemini-3.8-flash",
+            project="p",
+            max_tool_calls=60,
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(seen) == 2
+        assert seen[1]["model"] == "gemini-4-argon"
+        assert seen[1]["max_tool_calls"] == 25  # 60 explicit cap - 35 used
+        assert seen[1]["max_total_tokens"] == 2_500_000
+        assert d["applied"] is True
+        assert d.get("budget_exhausted") is None
+    finally:
+        jm.shutdown()
+
+
+def test_r7_r2_qa_review_wall_time_counted_in_wait_slice_and_marks_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[R7-R2 / R7-1]: Pre-apply QA duration is included in _wait_elapsed passed to delegate_continue so
+    delegate_start respects CC_AGY_MAX_WAIT_SLICE_SECONDS, and Turn-2 pass sets resolved_by_escalation=True."""
+    repo = tmp_path / "repo_r7_r2_slice"
+    _init_repo(repo)
+    (repo / "app.py").write_text("def f() -> int:\n    return 0\n", encoding="utf-8")
+    (repo / "test_app.py").write_text("from app import f\ndef test_f():\n    assert f() in (1, 2)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+    monkeypatch.setenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", "2.0")
+
+    seen: list[str] = []
+    qa_calls: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text(f"def f() -> int:\n    return {len(seen)}\n", encoding="utf-8")
+        time.sleep(0.1 if len(seen) == 1 else 2.2)
+        return {"text": f"turn {len(seen)}", "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110}}
+
+    def ask_qa(req: dict[str, object]) -> dict[str, object]:
+        qa_calls.append(str(req["model"]))
+        time.sleep(1.5)
+        return {"text": "VERDICT: NEEDS_FIXES\n- f() must return 2", "usage": {"prompt_token_count": 200, "candidates_token_count": 20, "total_token_count": 220}}
+
+    store = ReceiptStore(tmp_path / "data_r7_r2_slice", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker, ask_backend=ask_qa)
+    try:
+        t0 = time.monotonic()
+        d0 = jm.delegate_start(
+            "Make f() return 2",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        start_wall = time.monotonic() - t0
+        # Without counting QA wall-time, start_wall would wait Turn1 + QA(1.5s) + Turn2(1.5s+) >= 3.4s
+        assert start_wall < 2.9, f"delegate_start exceeded slice budget: {start_wall:.2f}s"
+        assert d0["status"] == "running"
+        fin = d0
+        for _ in range(4):
+            if fin.get("status") != "running":
+                break
+            fin = jm.delegate_result(d0["job_id"], wait=True, timeout=5.0)
+        assert fin["status"] == "ok"
+        assert fin["applied"] is True
+        assert len(qa_calls) == 1
+        rec = store.read_receipt(d0["job_id"])
+        assert rec is not None
+        assert rec["qa_review"]["resolved_by_escalation"] is True
+    finally:
+        jm.shutdown()
+
+
+def test_r7_r2_expectation_warnings_count_functions_ignore_pure_adds_exempt_spec_and_allow_argon_apply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[R7-R2 / R7-2]:
+    1. Multiple assert edits inside 1 test function do NOT trigger ExistingTestExpectationsModified.
+    2. Pure assertion additions alongside preserved assertions in the same cluster do NOT trigger.
+    3. Explicit spec instructions ('update the existing tests...') exempt ExistingTestExpectationsModified.
+    4. Un-exempted Turn-1 expectation edits escalate to Argon and auto-apply once Argon verifies and passes."""
+    from server.jobs import detect_existing_test_stub_mutations
+
+    repo = tmp_path / "repo_r7_r2_exp"
+    _init_repo(repo)
+    (repo / "fmt.py").write_text("def tag(x: str) -> str:\n    return f'v1:{x}'\n", encoding="utf-8")
+    (repo / "tests").mkdir(parents=True, exist_ok=True)
+    (repo / "tests" / "test_fmt.py").write_text(
+        "from fmt import tag\n\n"
+        "def test_a():\n    assert tag('a') == 'v1:a'\n    k = 1\n    assert tag('a2') == 'v1:a2'\n\n"
+        "def test_b():\n    assert tag('b') == 'v1:b'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init fmt"], cwd=str(repo), check=True)
+
+    # 1. Two asserts edited inside the SAME function test_a -> 1 function (<2) -> no warning
+    one_fn_two_asserts_diff = (
+        "diff --git a/tests/test_fmt.py b/tests/test_fmt.py\n"
+        "--- a/tests/test_fmt.py\n"
+        "+++ b/tests/test_fmt.py\n"
+        "@@ -2,5 +2,5 @@ from fmt import tag\n"
+        " def test_a():\n"
+        "-    assert tag('a') == 'v1:a'\n"
+        "+    assert tag('a') == 'v2:a'\n"
+        "     k = 1\n"
+        "-    assert tag('a2') == 'v1:a2'\n"
+        "+    assert tag('a2') == 'v2:a2'\n"
+    )
+    assert detect_existing_test_stub_mutations(repo, one_fn_two_asserts_diff, ["tests/test_fmt.py"]) == []
+
+    # 2. Existing assertions preserved verbatim + new assertions added in same cluster -> no warning
+    pure_add_in_cluster_diff = (
+        "diff --git a/tests/test_fmt.py b/tests/test_fmt.py\n"
+        "--- a/tests/test_fmt.py\n"
+        "+++ b/tests/test_fmt.py\n"
+        "@@ -2,8 +2,10 @@ from fmt import tag\n"
+        " def test_a():\n"
+        "-    assert tag('a') == 'v1:a'\n"
+        "+    assert tag('a') == 'v1:a'\n"
+        "+    assert tag('extra_a') == 'v1:extra_a'\n"
+        "     k = 1\n"
+        "     assert tag('a2') == 'v1:a2'\n"
+        " \n"
+        " def test_b():\n"
+        "-    assert tag('b') == 'v1:b'\n"
+        "+    assert tag('b') == 'v1:b'\n"
+        "+    assert tag('extra_b') == 'v1:extra_b'\n"
+    )
+    assert detect_existing_test_stub_mutations(repo, pure_add_in_cluster_diff, ["tests/test_fmt.py"]) == []
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "0")
+
+    models_explicit: list[str] = []
+
+    def worker_v2(req: dict[str, object]) -> dict[str, object]:
+        models_explicit.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "fmt.py").write_text("def tag(x: str) -> str:\n    return f'v2:{x}'\n", encoding="utf-8")
+        (wt / "tests" / "test_fmt.py").write_text(
+            "from fmt import tag\n\n"
+            "def test_a():\n    assert tag('a') == 'v2:a'\n    k = 1\n    assert tag('a2') == 'v2:a2'\n\n"
+            "def test_b():\n    assert tag('b') == 'v2:b'\n",
+            encoding="utf-8",
+        )
+        return {"text": "updated tag and tests"}
+
+    # 3. Explicit spec instruction vs negated instructions
+    from server.jobs import _prompt_requests_existing_test_updates
+
+    assert _prompt_requests_existing_test_updates(
+        "Change tag(x) in fmt.py from v1: to v2: and update the existing tests to expect v2:."
+    ) is True
+    for neg_prompt in (
+        "Do not update the existing tests; fix the production code.",
+        "Do NOT modify the existing tests.",
+        "Don't change existing test expectations; the implementation is wrong.",
+        "Fix parse() without updating any tests.",
+        "Never rewrite test assertions to make them pass.",
+        "Fix failing tests in parser.py.",
+        "Make sure existing tests still pass.",
+    ):
+        assert _prompt_requests_existing_test_updates(neg_prompt) is False, neg_prompt
+
+    store_exp = ReceiptStore(tmp_path / "data_exp", workspace_root=repo)
+    jm_exp = JobManager(workspace_root=repo, store=store_exp, worker_backend=worker_v2)
+    try:
+        d_exp = jm_exp.delegate_start(
+            "Change tag(x) in fmt.py from v1: to v2: and update the existing tests to expect v2:.",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q tests/test_fmt.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert models_explicit == ["gemini-3.8-flash"]
+        assert d_exp["applied"] is True
+        assert d_exp.get("auto_apply_skipped") is None
+    finally:
+        jm_exp.shutdown()
+
+    # Reset repo to v1 for Case 4 (un-exempted expectation rewrite -> escalates to Argon;
+    # if Argon keeps rewriting expectations without QA pass, auto-apply is skipped for Lead review;
+    # if Argon fixes production code without rewriting expectations, auto-apply succeeds)
+    (repo / "fmt.py").write_text("def tag(x: str) -> str:\n    return f'v1:{x}'\n", encoding="utf-8")
+    (repo / "tests" / "test_fmt.py").write_text(
+        "from fmt import tag\n\n"
+        "def test_a():\n    assert tag('a') == 'v1:a'\n    k = 1\n    assert tag('a2') == 'v1:a2'\n\n"
+        "def test_b():\n    assert tag('b') == 'v1:b'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "reset v1"], cwd=str(repo), check=True)
+
+    models_imp: list[str] = []
+
+    def worker_imp(req: dict[str, object]) -> dict[str, object]:
+        models_imp.append(str(req["model"]))
+        return worker_v2(req)
+
+    store_imp = ReceiptStore(tmp_path / "data_imp", workspace_root=repo)
+    jm_imp = JobManager(workspace_root=repo, store=store_imp, worker_backend=worker_imp)
+    try:
+        d_imp = jm_imp.delegate_start(
+            "Change tag(x) in fmt.py from v1: to v2: so the suite passes. Do NOT modify the existing tests.",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q tests/test_fmt.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert models_imp == ["gemini-3.8-flash", "gemini-4-argon"]
+        assert d_imp.get("applied") is not True
+        assert "altered pre-existing test expectations across >=2 test functions" in str(
+            d_imp.get("auto_apply_skipped") or ""
+        )
+        # Lead can still explicitly apply after inspecting get_diff (no deadlock):
+        apply_manual = jm_imp.delegate_apply(d_imp["job_id"])
+        assert apply_manual["applied"] is True
+    finally:
+        jm_imp.shutdown()
+
+
+def test_v9_qa_audited_checkpoint_promotion_and_needs_fixes_escalation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[V9-1]: In balanced mode when pre-apply QA is active, a Flash checkpoint (MAX_TOOL_CALLS_EXCEEDED)
+    with passing real acceptance tests promotes to status='ok' (recovered_from_checkpoint=True) so QA audits it:
+    - VERDICT: PASS auto-applies without wasting a Turn-2 worker escalation.
+    - VERDICT: NEEDS_FIXES escalates to Argon with 60-call escalation floor."""
+    import json
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+
+    # Case A: QA PASS on verified Flash checkpoint -> no Turn-2 worker escalation
+    repo_a = tmp_path / "repo_v9_chk_pass"
+    _init_repo(repo_a)
+    (repo_a / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return 0\n", encoding="utf-8")
+    (repo_a / "test_calc.py").write_text(
+        "import calc\ndef test_m():\n    assert calc.mul(3, 4) == 12\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo_a), check=True)
+    subprocess.run(["git", "commit", "-qm", "init calc"], cwd=str(repo_a), check=True)
+
+    worker_a_reqs: list[dict[str, object]] = []
+    qa_a_reqs: list[dict[str, object]] = []
+
+    def worker_a(req: dict[str, object]) -> dict[str, object]:
+        worker_a_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a * b\n", encoding="utf-8")
+        return {
+            "text": "Implemented mul(), reached tool cap on final check.",
+            "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+            "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(55)],
+            "usage": {"prompt_token_count": 1000, "candidates_token_count": 80, "total_token_count": 1080},
+        }
+
+    def ask_a(req: dict[str, object]) -> dict[str, object]:
+        qa_a_reqs.append(dict(req))
+        return {
+            "text": "VERDICT: PASS\nClean implementation.",
+            "usage": {"prompt_token_count": 500, "candidates_token_count": 20, "total_token_count": 520},
+        }
+
+    store_a = ReceiptStore(tmp_path / "data_v9_chk_pass", workspace_root=repo_a)
+    jm_a = JobManager(workspace_root=repo_a, store=store_a, worker_backend=worker_a, ask_backend=ask_a)
+    (store_a.data_dir / ".last_user_prompt.json").write_text(
+        json.dumps(
+            {
+                "ts": time.time() + 1.0,
+                "prompt": "Implement mul(a, b) returning a * b in calc.py with full integer multiplication support and negative handling.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        da = jm_a.delegate_start(
+            "Implement mul(a, b) in calc.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(worker_a_reqs) == 1
+        assert len(qa_a_reqs) == 1
+        assert "MAX_TOOL_CALLS_EXCEEDED" in str(qa_a_reqs[0]["prompt"])
+        assert "Summary: Original User Specification Takes Precedence" in str(qa_a_reqs[0]["prompt"])
+        assert qa_a_reqs[0]["thinking_level"] == "LOW"
+        assert da["status"] == "ok"
+        assert da["model"] == "gemini-3.8-flash"
+        assert da["applied"] is True
+        raw_a = store_a.read_receipt(da["job_id"])
+        assert raw_a is not None and raw_a.get("recovered_from_checkpoint") is True
+    finally:
+        jm_a.shutdown()
+
+    # Case B: QA NEEDS_FIXES on verified Flash checkpoint -> escalates to Argon with 60-call floor
+    repo_b = tmp_path / "repo_v9_chk_fail"
+    _init_repo(repo_b)
+    (repo_b / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return 0\n", encoding="utf-8")
+    (repo_b / "test_calc.py").write_text(
+        "import calc\ndef test_m():\n    assert calc.mul(3, 1) == 3\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=str(repo_b), check=True)
+    subprocess.run(["git", "commit", "-qm", "init calc b"], cwd=str(repo_b), check=True)
+
+    worker_b_reqs: list[dict[str, object]] = []
+
+    def worker_b(req: dict[str, object]) -> dict[str, object]:
+        worker_b_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        if len(worker_b_reqs) == 1:
+            (wt / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a\n", encoding="utf-8")
+            return {
+                "text": "Partial mul",
+                "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                "tool_calls": [{"name": "view_file", "args": {"path": "calc.py"}} for _ in range(55)],
+                "usage": {"prompt_token_count": 1000, "candidates_token_count": 80, "total_token_count": 1080},
+            }
+        (wt / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a * b\n", encoding="utf-8")
+        return {
+            "text": "Fixed mul(a, b) = a * b",
+            "tool_calls": [{"name": "edit_file", "args": {"path": "calc.py"}} for _ in range(4)],
+            "usage": {"prompt_token_count": 800, "candidates_token_count": 40, "total_token_count": 840},
+        }
+
+    def ask_b(_req: dict[str, object]) -> dict[str, object]:
+        return {
+            "text": "VERDICT: NEEDS_FIXES\n- ISSUE: calc.py:2: returns a instead of a * b when b != 1",
+            "usage": {"prompt_token_count": 500, "candidates_token_count": 30, "total_token_count": 530},
+        }
+
+    store_b = ReceiptStore(tmp_path / "data_v9_chk_fail", workspace_root=repo_b)
+    jm_b = JobManager(workspace_root=repo_b, store=store_b, worker_backend=worker_b, ask_backend=ask_b)
+    try:
+        db = jm_b.delegate_start(
+            "Implement mul(a, b) returning a * b in calc.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_calc.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert len(worker_b_reqs) == 2
+        assert worker_b_reqs[0]["model"] == "gemini-3.8-flash"
+        assert worker_b_reqs[1]["model"] == "gemini-4-argon"
+        assert worker_b_reqs[1]["max_tool_calls"] == 60
+        assert db["model"] == "gemini-4-argon"
+        assert db["applied"] is True
+    finally:
+        jm_b.shutdown()
+
+
+def test_v9_carbon_zero_thinking_budget_and_qa_retry_error_escalation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """[V9-2]: gemini-4-carbon-zero resolves to ZERO thinking (keeping Flash on LOW), QA audit passes
+    timeout_ms=90000 and retries once on transient error, and non-trivial QA ERROR escalates safely."""
+    from server.agy_runner import resolve_thinking_level
+    from server.regions import estimate_cost_usd
+
+    monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
+    monkeypatch.setenv("CC_AGY_ESCALATION_THINKING_LEVEL", "0")
+    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
+    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "ZERO"
+    monkeypatch.delenv("CC_AGY_ESCALATION_THINKING_LEVEL", raising=False)
+    assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
+    assert resolve_thinking_level(None, model="my-model-v2-0", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "LOW"
+
+    cost = estimate_cost_usd(
+        "gemini-4-carbon-zero",
+        {"prompt_token_count": 1_000_000, "cached_content_token_count": 500_000, "candidates_token_count": 100_000},
+        single_request=False,
+    )
+    assert abs(float(cost["total_cost_usd"]) - 2.30) < 1e-6
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon-zero")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+
+    repo = tmp_path / "repo_v9_czero"
+    _init_repo(repo)
+    (repo / "mod.py").write_text("X = 0\n", encoding="utf-8")
+    (repo / "test_mod.py").write_text("import mod\ndef test_x():\n    assert mod.X in (1, 2)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init mod"], cwd=str(repo), check=True)
+
+    qa_reqs: list[dict[str, object]] = []
+    worker_reqs: list[dict[str, object]] = []
+
+    def worker_cz(req: dict[str, object]) -> dict[str, object]:
+        worker_reqs.append(dict(req))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "mod.py").write_text(f"X = {len(worker_reqs)}\n", encoding="utf-8")
+        return {
+            "text": f"turn {len(worker_reqs)}",
+            "tool_calls": [{"name": "view_file", "args": {"path": "mod.py"}} for _ in range(18)],
+            "usage": {"prompt_token_count": 400, "candidates_token_count": 40, "total_token_count": 440},
+        }
+
+    def ask_timeout(req: dict[str, object]) -> dict[str, object]:
+        qa_reqs.append(dict(req))
+        raise TimeoutError("upstream read timed out")
+
+    store = ReceiptStore(tmp_path / "data_v9_czero", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker_cz, ask_backend=ask_timeout)
+    try:
+        d = jm.delegate_start(
+            "Set X = 2 in mod.py",
+            model="gemini-3.8-flash",
+            project="p",
+            acceptance=["python3 -m pytest -q test_mod.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        # QA retried once (2 attempts total), with thinking_level="ZERO" and timeout_ms=90000
+        assert len(qa_reqs) == 2
+        assert qa_reqs[0]["thinking_level"] == "ZERO"
+        assert qa_reqs[0]["timeout_ms"] == 90_000
+        # Non-trivial Flash job (>=15 tool calls) with persistent QA ERROR escalated to gemini-4-carbon-zero
+        assert len(worker_reqs) == 2
+        assert worker_reqs[0]["thinking_level"] == "LOW"
+        assert worker_reqs[1]["model"] == "gemini-4-carbon-zero"
+        assert worker_reqs[1]["thinking_level"] == "ZERO"
+        assert "timed out or errored before verifying Flash's candidate patch" in "\n".join(
+            str(p) for p in (worker_reqs[1].get("prompts") or [])
+        )
+        assert d["applied"] is True
+        assert (repo / "mod.py").read_text(encoding="utf-8").strip() == "X = 2"
+    finally:
+        jm.shutdown()
+
+
+

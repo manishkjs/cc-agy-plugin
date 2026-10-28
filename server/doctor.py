@@ -11,11 +11,11 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
-import subprocess
 from typing import Any, Mapping
 
 from server.jobs import detect_project_test_runner
 from server.receipts import ReceiptStore, resolve_workspace_root
+from server.verify import run_git
 from server.regions import (
     is_strict_mode_enabled,
     resolve_auth_config,
@@ -221,8 +221,8 @@ def run_doctor(
     is_git_repo = False
     tracked_files = 0
     if ws_path.is_dir():
-        git_probe = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
+        git_probe = run_git(
+            ["rev-parse", "--is-inside-work-tree"],
             cwd=str(ws_path),
             capture_output=True,
             text=True,
@@ -232,8 +232,8 @@ def run_doctor(
         )
         is_git_repo = git_probe.returncode == 0 and git_probe.stdout.strip().lower() == "true"
         if is_git_repo:
-            ls_probe = subprocess.run(
-                ["git", "ls-files", "-z"],
+            ls_probe = run_git(
+                ["ls-files", "-z"],
                 cwd=str(ws_path),
                 capture_output=True,
                 check=False,

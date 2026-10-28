@@ -43,7 +43,9 @@ def run_task_graph(
             result = run(task)
         except Exception:  # noqa: BLE001 - one task's crash must not take down the batch
             return "failed"
-        return result if result in ("landed", "unchanged", "failed") else "failed"
+        # "held" means the batch stopped (budget, cancel) before the task could finish: it is not a
+        # failure and a resumed run picks it up again.
+        return result if result in ("landed", "unchanged", "failed", "held") else "failed"
 
     with ThreadPoolExecutor(max_workers=width, thread_name_prefix="cc-agy-batch") as pool:
         while len(states) < len(order):

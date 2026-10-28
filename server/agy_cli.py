@@ -60,6 +60,7 @@ _SCRUBBED_SUBPROCESS_ENV_KEYS = frozenset(
 _EFFORT_SUFFIXES = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 _THINKING_TO_EFFORT: dict[str, str] = {
+    "ZERO": "low",
     "MINIMAL": "low",
     "LOW": "low",
     "MEDIUM": "medium",
@@ -720,7 +721,7 @@ def select_fallback_agy_model(
         return None
     req_low = (requested_model or "").lower()
     want_flash = "flash" in req_low
-    want_pro = ("argon" in req_low) or ("pro" in req_low) or not want_flash
+    want_pro = ("argon" in req_low) or ("carbon" in req_low) or ("pro" in req_low) or not want_flash
     eff_low = (requested_effort or "").strip().lower()
 
     best_score: tuple[int, int, int, int, int] | None = None
@@ -733,7 +734,7 @@ def select_fallback_agy_model(
         if "lite" in low and "lite" not in req_low:
             continue
         is_flash = "flash" in low
-        is_pro_or_argon = ("argon" in low) or ("pro" in low)
+        is_pro_or_argon = ("argon" in low) or ("carbon" in low) or ("pro" in low)
         if want_flash and not is_flash:
             continue
         if want_pro and not want_flash and not is_pro_or_argon:
@@ -742,7 +743,7 @@ def select_fallback_agy_model(
         ver_match = re.search(r"gemini[\s\-]*(\d+)(?:\.(\d+))?", low)
         major = int(ver_match.group(1)) if ver_match else 0
         minor = int(ver_match.group(2)) if (ver_match and ver_match.group(2)) else 0
-        argon_bonus = 1 if ("argon" in req_low and "argon" in low) else 0
+        argon_bonus = 1 if (("argon" in req_low and "argon" in low) or ("carbon" in req_low and "carbon" in low)) else 0
 
         eff_bonus = 0
         if eff_low:

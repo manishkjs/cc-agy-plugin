@@ -16,7 +16,11 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from scripts.pre_tool_guard import is_strict_mode_enabled, lint_delegation_prompt  # noqa: E402
-from server.jobs import _is_ephemeral_build_or_test_artifact, capture_live_workspace_diff  # noqa: E402
+from server.jobs import (  # noqa: E402
+    _is_ephemeral_build_or_test_artifact,
+    _matches_allowed_paths,
+    capture_live_workspace_diff,
+)
 from server.receipts import (  # noqa: E402
     ReceiptStore,
     extract_diff_provenance,
@@ -73,6 +77,7 @@ def verify_workspace_provenance(
     applied_added_hashes_by_file: dict[str, Counter[str]] = {}
     applied_removed_hashes_by_file: dict[str, Counter[str]] = {}
     latest_applied_file_hash: dict[str, str | None] = {}
+    escalated_lead_scopes: list[tuple[set[str], list[str], bool]] = []
 
     def _accumulate_provenance(prov: dict[str, Any], extra_files: list[str] | None = None) -> None:
         for fpath in (prov.get("files_changed") or []) + (extra_files or []):
@@ -112,7 +117,7 @@ def verify_workspace_provenance(
             sources_list = list(r.get("prompt_sources") or [])
             for idx, prompt_str in enumerate(prompts_list):
                 src = str(sources_list[idx]) if idx < len(sources_list) else "lead"
-                if src in ("plugin_escalation", "plugin_qa_review", "internal"):
+                if src in ("plugin_escalation", "plugin_retry", "plugin_qa_review", "internal"):
                     continue
                 lint = lint_delegation_prompt(str(prompt_str))
                 if not lint["ok"]:
@@ -151,6 +156,20 @@ def verify_workspace_provenance(
             if float(r.get("updated_at_epoch") or 0.0) >= baseline_recorded_at:
                 for fpath, fhash in (r.get("applied_file_hashes") or {}).items():
                     latest_applied_file_hash[fpath] = fhash
+        esc_meta = r.get("escalation")
+        if (
+            r.get("kind") == "delegate"
+            and not r.get("external_worktree_tamper")
+            and not r.get("reverted")
+            and (
+                r.get("escalate_to_lead") is True
+                or (isinstance(esc_meta, dict) and esc_meta.get("escalate_to_lead") is True)
+            )
+            and float(r.get("updated_at_epoch") or r.get("finished_at_epoch") or 0.0) >= max(0.0, baseline_recorded_at - 1.0)
+        ):
+            esc_files = set(r.get("applied_files") or []) | set(r.get("files_changed") or [])
+            esc_allowed = [str(p) for p in (r.get("allowed_paths") or []) if isinstance(p, str)]
+            escalated_lead_scopes.append((esc_files, esc_allowed, bool(r.get("applied"))))
         for hist_prov in r.get("applied_history") or []:
             if isinstance(hist_prov, dict):
                 _accumulate_provenance(hist_prov)
@@ -161,6 +180,22 @@ def verify_workspace_provenance(
     unverified_files: list[str] = []
     unverified_lines_by_file: dict[str, int] = {}
     unverified_deletions_by_file: dict[str, int] = {}
+    escalated_exempted_files = 0
+
+    def _is_escalated_lead_editable(fpath: str) -> bool:
+        if not escalated_lead_scopes or escalated_exempted_files >= 3:
+            return False
+        from server.jobs import _is_test_file_path
+
+        for esc_files, esc_allowed, _was_applied in escalated_lead_scopes:
+            if (
+                fpath in esc_files
+                or not esc_allowed
+                or _matches_allowed_paths(fpath, esc_allowed)
+                or _is_test_file_path(fpath)
+            ):
+                return True
+        return False
 
     from server.receipts import sha256_bytes
 
@@ -172,6 +207,9 @@ def verify_workspace_provenance(
         ):
             continue
         if fpath not in applied_files_allowed:
+            if _is_escalated_lead_editable(fpath):
+                escalated_exempted_files += 1
+                continue
             unverified_files.append(fpath)
             continue
 
@@ -184,8 +222,6 @@ def verify_workspace_provenance(
                 allowed_added[h] -= 1
             else:
                 unmatched_added += 1
-        if unmatched_added > 0:
-            unverified_lines_by_file[fpath] = unmatched_added
 
         live_removed = file_info.get("removed_line_sha256", [])
         allowed_removed = Counter(applied_removed_hashes_by_file.get(fpath, Counter()))
@@ -209,6 +245,12 @@ def verify_workspace_provenance(
             if actual_hash != expected_hash and unmatched_added == 0 and unmatched_removed == 0:
                 unmatched_removed += max(1, sum(allowed_added.values()))
 
+        if (unmatched_added > 0 or unmatched_removed > 0) and _is_escalated_lead_editable(fpath):
+            escalated_exempted_files += 1
+            continue
+
+        if unmatched_added > 0:
+            unverified_lines_by_file[fpath] = unmatched_added
         if unmatched_removed > 0:
             unverified_deletions_by_file[fpath] = unmatched_removed
 

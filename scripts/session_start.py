@@ -108,8 +108,45 @@ def _auto_apply_on_pass(env: dict[str, str]) -> bool:
     return is_strict_mode_enabled(env)
 
 
+ZERO_READ_GUIDANCE = (
+    "\nLead file reads are off in this session (Lead read limit 0): call delegate_start on Turn 1 without "
+    "Read, Grep, Glob, or Bash file inspection. The worker gets a repository map and reads the code itself. "
+    "A few review reads open up only if a worker job fails."
+)
+ECONOMY_SCOUT_GUIDANCE = (
+    "\nEconomy Lead scouting budget (up to 2 Glob/Grep or bounded Read(limit=120) calls; pre-delegation Bash is off): "
+    "when target files and test paths are already clear from the prompt, call delegate_start immediately on Turn 1 "
+    "with 0 reads. Use your <=2 Glob/Grep/Read(limit=120) calls ONLY when CLI entrypoints, existing API/query "
+    "helpers, or test file locations are uncertain so you pass accurate allowed_paths and acceptance commands."
+)
+BALANCED_SCOUT_GUIDANCE = (
+    "\nBalanced Lead scouting budget (up to 2 Glob/Grep or bounded Read(limit=120) calls; pre-delegation Bash is off): "
+    "when target files and test paths are clear, call delegate_start on Turn 1 with 0 reads. Use <=2 Glob/Grep/Read(limit=120) "
+    "calls ONLY to locate uncertain CLI entrypoints, existing API/query helpers, or test paths; NEVER prescribe speculative "
+    "implementation details or guessed API/query names from partial reads — state behavioral outcomes and invariants only."
+)
+
+
 def review_guidance_for(env: dict[str, str]) -> str:
-    return REVIEW_AFTER_APPLY_GUIDANCE if _auto_apply_on_pass(env) else REVIEW_BEFORE_APPLY_GUIDANCE
+    base = REVIEW_AFTER_APPLY_GUIDANCE if _auto_apply_on_pass(env) else REVIEW_BEFORE_APPLY_GUIDANCE
+    if is_strict_mode_enabled(env):
+        from scripts.pre_tool_guard import resolve_lead_read_limit
+        from server.regions import COST_PROFILE_ENV_KEYS, resolve_cost_profile
+
+        limit = resolve_lead_read_limit(env)
+        if limit == 0:
+            return base + ZERO_READ_GUIDANCE
+        profile = resolve_cost_profile(env)
+        if profile == "economy" and limit is not None and limit <= 2:
+            return base + ECONOMY_SCOUT_GUIDANCE
+        if (
+            profile == "balanced"
+            and limit is not None
+            and limit <= 2
+            and any(str(env.get(k) or "").strip().lower() == "balanced" for k in COST_PROFILE_ENV_KEYS)
+        ):
+            return base + BALANCED_SCOUT_GUIDANCE
+    return base
 
 
 def _review_guidance_enabled(env: dict[str, str]) -> bool:
@@ -170,6 +207,7 @@ def handle_session_start(
     if session_source in ("startup", "clear", ""):
         try:
             (receipt_store.data_dir / ".lead_read_count").write_text("0", encoding="utf-8")
+            (receipt_store.data_dir / ".lead_escalated_edit_count").write_text("0", encoding="utf-8")
             marker_payload = json.dumps({"ts": round(time.time(), 3), "session_id": session_id})
             (receipt_store.data_dir / ".lead_session_started").write_text(marker_payload, encoding="utf-8")
             (receipt_store.data_dir / ".lead_read_files.json").write_text("[]", encoding="utf-8")

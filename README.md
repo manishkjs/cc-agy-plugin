@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
-[![Tests](https://img.shields.io/badge/tests-297%20passing-1e8e3e)](tests/)
+[![Tests](https://img.shields.io/badge/tests-343%20passing-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Codex%20%7C%20Antigravity-f9ab00)](#quick-start)
 
@@ -30,18 +30,19 @@ Your main agent stays in charge of planning and code review. When files need to 
 
 ## Video walkthrough
 
-Click the preview below to open the **3m 55s voiced 3D walkthrough** ([`assets/walkthrough.mp4`](assets/walkthrough.mp4), 1080p with audio and burned-in captions; *Any MCP Client* in the diagram includes OpenAI Codex):
+Click the preview below to open the **4m 30s voiced 3D walkthrough** ([`assets/walkthrough.mp4`](assets/walkthrough.mp4), 1080p with audio and burned-in captions):
 
 <p align="center">
   <a href="assets/walkthrough.mp4">
-    <img src="assets/walkthrough-poster.png" alt="Watch the 3m 55s voiced 3D walkthrough: Claude and Gemini explain how cc-agy-plugin delegates work in an isolated git copy" width="100%">
+    <img src="assets/walkthrough-poster.png" alt="Watch the 4m 30s voiced 3D walkthrough: Claude and Gemini explain Gemini Enterprise seats via agy CLI vs pay-as-you-go and isolated git worktree delegation" width="100%">
   </a>
 </p>
 
 - **`0:00` Keep your workflow:** How Claude Code, Codex, or any MCP client stays in charge while Gemini runs heavy edits next door.
-- **`0:32` Isolated git copy and 18 MCP tools:** How `delegate_start`, `delegate_file_batch`, and zero-token `doctor` checks work.
-- **`1:22` Four cost-saving habits and Argon step-up:** Cached repo maps, bounded log storage, starting on `gemini-3.8-flash`, and stepping up to `gemini-4-argon` on retries.
-- **`2:28` Benchmark walkthrough:** Side-by-side pass rates and cost in cents across Aider Python, SymPy, and DeepSWE repository tasks.
+- **`0:32` Enterprise seats via `agy` CLI vs. pay-as-you-go:** How teams on Gemini Enterprise run on their included seats after installing and signing into the Antigravity CLI (`agy`) once, how pay-as-you-go keys work automatically, and why that beats a harness-locked Claude subscription.
+- **`1:07` Isolated git copy and 18 MCP tools:** How `delegate_start`, `delegate_file_batch`, and zero-token `doctor` checks work.
+- **`1:58` Four cost-saving habits and Argon step-up:** Cached repo maps, bounded log storage, starting on `gemini-3.8-flash`, and stepping up to `gemini-4-argon` on retries.
+- **`3:04` Benchmark walkthrough:** Side-by-side pass rates and cost in cents across Aider Python, SymPy, and DeepSWE repository tasks.
 
 ## Quick start
 
@@ -152,7 +153,7 @@ Every worker digest reports a `verification` mode so you always know how changes
 | **Google Cloud project** | `--project`, `GOOGLE_CLOUD_PROJECT`, or `userConfig.google_cloud_project` | unset (required on Vertex) | Required for pay-as-you-go Vertex AI (`aiplatform.googleapis.com`); not required for Gemini Enterprise `agy` CLI mode. |
 | **Corporate AI gateway** | `--base-url`, `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`), or `userConfig.vertex_base_url` | unset | Routes Gemini calls through a corporate proxy or AI gateway (with optional bearer token in `CC_AGY_VERTEX_BASE_URL_TOKEN` or `userConfig.vertex_base_url_token`). Takes priority over an ambient shell `GEMINI_API_KEY`. |
 | **Cost profile** | `--profile`, `CC_AGY_COST_PROFILE`, or `userConfig.cost_profile` | `balanced` | Selects `balanced`, `economy`, or `quality` model routing. |
-| **Daily spend cap** | `--max-daily-cents`, `CC_AGY_MAX_DAILY_CENTS`, or `userConfig.max_daily_cents` | unlimited | Optional workspace daily ceiling in US cents (for example `500` for \$5.00/day). Blocks new Gemini calls once UTC daily receipts reach the limit. |
+| **Daily spend cap** | `--max-daily-cents`, `CC_AGY_MAX_DAILY_CENTS`, or `userConfig.max_daily_cents` | unlimited | Optional workspace daily ceiling in US cents (for example `500` for 500¢/day). Blocks new Gemini calls once UTC daily receipts reach the limit. |
 | **Vertex AI region** | `--location`, `GOOGLE_CLOUD_LOCATION`, or `userConfig.google_cloud_location` | `us-central1` | Preferred Vertex AI region (global-only models such as `gemini-3.8-flash` and `gemini-4-argon` route to `global` automatically). |
 | **Managed SDK venv** | `CC_AGY_VENV_DIR`, `CC_AGY_PYTHON_BIN`, or `--no-bootstrap` | `~/.local/share/cc-agy-plugin/venv` | Isolated per-user Python environment used by both Codex and cached Claude Code installs (`~/.claude/plugins/cache/...`). |
 | **One-off or marketplace install** | `claude --plugin-dir /path/to/cc-agy-plugin` or `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main` | optional | Run in Claude Code for a single session without installing globally, or install via native Codex plugin marketplace. |
@@ -162,28 +163,32 @@ Every worker digest reports a `verification` mode so you always know how changes
 
 ## Benchmark results
 
-Early benchmark on **16 real repository tasks** (DeepSWE v1.1), one run each, using the same Gemini model and settings in every setup:
+Paired cross-language benchmark across 26 real repository tasks (10 Python DeepSWE repos, 10 Go Aider Polyglot + Multi-SWE-bench `cli/cli` tasks, and 6 TypeScript Multi-SWE-bench + DeepSWE tasks, 156 runs at `n=1` per setup), priced at Opus 5.5 (`400¢` in / `20¢` cached / `2,000¢` out per 1M tokens), Gemini 4 Argon (`200¢` / `20¢` / `1,200¢`), and Gemini 3.8 Flash (`50¢` / `5¢` / `300¢`):
 
-| Setup | Tasks solved | Total cost | Cost per solved task | Model turns |
-|:--|:--:|:--:|:--:|:--:|
-| Antigravity alone | 10 / 16 | 3,084¢ | 308¢ | 580 |
-| **Antigravity + cc-agy-plugin** | 11 / 16 | **2,352¢** | **214¢** | **433** |
-| **Claude Code + cc-agy-plugin** | **12 / 16** | 2,984¢ | 249¢ | 598 |
+| Setup | Tasks solved | Hidden tests passed | Avg cost / task | vs Opus solo | Avg time | Best fit |
+|:--|:--:|:--:|:--:|:--:|:--:|:--|
+| Claude Code · Opus 5.5 (solo) | 22 / 26 | 806 / 891 | 87.6¢ | baseline | 4m 12s | Fast 7-turn edits and TypeScript generics (6 / 6 at 71¢) |
+| Claude Code + plugin · Opus + Argon (`quality`) | 20 / 26 | 865 / 891 | 80.0¢ (22¢ + 58¢) | -9% | 5m 37s | Highest holdout test pass rate (97% overall; 99.8% on Python) |
+| Claude Code + plugin · Opus + Flash (`economy`) | 19 / 26 | 742 / 891 | 63.2¢ (25¢ + 38¢) | -28% | 4m 25s | Python (-31% cost) and Go (-34% cost); lowest cost per solve (86¢) |
+| Claude Code + plugin · Flash -> Argon (`balanced`) | 19 / 26 | 786 / 891 | 82.3¢ (30¢ + 52¢) | -6% | 5m 24s | Multi-package Go (8 / 10 solved, -24% per solve) and 6+ file Python |
+| Antigravity · Argon (solo) | 18 / 26 | 785 / 891 | 81.1¢ | -7% | 5m 17s | Zero-Claude budgets |
+| Antigravity · Flash 3.8 (solo) | 7 / 26 | 272 / 891 | 29.9¢ | -66% | 3m 01s | Single-file exercises only (5 / 5 Aider Go) |
 
-- **Lowest cost:** Antigravity with the plugin solved one more task at **24% lower total cost** and **25% fewer model turns** than running Antigravity alone.
-- **Most tasks solved:** Claude Code with the plugin solved **12 of 16** tasks because the lead agent reviews the worker's diff and sends targeted follow-up instructions when an edge case is missed.
+- Python and Go: `economy` cuts average per-task spend by 31% on Python (8 / 10 solved at 106¢ vs 154¢ Opus solo, cheaper on 8 of 10 tasks) and 34% on Go (7 / 10 solved at 20¢ vs 31¢, cheaper on all 10 Go tasks), while `balanced` leads Go at 8 / 10 solved (-13% total cost, -24% per solve). On larger 6-to-13 file Python changes, single-worker delegation cuts spend by 23% to 50% (152¢ `balanced`, 98¢ `economy` vs 196¢ Opus solo).
+- TypeScript generic types: Opus 5.5 solo solves 6 / 6 at 71¢/solve, ahead of `quality` (5 / 6, 103 / 103 holdout tests, 80¢ avg) and `economy` (4 / 6, 101 / 103 holdout tests, 63¢ avg / 94¢ per solve), where Vue 3 generic prop inference still favors Opus or Argon over Flash.
+- Worktree isolation without a cheaper model: Holding Gemini 4 Argon fixed as both Lead and Worker across 16 DeepSWE tasks still cut model turns by 25% (580 to 433) and cost by 24% (3,084¢ to 2,352¢, solving 11 / 16 vs 10 / 16 standalone) purely from keeping failed edits and test tracebacks inside a disposable worktree. Interactive per-run receipts across all 477 graded runs are in [`docs/brownfield_gemini_benchmark.html`](docs/brownfield_gemini_benchmark.html).
 
 > [!NOTE]
-> These early numbers cover 16 of the 33 tasks in the DeepSWE v1.1 suite at one run per setup (`n=1`). On a 16-task single-run sample, a 1-to-2 task pass-rate difference (`10/16` vs `11/16` vs `12/16`) sits within normal run-to-run variance, whereas the 24% lower spend and 25% turn reduction come structurally from moving file exploration and test loops onto Flash.
+> Each setup ran once per task (`n=1`) in the 26-task cross-language suite, so 1-to-3 task solve differences sit within normal single-run variance, whereas per-task cost reductions held across 23 of 26 tasks in `economy` (8 / 10 Python, 10 / 10 Go, and 5 / 6 TypeScript) with wire-reconciled token logs (`0` post-exit orphan calls).
 
 ## Status
 
 | Item | Detail |
 |:--|:--|
 | **Version** | 0.3.0, Apache 2.0 |
-| **Quality** | 297 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
+| **Quality** | 343 automated tests (`scripts/validate.sh` checks manifests and badge sync) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
-| **Next** | Finish the full 33-task DeepSWE suite and publish per-pattern cost guidance |
+| **Next** | Parallel multi-worker file batching on 6+ file specs under strict delegation mode |
 
 ---
 
@@ -214,13 +219,13 @@ Configured Gemini model rates in `server/regions.py` and Claude lead rates in `s
 
 | Model | Role | Uncached Input / 1M | Cached Input / 1M | Output / 1M |
 |---|---|---|---|---|
-| **Claude Opus** | Lead Planner & Reviewer (`server/true_cost.py`, override via `CC_AGY_LEAD_RATES`) | $5.00 | $0.50 | $25.00 |
-| **Gemini 3.8 Flash** | Default Worker & Review Model (`balanced` / `economy`) | $0.50 | $0.05 | $3.00 |
-| **Gemini 4 Argon** | Escalation & `quality` Profile Reasoning Worker | $2.00 | $0.20 | $12.00 |
-| **Gemini 3.1 Pro** | Supported Pro Preview Model | $2.00 | $0.20 | $12.00 |
-| **Gemini 2.5 Flash** | Supported Regional Review Model | $0.30 | $0.03 | $2.50 |
+| **Claude Opus 5.5** | Lead Planner & Reviewer (`server/true_cost.py`, override via `CC_AGY_LEAD_RATES`; legacy Opus 4.x/5.0 at 500¢ / 50¢ / 2,500¢) | 400¢ | 20¢ | 2,000¢ |
+| **Gemini 3.8 Flash** | Default Worker & Review Model (`balanced` / `economy`) | 50¢ | 5¢ | 300¢ |
+| **Gemini 4 Argon** | Escalation & `quality` Profile Reasoning Worker | 200¢ | 20¢ | 1,200¢ |
+| **Gemini 3.1 Pro** | Supported Pro Preview Model | 200¢ | 20¢ | 1,200¢ |
+| **Gemini 2.5 Flash** | Supported Regional Review Model | 30¢ | 3¢ | 250¢ |
 
-Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` reports cumulative workspace spend in USD and cents based on `server/regions.py`, and `/cc-agy-plugin:cost --true-total` (`cost_report`) adds your Claude Code session's own cost from `server/true_cost.py` alongside it for the full session total.
+Every tool call writes a signed receipt with token usage. `/cc-agy-plugin:cost` reports cumulative workspace spend in cents based on `server/regions.py`, and `/cc-agy-plugin:cost --true-total` (`cost_report`) adds your Claude Code session's own cost from `server/true_cost.py` alongside it for the full session total.
 
 ---
 
@@ -263,7 +268,7 @@ Set `userConfig.cost_profile` in Claude Code, `--profile` in `cc-agy-install`, o
    - An 8-worker thread pool dispatches `tools/call` requests concurrently (up to 8 simultaneous in-flight tool calls) so `delegate_status`, `ping`, and `delegate_cancel` can respond while a worker job is running.
 3. **Isolated copy snapshot and worker execution (`server/jobs.py`, `server/agy_runner.py`)**:
    - `JobManager` copies tracked and non-ignored files (`git ls-files -co --exclude-standard -z`) into a standalone git repository under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) and creates a baseline commit (`git init -b main`).
-   - `run_antigravity_worker()` launches either the standalone `agy` CLI (`--output-format stream-json` in `gemini_enterprise` mode) or `google.antigravity.Agent` (on API key, Vertex AI, or gateway paths) with per-turn safety caps (default: `40` tool calls on Flash, `100` on Argon/Pro, and `5,000,000` total tokens). On the Python SDK path, `types.BudgetConfig` enforces caps inside the harness and Straitjacket (`ctx-harness`) provides bounded shell tools (`run_command`, `ctx_get`, `ctx_search`), falling back to standard Antigravity tools with `containment: "none"` when `ctx-harness` is absent. On the `agy` CLI path, the plugin monitors streamed `step_update` tool and token counters directly (terminating the worker process group cleanly on `MAX_TOOL_CALLS_EXCEEDED` or `MAX_TOTAL_TOKENS_EXCEEDED`), scrubs plugin and cloud secrets from the child environment, and reports `containment: "agy_cli"`.
+   - `run_antigravity_worker()` launches either the standalone `agy` CLI (`--output-format stream-json` in `gemini_enterprise` mode) or `google.antigravity.Agent` (on API key, Vertex AI, or gateway paths) with per-turn safety caps (default: `75` tool calls on Flash in `balanced`, `100` in `economy` and on Argon/Pro, and `5,000,000` total tokens). On the Python SDK path, `types.BudgetConfig` enforces caps inside the harness and Straitjacket (`ctx-harness`) provides bounded shell tools (`run_command`, `ctx_get`, `ctx_search`), falling back to standard Antigravity tools with `containment: "none"` when `ctx-harness` is absent. On the `agy` CLI path, the plugin monitors streamed `step_update` tool and token counters directly (terminating the worker process group cleanly on `MAX_TOOL_CALLS_EXCEEDED` or `MAX_TOTAL_TOKENS_EXCEEDED`), scrubs plugin and cloud secrets from the child environment, and reports `containment: "agy_cli"`.
 4. **Acceptance checks, compile smoke checks, and token-bounded diffs**:
    - When the worker finishes, the plugin executes any explicit or auto-discovered `acceptance` commands (`verification: "acceptance_tests"`), or falls back to fast read-only compile/syntax smoke checks (`verification: "smoke_only"`), cleans up untracked test artifacts, and returns pass/fail counts with a 600-token output tail.
    - The lead agent inspects changes via `get_diff` (paginated at `4,000` tokens per page, up to `8,000` max, so large diffs never exceed MCP token limits) and merges verified work with `delegate_apply`.
@@ -360,9 +365,10 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 | Variable | Default | What it does |
 |---|---|---|
 | `CC_AGY_AUTH_MODE` | `auto` | Set `gemini_enterprise` (or `agy_cli` / `CC_AGY_GEMINI_ENTERPRISE=true`) to route calls through your included Gemini Enterprise seat via the standalone `agy` CLI. |
+| `CC_AGY_CHECK_ENV_ALLOW` | unset | Comma-separated variable names to pass through to acceptance checks, batch checks and worker commands. By default every credential-looking variable is removed from those commands (API keys, tokens, passwords, `*_DSN`, URLs with a password such as `DATABASE_URL`, `SSH_AUTH_SOCK`); a failed check lists the removed names (never the values) under `credential_env_removed`. |
 | `CC_AGY_CLI_BIN` / `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | Optional path override for the external `agy` binary or its OAuth state directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
 | `CC_AGY_COST_PROFILE` | `balanced` | Preset controlling model routing and step-up: `economy` (Flash only), `balanced` (Flash first, Argon on retries/follow-ups), or `quality` (Argon first). |
-| `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | Optional daily workspace spend cap in US cents (for example `500` for \$5.00/day). Rejects new Gemini calls once UTC daily spend reaches the limit. |
+| `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | Optional daily workspace spend cap in US cents (for example `500` for 500¢/day). Rejects new Gemini calls once UTC daily spend reaches the limit. |
 | `CC_AGY_VENV_DIR` / `CC_AGY_PYTHON_BIN` | `~/.local/share/cc-agy-plugin/venv` | Per-user virtualenv directory or explicit Python interpreter path used by the MCP server and installer on PEP 668 systems. |
 | `CC_AGY_VERTEX_BASE_URL` (alias `GOOGLE_VERTEX_BASE_URL`) | unset | Sends worker and `ask_gemini` calls to a custom Vertex-compatible endpoint, such as a corporate AI gateway. Takes priority over an ambient shell `GEMINI_API_KEY`. |
 | `CC_AGY_VERTEX_BASE_URL_TOKEN` | unset | Optional bearer token or virtual key sent to `CC_AGY_VERTEX_BASE_URL` (redacted from child shells and receipts). |
@@ -373,7 +379,9 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 | `CC_AGY_MIN_VIEW_LINES` | `250` | Widens small `view_file` reads to at least this many lines. `0` disables it. |
 | `CC_AGY_QA_REVIEW_MODEL` | unset | Runs a blocker-only spec-vs-diff QA check with this model before auto-apply (also `qa_review_model` per call). |
 | `CC_AGY_TOOL_PROFILE` | `core` in strict mode, `full` otherwise | `core` exposes only the 9 core delegation and diagnostic tools, cutting the MCP tool list from about 7,200 tokens to under 1,250 tokens. |
-| `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`) | `2` in strict mode | Caps direct Lead file reads so the Lead delegates instead of reading the repo twice. `0` removes the cap. |
+| `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`) | `2` (strict mode) | Caps direct Lead file/search reads before delegation so the Lead hands off quickly instead of reading the repository twice (up to 6 review reads are added when a worker finishes without auto-apply). `0` allows no reads before the first delegation; `off` or a negative number removes the cap. |
+| `CC_AGY_FLASH_MAX_TOOL_CALLS` | `100` in economy, `75` otherwise | Per-turn tool-call cap for Flash workers. Economy has no Argon escalation, so it gives Flash the same 100 calls as Pro/Argon; `balanced` gives Flash 75 calls before stepping up to Argon. |
+| `CC_AGY_SAME_MODEL_RETRIES` | `1` in economy, `0` otherwise | In bounded Lead sessions with no escalation model, gives a voluntary `status="ok"` worker turn that edited files, stayed under 60% of its tool-call budget, and failed (or had vacuous) acceptance checks this many automatic same-model fix turns before waking the Lead. Checkpoints (`MAX_TOOL_CALLS_EXCEEDED`), timeouts, and quota hits return directly to the Lead. |
 
 </details>
 
@@ -393,7 +401,7 @@ Every setting below is an environment variable. Strict mode means `CC_AGY_STRICT
 ```text
 cc-agy-plugin/
 ├── assets/
-│   ├── walkthrough.mp4       # 3m 55s voiced 3D walkthrough (1080p H.264 + AAC)
+│   ├── walkthrough.mp4       # 4m 30s voiced 3D walkthrough (1080p H.264 + AAC)
 │   ├── walkthrough-poster.png # Clickable preview poster for the README walkthrough
 │   ├── overview.svg          # High-level 4-step workflow diagram
 │   └── architecture.svg      # Cross-harness MCP architecture diagram

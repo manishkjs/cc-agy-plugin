@@ -15,6 +15,7 @@ Doc, tests from cases, one edit repeated        ``draft_document`` / ``write_tes
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from typing import Any
 
@@ -89,16 +90,20 @@ def resolve_batch_settings(args: dict[str, Any] | None = None) -> BatchSettings:
         raise ValueError("max_parallel must be an integer") from exc
     max_parallel = max(1, min(MAX_PARALLEL_CAP, max_parallel))
     try:
-        check_timeout = float(args.get("check_timeout_seconds") or 300.0)
+        raw_timeout = args.get("check_timeout_seconds")
+        check_timeout = float(raw_timeout) if raw_timeout not in (None, "") else 300.0
         max_cost = args.get("max_cost_cents")
         max_cost_cents = float(max_cost) if max_cost not in (None, "") else None
         max_claude = int(args.get("max_claude_escalations") if args.get("max_claude_escalations") is not None
                          else _env_first("CC_AGY_BATCH_MAX_CLAUDE") or DEFAULT_MAX_CLAUDE_ESCALATIONS)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid numeric batch setting: {exc}") from exc
+    # NaN compares False against everything, so "nan <= 0" passes and a NaN budget never trips.
+    if not math.isfinite(check_timeout):
+        raise ValueError(f"check_timeout_seconds must be a finite number, got {check_timeout!r}")
     check_timeout = max(CHECK_TIMEOUT_RANGE[0], min(CHECK_TIMEOUT_RANGE[1], check_timeout))
-    if max_cost_cents is not None and max_cost_cents <= 0:
-        raise ValueError("max_cost_cents must be positive")
+    if max_cost_cents is not None and (not math.isfinite(max_cost_cents) or max_cost_cents <= 0):
+        raise ValueError("max_cost_cents must be a positive, finite number of cents")
     return BatchSettings(
         writer=writer, model=model, thinking_level=thinking, claude_model=claude_model,
         claude_writer=bool(claude_writer), max_parallel=max_parallel, check_timeout=check_timeout,

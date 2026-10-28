@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable, Mapping
+import urllib.parse
 
 from server.regions import (
     env_flag,
@@ -91,7 +92,14 @@ async def maybe_await(value: Any) -> Any:
     return value
 
 
-THINKING_LEVELS = ("MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH")
+THINKING_LEVELS = ("ZERO", "MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH")
+
+
+def _normalize_thinking_token(raw: str | None) -> str:
+    clean = (raw or "").strip().upper()
+    if clean in ("0", "OFF"):
+        return "ZERO"
+    return clean
 PROGRESS_KINDS = ("milestone", "question", "blocker", "spec_conflict")
 _progress_lock = threading.Lock()
 
@@ -221,11 +229,30 @@ def resolve_thinking_level(
     raw_env = (os.environ.get("CC_AGY_DELEGATE_THINKING_LEVEL") or "").strip()
     if raw_env.startswith("${"):
         raw_env = ""
-    forced_env = (os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL") or "").strip().upper()
+    forced_env = _normalize_thinking_token(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL"))
     if not read_only and forced_env in THINKING_LEVELS:
         return forced_env
+    model_low = (model or "").strip().lower()
+    clean_val = _normalize_thinking_token(value)
+    esc_env = _normalize_thinking_token(os.environ.get("CC_AGY_ESCALATION_THINKING_LEVEL"))
+    if not read_only and esc_env and not esc_env.startswith("${") and "flash" not in model_low:
+        if clean_val in THINKING_LEVELS:
+            return clean_val
+        if esc_env in THINKING_LEVELS:
+            return esc_env
+    explicit_model_thinking = (
+        "HIGH" if model_low.endswith("-high")
+        else "MEDIUM" if model_low.endswith("-medium")
+        else "LOW" if model_low.endswith("-low")
+        else "ZERO" if model_low.endswith("-zero")
+        else None
+    )
+    if not read_only and explicit_model_thinking:
+        if clean_val in THINKING_LEVELS:
+            return clean_val
+        return explicit_model_thinking
     default_level = "HIGH" if read_only else ("MEDIUM" if resolve_cost_profile() == "quality" else "LOW")
-    raw = (value or raw_env or default_level).strip().upper()
+    raw = _normalize_thinking_token(value or raw_env or default_level)
     if raw.startswith("${"):
         raw = default_level
     if raw in ("DEFAULT", "NONE", ""):
@@ -410,7 +437,8 @@ def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, A
     for db_path in sorted(glob.glob(os.path.join(str(save_dir), "*.db"))):
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            ro_uri = "file:" + urllib.parse.quote(os.path.abspath(db_path)) + "?mode=ro"
+            conn = sqlite3.connect(ro_uri, uri=True)
             col_rows = conn.execute("PRAGMA table_info(steps)").fetchall()
             col_names = {str(r[1]) for r in col_rows if len(r) > 1}
             if not required_cols.issubset(col_names):
@@ -591,6 +619,8 @@ def build_straitjacket_tools(
     host_workspace_root: str | Path | None = None,
     nm_linked: bool = False,
     isolated_worktree: bool = False,
+    live_state_path: str | Path | None = None,
+    save_dir: str | Path | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -664,6 +694,12 @@ def build_straitjacket_tools(
             "OLDPWD",
         ):
             scrubbed_env[env_k] = ""
+    # Same credential policy as acceptance and batch checks: blank every credential-looking variable
+    # (GITHUB_TOKEN, AWS keys, database passwords, ...) unless CC_AGY_CHECK_ENV_ALLOW lists it.
+    from server.verify import secret_env_names
+
+    for env_k in secret_env_names(os.environ):
+        scrubbed_env[env_k] = ""
     py_parts = [str(ws_resolved)]
     if (ws_resolved / "src").is_dir():
         py_parts.append(str(ws_resolved / "src"))
@@ -671,13 +707,9 @@ def build_straitjacket_tools(
     if existing_py:
         py_parts.append(existing_py)
     scrubbed_env["PYTHONPATH"] = ":".join(py_parts)
-    path_prefixes: list[str] = []
-    nm_bin = ws_resolved / "node_modules" / ".bin"
-    if nm_bin.is_dir():
-        nm_bin_resolved = str(nm_bin.resolve())
-        path_prefixes.append(nm_bin_resolved)
-        if str(nm_bin) != nm_bin_resolved:
-            path_prefixes.append(str(nm_bin))
+    from server.jobs import _collect_workspace_node_bin_dirs
+
+    path_prefixes: list[str] = _collect_workspace_node_bin_dirs(ws_resolved)
     venv_bin = ws_resolved / ".venv" / "bin"
     if venv_bin.is_dir():
         path_prefixes.append(str(venv_bin))
@@ -929,9 +961,30 @@ def build_straitjacket_tools(
                     return True
         return False
 
-    import subprocess as _sp
+    from server.verify import run_git as _git_run
     _session_started_mono = time.monotonic()
     _straitjacket_state = {"calls": 0, "last_git_check": 0.0, "has_edits": False}
+    _live_state_p = Path(live_state_path) if live_state_path else None
+
+    def _persist_live_tool_count(calls_count: int) -> None:
+        if _live_state_p is None:
+            return
+        try:
+            _live_state_p.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = _live_state_p.with_suffix(".live.tmp")
+            tmp_p.write_text(
+                json.dumps(
+                    {
+                        "straitjacket_calls": int(calls_count),
+                        "save_dir": str(save_dir or ""),
+                        "updated_at_epoch": round(time.time(), 3),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp_p, _live_state_p)
+        except Exception:
+            pass
 
     def _maybe_append_turn_budget_note(raw_output: str) -> str:
         if resolved_profile == "read-only":
@@ -949,6 +1002,7 @@ def build_straitjacket_tools(
             return raw_output
         _straitjacket_state["calls"] += 1
         calls = _straitjacket_state["calls"]
+        _persist_live_tool_count(calls)
         elapsed = max(0.0, time.monotonic() - _session_started_mono)
         if calls < 8 and elapsed < session_timeout * 0.35:
             return raw_output
@@ -956,8 +1010,8 @@ def build_straitjacket_tools(
         if not _straitjacket_state["has_edits"] and (now_m - _straitjacket_state["last_git_check"] >= 4.0):
             _straitjacket_state["last_git_check"] = now_m
             try:
-                gs = _sp.run(
-                    ["git", "status", "--porcelain", "--untracked-files=normal"],
+                gs = _git_run(
+                    ["status", "--porcelain", "--untracked-files=normal"],
                     cwd=str(ws_resolved),
                     capture_output=True,
                     text=True,
@@ -991,8 +1045,8 @@ def build_straitjacket_tools(
         used_git_status = False
         if (ws_resolved / ".git").exists():
             try:
-                gs_res = _sp.run(
-                    ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                gs_res = _git_run(
+                    ["status", "--porcelain", "-z", "--untracked-files=all"],
                     cwd=str(ws_resolved),
                     capture_output=True,
                     timeout=2.0,
@@ -1795,7 +1849,7 @@ def build_straitjacket_tools(
                     dedup_msg = (
                         f"[ctx read repo:{norm_rel} L{s_line}:{e_line} · already in context from earlier "
                         f"view_file(L{prev_s}:{prev_e}) at identical sha256:{file_sha[:12]}; "
-                        f"refer to lines L{s_line}..L{e_line} above or pass fresh=True]"
+                        f"file is unchanged, so use lines L{s_line}..L{e_line} above and proceed with edit_file or run_command]"
                     )
                     return _maybe_append_turn_budget_note(dedup_msg)
         if min_span > 0 and (e_line - s_line + 1) < min_span:
@@ -1812,7 +1866,7 @@ def build_straitjacket_tools(
                     dedup_msg = (
                         f"[ctx read repo:{norm_rel} L{s_line}:{e_line} · already in context from earlier "
                         f"view_file(L{prev_s}:{prev_e}) at identical sha256:{file_sha[:12]}; "
-                        f"refer to lines L{s_line}..L{e_line} above or pass fresh=True]"
+                        f"file is unchanged, so use lines L{s_line}..L{e_line} above and proceed with edit_file or run_command]"
                     )
                     return _maybe_append_turn_budget_note(dedup_msg)
         try:
@@ -2041,9 +2095,12 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     from google import antigravity as ag
     from google.antigravity import policy, types
 
+    req_tl = str(request.get("thinking_level") or "").strip().upper()
+    is_zero_thinking = req_tl in ("ZERO", "0", "OFF")
+    sdk_tl_name = "MINIMAL" if is_zero_thinking else req_tl
     options = (
-        types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, request["thinking_level"]))
-        if request.get("thinking_level")
+        types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, sdk_tl_name))
+        if sdk_tl_name
         else None
     )
 
@@ -2068,7 +2125,12 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             gw_tok = resolve_vertex_base_url_token() or "custom-endpoint"
             ep_kwargs["base_url"] = vertex_base_url
             ep_kwargs["api_key"] = gw_tok
-            ep_kwargs["http_headers"] = {"Authorization": f"Bearer {gw_tok}"}
+            hdrs = {"Authorization": f"Bearer {gw_tok}"}
+            if is_zero_thinking:
+                hdrs["X-CC-AGY-Thinking-Budget"] = "0"
+            ep_kwargs["http_headers"] = hdrs
+        elif is_zero_thinking:
+            ep_kwargs["http_headers"] = {"X-CC-AGY-Thinking-Budget": "0"}
         endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     resolved_model = str(request.get("model") or "")
@@ -2146,6 +2208,22 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     budget_cfg = types.BudgetConfig(**budget_kwargs) if budget_kwargs else None
 
     progress_path = request.get("progress_path")
+    live_state_file = Path(f"{progress_path}.live") if progress_path else None
+    if live_state_file is not None:
+        try:
+            live_state_file.parent.mkdir(parents=True, exist_ok=True)
+            live_state_file.write_text(
+                json.dumps(
+                    {
+                        "straitjacket_calls": 0,
+                        "save_dir": str(save_dir),
+                        "updated_at_epoch": round(time.time(), 3),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def report_to_lead(kind: str, message: str) -> str:
         """Send a short signal to the lead engineer.
@@ -2189,6 +2267,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 host_workspace_root=request.get("host_workspace_root"),
                 nm_linked=bool(request.get("nm_linked")),
                 isolated_worktree=bool(request.get("isolated_worktree")),
+                live_state_path=live_state_file,
+                save_dir=save_dir,
             )
             for sj_fn in sj_tools:
                 if getattr(sj_fn, "__name__", "") == "run_command" and isinstance(getattr(sj_fn, "command_runs", None), list):
@@ -2466,6 +2546,11 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             except (Exception, asyncio.CancelledError):
                 pass
         _force_terminate_agent_process(agent, save_dir, pre_child_pids=pre_children)
+        if live_state_file is not None:
+            try:
+                live_state_file.unlink(missing_ok=True)
+            except OSError:
+                pass
         shutil.rmtree(save_dir, ignore_errors=True)
         shutil.rmtree(Path(ws_str) / ".ctx-session-reads", ignore_errors=True)
 

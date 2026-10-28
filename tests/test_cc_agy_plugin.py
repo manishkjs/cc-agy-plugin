@@ -1121,8 +1121,8 @@ class TestCostControls(unittest.TestCase):
             res = jm.delegate_start("edit greet", project="p", wait=True)
             self.assertEqual(res["status"], "checkpoint")
             self.assertEqual(res["stop_reason"], "MAX_TOOL_CALLS_EXCEEDED")
-            self.assertEqual(res["budget"], {"max_tool_calls": 40, "max_total_tokens": 5_000_000})
-            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (40, 5_000_000))
+            self.assertEqual(res["budget"], {"max_tool_calls": 55, "max_total_tokens": 5_000_000})
+            self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (55, 5_000_000))
             self.assertTrue(jm.delegate_apply(res["job_id"])["applied"])
 
             argon_res = jm.delegate_start("edit greet argon", model="gemini-4-argon", project="p", wait=True)
@@ -2589,7 +2589,7 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
         return {"prompt_token_count": 100, "candidates_token_count": 20, "total_token_count": 120}
 
     def test_true_cost_report_splits_dispatched_and_lead(self) -> None:
-        from server.true_cost import collect_lead_usage, project_hash, true_total_report
+        from server.true_cost import collect_lead_usage, project_hash, rate_for_model, true_total_report
 
         self.assertEqual(project_hash("/Users/you/repro-v0.6.0"), "-Users-you-repro-v0-6-0")
         with tempfile.TemporaryDirectory() as tmp:
@@ -2631,13 +2631,24 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
             (tdir / "session.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
 
             lead = collect_lead_usage(repo, since_epoch=now - 60, transcripts_dir=tdir)
-            # Opus: 1M*5 + 1M*0.5 + 100k*6.25 + 200k*10 + 100k*25 = 5 + 0.5 + 0.625 + 2 + 2.5 = 10.625 USD
-            self.assertAlmostEqual(lead["per_model"]["claude-opus-5-5"]["cost_cents"], 1062.5, places=3)
+            # Opus 5.5: 1M*4 + 1M*0.2 + 100k*5.0 + 200k*8.0 + 100k*20 = 4 + 0.2 + 0.5 + 1.6 + 2.0 = 8.30 USD
+            self.assertEqual(rate_for_model("claude-opus-5-5"), (4.00, 0.20, 5.00, 8.00, 20.00))
+            self.assertEqual(rate_for_model("claude-opus-5.5-high"), (4.00, 0.20, 5.00, 8.00, 20.00))
+            self.assertEqual(rate_for_model("claude-opus-4-6"), (5.00, 0.50, 6.25, 10.00, 25.00))
+            self.assertEqual(rate_for_model("claude-4-opus-20250514"), (5.00, 0.50, 6.25, 10.00, 25.00))
+            self.assertEqual(rate_for_model("claude-opus-5-0"), (5.00, 0.50, 6.25, 10.00, 25.00))
+            self.assertEqual(rate_for_model("claude-3-opus-20240229"), (15.00, 1.50, 18.75, 30.00, 75.00))
+            self.assertEqual(rate_for_model("claude-sonnet-4-6"), (3.00, 0.30, 3.75, 6.00, 15.00))
+            with unittest.mock.patch.dict(os.environ, {"CC_AGY_LEAD_RATES": '{"opus": [5, 0.5, 6.25, 10, 25]}'}):
+                self.assertEqual(rate_for_model("claude-opus-5-5"), (5.00, 0.50, 6.25, 10.00, 25.00))
+                self.assertEqual(rate_for_model("claude-sonnet-4-6"), (3.00, 0.30, 3.75, 6.00, 15.00))
+                self.assertEqual(rate_for_model("claude-haiku-4"), (1.00, 0.10, 1.25, 2.00, 5.00))
+            self.assertAlmostEqual(lead["per_model"]["claude-opus-5-5"]["cost_cents"], 830.0, places=3)
             self.assertEqual(lead["per_model"]["claude-opus-5-5"]["messages"], 1)
             self.assertAlmostEqual(lead["per_model"]["claude-haiku-4"]["cost_cents"], 100.0, places=3)
             self.assertFalse(lead["per_model"]["mystery-model"]["priced"])
             self.assertFalse(lead["all_lead_pricing_known"])
-            self.assertAlmostEqual(lead["lead_cost_cents"], 1162.5, places=3)
+            self.assertAlmostEqual(lead["lead_cost_cents"], 930.0, places=3)
 
             # Default window: whole sessions overlapping the jobs, so session.jsonl's early 9M-token
             # planning message (before the first receipt) counts; another session that ended before
@@ -2647,11 +2658,11 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
             (tdir / "old.jsonl").write_text(json.dumps(old_session[0]) + "\n", encoding="utf-8")
             rep = true_total_report(store, repo, transcripts_dir=tdir)
             self.assertAlmostEqual(rep["dispatched"]["cost_cents"], dispatched, places=3)
-            self.assertAlmostEqual(rep["lead"]["lead_cost_cents"], 1162.5 + 4500.0, places=3)
+            self.assertAlmostEqual(rep["lead"]["lead_cost_cents"], 930.0 + 3600.0, places=3)
             self.assertEqual(rep["lead"]["transcript_files"], 1)
-            self.assertAlmostEqual(rep["true_total_cost_cents"], dispatched + 5662.5, places=3)
+            self.assertAlmostEqual(rep["true_total_cost_cents"], dispatched + 4530.0, places=3)
             rep_explicit = true_total_report(store, repo, transcripts_dir=tdir, since_epoch=now - 60)
-            self.assertAlmostEqual(rep_explicit["true_total_cost_cents"], dispatched + 1162.5, places=3)
+            self.assertAlmostEqual(rep_explicit["true_total_cost_cents"], dispatched + 930.0, places=3)
             self.assertGreater(rep["lead_share_of_true_total"], 0.5)
 
             jm = JobManager(workspace_root=repo, store=store, worker_backend=lambda _r: {"text": "ok"})
@@ -2662,7 +2673,7 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
             resp = srv.handle_Message({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
                 "name": "cost_report", "arguments": {"transcripts_dir": str(tdir)}}})
             payload = json.loads(resp["result"]["content"][0]["text"])
-            self.assertAlmostEqual(payload["true_total_cost_cents"], dispatched + 5662.5, places=3)
+            self.assertAlmostEqual(payload["true_total_cost_cents"], dispatched + 4530.0, places=3)
             jm.shutdown()
 
     def test_escalates_to_lead_after_two_failed_attempts(self) -> None:
@@ -2742,12 +2753,24 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
             resp = srv.handle_Message({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
                 "name": "delegate_revert", "arguments": {"job_id": d["job_id"], "skip_dirty": True}}})
             out = json.loads(resp["result"]["content"][0]["text"])
-            self.assertTrue(out["reverted"])
+            self.assertFalse(out["reverted"])
+            self.assertTrue(out["partially_reverted"])
             self.assertEqual(out["reverted_files"], ["app.py"])
             self.assertEqual((repo / "app.py").read_bytes(), original)
             self.assertEqual((repo / "new_mod.py").read_text(encoding="utf-8"), "X = 2  # human edit\n")
+            # The skipped file is still dirty: a plain revert refuses again instead of claiming success.
             again = jm.delegate_revert(d["job_id"])
-            self.assertTrue(again["already_reverted"])
+            self.assertTrue(again["refused"])
+            self.assertEqual([x["file"] for x in again["dirty_files"]], ["new_mod.py"])
+            # Once the skipped file matches what the job applied again, a later revert finishes the job.
+            (repo / "new_mod.py").write_text("X = 1\n", encoding="utf-8")
+            done = jm.delegate_revert(d["job_id"])
+            self.assertTrue(done["reverted"])
+            self.assertEqual(done["reverted_files"], ["new_mod.py"])
+            self.assertFalse((repo / "new_mod.py").exists())
+            final = jm.delegate_revert(d["job_id"])
+            self.assertTrue(final["already_reverted"])
+            self.assertEqual(sorted(final["reverted_files"]), ["app.py", "new_mod.py"])
             self.assertTrue(store.verify_receipt_signature(store.read_receipt(d["job_id"])))
             jm.shutdown()
 

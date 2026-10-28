@@ -122,9 +122,9 @@ def needs_review(rel_path: str) -> bool:
 
 
 def _git_ignored(root: Path, rel: str) -> bool:
-    import subprocess
+    from server.verify import run_git
 
-    res = subprocess.run(["git", "check-ignore", "-q", "--", rel], cwd=str(root), capture_output=True, check=False)
+    res = run_git(["check-ignore", "-q", "--", rel], cwd=str(root), capture_output=True, check=False)
     return res.returncode == 0
 
 

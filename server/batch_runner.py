@@ -14,9 +14,11 @@ unverified candidate.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -47,6 +49,7 @@ from server.writers import (
     make_genai_writer,
     render_task_prompt,
     run_writer_ladder,
+    symlink_component,
 )
 
 WriterFactory = Callable[[str, BatchSettings, dict[str, Any]], Writer | None]
@@ -94,26 +97,155 @@ class TaskRecord:
     pricing_known: bool = True
 
 
-class BatchControls:
-    """Batch-wide throttle, budget and Claude escalation cap shared by every task."""
+# Writer-ladder history results that mean a writer call returned a reply (and was paid for).
+_REPLY_RESULTS = frozenset({"landed", "checks_failed", "answer_rejected", "cut_off"})
 
-    def __init__(self, settings: BatchSettings, stop: threading.Event) -> None:
+
+class BatchControls:
+    """Batch-wide throttle, budget and Claude escalation cap shared by every task.
+
+    The cost cap covers the whole batch job, resumed runs included: spend, Claude escalations and
+    per-writer call prices are seeded from the prior receipt. Each call's spend is recorded the moment
+    it returns (``after_call``). The first call of each writer (or every call of a writer whose replies
+    cost nothing so far) runs alone, so a price is known before parallel calls of that writer start.
+    After that a call is admitted while the spend so far, plus what is reserved for calls in flight,
+    plus one worst-case call of this writer (its most expensive call seen) fits the cap. When it does
+    not fit only because of calls in flight, the caller waits for them to settle; the batch stops when
+    even one more call cannot fit. Usage is only known once a reply arrives, so the cap is best effort:
+    a call that costs more than every earlier call of its writer can still push spend past it.
+    Claude escalation slots are reserved atomically in ``before_call`` and given back when the call
+    produced no reply (a transient error or timeout), so retries never burn the cap.
+    """
+
+    _WAIT_SECONDS = 1.0
+
+    def __init__(self, settings: BatchSettings, stop: threading.Event, prior: dict[str, Any] | None = None) -> None:
         self.settings = settings
         self.stop = stop
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._local = threading.local()
         self._cool_until = 0.0
         self.spent_cents = 0.0
         self.claude_calls = 0
         self.stop_reason = ""
+        self.in_flight = 0
+        self.reserved_cents = 0.0
+        self.unpriced_in_flight = 0
+        self.unpriced_waiting = 0
+        self.completed_calls = 0
+        self.max_call_cents_by_writer: dict[str, float] = {}
+        if prior:
+            self._seed_from_prior(prior)
 
-    def before_call(self, writer_name: str) -> None:
+    def _seed_from_prior(self, prior: dict[str, Any]) -> None:
+        self.spent_cents = _finite_cents((prior.get("cost") or {}).get("total_cost_cents"))
+        history_claude = 0
+        for row in prior.get("tasks") or []:
+            for item in (row.get("history") or []) if isinstance(row, dict) else []:
+                if not isinstance(item, dict) or str(item.get("result") or "") not in _REPLY_RESULTS:
+                    continue
+                writer = str(item.get("writer") or "")
+                history_claude += writer == "claude"
+                cents = _finite_cents(item.get("cost_cents"))
+                if writer and cents > 0.0:
+                    self.max_call_cents_by_writer[writer] = max(self.max_call_cents_by_writer.get(writer, 0.0), cents)
+        recorded = prior.get("claude_calls")
+        self.claude_calls = max(history_claude, int(recorded) if isinstance(recorded, int) else 0)
+
+    @property
+    def max_call_cents(self) -> float:
+        return max(self.max_call_cents_by_writer.values(), default=0.0)
+
+    def before_call(self, writer_name: str) -> bool:
+        """Wait out any shared cool-down, then admit (True) or refuse (False) one writer call."""
         with self._lock:
             wait = self._cool_until - time.time()
         if wait > 0:
             time.sleep(min(wait, 60.0))
+        with self._cond:
+            return self._admit_locked(writer_name)
+
+    def _admit_locked(self, writer_name: str) -> bool:
+        # Caller holds self._cond.
+        estimate = 0.0
+        waiting_unpriced = False
+        try:
+            while True:
+                if self.stop.is_set():
+                    return False
+                if writer_name == "claude" and self.claude_calls >= self.settings.max_claude_escalations:
+                    return False
+                limit = self.settings.max_cost_cents
+                if limit is None:
+                    break
+                if self.spent_cents >= limit:
+                    self._stop_for_budget(limit, self.spent_cents)
+                    return False
+                if self.unpriced_in_flight > 0:
+                    # A call of a writer with no known price is running: nothing else starts until it
+                    # reports what it cost.
+                    self._cond.wait(timeout=self._WAIT_SECONDS)
+                    continue
+                estimate = self.max_call_cents_by_writer.get(writer_name, 0.0)
+                if waiting_unpriced and (estimate > 0.0 or self.in_flight == 0):
+                    # No longer waiting as an unpriced call (its writer got a price, or the slot is
+                    # free): drop the registration before checking it, or this caller waits on itself.
+                    waiting_unpriced = False
+                    self.unpriced_waiting = max(0, self.unpriced_waiting - 1)
+                    self._cond.notify_all()
+                if estimate <= 0.0:
+                    if self.in_flight > 0:
+                        # No price for this writer yet: wait until its first call can run alone, and
+                        # keep priced calls from starting meanwhile so it is not postponed forever.
+                        if not waiting_unpriced:
+                            waiting_unpriced = True
+                            self.unpriced_waiting += 1
+                        self._cond.wait(timeout=self._WAIT_SECONDS)
+                        continue
+                    break
+                if self.unpriced_waiting > 0:
+                    self._cond.wait(timeout=self._WAIT_SECONDS)
+                    continue
+                if self.spent_cents + estimate > limit:
+                    self._stop_for_budget(limit, self.spent_cents + estimate)
+                    return False
+                if self.spent_cents + self.reserved_cents + estimate > limit and self.in_flight > 0:
+                    # Only the calls in flight stand in the way: wait for them to settle, then re-check.
+                    self._cond.wait(timeout=self._WAIT_SECONDS)
+                    continue
+                break
+        finally:
+            if waiting_unpriced:
+                self.unpriced_waiting = max(0, self.unpriced_waiting - 1)
+                self._cond.notify_all()
         if writer_name == "claude":
-            with self._lock:
-                self.claude_calls += 1
+            self.claude_calls += 1
+        unpriced = self.settings.max_cost_cents is not None and estimate <= 0.0
+        self.in_flight += 1
+        self.unpriced_in_flight += int(unpriced)
+        self.reserved_cents += estimate
+        self._local.reserved = estimate
+        self._local.unpriced = unpriced
+        return True
+
+    def after_call(self, writer_name: str, reply: Any | None) -> None:
+        """Release the call's in-flight slot and reservation, and record what it cost (0 when it raised)."""
+        cents = _finite_cents(getattr(reply, "cost_cents", 0.0) if reply is not None else 0.0)
+        with self._cond:
+            self.in_flight = max(0, self.in_flight - 1)
+            self.reserved_cents = max(0.0, self.reserved_cents - float(getattr(self._local, "reserved", 0.0)))
+            self._local.reserved = 0.0
+            if getattr(self._local, "unpriced", False):
+                self.unpriced_in_flight = max(0, self.unpriced_in_flight - 1)
+                self._local.unpriced = False
+            if reply is not None:
+                self.completed_calls += 1
+                self.max_call_cents_by_writer[writer_name] = max(self.max_call_cents_by_writer.get(writer_name, 0.0), cents)
+            elif writer_name == "claude":
+                self.claude_calls = max(0, self.claude_calls - 1)
+            self._add_cost_locked(cents)
+            self._cond.notify_all()
 
     def on_transient(self, delay: float) -> None:
         with self._lock:
@@ -124,12 +256,77 @@ class BatchControls:
             return self.claude_calls < self.settings.max_claude_escalations
 
     def add_cost(self, cents: float) -> None:
+        with self._cond:
+            self._add_cost_locked(cents)
+            self._cond.notify_all()
+
+    def _add_cost_locked(self, cents: float) -> None:
+        self.spent_cents += _finite_cents(cents)
+        limit = self.settings.max_cost_cents
+        if limit is not None and self.spent_cents >= limit:
+            self._stop_for_budget(limit, self.spent_cents)
+
+    def _stop_for_budget(self, limit: float, projected: float) -> None:
+        # Caller holds self._lock.
+        if not self.stop.is_set():
+            self.stop_reason = (
+                f"cost budget of {limit} cents reached (spent {self.spent_cents:.4f} cents; "
+                f"one more call could bring it to {projected:.4f} cents)"
+            )
+            self.stop.set()
+
+
+def _finite_cents(value: Any) -> float:
+    try:
+        cents = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return cents if math.isfinite(cents) and cents > 0.0 else 0.0
+
+
+class RunLedger:
+    """Spend of the current run, recorded per writer call as it happens.
+
+    Kept outside the task records so an error receipt can still report what the run paid for, and
+    bucketed by UTC day so a run that crosses midnight is charged to the right day.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.cents = 0.0
+        self.usage: dict[str, int] = {}
+        self.pricing_known = True
+        self.by_utc_day: dict[str, float] = {}
+
+    def record(self, reply: Any, *, now: float | None = None) -> None:
+        cents = _finite_cents(getattr(reply, "cost_cents", 0.0))
+        day = datetime.fromtimestamp(now if now is not None else time.time(), tz=timezone.utc).strftime("%Y-%m-%d")
         with self._lock:
-            self.spent_cents += cents
-            limit = self.settings.max_cost_cents
-            if limit is not None and self.spent_cents >= limit and not self.stop.is_set():
-                self.stop_reason = f"cost budget of {limit} cents reached"
-                self.stop.set()
+            self.cents += cents
+            self.pricing_known = self.pricing_known and bool(getattr(reply, "pricing_known", True))
+            for key, val in (getattr(reply, "usage", None) or {}).items():
+                if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                    self.usage[key] = int(self.usage.get(key, 0)) + int(val)
+            if cents > 0.0:
+                self.by_utc_day[day] = self.by_utc_day.get(day, 0.0) + cents
+
+    def merged_days(self, prior: dict[str, Any] | None) -> dict[str, float]:
+        """Prior receipt's per-day spend plus this run's, rounded for the receipt."""
+        merged: dict[str, float] = {}
+        prior_days = (prior or {}).get("cost_by_utc_day")
+        if isinstance(prior_days, dict) and prior_days:
+            for day, cents in prior_days.items():
+                merged[str(day)] = merged.get(str(day), 0.0) + _finite_cents(cents)
+        elif prior:
+            prior_cents = _finite_cents(((prior.get("cost") or {}).get("total_cost_cents")))
+            stamp = float(prior.get("finished_at_epoch") or prior.get("started_at_epoch") or 0.0)
+            if prior_cents > 0.0 and stamp > 0.0:
+                day = datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d")
+                merged[day] = prior_cents
+        with self._lock:
+            for day, cents in self.by_utc_day.items():
+                merged[day] = merged.get(day, 0.0) + cents
+        return {day: round(cents, 6) for day, cents in sorted(merged.items()) if cents > 0.0}
 
 
 class _LadderWriters(dict):
@@ -145,12 +342,94 @@ class _LadderWriters(dict):
         return super().get(key, default)
 
 
-def _workspace_state(root: Path) -> str:
-    """Fingerprint of HEAD plus uncommitted state, so a moved workspace never resumes a stale job copy."""
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, check=False).stdout
-    status = subprocess.run(["git", "status", "--porcelain=v1", "-z"], cwd=str(root), capture_output=True, check=False).stdout
-    diff = subprocess.run(["git", "diff", "HEAD", "--binary"], cwd=str(root), capture_output=True, check=False).stdout
-    return hashlib.sha256(head.encode() + b"\0" + status + b"\0" + diff).hexdigest()
+# Plugin-owned directories that may sit inside a workspace; their churn must not change its fingerprint.
+_STATE_SKIP_PREFIXES = (".cc-agy-data/", ".worktrees/", ".ctx-session-reads/", ".cc-agy-review/", ".git/")
+_UNTRACKED_HASH_MAX_FILES = 5_000
+_UNTRACKED_HASH_MAX_FILE_BYTES = 16 * 1024 * 1024
+_UNTRACKED_HASH_TOTAL_BYTES = 64 * 1024 * 1024
+
+
+def _git_out(root: Path, *args: str) -> subprocess.CompletedProcess:
+    from server.verify import run_git
+
+    return run_git(args, root, capture_output=True, check=False)
+
+
+def _hash_file_into(digest: Any, path: Path, budget: list[int]) -> None:
+    try:
+        if path.is_symlink():
+            digest.update(b"L" + os.readlink(path).encode("utf-8", "surrogateescape"))
+            return
+        st = path.stat()
+        if st.st_size > _UNTRACKED_HASH_MAX_FILE_BYTES or st.st_size > budget[0]:
+            digest.update(f"S{st.st_size}:{st.st_mtime_ns}".encode())
+            return
+        budget[0] -= st.st_size
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        digest.update(b"?")
+
+
+def _workspace_state(root: Path, skip_prefixes: tuple[str, ...] = ()) -> str:
+    """Fingerprint of HEAD plus uncommitted state, so a moved workspace never resumes a stale job copy.
+
+    Covers tracked changes (status, staged and unstaged binary diffs) and the content of untracked,
+    non-ignored files: ``git status`` only names untracked files, so editing one would otherwise leave
+    the fingerprint unchanged. Plugin-owned directories are excluded everywhere, so a receipt write or a
+    scratch directory inside the workspace never changes it. A workspace that is not a git checkout is
+    fingerprinted by walking its files. Very large files contribute their size and mtime instead of
+    their bytes.
+    """
+    skip = _STATE_SKIP_PREFIXES + tuple(skip_prefixes)
+    budget = [_UNTRACKED_HASH_TOTAL_BYTES]
+    if _git_out(root, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        digest = hashlib.sha256(b"nogit\0")
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root).as_posix()
+            rel_dir = "" if rel_dir == "." else rel_dir + "/"
+            dirnames[:] = sorted(d for d in dirnames if not (rel_dir + d + "/").startswith(skip)
+                                 and d not in ("node_modules", "__pycache__", ".venv"))
+            for name in sorted(filenames):
+                rel = rel_dir + name
+                if rel.startswith(skip):
+                    continue
+                count += 1
+                digest.update(b"\0F\0" + rel.encode("utf-8", "surrogateescape") + b"\0")
+                if count > _UNTRACKED_HASH_MAX_FILES:
+                    # Past the cap: size and mtime only, so edits anywhere still change the fingerprint.
+                    try:
+                        st = (Path(dirpath) / name).lstat()
+                        digest.update(f"S{st.st_size}:{st.st_mtime_ns}".encode())
+                    except OSError:
+                        digest.update(b"?")
+                    continue
+                _hash_file_into(digest, Path(dirpath) / name, budget)
+        return digest.hexdigest()
+    head_res = _git_out(root, "rev-parse", "--verify", "-q", "HEAD")
+    head = head_res.stdout if head_res.returncode == 0 else b"unborn"
+    pathspec = ["--", ".", *(f":(exclude,literal){p.rstrip('/')}" for p in skip if p != ".git/")]
+    status = _git_out(root, "status", "--porcelain=v1", "-z", *pathspec).stdout
+    if head_res.returncode == 0:
+        diff = _git_out(root, "diff", "HEAD", "--binary", *pathspec).stdout
+    else:
+        # No commit yet: staged content plus unstaged edits on top of it.
+        diff = (_git_out(root, "diff", "--cached", "--binary", *pathspec).stdout + b"\0"
+                + _git_out(root, "diff", "--binary", *pathspec).stdout)
+    digest = hashlib.sha256(head + b"\0" + status + b"\0" + diff)
+    listed = _git_out(root, "ls-files", "--others", "--exclude-standard", "-z", *pathspec)
+    untracked = sorted(
+        p for p in listed.stdout.decode("utf-8", "surrogateescape").split("\0")
+        if p and not p.startswith(skip)
+    ) if listed.returncode == 0 else []
+    for rel in untracked[:_UNTRACKED_HASH_MAX_FILES]:
+        digest.update(b"\0U\0" + rel.encode("utf-8", "surrogateescape") + b"\0")
+        _hash_file_into(digest, root / rel, budget)
+    if len(untracked) > _UNTRACKED_HASH_MAX_FILES:
+        digest.update(f"+{len(untracked)}".encode())
+    return digest.hexdigest()
 
 
 class FileBatchRunner:
@@ -193,6 +472,18 @@ class FileBatchRunner:
             rec = self.store.read_receipt(resume_job_id)
             if rec.get("kind") not in RESUMABLE_KINDS or rec.get("applied"):
                 raise ValueError(f"job {resume_job_id!r} is not an unapplied batch job")
+            # Same compatibility rules as an automatic resume: a job copy made from another plan or an
+            # older workspace would mix stale files into this run's checks and diff.
+            if rec.get("plan_fingerprint") != plan.raw_fingerprint:
+                raise ValueError(
+                    f"job {resume_job_id!r} was started from a different plan; re-send that exact plan to "
+                    "resume it, or omit resume_job_id to start a new job for this plan"
+                )
+            if rec.get("workspace_state") != ws_state:
+                raise ValueError(
+                    f"the workspace changed since job {resume_job_id!r} made its job copy (commit, tracked or "
+                    "untracked files); omit resume_job_id to start a new job from the current workspace"
+                )
             wt = Path(str(rec.get("worktree_dir") or ""))
             if not wt.is_dir():
                 raise ValueError(f"job {resume_job_id!r} has no job copy left to resume")
@@ -228,15 +519,25 @@ class FileBatchRunner:
             used += len(body)
         return "\n\n".join(parts)
 
-    def _make_verify(self, task, wt, plan, settings, log_dir, apply_lock, content_gate=None):
+    def _make_verify(self, task, wt, plan, settings, log_dir, apply_lock, content_gate=None, side_effects=None):
         def restore(answer: AppliedAnswer, target: Path) -> None:
+            # Never write through a link a check may have planted: drop the link itself first.
+            link = symlink_component(wt, task.path)
+            if link is not None:
+                (wt / link).unlink(missing_ok=True)
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)  # a broken formatter or check replaced the file with a directory
             if answer.previous_bytes is None:
                 target.unlink(missing_ok=True)
             else:
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(answer.previous_bytes)
 
         def verify(answer: AppliedAnswer) -> tuple[bool, str]:
             with apply_lock:
+                link = symlink_component(wt, task.path)
+                if link is not None:
+                    return False, f"{task.path!r} goes through a symlink ({link!r}) in the job copy; not writing it"
                 target = wt / task.path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(answer.new_bytes)
@@ -251,7 +552,15 @@ class FileBatchRunner:
                 cmds.extend(task.checks)
                 if task.repro_test:
                     cmds.append(task.repro_test)
-                results = run_commands(cmds, wt, timeout=settings.check_timeout, log_dir=log_dir) if cmds else []
+                # Only the plan's formatter may rewrite the target; any other file a check touches is
+                # restored by run_commands so test side effects never reach the job's diff.
+                allowed = (task.path,) if plan.formatter else ()
+                results = run_commands(cmds, wt, timeout=settings.check_timeout, log_dir=log_dir,
+                                       allowed_mutations=allowed) if cmds else []
+                restored = sorted({p for r in results for p in r.side_effects_restored})
+                if restored and side_effects is not None:
+                    seen = side_effects.setdefault(task.task_id, [])
+                    seen.extend(p for p in restored if p not in seen)
                 if all(r.passed for r in results):
                     return True, ""
                 restore(answer, target)
@@ -322,38 +631,69 @@ class FileBatchRunner:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    def _state_skip_prefixes(self) -> tuple[str, ...]:
+        """Plugin data and job-copy directories that live inside this workspace, as path prefixes."""
+        prefixes: list[str] = []
+        for candidate in (getattr(self.store, "data_dir", None), getattr(self.store, "worktrees_dir", None)):
+            if candidate is None:
+                continue
+            try:
+                rel = Path(candidate).resolve().relative_to(self.root)
+            except (OSError, ValueError):
+                continue
+            if rel.parts:
+                prefixes.append(rel.as_posix().rstrip("/") + "/")
+        return tuple(prefixes)
+
     def _run_locked(self, plan, settings, auth, *, allowed_paths, extra_acceptance, resume_job_id, edits_only,
                     kind, extra_receipt, content_gate, shared_note) -> dict[str, Any]:
-        ws_state = _workspace_state(self.root)
+        ws_state = _workspace_state(self.root, self._state_skip_prefixes())
         job_id, wt, baseline_sha, baseline_hashes, prior = self._open_job(plan, resume_job_id, ws_state)
         started = round(time.time(), 3)
+        ledger = RunLedger()
         try:
             return self._execute(
                 plan, settings, auth, job_id=job_id, wt=wt, baseline_sha=baseline_sha, baseline_hashes=baseline_hashes,
                 prior=prior, started=started, ws_state=ws_state, allowed_paths=allowed_paths,
                 extra_acceptance=extra_acceptance, edits_only=edits_only, kind=kind, extra_receipt=extra_receipt,
-                content_gate=content_gate, shared_note=shared_note,
+                content_gate=content_gate, shared_note=shared_note, ledger=ledger,
             )
         except Exception as exc:  # noqa: BLE001 - never leave a job copy without a receipt
             error = f"{type(exc).__name__}: {str(exc)[:500]}"
-            self.store.write_receipt(job_id, {
+            # Keep what was already paid for: the resumed job's earlier spend plus every call this run made.
+            prior_cost = (prior or {}).get("cost") or {}
+            total_cents = _finite_cents(prior_cost.get("total_cost_cents")) + ledger.cents
+            usage_total = {k: int(v) for k, v in ((prior or {}).get("usage") or {}).items() if isinstance(v, (int, float))}
+            for key, val in ledger.usage.items():
+                usage_total[key] = int(usage_total.get(key, 0)) + int(val)
+            priced = ledger.pricing_known and bool(prior_cost.get("pricing_known", True))
+            receipt = {k: v for k, v in (prior or {}).items() if k not in ("receipt_hmac", "cost", "updated_at_epoch")}
+            receipt.update({
                 "job_id": job_id, "kind": kind, "status": "error", "model": settings.model,
                 "worktree_dir": str(wt), "baseline_commit_sha": baseline_sha, "baseline_file_hashes": baseline_hashes,
-                "started_at_epoch": started, "finished_at_epoch": round(time.time(), 3), "files_changed": [],
+                "started_at_epoch": float((prior or {}).get("started_at_epoch") or started),
+                "finished_at_epoch": round(time.time(), 3), "files_changed": [],
                 "applied": False, "in_place": False, "plan_fingerprint": plan.raw_fingerprint, "workspace_state": ws_state,
-                "prompts": [f"{t.task_id}: {t.intent}" for t in plan.tasks], "error": error, "usage": {},
-                "precomputed_cost": {"total_cost_cents": 0.0, "total_cost_usd": 0.0, "pricing_known": False},
-            }, workspace_root=str(self.root), api_key=auth.get("api_key"))
-            return {"job_id": job_id, "status": "error", "error": error, "is_error": True}
+                "prompts": [f"{t.task_id}: {t.intent}" for t in plan.tasks], "error": error, "usage": usage_total,
+                "precomputed_cost": {"total_cost_cents": round(total_cents, 4), "total_cost_usd": round(total_cents / 100.0, 6),
+                                     "pricing_known": priced},
+                "cost_by_utc_day": ledger.merged_days(prior),
+            })
+            self.store.write_receipt(job_id, receipt, workspace_root=str(self.root), api_key=auth.get("api_key"))
+            return {"job_id": job_id, "status": "error", "error": error, "is_error": True,
+                    "totals": {"cost_cents": round(ledger.cents, 4), "job_cost_cents": round(total_cents, 4)}}
 
     def _execute(self, plan, settings, auth, *, job_id, wt, baseline_sha, baseline_hashes, prior, started, ws_state,
-                 allowed_paths, extra_acceptance, edits_only, kind, extra_receipt, content_gate, shared_note):
+                 allowed_paths, extra_acceptance, edits_only, kind, extra_receipt, content_gate, shared_note,
+                 ledger: RunLedger | None = None):
+        ledger = ledger or RunLedger()
         journal = BatchJournal(self.store.data_dir, job_id)
         log_dir = self.store.data_dir / "file_batches" / f"{job_id}.logs"
         records = {t.task_id: TaskRecord(t) for t in plan.tasks}
         by_id = {t.task_id: t for t in plan.tasks}
-        controls = BatchControls(settings, self.stop)
+        controls = BatchControls(settings, self.stop, prior=prior)
         apply_lock = threading.Lock()
+        check_side_effects: dict[str, list[str]] = {}
         auth_error: list[str] = []
         lock = threading.Lock()
         settled = {"n": 0}
@@ -406,6 +746,22 @@ class FileBatchRunner:
 
         def run_one(task: FileTask) -> str:
             rec = records[task.task_id]
+            spent_lock = threading.Lock()
+
+            def after_call(writer_name: str, reply: Any | None) -> None:
+                # Record spend per call, so the budget sees it at once and a later exception in the
+                # ladder cannot drop what this task already paid for.
+                controls.after_call(writer_name, reply)
+                if reply is None:
+                    return
+                ledger.record(reply)
+                with spent_lock:
+                    rec.cost_cents += _finite_cents(reply.cost_cents)
+                    rec.pricing_known = rec.pricing_known and bool(reply.pricing_known)
+                    for key, val in (reply.usage or {}).items():
+                        if isinstance(val, (int, float)):
+                            rec.usage[key] = int(rec.usage.get(key, 0)) + int(val)
+
             try:
                 if self._already_done(task, plan, journal, wt):
                     rec.state = "unchanged"
@@ -420,10 +776,12 @@ class FileBatchRunner:
                         return "failed"
                 outcome = run_writer_ladder(
                     task, routed=settings.writer, writers=writers,
-                    verify=self._make_verify(task, wt, plan, settings, log_dir, apply_lock, content_gate),
+                    verify=self._make_verify(task, wt, plan, settings, log_dir, apply_lock, content_gate,
+                                             side_effects=check_side_effects),
                     build_request=build_request, root=wt, edits_only=edits_only,
                     allow_existing=task.path in landed_paths,
                     before_call=controls.before_call, on_transient=controls.on_transient,
+                    after_call=after_call, should_stop=self.stop.is_set,
                 )
             except WriterAuthError as exc:
                 with lock:
@@ -437,10 +795,10 @@ class FileBatchRunner:
                 rec.history.append({"writer": "", "result": "writer_error", "detail": rec.detail[-300:]})
                 return "failed"
             rec.attempts, rec.writer, rec.detail = outcome.attempts, outcome.writer_used, outcome.detail
-            rec.cost_cents, rec.usage, rec.history = outcome.cost_cents, outcome.usage, outcome.history
-            rec.pricing_known = outcome.pricing_known
+            rec.history = outcome.history
             rec.state = outcome.state
-            controls.add_cost(outcome.cost_cents)
+            if outcome.state == "held" and controls.stop_reason:
+                rec.detail = controls.stop_reason
             if outcome.state == "landed":
                 journal.record_landed(task, wt)
             return outcome.state
@@ -466,8 +824,11 @@ class FileBatchRunner:
         )
         try:
             try:
+                # With a cost cap, the first call runs alone so the per-call reservation has a real
+                # price to work with before parallel calls start.
                 run_task_graph(list(plan.tasks), run_one, max_parallel=settings.max_parallel, on_settle=on_settle,
-                               warm_first=bool(cache_name) or settings.claude_writer, stop=self.stop)
+                               warm_first=bool(cache_name) or settings.claude_writer or settings.max_cost_cents is not None,
+                               stop=self.stop)
             finally:
                 if cache_name:
                     self.cache_cleanup(auth, cache_name)
@@ -487,12 +848,14 @@ class FileBatchRunner:
             settings=settings, auth=auth, records=records, started=started, prior=prior, ws_state=ws_state,
             allowed_paths=allowed_paths, acceptance_cmds=acceptance_cmds, acceptance_results=acceptance_results,
             acceptance_passed=acceptance_passed, auth_error=auth_error[0] if auth_error else None, kind=kind,
-            extra_receipt=extra_receipt, stop_reason=controls.stop_reason,
+            extra_receipt=extra_receipt, stop_reason=controls.stop_reason, ledger=ledger,
+            check_side_effects=check_side_effects, claude_calls=controls.claude_calls,
         )
 
     def _finish(self, *, job_id, wt, baseline_sha, baseline_hashes, plan, settings, auth, records, started, prior,
                 ws_state, allowed_paths, acceptance_cmds, acceptance_results, acceptance_passed, auth_error, kind,
-                extra_receipt, stop_reason):
+                extra_receipt, stop_reason, ledger: RunLedger | None = None,
+                check_side_effects: dict[str, list[str]] | None = None, claude_calls: int = 0):
         from server.jobs import _matches_allowed_paths
         from server.receipts import extract_diff_provenance
 
@@ -566,6 +929,19 @@ class FileBatchRunner:
             status = "ok"
         else:
             status = "checkpoint"
+        # The weakest evidence across finished files: "ok" alone must never read as "verified".
+        done_rows = [r for r in task_rows if r["state"] in DONE_STATES]
+        strength = {"unverified": 0, "syntax_only": 1, "behavioral": 2}
+        verification = min((r["verification"] for r in done_rows), key=strength.__getitem__) if done_rows else None
+        unverified_ids = [r["task_id"] for r in done_rows if r["verification"] == "unverified"]
+        # Tracked files that checks modified and run_commands put back: never in the diff, but reported.
+        side_effects = {tid: list(paths) for tid, paths in (check_side_effects or {}).items() if paths}
+        acc_restored = sorted({p for r in acceptance_results for p in (r.get("side_effects_restored") or [])})
+        if acc_restored:
+            side_effects["acceptance"] = acc_restored
+        for row in task_rows:
+            if row["task_id"] in side_effects:
+                row["check_side_effects"] = side_effects[row["task_id"]][:20]
         finished = round(time.time(), 3)
         review = sorted({r["path"] for r in task_rows if r["review_required"] and r["state"] in DONE_STATES})
         receipt = {
@@ -579,10 +955,13 @@ class FileBatchRunner:
             "duration_seconds": round(finished - started, 3), "usage": usage_total,
             "precomputed_cost": {"total_cost_cents": round(total_cents, 4), "total_cost_usd": round(total_cents / 100.0, 6),
                                  "pricing_known": priced},
+            "cost_by_utc_day": (ledger or RunLedger()).merged_days(prior),
             "files_changed": files_changed, "provenance": provenance, "applied": False, "in_place": False,
             "acceptance": acceptance_cmds, "acceptance_results": acceptance_results, "acceptance_passed": acceptance_passed,
             "error": auth_error or (stop_reason or None), "plan_fingerprint": plan.raw_fingerprint,
             "workspace_state": ws_state, "tasks": task_rows, "resumed": prior is not None, "review_required": review,
+            "verification": verification, "unverified_task_ids": unverified_ids, "check_side_effects": side_effects,
+            "claude_calls": int(claude_calls),
             "writer_route": {"writer": settings.writer, "model": settings.model, "thinking_level": settings.thinking_level,
                              "read_budget": settings.read_budget,
                              "claude_writer": settings.claude_model if settings.claude_writer else None},
@@ -591,11 +970,14 @@ class FileBatchRunner:
         receipt.update(extra_receipt)
         self.store.write_receipt(job_id, receipt, workspace_root=str(self.root), api_key=auth.get("api_key"))
         return self._digest(job_id, status, task_rows, counts, run_cents, total_cents, usage_run, acceptance_passed,
-                            auth_error or stop_reason, files_changed, scope_violations, review)
+                            auth_error or stop_reason, files_changed, scope_violations, review,
+                            verification=verification, unverified_ids=unverified_ids, side_effects=side_effects)
 
     @staticmethod
     def _digest(job_id, status, rows, counts, run_cents, total_cents, usage, acceptance_passed, error, files_changed,
-                scope_violations, review) -> dict[str, Any]:
+                scope_violations, review, *, verification: str | None = None,
+                unverified_ids: list[str] | tuple[str, ...] = (),
+                side_effects: dict[str, list[str]] | None = None) -> dict[str, Any]:
         tokens = sum(int(v) for k, v in usage.items() if k.endswith("_tokens") or k == "total_token_count")
         tasks: list[dict[str, Any]] = []
         tails_left = DIGEST_TAIL_TASKS
@@ -623,8 +1005,28 @@ class FileBatchRunner:
         ]
         if syntax_only:
             digest["syntax_only_tasks"] = syntax_only[:10]
+        if verification:
+            digest["verification"] = verification
+        if side_effects:
+            digest["check_side_effects"] = {k: v[:5] for k, v in list(side_effects.items())[:10]}
+            digest["side_effects_note"] = (
+                "Files changed while checks ran (tracked files or files earlier tasks created); those edits "
+                "were undone and are not in the diff. A check that rewrites source files does not count as passing."
+            )
+        if unverified_ids:
+            digest["unverified_task_ids"] = list(unverified_ids)[:10]
+            digest["warning"] = (
+                f"{len(unverified_ids)} finished file(s) had no check and no passing acceptance command covered "
+                "them: nothing verified these edits. Review the diff before applying."
+            )
         if status in ("ok", "checkpoint"):
-            digest["next"] = f"get_diff(job_id={job_id!r}) then delegate_apply(job_id={job_id!r})"
+            if unverified_ids:
+                digest["next"] = (
+                    f"review get_diff(job_id={job_id!r}) (unverified files listed in unverified_task_ids), "
+                    f"then delegate_apply(job_id={job_id!r})"
+                )
+            else:
+                digest["next"] = f"get_diff(job_id={job_id!r}) then delegate_apply(job_id={job_id!r})"
         if any(t["state"] == "failed" for t in tasks):
             digest["details"] = f"batch_task_log(job_id={job_id!r}, task_id=...) for attempt history and logs"
         # Keep the reply near ~600 tokens on large batches: collapse quiet rows, then trim tails, then held rows.

@@ -19,10 +19,10 @@ from dataclasses import replace
 import hashlib
 from pathlib import Path, PurePosixPath
 import re
-import subprocess
 from typing import Any
 
 from server.batch_plan import BatchPlan, BatchPlanError, FileTask, PlanProblem, validate_batch_plan
+from server.verify import run_git
 
 _MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 _CODE_PATH_RE = re.compile(r"`([A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+\.[A-Za-z0-9]{1,8})`")
@@ -214,8 +214,8 @@ def prepare_replication(
         targets = []
     if example_path in targets:
         problems.append(PlanProblem("$.targets", "must not include the example file"))
-    diff = subprocess.run(["git", "diff", "--no-color", "HEAD", "--", example_path], cwd=str(root),
-                          capture_output=True, text=True, check=False).stdout
+    diff = run_git(["diff", "--no-color", "HEAD", "--", example_path], cwd=str(root),
+                   capture_output=True, text=True, check=False).stdout
     if not diff.strip():
         problems.append(PlanProblem("$.example_path", f"{example_path!r} has no uncommitted change to copy; make the edit there first"))
     if problems:

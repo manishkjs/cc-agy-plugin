@@ -24,10 +24,21 @@ from typing import Any, Iterable
 
 # Claude list prices in USD per 1M tokens:
 # (input, cache_read, cache_write_5m, cache_write_1h, output).
-# Matched by substring of the model id, first match wins. Override with
-# CC_AGY_LEAD_RATES='{"opus": [5, 0.5, 6.25, 10, 25], ...}'.
+# Matched by longest substring of the model id first. Override specific keys via
+# CC_AGY_LEAD_RATES='{"opus": [4, 0.2, 5, 8, 20], ...}' (merges onto DEFAULT_LEAD_RATES).
+# Opus 5.5 official rate card uses 0.05x cache read ($0.20/1M), 1.25x 5m write ($5.00/1M),
+# and 2.0x 1h write ($8.00/1M); legacy Opus 4.x / 5.0 remain at $5.00 / $0.50 / $25.00,
+# and Claude 3 Opus remains at $15.00 / $1.50 / $75.00.
 DEFAULT_LEAD_RATES: dict[str, tuple[float, float, float, float, float]] = {
-    "opus": (5.00, 0.50, 6.25, 10.00, 25.00),
+    "claude-3-opus": (15.00, 1.50, 18.75, 30.00, 75.00),
+    "opus-3": (15.00, 1.50, 18.75, 30.00, 75.00),
+    "opus-4": (5.00, 0.50, 6.25, 10.00, 25.00),
+    "4-opus": (5.00, 0.50, 6.25, 10.00, 25.00),
+    "opus-5-0": (5.00, 0.50, 6.25, 10.00, 25.00),
+    "opus-5.0": (5.00, 0.50, 6.25, 10.00, 25.00),
+    "opus-5-5": (4.00, 0.20, 5.00, 8.00, 20.00),
+    "opus-5.5": (4.00, 0.20, 5.00, 8.00, 20.00),
+    "opus": (4.00, 0.20, 5.00, 8.00, 20.00),
     "sonnet": (3.00, 0.30, 3.75, 6.00, 15.00),
     "haiku": (1.00, 0.10, 1.25, 2.00, 5.00),
 }
@@ -39,12 +50,21 @@ def lead_rates() -> dict[str, tuple[float, float, float, float, float]]:
         return dict(DEFAULT_LEAD_RATES)
     try:
         parsed = json.loads(raw)
-        out = {}
+        if not isinstance(parsed, dict):
+            raise ValueError("top-level JSON value must be an object")
+        out = dict(DEFAULT_LEAD_RATES)
+        explicit_keys: set[str] = set()
         for k, v in parsed.items():
             vals = [float(x) for x in v]
             if len(vals) != 5:
                 raise ValueError(f"rate for {k!r} needs 5 numbers")
-            out[str(k).lower()] = tuple(vals)  # type: ignore[assignment]
+            lk = str(k).lower()
+            explicit_keys.add(lk)
+            out[lk] = tuple(vals)  # type: ignore[assignment]
+        if "opus" in explicit_keys:
+            for alias in ("opus-5-5", "opus-5.5"):
+                if alias not in explicit_keys:
+                    out[alias] = out["opus"]
         return out
     except (ValueError, TypeError, AttributeError) as exc:
         raise ValueError(f"CC_AGY_LEAD_RATES is not valid JSON rate table: {exc}") from exc
@@ -53,7 +73,7 @@ def lead_rates() -> dict[str, tuple[float, float, float, float, float]]:
 def rate_for_model(model: str, rates: dict[str, tuple[float, ...]] | None = None) -> tuple[float, ...] | None:
     table = rates if rates is not None else lead_rates()
     m = (model or "").lower()
-    for key, val in table.items():
+    for key, val in sorted(table.items(), key=lambda kv: len(kv[0]), reverse=True):
         if key in m:
             return val
     return None

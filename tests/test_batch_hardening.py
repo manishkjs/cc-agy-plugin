@@ -120,7 +120,10 @@ class RunnerHardeningTests(unittest.TestCase):
             self.assertIn("disk full", rec["error"])
             jm.shutdown()
 
-    def test_tracked_file_changed_by_a_check_is_a_scope_violation(self) -> None:
+    def test_tracked_file_changed_by_a_check_fails_the_check_and_is_restored(self) -> None:
+        # A check that edits another tracked file used to leave that edit in the job copy (and so in
+        # the diff, where only allowed_paths could catch it). Now the edit is undone and reported, and
+        # the check fails: it did not test the files that will ship.
         with tempfile.TemporaryDirectory() as tmp:
             root, store = _repo(tmp)
             (root / "tests_x").mkdir()
@@ -133,8 +136,11 @@ class RunnerHardeningTests(unittest.TestCase):
             srv, jm = _server(root, store, _content_writer({"pkg/a.py": ["A = 1\n"]}))
             out = _call(srv, "delegate_file_batch", {"tasks": [_task("a", "pkg/a.py", checks=["python3 -m unittest -q tests_x.test_sneaky"])],
                                                      "project": "p", "allowed_paths": ["pkg/a.py"]})
-            self.assertEqual(out["status"], "scope_violation")
-            self.assertIn("pkg/core.py", out["scope_violations"])
+            self.assertNotIn("pkg/core.py", out.get("scope_violations") or [])
+            self.assertEqual(out["tasks"][0]["state"], "failed")
+            self.assertEqual(out["check_side_effects"], {"a": ["pkg/core.py"]})
+            diff = store.diff_path(out["job_id"]).read_text(encoding="utf-8")
+            self.assertNotIn("pkg/core.py", diff)
             jm.shutdown()
 
     def test_receipt_hmac_covers_task_rows(self) -> None:

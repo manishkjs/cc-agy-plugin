@@ -152,6 +152,8 @@ def main() -> int:
 
     atexit.register(_record_unfinished)
     signal.signal(signal.SIGTERM, _on_sigterm)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _on_sigterm)
     serve_stdio(server)
     # Record unfinished jobs and terminate active workers right when stdin closes. The atexit hook alone
     # is too late: Python joins ThreadPoolExecutor worker threads before atexit handlers run.

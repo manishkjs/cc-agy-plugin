@@ -12,12 +12,12 @@ import os
 from pathlib import Path
 import re
 import secrets
-import subprocess
 import tempfile
 import time
 from typing import Any, Mapping
 
 from server.regions import estimate_cost_usd, resolve_max_daily_cents
+from server.verify import run_git
 
 _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _BINARY_DIFF_RE = re.compile(r"^Binary files (.+?) and (.+?) differ$")
@@ -182,8 +182,8 @@ def resolve_workspace_root(
         base = Path.cwd().resolve()
 
     if anchor_to_git_root and base.exists():
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+        res = run_git(
+            ["rev-parse", "--show-toplevel"],
             cwd=str(base),
             capture_output=True,
             text=True,
@@ -409,6 +409,28 @@ def _register_empty_worktree_dir_cleanup(path: Path) -> None:
     _REGISTERED_WORKTREE_DIRS.add(path)
 
 
+def _finite_positive(value: Any) -> float:
+    try:
+        num = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return num if num == num and num not in (float("inf"), float("-inf")) and num > 0.0 else 0.0
+
+
+def _utc_day(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _receipt_cost_cents(rec: Mapping[str, Any]) -> float:
+    """Total cost of a receipt in cents, from its priced ``cost`` block (cents first, then USD)."""
+    cost = rec.get("cost") or rec.get("precomputed_cost") or {}
+    if not isinstance(cost, Mapping):
+        return 0.0
+    if cost.get("total_cost_cents") is not None:
+        return _finite_positive(cost.get("total_cost_cents"))
+    return _finite_positive(cost.get("total_cost_usd")) * 100.0
+
+
 class ReceiptStore:
     """Atomic, HMAC-signed, crash-safe receipt storage for Vertex AI delegations and queries."""
 
@@ -545,10 +567,27 @@ class ReceiptStore:
             "applied_history": record.get("applied_history", []),
             "prompts": record.get("prompts", []),
         }
-        # Revert metadata is signed only when present, so receipts written before it existed still verify.
-        for opt_key in ("pre_apply", "reverted_files", "tasks", "plan_fingerprint", "precomputed_cost", "writer_route"):
+        # Revert and escalation metadata are signed only when present, so earlier receipts still verify.
+        for opt_key in (
+            "pre_apply",
+            "reverted_files",
+            "tasks",
+            "plan_fingerprint",
+            "precomputed_cost",
+            "writer_route",
+            "escalate_to_lead",
+            "escalation",
+        ):
             if opt_key in record:
                 canonical_payload[opt_key] = record.get(opt_key)
+        # Receipts written from scope 2 on also sign the revert state flags and the per-day spend, which
+        # gate delegate_revert and the daily budget. Older receipts (no marker) verify exactly as before;
+        # dropping the marker from a newer receipt breaks its signature.
+        if record.get("hmac_scope") == 2:
+            canonical_payload["hmac_scope"] = 2
+            for opt_key in ("reverted", "partially_reverted", "revert_skipped", "cost_by_utc_day"):
+                if opt_key in record:
+                    canonical_payload[opt_key] = record.get(opt_key)
         serialized = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hmac.new(self._active_hmac_key(), serialized, hashlib.sha256).hexdigest()
 
@@ -743,6 +782,8 @@ class ReceiptStore:
                 usage,
                 single_request=(record.get("kind") == "ask"),
             )
+        record["cost_by_utc_day"] = self._cost_by_utc_day(safe_id, record)
+        record["hmac_scope"] = 2
 
         # Always redact secret API keys even when scrub=False
         record = redact_api_keys(record, api_key=api_key)
@@ -780,6 +821,53 @@ class ReceiptStore:
 
         return record
 
+    def _cost_by_utc_day(self, safe_id: str, record: dict[str, Any]) -> dict[str, float]:
+        """Per-UTC-day spend for a receipt, so a job resumed or continued across midnight is charged to
+        the days its calls actually ran. The buckets always add up to the receipt's total cost.
+
+        Starting point: the payload's own ``cost_by_utc_day`` (batch jobs record it per writer call),
+        else the buckets of the receipt on disk, else that receipt's total on its finish day. Any cost
+        the buckets do not cover yet is new spend: on a first write it is charged to the day the record
+        says the work finished, on a rewrite (a continued turn, an appended QA review, a payload read
+        back with stale buckets) to the day of this write. Buckets above the total are trimmed from the
+        latest day back.
+        """
+        total = _receipt_cost_cents(record)
+        explicit = record.get("cost_by_utc_day")
+        try:
+            prev = self.read_receipt(safe_id)
+        except (FileNotFoundError, OSError, ValueError):
+            prev = {}
+        if not isinstance(prev, dict):
+            prev = {}
+        buckets: dict[str, float] = {}
+        if isinstance(explicit, dict) and explicit:
+            buckets = {str(day): _finite_positive(cents) for day, cents in explicit.items()}
+        elif isinstance(prev.get("cost_by_utc_day"), dict) and prev.get("cost_by_utc_day"):
+            buckets = {str(day): _finite_positive(cents) for day, cents in prev["cost_by_utc_day"].items()}
+        elif prev:
+            prev_stamp = float(prev.get("finished_at_epoch") or prev.get("started_at_epoch") or 0.0)
+            prev_cents = _receipt_cost_cents(prev)
+            if prev_cents > 0.0 and prev_stamp > 0.0:
+                buckets[_utc_day(prev_stamp)] = prev_cents
+        growth = total - sum(buckets.values())
+        if growth > 1e-9:
+            if prev:
+                stamp = float(record.get("updated_at_epoch") or time.time())
+            else:
+                stamp = float(record.get("finished_at_epoch") or record.get("started_at_epoch")
+                              or record.get("updated_at_epoch") or time.time())
+            day = _utc_day(stamp)
+            buckets[day] = buckets.get(day, 0.0) + growth
+        excess = sum(buckets.values()) - total
+        for day in sorted(buckets, reverse=True):
+            if excess <= 1e-9:
+                break
+            cut = min(buckets[day], excess)
+            buckets[day] -= cut
+            excess -= cut
+        return {day: round(cents, 6) for day, cents in sorted(buckets.items()) if cents > 1e-9}
+
     def read_receipt(self, job_id: str) -> dict[str, Any]:
         path = self.receipt_path(job_id)
         if not path.exists():
@@ -790,9 +878,13 @@ class ReceiptStore:
         target_ws = str(Path(workspace_root).resolve()) if workspace_root else None
         receipts: list[dict[str, Any]] = []
         for path in sorted(self.receipts_dir.glob("*.json")):
+            if path.name.endswith(".live.json"):
+                continue
             try:
                 rec = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(rec, dict) or not rec.get("job_id"):
                 continue
             if target_ws and rec.get("workspace_root") not in (None, "/workspace", target_ws):
                 continue
@@ -917,6 +1009,15 @@ class ReceiptStore:
         jobs_today = 0
         for rec in receipts:
             stamp = float(rec.get("finished_at_epoch") or rec.get("started_at_epoch") or 0.0)
+            buckets = rec.get("cost_by_utc_day")
+            if isinstance(buckets, dict) and buckets:
+                # Per-day spend recorded as the job ran: a job resumed across midnight is split correctly.
+                cents_today = _finite_positive(buckets.get(utc_day))
+                if cents_today <= 0.0 and (stamp <= 0.0 or _utc_day(stamp) != utc_day):
+                    continue
+                jobs_today += 1
+                spent_usd = round(spent_usd + cents_today / 100.0, 8)
+                continue
             if stamp <= 0.0:
                 continue
             if datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d") != utc_day:

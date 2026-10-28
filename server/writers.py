@@ -127,7 +127,7 @@ class AppliedAnswer:
 
 @dataclass
 class LadderOutcome:
-    state: str  # "landed" | "failed"
+    state: str  # "landed" | "failed" | "held" (batch stopped before the task finished)
     attempts: int
     writer_used: str
     detail: str = ""
@@ -177,6 +177,21 @@ def _detect_eol(data: bytes) -> str:
     return "\r\n" if crlf and crlf == data.count(b"\n") else "\n"
 
 
+def symlink_component(root: str | Path, rel: str) -> str | None:
+    """Return the first existing component of ``rel`` under ``root`` that is a symlink, else None.
+
+    Walks the unresolved path one component at a time, so an alias such as ``safe.txt -> .env`` or a
+    linked directory is caught before anything follows it.
+    """
+    base = Path(root)
+    current = base
+    for part in PurePosixPath(rel).parts:
+        current = current / part
+        if current.is_symlink():
+            return current.relative_to(base).as_posix()
+    return None
+
+
 def apply_writer_answer(
     task: FileTask,
     raw: Any,
@@ -194,10 +209,20 @@ def apply_writer_answer(
     if path != task.path:
         raise AnswerRejected(f"answer path {path!r} does not match the task path {task.path!r}")
     posix = PurePosixPath(task.path)
-    root_path = Path(root).resolve()
-    target = (root_path / posix.as_posix()).resolve()
-    if posix.is_absolute() or ".." in posix.parts or not target.is_relative_to(root_path) or is_protected_path(task.path):
+    if posix.is_absolute() or ".." in posix.parts or not posix.parts or is_protected_path(task.path):
         raise AnswerRejected(f"answer path {path!r} is not a safe workspace path")
+    root_path = Path(root).resolve()
+    # Check every unresolved component first: resolve() follows links, so a check on the resolved
+    # path alone can never see that safe.txt is an alias for .env.
+    link = symlink_component(root_path, task.path)
+    if link is not None:
+        raise AnswerRejected(f"{task.path!r} goes through a symlink ({link!r})")
+    target = (root_path / posix.as_posix()).resolve()
+    if not target.is_relative_to(root_path) or target == root_path:
+        raise AnswerRejected(f"answer path {path!r} is not a safe workspace path")
+    resolved_rel = target.relative_to(root_path).as_posix()
+    if is_protected_path(resolved_rel):
+        raise AnswerRejected(f"answer path {path!r} resolves to the protected path {resolved_rel!r}")
 
     has_content = "content" in answer
     has_edits = "edits" in answer
@@ -206,8 +231,6 @@ def apply_writer_answer(
     if not has_content and not has_edits:
         raise AnswerRejected("answer has neither 'content' nor 'edits'")
 
-    if target.is_symlink() or any(p.is_symlink() for p in target.parents if p.is_relative_to(root_path) and p != root_path):
-        raise AnswerRejected(f"{task.path!r} goes through a symlink")
     previous = target.read_bytes() if target.is_file() else None
     if task.action == "modify" and previous is None:
         raise AnswerRejected(f"cannot modify {task.path!r}: the file does not exist")
@@ -291,15 +314,21 @@ def run_writer_ladder(
     allow_existing: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     jitter: Callable[[], float] = random.random,
-    before_call: Callable[[str], None] | None = None,
+    before_call: Callable[[str], bool | None] | None = None,
     on_transient: Callable[[float], None] | None = None,
+    after_call: Callable[[str, WriterReply | None], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> LadderOutcome:
     """Run one task up the writer ladder until an answer passes verification or the ladder ends.
 
     ``verify`` writes the answer into the job copy, runs the task's checks and returns
     ``(passed, failure_tail)``; it must restore the previous file content when checks fail.
-    ``before_call`` runs before every writer call (batch-wide throttle and budget); ``on_transient``
-    is told about every transient wait so other tasks can back off too.
+    ``before_call`` runs before every writer call (batch-wide throttle, budget and escalation cap);
+    returning False means the call is not admitted: the task is ``held`` when ``should_stop`` reports
+    a batch stop (budget reached, cancel, auth failure), otherwise that rung is skipped.
+    ``after_call`` runs after every admitted call, with the reply or None when the call raised, so
+    spend is recorded the moment it happens rather than when the whole ladder ends.
+    ``on_transient`` is told about every transient wait so other tasks can back off too.
     Network failures that carry no HTTP status (connection reset, client timeout) count as transient
     by exception type; everything else is decided from the status code only.
     """
@@ -314,25 +343,42 @@ def run_writer_ladder(
     def note(name: str, result: str, detail: str = "", cost: float = 0.0) -> None:
         outcome.history.append({"writer": name, "result": result, "detail": detail[-300:], "cost_cents": round(cost, 4)})
 
+    def hold(name: str) -> LadderOutcome:
+        note(name, "stopped", "batch stopped before this call")
+        outcome.state = "held"
+        outcome.detail = outcome.detail or "batch stopped before this task finished"
+        return outcome
+
     while idx < len(rungs):
         name = rungs[idx]
         writer = writers.get(name)
         if writer is None:
             idx += 1
             continue
-        if before_call is not None:
-            before_call(name)
-        request = make(task, name, failure_tail)
-        try:
-            reply = writer(request)
-        except WriterAuthError:
-            raise
-        except WriterConfigError as exc:
-            note(name, "writer_error", str(exc))
-            outcome.detail = f"writer {name!r} could not run: {exc}"
+        if should_stop is not None and should_stop():
+            return hold(name)
+        if before_call is not None and before_call(name) is False:
+            if should_stop is not None and should_stop():
+                return hold(name)
+            note(name, "not_admitted", "writer call not admitted (escalation cap reached)")
             idx = _next_distinct(rungs, idx)
             continue
-        except WriterTransportError as exc:
+        reply: WriterReply | None = None
+        try:
+            request = make(task, name, failure_tail)
+            reply = writer(request)
+        except BaseException as exc:
+            # Release the call's budget slot before any backoff sleep, so a waiting task is not
+            # blocked by a call that is no longer running.
+            if after_call is not None:
+                after_call(name, None)
+            if isinstance(exc, WriterConfigError):
+                note(name, "writer_error", str(exc))
+                outcome.detail = f"writer {name!r} could not run: {exc}"
+                idx = _next_distinct(rungs, idx)
+                continue
+            if not isinstance(exc, WriterTransportError):
+                raise
             used = waits_by_writer.get(name, 0)
             if used >= MAX_TRANSIENT_WAITS:
                 note(name, "transient_exhausted", str(exc))
@@ -347,6 +393,8 @@ def run_writer_ladder(
                 on_transient(delay)
             sleep(delay)
             continue
+        if after_call is not None:
+            after_call(name, reply)
         outcome.cost_cents += float(reply.cost_cents or 0.0)
         outcome.pricing_known = outcome.pricing_known and bool(reply.pricing_known)
         _add_usage(outcome.usage, reply.usage)

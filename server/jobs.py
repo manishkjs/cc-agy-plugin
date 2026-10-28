@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -58,15 +59,27 @@ from server.regions import (
 
 
 def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-c", "core.quotePath=false", *args],
-        cwd=str(cwd),
+    # Hooks, fsmonitor, external diff/textconv, and clean/smudge filters stay off and the environment is
+    # credential-free: worker or check commands can rewrite a job copy's .git/config or hooks.
+    from server.verify import run_git
+
+    return run_git(
+        ["-c", "core.quotePath=false", *args],
+        cwd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         check=check,
     )
+
+
+def _git_raw(args: list[str], cwd: Path | str | None = None, **kwargs: Any) -> subprocess.CompletedProcess:
+    """A plugin git call with the caller's own ``subprocess.run`` options, guarded like ``_run_git``
+    (see ``verify.run_git``)."""
+    from server.verify import run_git
+
+    return run_git(args, cwd, **kwargs)
 
 
 def _strip_dot_slash(path_str: str) -> str:
@@ -186,22 +199,21 @@ def capture_live_workspace_diff(
             shutil.copy2(real_index, tmp_index_path)
         else:
             tmp_index_path.unlink(missing_ok=True)
-        env = dict(os.environ)
-        env["GIT_INDEX_FILE"] = str(tmp_index_path)
-        subprocess.run(
-            ["git", "-c", "core.quotePath=false", "add", "-N", "."],
+        index_env = {"GIT_INDEX_FILE": str(tmp_index_path)}
+        _git_raw(
+            ["-c", "core.quotePath=false", "add", "-N", "."],
             cwd=str(workspace_root),
-            env=env,
+            env_overrides=index_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=False,
         )
-        diff_res = subprocess.run(
-            ["git", "-c", "core.quotePath=false", "diff", "--binary", "--no-renames", target_ref],
+        diff_res = _git_raw(
+            ["-c", "core.quotePath=false", "diff", "--binary", "--no-renames", target_ref],
             cwd=str(workspace_root),
-            env=env,
+            env_overrides=index_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -213,50 +225,304 @@ def capture_live_workspace_diff(
         tmp_index_path.unlink(missing_ok=True)
 
 
+class _DirTreeSnapshot(dict[str, bytes]):
+    """Byte and metadata snapshot of a file or directory tree under .git."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kind: str = "absent"
+        self.root_mode: int | None = None
+        self.link_target: str | None = None
+        self.link_target_digest: str | None = None
+        self.modes: dict[str, int] = {}
+        self.subdirs: dict[str, int] = {}
+        self.symlinks: dict[str, str] = {}
+        self.unreadable: bool = False
+
+
 def _snapshot_directory_tree(root: Path) -> dict[str, bytes]:
-    """Capture a byte snapshot of files inside `root` (used to protect host .git/hooks and .git/config)."""
-    snap: dict[str, bytes] = {}
-    if not root.exists():
+    """Capture a byte and mode snapshot of `root` (used to protect .git/hooks, .git/config, .git/info)."""
+    snap = _DirTreeSnapshot()
+    try:
+        st = root.lstat()
+    except FileNotFoundError:
         return snap
-    if root.is_file():
+    except OSError:
+        snap.unreadable = True
+        return snap
+    if stat.S_ISLNK(st.st_mode):
+        from server.verify import _symlink_target_digest
+
+        snap.kind = "symlink"
+        try:
+            snap.link_target = os.readlink(root)
+            snap.link_target_digest = _symlink_target_digest(root)
+            if snap.link_target_digest is None:
+                snap.unreadable = True
+        except OSError:
+            snap.unreadable = True
+        return snap
+    if stat.S_ISREG(st.st_mode):
+        snap.kind = "file"
+        snap.root_mode = st.st_mode & 0o7777
+        snap.modes[""] = snap.root_mode
         try:
             snap[""] = root.read_bytes()
         except OSError:
-            pass
+            snap.unreadable = True
         return snap
-    for p in sorted(root.rglob("*")):
-        if p.is_file() and not p.is_symlink():
-            rel = str(p.relative_to(root))
+    if not stat.S_ISDIR(st.st_mode):
+        snap.unreadable = True
+        return snap
+    snap.kind = "dir"
+    snap.root_mode = st.st_mode & 0o7777
+
+    def _on_walk_err(_err: OSError) -> None:
+        snap.unreadable = True
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_on_walk_err, followlinks=False):
+        dp = Path(dirpath)
+        dirnames.sort()
+        filenames.sort()
+        real_dirs: list[str] = []
+        for d in dirnames:
+            sub = dp / d
+            rel_d = sub.relative_to(root).as_posix()
             try:
-                snap[rel] = p.read_bytes()
+                 dst = sub.lstat()
             except OSError:
-                pass
+                snap.unreadable = True
+                continue
+            if stat.S_ISLNK(dst.st_mode):
+                try:
+                    snap.symlinks[rel_d] = os.readlink(sub)
+                except OSError:
+                    snap.unreadable = True
+            elif stat.S_ISDIR(dst.st_mode):
+                snap.subdirs[rel_d] = dst.st_mode & 0o7777
+                real_dirs.append(d)
+            else:
+                snap.unreadable = True
+        dirnames[:] = real_dirs
+        for f in filenames:
+            fp = dp / f
+            rel_f = fp.relative_to(root).as_posix()
+            try:
+                fst = fp.lstat()
+            except OSError:
+                snap.unreadable = True
+                continue
+            if stat.S_ISLNK(fst.st_mode):
+                try:
+                    snap.symlinks[rel_f] = os.readlink(fp)
+                except OSError:
+                    snap.unreadable = True
+            elif stat.S_ISREG(fst.st_mode):
+                snap.modes[rel_f] = fst.st_mode & 0o7777
+                try:
+                    snap[rel_f] = fp.read_bytes()
+                except OSError:
+                    snap.unreadable = True
+            else:
+                snap.unreadable = True
     return snap
 
 
+def _make_dir_owner_writable(d: Path) -> None:
+    if not d.is_symlink() and d.is_dir():
+        try:
+            os.chmod(d, (d.lstat().st_mode & 0o7777) | 0o700)
+        except OSError:
+            pass
+
+
+def _force_remove_tree_or_entry(p: Path) -> None:
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        p.unlink(missing_ok=True)
+        return
+    if stat.S_ISDIR(st.st_mode):
+        _make_dir_owner_writable(p)
+        for dirpath, dirnames, filenames in os.walk(p, topdown=True, followlinks=False):
+            dp = Path(dirpath)
+            for d in dirnames:
+                _make_dir_owner_writable(dp / d)
+            for f in filenames:
+                fp = dp / f
+                if not fp.is_symlink() and fp.is_file():
+                    try:
+                        os.chmod(fp, 0o600)
+                    except OSError:
+                        pass
+        shutil.rmtree(p, ignore_errors=True)
+        return
+    if stat.S_ISREG(st.st_mode):
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+    p.unlink(missing_ok=True)
+
+
 def _restore_directory_tree(root: Path, snap: dict[str, bytes]) -> bool:
-    """Verify `root` matches `snap`; if tampered, restore `root` to `snap` and return True."""
+    """Verify `root` matches `snap`; if tampered (including planted symlinks or read-only modes), restore `root` and return True."""
+    if root.parent.is_symlink():
+        return True
     current = _snapshot_directory_tree(root)
-    if current == snap:
-        return False
-    if root.is_file() or ("" in snap):
-        if "" in snap:
-            root.parent.mkdir(parents=True, exist_ok=True)
-            root.write_bytes(snap[""])
-        elif root.exists():
-            root.unlink(missing_ok=True)
+    assert isinstance(current, _DirTreeSnapshot)
+    if isinstance(snap, _DirTreeSnapshot):
+        expected_kind = snap.kind
+        expected_root_mode = snap.root_mode
+        expected_link = snap.link_target
+        expected_modes = snap.modes
+        expected_subdirs = snap.subdirs
+        expected_symlinks = snap.symlinks
+        if (
+            not snap.unreadable
+            and not current.unreadable
+            and current.kind == expected_kind
+            and current.link_target == expected_link
+            and (expected_kind != "symlink" or current.link_target_digest == snap.link_target_digest)
+            and (expected_root_mode is None or current.root_mode == expected_root_mode)
+            and dict(current) == dict(snap)
+            and current.modes == expected_modes
+            and current.subdirs == expected_subdirs
+            and current.symlinks == expected_symlinks
+        ):
+            return False
+    else:
+        expected_kind = "file" if "" in snap else ("dir" if snap else "absent_or_empty")
+        expected_root_mode = None
+        expected_link = None
+        expected_modes = {}
+        expected_subdirs = {}
+        expected_symlinks = {}
+        if not current.unreadable and not current.symlinks:
+            if expected_kind == "file" and current.kind == "file" and dict(current) == snap:
+                return False
+            if expected_kind == "dir" and current.kind == "dir" and dict(current) == snap:
+                return False
+            if expected_kind == "absent_or_empty" and (
+                current.kind == "absent" or (current.kind == "dir" and not current)
+            ):
+                return False
+
+    if root.parent.exists():
+        _make_dir_owner_writable(root.parent)
+    else:
+        root.parent.mkdir(parents=True, exist_ok=True)
+
+    if expected_kind == "absent":
+        _force_remove_tree_or_entry(root)
+        return True
+    if expected_kind == "absent_or_empty":
+        if root.is_dir() and not root.is_symlink():
+            _make_dir_owner_writable(root)
+            for child in list(root.iterdir()):
+                _force_remove_tree_or_entry(child)
+        else:
+            _force_remove_tree_or_entry(root)
+        return True
+    if expected_kind == "symlink" and expected_link is not None:
+        _force_remove_tree_or_entry(root)
+        os.symlink(expected_link, root)
+        return True
+    if expected_kind == "file":
+        _force_remove_tree_or_entry(root)
+        root.write_bytes(snap[""])
+        if expected_root_mode is not None:
+            os.chmod(root, expected_root_mode)
         return True
 
-    if root.exists():
-        for p in list(root.rglob("*")):
-            if p.is_file() or p.is_symlink():
-                rel = str(p.relative_to(root))
-                if rel not in snap:
-                    p.unlink(missing_ok=True)
-    for rel, content in snap.items():
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+    # expected_kind == "dir"
+    if not root.is_dir() or root.is_symlink():
+        _force_remove_tree_or_entry(root)
+        root.mkdir(parents=True, exist_ok=True)
+    _make_dir_owner_writable(root)
+    for dirpath, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+        dp = Path(dirpath)
+        for d in dirnames:
+            _make_dir_owner_writable(dp / d)
+
+    needed_dirs: set[str] = set(expected_subdirs)
+    for rel_key in (*snap.keys(), *expected_symlinks.keys()):
+        if not rel_key:
+            continue
+        parts = Path(rel_key).parts
+        for idx in range(1, len(parts)):
+            needed_dirs.add(Path(*parts[:idx]).as_posix())
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        dp = Path(dirpath)
+        for name in filenames:
+            fp = dp / name
+            rel = fp.relative_to(root).as_posix()
+            keep_file = rel in snap and fp.is_file() and not fp.is_symlink()
+            keep_link = rel in expected_symlinks and fp.is_symlink() and os.readlink(fp) == expected_symlinks[rel]
+            if not (keep_file or keep_link):
+                _force_remove_tree_or_entry(fp)
+        for name in dirnames:
+            sub = dp / name
+            rel = sub.relative_to(root).as_posix()
+            if sub.is_symlink():
+                if rel not in expected_symlinks or os.readlink(sub) != expected_symlinks[rel]:
+                    sub.unlink(missing_ok=True)
+            elif rel not in needed_dirs:
+                _force_remove_tree_or_entry(sub)
+
+    for drel in sorted(needed_dirs):
+        dp = root / drel
+        if dp.is_symlink() or (dp.exists() and not dp.is_dir()):
+            _force_remove_tree_or_entry(dp)
+        dp.mkdir(parents=True, exist_ok=True)
+        _make_dir_owner_writable(dp)
+
+    for srel, target_str in sorted(expected_symlinks.items()):
+        sp = root / srel
+        if not (sp.is_symlink() and os.readlink(sp) == target_str):
+            _force_remove_tree_or_entry(sp)
+            os.symlink(target_str, sp)
+
+    for rel, content in sorted(snap.items()):
+        if not rel:
+            continue
+        tp = root / rel
+        if tp.is_symlink() or (tp.exists() and not tp.is_file()):
+            _force_remove_tree_or_entry(tp)
+        need_write = True
+        if tp.is_file() and not tp.is_symlink():
+            try:
+                if tp.read_bytes() == content:
+                    need_write = False
+            except OSError:
+                need_write = True
+        if need_write:
+            if tp.exists():
+                try:
+                    os.chmod(tp, (tp.lstat().st_mode & 0o7777) | 0o600)
+                except OSError:
+                    pass
+            tp.write_bytes(content)
+        if rel in expected_modes:
+            os.chmod(tp, expected_modes[rel])
+
+    for drel, dmode in sorted(expected_subdirs.items(), reverse=True):
+        dp = root / drel
+        if dp.is_dir() and not dp.is_symlink():
+            try:
+                os.chmod(dp, dmode)
+            except OSError:
+                pass
+    if expected_root_mode is not None:
+        try:
+            os.chmod(root, expected_root_mode)
+        except OSError:
+            pass
     return True
 
 
@@ -537,6 +803,106 @@ def _nm_links_contain_host_symlinks(created_dirs: list[Path], host_root: Path) -
     return False
 
 
+def _iter_pnpm_nm_symlinks(nm_dir: Path) -> list[Path]:
+    """Yield direct package symlinks inside `.pnpm/<pkg>/node_modules` (including `@scope/*`)."""
+    out: list[Path] = []
+    try:
+        for entry in os.scandir(nm_dir):
+            ep = Path(entry.path)
+            if entry.is_symlink():
+                out.append(ep)
+            elif entry.name.startswith("@") and entry.is_dir(follow_symlinks=False):
+                for sub in os.scandir(ep):
+                    if sub.is_symlink():
+                        out.append(Path(sub.path))
+    except OSError:
+        pass
+    return out
+
+
+def _copy_pnpm_virtual_store_closure(
+    pnpm_nm_anc: Path,
+    ext_pnpm_root: Path,
+    *,
+    fs_cow: bool,
+    allow_shallow_symlinks: bool,
+    copy_budget: list[int] | None = None,
+) -> bool:
+    """Materialize `pnpm_nm_anc` plus its transitive sibling `.pnpm/<dep>/node_modules` closure."""
+    pnpm_store_root = pnpm_nm_anc.parent.parent
+    if pnpm_store_root.name != ".pnpm" or not pnpm_nm_anc.is_dir():
+        return False
+    visited: set[Path] = set()
+    to_copy: list[Path] = []
+    queue: list[Path] = [pnpm_nm_anc]
+    budget = copy_budget if (isinstance(copy_budget, list) and len(copy_budget) >= 2) else [0, 0]
+    start_files, start_bytes = int(budget[0]), int(budget[1])
+    while queue:
+        cur_nm = queue.pop(0)
+        if cur_nm in visited:
+            continue
+        visited.add(cur_nm)
+        dst_cur_nm = ext_pnpm_root / cur_nm.parent.name / "node_modules"
+        if not dst_cur_nm.exists():
+            if not fs_cow:
+                cur_str = str(cur_nm)
+                try:
+                    for cr, sdirs, fnames in os.walk(cur_str, topdown=True, followlinks=False):
+                        budget[0] += len(fnames) + len(sdirs)
+                        if budget[0] > _NM_COPY_MAX_FILES:
+                            budget[0], budget[1] = start_files, start_bytes
+                            return False
+                        for fn in fnames:
+                            try:
+                                budget[1] += int(os.lstat(os.path.join(cr, fn)).st_size)
+                                if budget[1] > _NM_COPY_MAX_BYTES:
+                                    budget[0], budget[1] = start_files, start_bytes
+                                    return False
+                            except OSError:
+                                continue
+                except OSError:
+                    budget[0], budget[1] = start_files, start_bytes
+                    return False
+            to_copy.append(cur_nm)
+        for s_link in _iter_pnpm_nm_symlinks(cur_nm):
+            try:
+                s_res = (s_link.parent / os.readlink(s_link)).resolve()
+            except OSError:
+                continue
+            if not s_res.exists():
+                continue
+            if s_res.is_relative_to(pnpm_store_root):
+                for anc in s_res.parents:
+                    if anc.name == "node_modules" and anc.parent.parent == pnpm_store_root:
+                        if anc not in visited:
+                            queue.append(anc)
+                        break
+
+    for cur_nm in to_copy:
+        dst_cur_nm = ext_pnpm_root / cur_nm.parent.name / "node_modules"
+        if not dst_cur_nm.exists():
+            _copy_isolated_pkg_entry(cur_nm, dst_cur_nm, try_cow=fs_cow)
+    for cur_nm in to_copy:
+        dst_cur_nm = ext_pnpm_root / cur_nm.parent.name / "node_modules"
+        for dst_link in _iter_pnpm_nm_symlinks(dst_cur_nm):
+            if dst_link.exists():
+                continue
+            rel_in_nm = dst_link.relative_to(dst_cur_nm)
+            src_link = cur_nm / rel_in_nm
+            try:
+                s_res = (src_link.parent / os.readlink(src_link)).resolve()
+            except OSError:
+                continue
+            if not s_res.exists():
+                continue
+            dst_link.unlink(missing_ok=True)
+            if fs_cow or _probe_nm_within_copy_budget(s_res):
+                _copy_isolated_pkg_entry(s_res, dst_link, try_cow=fs_cow)
+            elif allow_shallow_symlinks:
+                os.symlink(str(s_res), str(dst_link))
+    return True
+
+
 def link_host_node_modules_farm(
     host_root: Path,
     wt_dir: Path,
@@ -559,6 +925,7 @@ def link_host_node_modules_farm(
         return []
 
     created_dirs: list[Path] = []
+    cumulative_pnpm_budget: list[int] = [0, 0]
     for cur_root, dirs, _files in os.walk(str(host_resolved), topdown=True, followlinks=False):
         cur_path = Path(cur_root)
         has_nm = "node_modules" in dirs
@@ -621,6 +988,36 @@ def link_host_node_modules_farm(
                     elif allow_shallow_symlinks:
                         os.symlink(str(src_p), str(dst_p))
                     return
+                if resolved_target.is_relative_to(host_resolved):
+                    wt_equiv = wt_resolved / resolved_target.relative_to(host_resolved)
+                    if wt_equiv.exists() or wt_equiv.is_symlink():
+                        os.symlink(os.path.relpath(wt_equiv, dst_parent), str(dst_p))
+                        return
+                if "/.pnpm/" in resolved_target.as_posix() and resolved_target.exists():
+                    pnpm_nm_anc: Path | None = None
+                    for anc in resolved_target.parents:
+                        if anc.name == "node_modules" and anc.parent.parent.name == ".pnpm":
+                            pnpm_nm_anc = anc
+                            break
+                    ext_pnpm_root = wt_nm / ".cc-agy-ext-store" / ".pnpm"
+                    if (
+                        pnpm_nm_anc is not None
+                        and _copy_pnpm_virtual_store_closure(
+                            pnpm_nm_anc,
+                            ext_pnpm_root,
+                            fs_cow=fs_cow,
+                            allow_shallow_symlinks=allow_shallow_symlinks,
+                            copy_budget=cumulative_pnpm_budget,
+                        )
+                    ):
+                        ext_pnpm_nm = ext_pnpm_root / pnpm_nm_anc.parent.name / "node_modules"
+                        ext_pkg = ext_pnpm_nm / resolved_target.relative_to(pnpm_nm_anc)
+                        os.symlink(os.path.relpath(ext_pkg, dst_parent), str(dst_p))
+                        return
+                    if allow_shallow_symlinks:
+                        os.symlink(str(resolved_target), str(dst_p))
+                        return
+                    return
                 if resolved_target.exists() and (isolate_copies or _probe_nm_within_copy_budget(resolved_target)):
                     ext_copy = wt_nm / ".cc-agy-ext-store" / dst_p.relative_to(wt_nm)
                     if not ext_copy.exists():
@@ -646,6 +1043,32 @@ def link_host_node_modules_farm(
             if name in _NM_TRANSIENT_CACHE_ENTRIES:
                 continue
             entry_path = Path(entry.path)
+            if name == ".bin" and entry.is_dir(follow_symlinks=True):
+                wt_bin = wt_nm / ".bin"
+                try:
+                    wt_bin.mkdir(parents=False, exist_ok=True)
+                    bin_entries = sorted(os.scandir(entry_path), key=lambda e: e.name)
+                except OSError:
+                    continue
+                for b_ent in bin_entries:
+                    b_src = Path(b_ent.path)
+                    b_dst = wt_bin / b_ent.name
+                    try:
+                        if b_src.is_symlink():
+                            raw_b_target = os.readlink(b_src)
+                            res_b_target = (b_src.parent / raw_b_target).resolve()
+                            if res_b_target.is_relative_to(host_nm_resolved):
+                                rel_in_nm = res_b_target.relative_to(host_nm_resolved)
+                                os.symlink(os.path.relpath(wt_nm / rel_in_nm, wt_bin), str(b_dst))
+                            elif not os.path.isabs(raw_b_target):
+                                os.symlink(raw_b_target, str(b_dst))
+                            elif res_b_target.is_file():
+                                shutil.copy2(res_b_target, b_dst)
+                        elif b_src.is_file():
+                            shutil.copy2(b_src, b_dst)
+                    except OSError:
+                        continue
+                continue
             if name.startswith("@") and entry.is_dir(follow_symlinks=False):
                 wt_scope = wt_nm / name
                 try:
@@ -722,6 +1145,150 @@ _GENERATED_REPORT_NAMES: frozenset[str] = frozenset(
         "nosetests.xml",
     }
 )
+_FIXTURE_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {"testdata", "fixtures", "fixture", "snapshots", "__snapshots__", "golden"}
+)
+_UNTRACKED_MODEL_OR_DATA_DUMP_SUFFIXES: tuple[str, ...] = (
+    ".joblib",
+    ".pkl",
+    ".pickle",
+    ".npy",
+    ".npz",
+    ".pt",
+    ".pth",
+    ".h5",
+    ".onnx",
+    ".parquet",
+)
+
+
+def _is_untracked_runtime_artifact_name(rel_path: str) -> bool:
+    """Return True for transient runtime log, pid, or serialized model/dataset dump files unless in a fixture dir."""
+    norm = rel_path.replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    parts = norm.split("/")
+    if any(p.lower() in _FIXTURE_PATH_SEGMENTS for p in parts[:-1]):
+        return False
+    low_name = parts[-1].lower()
+    if low_name.endswith((".log", ".pid", ".pid.lock", *_UNTRACKED_MODEL_OR_DATA_DUMP_SUFFIXES)):
+        return True
+    return False
+
+
+_GENERIC_MODULE_STEMS: frozenset[str] = frozenset(
+    {"__init__", "init", "index", "main", "test", "tests", "utils", "common", "base", "types", "config", "constants"}
+)
+_IMPORTABLE_MODULE_EXTS: frozenset[str] = frozenset(
+    {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".kt", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".cs", ".swift"}
+)
+
+
+def _is_referenced_by_files_or_prompt(
+    rel_cand: str,
+    ref_files: list[str] | None,
+    root: Path | None,
+    *,
+    prompt_text: str = "",
+) -> bool:
+    """Return True if `rel_cand` (or its basename with extension, or its module stem for importable code files) is referenced in `prompt_text` or `ref_files`."""
+    cand_norm = rel_cand.replace("\\", "/").strip("/")
+    if not cand_norm:
+        return False
+    cand_name = Path(cand_norm).name
+    cand_sfx = Path(cand_norm).suffix.lower()
+    cand_stem = Path(cand_norm).stem
+    cand_no_ext = str(Path(cand_norm).with_suffix("")).replace("\\", "/")
+    cand_dotted = cand_no_ext.replace("/", ".")
+    prompt_low = (prompt_text or "").lower()
+    if prompt_low:
+        if cand_norm.lower() in prompt_low or (len(cand_name) >= 4 and "." in cand_name and cand_name.lower() in prompt_low):
+            return True
+    if not ref_files or root is None or not root.exists():
+        return False
+    check_stem = (
+        cand_sfx in _IMPORTABLE_MODULE_EXTS
+        and not _is_untracked_runtime_artifact_name(cand_norm)
+        and len(cand_stem) >= 3
+        and cand_stem.lower() not in _GENERIC_MODULE_STEMS
+    )
+    stem_re = re.compile(rf"\b{re.escape(cand_stem)}\b") if check_stem else None
+    for rf in ref_files:
+        rf_norm = str(rf or "").replace("\\", "/").strip("/")
+        if not rf_norm or rf_norm == cand_norm:
+            continue
+        if cand_sfx == ".go" and Path(rf_norm).suffix.lower() == ".go" and Path(rf_norm).parent == Path(cand_norm).parent:
+            return True
+        rf_p = root / rf_norm
+        try:
+            if not rf_p.is_file() or rf_p.is_symlink():
+                continue
+            with rf_p.open("rb") as fh:
+                raw_bytes = fh.read(262_144)
+            txt = raw_bytes.decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+        if cand_norm in txt or ("." in cand_name and cand_name in txt):
+            return True
+        if check_stem and (
+            cand_dotted in txt
+            or cand_no_ext in txt
+            or (stem_re is not None and stem_re.search(txt))
+        ):
+            return True
+    return False
+
+
+def _explicitly_targets_runtime_artifact(
+    rel_cand: str,
+    allowed_paths: list[str] | None,
+    *,
+    prompt_text: str = "",
+    ref_files: list[str] | None = None,
+    root: Path | None = None,
+) -> bool:
+    """Return True when `allowed_paths`, `prompt_text`, or `ref_files` explicitly names or references `rel_cand`."""
+    if not _is_untracked_runtime_artifact_name(rel_cand):
+        return False
+    cand_norm = rel_cand.replace("\\", "/").strip("/")
+    cand_sfx = Path(cand_norm).suffix.lower()
+    for pat in allowed_paths or []:
+        p_norm = str(pat or "").replace("\\", "/").strip("/")
+        if not p_norm or p_norm in (".", "*", "**", "**/*"):
+            continue
+        if (
+            p_norm == cand_norm
+            or (
+                cand_sfx
+                and p_norm.lower().endswith(cand_sfx)
+                and _matches_allowed_paths(cand_norm, [p_norm])
+            )
+            or (
+                "/" in cand_norm
+                and p_norm.split("/", 1)[0] == cand_norm.split("/", 1)[0]
+                and _matches_allowed_paths(cand_norm, [p_norm])
+            )
+        ):
+            return True
+    if (prompt_text or ref_files) and _is_referenced_by_files_or_prompt(
+        cand_norm, ref_files, root, prompt_text=prompt_text
+    ):
+        return True
+    return False
+
+
+def _is_tracked_in_git(root: Path, rel_path: str) -> bool:
+    try:
+        res = _git_raw(
+            ["ls-files", "--error-unmatch", "--", rel_path],
+            cwd=str(root),
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        return res.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None) -> bool:
@@ -741,6 +1308,9 @@ def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None
         or name.endswith(_EPHEMERAL_CACHE_SUFFIXES)
     ):
         return True
+    if root is not None and _is_untracked_runtime_artifact_name(norm):
+        if not _is_tracked_in_git(root, norm):
+            return True
     if root is not None:
         candidate = root / norm
         if candidate.is_file() and not candidate.is_symlink():
@@ -758,8 +1328,8 @@ def _is_ephemeral_build_or_test_artifact(rel_path: str, root: Path | None = None
 def _is_gitignored_on_host(workspace_root: Path, rel_path: str) -> bool:
     """True if `rel_path` is ignored by the host repo's .gitignore rules (False when not a git repo)."""
     try:
-        res = subprocess.run(
-            ["git", "check-ignore", "-q", "--", rel_path],
+        res = _git_raw(
+            ["check-ignore", "-q", "--", rel_path],
             cwd=str(workspace_root),
             capture_output=True,
             check=False,
@@ -787,10 +1357,14 @@ def _is_ignored_build_artifact(rel_path: str, root: Path | None = None) -> bool:
 
 
 DEFAULT_MAX_TOOL_CALLS = 100
-DEFAULT_FLASH_MAX_TOOL_CALLS = 40
+DEFAULT_FLASH_MAX_TOOL_CALLS = 55
+# Economy has no Argon escalation, so it gives Flash the full 100-call budget; balanced gives Flash
+# 55 calls before escalating to Argon/Carbon (with a 60-call escalation floor) so Flash finishes verified patches cleanly.
+DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS = 100
 DEFAULT_MAX_TOTAL_TOKENS = 5_000_000
 DEFAULT_MAX_WAIT_SLICE_SECONDS = 240.0
 DEFAULT_ACCEPTANCE_TIMEOUT = 300.0
+DEFAULT_BOUNDED_ACCEPTANCE_TIMEOUT = 90.0
 MAX_ACCEPTANCE_COMMANDS = 5
 MAX_PLAN_STEPS = 15
 ACCEPTANCE_OUTPUT_TOKENS = 600
@@ -819,11 +1393,17 @@ def resolve_budget(
     *,
     model: str | None = None,
 ) -> tuple[int | None, int | None]:
-    """Per-turn worker caps (defaults 40 tool calls on Flash / 100 on Pro/Argon, 5M tokens; env overrides; 0 disables)."""
+    """Per-turn worker caps (defaults 55 tool calls on Flash in balanced, 100 on Flash in economy and on Pro/Argon/Carbon,
+    5M tokens; env overrides; 0 disables)."""
     if max_tool_calls is not None:
         calls = max_tool_calls
     elif "flash" in (model or "").lower() and not str(os.environ.get("CC_AGY_MAX_TOOL_CALLS") or "").strip():
-        calls = _env_int("CC_AGY_FLASH_MAX_TOOL_CALLS", DEFAULT_FLASH_MAX_TOOL_CALLS)
+        flash_default = (
+            DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS
+            if resolve_cost_profile() == "economy"
+            else DEFAULT_FLASH_MAX_TOOL_CALLS
+        )
+        calls = _env_int("CC_AGY_FLASH_MAX_TOOL_CALLS", flash_default)
     else:
         calls = _env_int("CC_AGY_MAX_TOOL_CALLS", DEFAULT_MAX_TOOL_CALLS)
     tokens = (
@@ -847,6 +1427,40 @@ def validate_plan(plan: Any) -> list[str]:
     return steps
 
 
+_GO_BUILD_HEAD_RE = re.compile(
+    r"^([\s(]*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s;|&()]+)\s+)*"
+    r"(?:\S*/)?go(?:\s+(?:-C|--C)(?:=(?:\"[^\"]*\"|'[^']*'|[^\s;|&()]+)|\s+(?:\"[^\"]*\"|'[^']*'|[^\s;|&()]+)))*"
+    r"\s+build)(?=\s|$|\))"
+)
+
+
+def _normalize_readonly_go_build_acceptance(cmd: str) -> str:
+    """Insert `-o /dev/null` into bare `go build ...` segments (with no `-o`/`--o`) without re-quoting shell syntax."""
+    parts = re.split(r"(\s*(?:&&|\|\||;|\||\n)\s*)", cmd)
+    changed = False
+    rebuilt: list[str] = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1 or not part.strip():
+            rebuilt.append(part)
+            continue
+        m = _GO_BUILD_HEAD_RE.match(part)
+        if not m:
+            rebuilt.append(part)
+            continue
+        rest = part[m.end() :]
+        rest_for_tokens = re.sub(r"\s*(?:\d*>>?\s*(?:&\d+|\S+)|\d*<\s*\S+)\s*", " ", rest.rstrip(") \t"))
+        try:
+            rest_tokens = shlex.split(rest_for_tokens)
+        except ValueError:
+            rest_tokens = rest_for_tokens.split()
+        if any(a in ("-o", "--o") or a.startswith(("-o=", "--o=")) for a in rest_tokens):
+            rebuilt.append(part)
+            continue
+        rebuilt.append(f"{m.group(1)} -o /dev/null{rest}")
+        changed = True
+    return "".join(rebuilt) if changed else cmd
+
+
 def validate_acceptance(acceptance: Any, workdir: Path) -> list[str]:
     """Acceptance commands must be read-only checks (tests, linters); mutating commands are refused.
 
@@ -856,7 +1470,7 @@ def validate_acceptance(acceptance: Any, workdir: Path) -> list[str]:
         return []
     if not isinstance(acceptance, list) or not all(isinstance(c, str) for c in acceptance):
         raise ValueError("acceptance must be a list of shell command strings")
-    cmds = [c.strip() for c in acceptance if c.strip()]
+    cmds = [_normalize_readonly_go_build_acceptance(c.strip()) for c in acceptance if c.strip()]
     if len(cmds) > MAX_ACCEPTANCE_COMMANDS:
         raise ValueError(f"acceptance has {len(cmds)} commands; at most {MAX_ACCEPTANCE_COMMANDS} allowed")
     from scripts.pre_tool_guard import detect_bash_workspace_mutation
@@ -877,6 +1491,35 @@ _PRELOAD_SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".pdf",
     ".whl", ".tar", ".gz", ".zip", ".pyc", ".so", ".dylib", ".lock",
 }
+_PRELOAD_BOILERPLATE_STEMS = frozenset({
+    "license", "licence", "copying", "notice", "dockerfile", "makefile", "gnumakefile",
+    "changelog", "changes", "history", "authors", "contributors", "contributing",
+    "code_of_conduct", "security",
+})
+_PRELOAD_BOILERPLATE_EXACT = frozenset({
+    ".dockerignore", ".editorconfig", ".gitattributes", ".gitignore",
+    ".prettierrc", ".eslintrc", ".flake8", ".yamllint",
+})
+_PRELOAD_ENTRYPOINT_NAMES = frozenset({
+    "__main__.py", "cli.py", "main.py", "app.py", "main.go", "root.go",
+    "index.ts", "index.tsx", "index.js", "main.ts", "cli.ts", "main.rs", "lib.rs",
+})
+
+
+def _is_preload_boilerplate(rel_path: str, prompt_low: str) -> bool:
+    """Exclude license/Docker/Makefile/README/changelog boilerplate unless explicitly referenced in the prompt."""
+    norm_low = rel_path.replace("\\", "/").strip("/").lower()
+    bname = norm_low.rsplit("/", 1)[-1]
+    if norm_low in prompt_low or bname in prompt_low:
+        return False
+    if bname in _PRELOAD_BOILERPLATE_EXACT:
+        return True
+    stem = bname.split(".", 1)[0]
+    if stem in _PRELOAD_BOILERPLATE_STEMS:
+        return True
+    if stem == "readme" and "readme" not in prompt_low:
+        return True
+    return False
 
 # Reviewer context cap for qa_review_model diff audits.
 QA_REVIEW_MAX_TOKENS = 25_000
@@ -914,9 +1557,9 @@ def is_quota_or_rate_limit_error(error_text: str | None) -> bool:
 
 QA_DIFF_AUDIT_SYSTEM = """You are a senior software engineer performing a 1-shot blocker-only code review of a git diff against a task specification.
 Report ONLY High or Medium functional blockers:
-1. Missing requirements or edge cases explicitly stated in the task specification.
+1. Missing requirements, cross-module wiring, or edge cases explicitly stated in the task specification (check every branch and requirement in the Original User Specification even if abbreviated in the Lead brief).
 2. Subtle logic bugs, off-by-one errors, state leaks, security bugs, or broken imports/exports.
-3. Missing or weak unit test coverage when the repository has automated tests or the task asked for tests.
+3. Weakened or altered pre-existing test assertions/expected outputs made to match broken behavior instead of fixing production code, or missing unit test coverage when the repository has automated tests.
 
 Do NOT report Low, Optional, polish, naming, style, formatting, or future-hardening suggestions.
 Output format:
@@ -931,7 +1574,7 @@ def build_qa_diff_audit_system(*, verification: str | None = None, prompt: str =
         return (
             "You are a senior software engineer performing a 1-shot blocker-only code review of a git diff against a task specification.\n"
             "Report ONLY High or Medium functional blockers:\n"
-            "1. Missing requirements or edge cases explicitly stated in the task specification.\n"
+            "1. Missing requirements or edge cases explicitly stated in the task specification (check every branch and requirement in the Original User Specification even if abbreviated in the Lead brief).\n"
             "2. Subtle logic bugs, off-by-one errors, state leaks, security bugs, or broken imports/exports.\n\n"
             f"This repository has no automated test suite covering this change (verification={ver!r}). "
             "Do NOT fail the diff for missing unit tests unless the task specification explicitly asked to add tests.\n"
@@ -980,8 +1623,8 @@ def select_candidate_files(
     token_budget: int = 120_000,
 ) -> list[tuple[str, str]]:
     """Rank tracked repository files by keyword overlap with task_prompt and return (rel_path, content) pairs."""
-    res = subprocess.run(
-        ["git", "ls-files"],
+    res = _git_raw(
+        ["ls-files"],
         cwd=str(workspace_root),
         capture_output=True,
         text=True,
@@ -1003,6 +1646,8 @@ def select_candidate_files(
         p = workspace_root / rel
         if p.suffix.lower() in _PRELOAD_SKIP_EXTS or not p.is_file() or p.is_symlink():
             continue
+        if _is_preload_boilerplate(rel, prompt_low):
+            continue
         try:
             sz = p.stat().st_size
         except OSError:
@@ -1010,6 +1655,8 @@ def select_candidate_files(
         if sz == 0 or sz > 400_000:
             continue
         rel_low = rel.lower()
+        bname_low = p.name.lower()
+        parts_low = rel_low.split("/")
         score = 0.0
         if rel_low in prompt_low:
             score += 50.0
@@ -1025,7 +1672,17 @@ def select_candidate_files(
         for kw in keywords:
             if kw and kw in txt_low:
                 score += 1.0
-        if not rel_low.startswith(("docs/", "examples/", ".github/")):
+        if score > 0 or bname_low in _PRELOAD_ENTRYPOINT_NAMES:
+            if bname_low in _PRELOAD_ENTRYPOINT_NAMES and not rel_low.startswith(("docs/", "examples/", "tests/", "test/")):
+                score += 4.0
+            elif any(
+                tok in ("api", "client", "queries", "query", "graphql", "rpc", "routes", "router", "handler", "handlers", "cmd", "cli")
+                for seg in parts_low
+                for tok in re.split(r"[._-]+", seg.split(".", 1)[0])
+                if tok
+            ) and score > 0:
+                score += 3.0
+        if score > 0 and not rel_low.startswith(("docs/", "examples/", ".github/")):
             score += 0.5
         if score > 0:
             scored.append((score, rel, sample_txt))
@@ -1215,6 +1872,7 @@ def render_worker_prompt(
         else:
             dynamic_parts.append(
                 "## Original User Request (Verbatim: Do Not Omit Any Requirement)\n"
+                "If the Lead's brief above omits a branch or guesses an unverified flag/helper name, follow this Original User Request and existing repository helpers/callers.\n"
                 + raw_user_prompt.strip()
             )
     if spec_files_inlined:
@@ -1266,12 +1924,21 @@ def render_worker_prompt(
     if acceptance:
         baseline_notes: list[str] = []
         for bp in baseline_acceptance_probe or []:
-            if not isinstance(bp, dict) or bp.get("passed") or bp.get("timed_out"):
+            if not isinstance(bp, dict) or bp.get("passed"):
+                continue
+            bp_cmd = str(bp.get("command") or "").strip()
+            if bp.get("timed_out"):
+                if bp_cmd:
+                    baseline_notes.append(
+                        f"[Baseline Acceptance Timeout Note] Command `{bp_cmd}` exceeded the 15s baseline probe "
+                        f"on clean HEAD because the full test suite is large. Do NOT run the full `{bp_cmd}` "
+                        f"suite during iteration; run only targeted test file(s) covering your modified modules "
+                        f"(post-turn acceptance will also scope to related tests automatically)."
+                    )
                 continue
             bp_rc = bp.get("exit_code")
             if bp_rc in (None, 0):
                 continue
-            bp_cmd = str(bp.get("command") or "").strip()
             bp_tail = " | ".join(
                 ln.strip() for ln in str(bp.get("error_tail") or "").splitlines() if ln.strip()
             )[:280]
@@ -1468,9 +2135,96 @@ def _parse_test_counts(output: str) -> dict[str, int]:
     return counts
 
 
+def _collect_workspace_node_bin_dirs(ws_root: Path, max_sub_dirs: int = 16) -> list[str]:
+    """Return root `node_modules/.bin` followed by bounded 1-to-2-level monorepo subpackage `.bin` directories."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _safe_is_dir(p: Path) -> bool:
+        try:
+            return p.is_dir()
+        except OSError:
+            return False
+
+    def _add_bin(p: Path) -> None:
+        if not _safe_is_dir(p):
+            return
+        resolved_str: str | None = None
+        try:
+            resolved_str = str(p.resolve())
+        except OSError:
+            resolved_str = None
+        for cand in (str(p), resolved_str):
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+
+    _add_bin(ws_root / "node_modules" / ".bin")
+    skip_names = {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        "target",
+    }
+    sub_bins: list[Path] = []
+    try:
+        lvl1 = sorted(os.scandir(ws_root), key=lambda e: e.name)
+    except OSError:
+        lvl1 = []
+    for e1 in lvl1:
+        try:
+            is_d1 = e1.is_dir(follow_symlinks=False)
+        except OSError:
+            is_d1 = False
+        if e1.name.startswith(".") or e1.name in skip_names or not is_d1:
+            continue
+        p1 = Path(e1.path)
+        b1 = p1 / "node_modules" / ".bin"
+        if _safe_is_dir(b1):
+            sub_bins.append(b1)
+        try:
+            lvl2 = sorted(os.scandir(p1), key=lambda e: e.name)
+        except OSError:
+            continue
+        for e2 in lvl2:
+            try:
+                is_d2 = e2.is_dir(follow_symlinks=False)
+            except OSError:
+                is_d2 = False
+            if e2.name.startswith(".") or e2.name in skip_names or not is_d2:
+                continue
+            b2 = Path(e2.path) / "node_modules" / ".bin"
+            if _safe_is_dir(b2):
+                sub_bins.append(b2)
+    for sb in sub_bins[:max_sub_dirs]:
+        _add_bin(sb)
+    return out
+
+
 def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Return an environment dict that prepends cwd (and cwd/src) to PYTHONPATH and node_modules/.bin + .venv/bin to PATH."""
-    env = dict(os.environ if base_env is None else base_env)
+    """Return an environment dict that prepends cwd (and cwd/src) to PYTHONPATH and node_modules/.bin + .venv/bin to PATH.
+
+    Without ``base_env`` it starts from ``verify.credential_free_environ()``: every command this module
+    runs in a workspace (acceptance, baseline probes, runner detection, smoke checks) gets an
+    environment with plugin internals and credentials removed.
+    """
+    if base_env is None:
+        from server.verify import credential_free_environ
+
+        env = credential_free_environ()
+    else:
+        env = dict(base_env)
     cwd_resolved = cwd.resolve()
     py_parts = [str(cwd_resolved)]
     src_dir = cwd_resolved / "src"
@@ -1480,13 +2234,7 @@ def _build_workdir_exec_env(cwd: Path, base_env: dict[str, str] | None = None) -
     if existing_py:
         py_parts.append(existing_py)
     env["PYTHONPATH"] = ":".join(py_parts)
-    path_prefixes: list[str] = []
-    nm_bin = cwd_resolved / "node_modules" / ".bin"
-    if nm_bin.is_dir():
-        nm_bin_resolved = str(nm_bin.resolve())
-        path_prefixes.append(nm_bin_resolved)
-        if str(nm_bin) != nm_bin_resolved:
-            path_prefixes.append(str(nm_bin))
+    path_prefixes: list[str] = _collect_workspace_node_bin_dirs(cwd_resolved)
     venv_dir = cwd_resolved / ".venv"
     venv_bin = venv_dir / "bin"
     if venv_bin.is_dir():
@@ -1537,80 +2285,314 @@ def _invalidate_python_bytecode_for_paths(root: Path, rel_paths: list[str] | tup
                 pass
 
 
-def run_acceptance(cmds: list[str], cwd: Path, timeout: float | None = None) -> list[dict[str, Any]]:
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-k",
+    "-m",
+    "-o",
+    "-c",
+    "-p",
+    "--rootdir",
+    "--confcutdir",
+    "--import-mode",
+    "--basetemp",
+    "--tb",
+    "--maxfail",
+    "--durations",
+    "--ignore",
+    "--ignore-glob",
+    "--deselect",
+    "--cov",
+    "--cov-report",
+    "--cov-config",
+})
+
+
+def _strip_missing_pytest_file_targets(
+    cmd: str,
+    output: str,
+    cwd: Path,
+) -> tuple[str | None, list[str]]:
+    """When a pytest command fails with `exit_code == 4` (`ERROR: file or directory not found: <path>`),
+    strip non-existent file/dir target arguments if at least one existing test target remains in `cmd`."""
+    if "file or directory not found:" not in (output or "").lower():
+        return None, []
+    stripped = cmd.strip()
+    if any(sep in stripped for sep in ("&&", "||", ";", "|", "\n")):
+        return None, []
+    runner_pref = _extract_pytest_runner_prefix(stripped)
+    if not runner_pref:
+        return None, []
+    try:
+        tokens = shlex.split(stripped)
+        pref_tokens = shlex.split(runner_pref)
+    except ValueError:
+        return None, []
+    if len(tokens) <= len(pref_tokens):
+        return None, []
+    reported_missing = {
+        m.strip().rstrip(",'\"")
+        for m in re.findall(r"ERROR:\s+file or directory not found:\s+(\S+)", output or "", re.I)
+        if m.strip()
+    }
+    kept_tokens: list[str] = list(tokens[: len(pref_tokens)])
+    existing_targets: list[str] = []
+    missing_targets: list[str] = []
+    skip_next = False
+    for tok in tokens[len(pref_tokens) :]:
+        if skip_next:
+            kept_tokens.append(tok)
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            kept_tokens.append(tok)
+            if tok in _PYTEST_VALUE_FLAGS:
+                skip_next = True
+            continue
+        file_part = tok.split("::", 1)[0].strip()
+        cand_path = cwd / file_part
+        if file_part and cand_path.exists():
+            existing_targets.append(file_part)
+            kept_tokens.append(tok)
+        elif file_part and (
+            file_part in reported_missing
+            or tok in reported_missing
+            or "/" in file_part
+            or file_part.endswith(".py")
+        ):
+            missing_targets.append(file_part)
+        else:
+            kept_tokens.append(tok)
+    if not missing_targets or not existing_targets:
+        return None, []
+    return shlex.join(kept_tokens), missing_targets
+
+
+def run_acceptance(
+    cmds: list[str],
+    cwd: Path,
+    timeout: float | None = None,
+    *,
+    total_wall_budget: float | None = None,
+    restore_tracked: bool = True,
+    change_set: list[str] | tuple[str, ...] = (),
+    quarantine_dir: Path | None = None,
+) -> list[dict[str, Any]]:
     """Run acceptance checks with a hard timeout (whole process group is killed), then delete any new
     untracked files the checks themselves created (e.g. caches or TLS key logs), so they never land in
-    the diff or block later turns."""
-    limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(DEFAULT_ACCEPTANCE_TIMEOUT)))
-    before = set(_snapshot_untracked_hashes(cwd))
-    exec_env = _build_workdir_exec_env(cwd)
+    the diff or block later turns.
+
+    Checks run with the same credential-free environment as batch checks (``verify.scrubbed_env``).
+    The change set is snapshotted before every command: files a command modifies or deletes are
+    restored and listed under ``side_effects_restored`` (with ``restore_tracked=False``, for in-place
+    jobs whose checks run in the user's own tree, they are only listed under ``tracked_side_effects``),
+    and a command that changed anything other than a generated artifact (lockfile, snapshot, coverage)
+    fails with ``untrusted_side_effects``, because it did not test the files that will ship.
+    """
+    from server.verify import _is_run_artifact, _non_git_files, remove_new_untracked, scrubbed_env, untracked_baseline
+
+    default_timeout = (
+        DEFAULT_BOUNDED_ACCEPTANCE_TIMEOUT
+        if (
+            os.environ.get("CC_AGY_SESSION_DEADLINE_SECONDS", "").strip()
+            or resolve_cost_profile() == "economy"
+        )
+        else DEFAULT_ACCEPTANCE_TIMEOUT
+    )
+    limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(default_timeout)))
+    acc_started_mono = time.monotonic()
+    run_baseline = untracked_baseline(cwd)
+    non_git_unreadable_dirs: set[str] = set()
+    non_git_before_dirs: set[str] = set()
+    non_git_before = (
+        _non_git_files(cwd, unreadable_dirs_out=non_git_unreadable_dirs, dirs_out=non_git_before_dirs)
+        if run_baseline is None
+        else None
+    )
+    exec_env = scrubbed_env(cwd)
     exec_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     results: list[dict[str, Any]] = []
+    _run_acceptance_commands(cmds, cwd, exec_env, limit, acc_started_mono, total_wall_budget, results,
+                             restore_tracked=restore_tracked, change_set=change_set)
+    if run_baseline is not None:
+        # Anchored at the checkout root: a check run from a subdirectory can create files beside it.
+        cleanup: dict[str, Any] = {}
+        created = remove_new_untracked(cwd, run_baseline, whole_checkout=restore_tracked,
+                                       quarantine_dir=quarantine_dir, report=cleanup)
+        if cleanup.get("moved") and results:
+            results[-1]["quarantined_files"] = {"dir": cleanup["quarantine_dir"], "files": cleanup["moved"][:20]}
+        if cleanup.get("left_in_place") and results:
+            results[-1]["untracked_left_in_place"] = cleanup["left_in_place"][:20]
+    else:
+        from server.verify import _unlink_forcefully
+
+        created = []
+        if non_git_before is not None:
+            if restore_tracked and not cwd.is_symlink() and cwd.is_dir():
+                try:
+                    cmode = cwd.lstat().st_mode & 0o7777
+                    if (cmode & 0o700) != 0o700:
+                        os.chmod(cwd, cmode | 0o700)
+                except OSError:
+                    pass
+            non_git_after_dirs: set[str] = set()
+            non_git_after = _non_git_files(
+                cwd,
+                make_dirs_readable=restore_tracked,
+                skip_unreadable_dirs=non_git_unreadable_dirs,
+                dirs_out=non_git_after_dirs,
+            )
+            if non_git_after is not None:
+                for rel in sorted(non_git_after - non_git_before):
+                    p = cwd / rel
+                    if not (p.is_file() or p.is_symlink()):
+                        continue
+                    if restore_tracked or p.is_symlink() or _is_run_artifact(rel):
+                        if _unlink_forcefully(cwd, p):
+                            created.append(rel)
+                if restore_tracked:
+                    for drel in sorted(non_git_after_dirs - non_git_before_dirs, reverse=True):
+                        try:
+                            os.rmdir(cwd / drel)
+                        except OSError:
+                            pass
+    if created and results:
+        results[-1]["cleaned_artifacts"] = created[:20]
+    return results
+
+
+def _run_acceptance_commands(
+    cmds: list[str],
+    cwd: Path,
+    exec_env: dict[str, str],
+    limit: float,
+    acc_started_mono: float,
+    total_wall_budget: float | None,
+    results: list[dict[str, Any]],
+    *,
+    restore_tracked: bool = True,
+    change_set: list[str] | tuple[str, ...] = (),
+) -> None:
+    """Run each acceptance command in order, appending one result dict per command to ``results``."""
+    from server.verify import (
+        check_side_effects,
+        secret_env_names,
+        side_effect_note,
+        snapshot_workspace,
+        untracked_baseline,
+        vacuous_test_run,
+    )
+
+    baseline = untracked_baseline(cwd)
+    removed_env = sorted(secret_env_names())[:30]
     for cmd in cmds:
-        started = time.time()
-        proc = subprocess.Popen(
-            ["bash", "-c", cmd],
-            cwd=str(cwd),
-            env=exec_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
-        timed_out = False
+        eff_limit = limit
+        if total_wall_budget is not None:
+            rem_wall = float(total_wall_budget) - max(0.0, time.monotonic() - acc_started_mono)
+            if rem_wall < 1.0:
+                results.append(
+                    {
+                        "command": cmd,
+                        "exit_code": None,
+                        "timed_out": True,
+                        "passed": False,
+                        "duration_seconds": 0.0,
+                        "counts": {"passed": 0, "failed": 0, "errors": 0},
+                        "output_tail": "Skipped: acceptance wall budget exhausted before session deadline.",
+                    }
+                )
+                break
+            eff_limit = min(eff_limit, max(1.0, rem_wall))
+        snapshot = snapshot_workspace(cwd, baseline)
         try:
-            out, _ = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            started = time.time()
+            proc = subprocess.Popen(
+                ["bash", "-c", cmd],
+                cwd=str(cwd),
+                env=exec_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=True,
+            )
+            timed_out = False
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            out, _ = proc.communicate()
+                out, _ = proc.communicate(timeout=eff_limit)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                out, _ = proc.communicate()
+            filtered_cmd: str | None = None
+            filtered_missing_paths: list[str] = []
+            if not timed_out and proc.returncode == 4:
+                filtered_cmd, filtered_missing_paths = _strip_missing_pytest_file_targets(cmd, out or "", cwd)
+                if filtered_cmd:
+                    eff_limit2 = limit
+                    if total_wall_budget is not None:
+                        rem_wall2 = float(total_wall_budget) - max(0.0, time.monotonic() - acc_started_mono)
+                        eff_limit2 = min(eff_limit2, max(1.0, rem_wall2))
+                    proc = subprocess.Popen(
+                        ["bash", "-c", filtered_cmd],
+                        cwd=str(cwd),
+                        env=exec_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        start_new_session=True,
+                    )
+                    try:
+                        out, _ = proc.communicate(timeout=eff_limit2)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                        out, _ = proc.communicate()
+        except BaseException:
+            check_side_effects(snapshot, restore=restore_tracked, change_set=change_set)
+            raise
+        changed, untrusted = check_side_effects(snapshot, restore=restore_tracked, change_set=change_set)
         tail, _, _ = truncate_to_token_budget((out or "")[-20000:], ACCEPTANCE_OUTPUT_TOKENS)
+        if untrusted:
+            tail = (tail or "") + side_effect_note(untrusted, restored=restore_tracked)
         counts = _parse_test_counts(out or "")
-        has_skipped_only = bool(
-            proc.returncode == 0
-            and re.search(
-                r"\b(?:[1-9]\d*\s+skipped|skipped\s*[=:]\s*[1-9]\d*|Skipped:\s*[1-9]\d*|[1-9]\d*\s+ignored)\b",
-                out or "",
-                re.I,
-            )
-        )
-        vacuous_zero_tests = bool(
-            not timed_out
-            and proc.returncode in (0, 5)
-            and int(counts.get("passed") or 0) == 0
-            and int(counts.get("failed") or 0) == 0
-            and int(counts.get("errors") or 0) == 0
-            and (
-                bool(re.search(r"\b(?:ran\s+0\s+tests|collected\s+0\s+items|no\s+tests\s+ran)\b", out or "", re.I))
-                or has_skipped_only
-            )
-        )
+        vacuous_zero_tests = vacuous_test_run(out or "", proc.returncode, timed_out, counts)
+        cmd_passed = (not timed_out) and proc.returncode == 0 and not vacuous_zero_tests and not untrusted
         results.append(
             {
                 "command": cmd,
                 "exit_code": None if timed_out else proc.returncode,
                 "timed_out": timed_out,
-                "passed": (not timed_out) and proc.returncode == 0 and not vacuous_zero_tests,
+                "passed": cmd_passed,
                 "duration_seconds": round(time.time() - started, 1),
                 "counts": counts,
                 "output_tail": tail,
                 **({"vacuous": True} if vacuous_zero_tests else {}),
+                **({"side_effects_restored" if restore_tracked else "tracked_side_effects": changed[:50]}
+                   if changed else {}),
+                **({"untrusted_side_effects": untrusted[:50]} if untrusted else {}),
+                **({"credential_env_removed": removed_env} if (removed_env and not cmd_passed) else {}),
+                **(
+                    {
+                        "effective_command": filtered_cmd,
+                        "filtered_missing_paths": filtered_missing_paths,
+                    }
+                    if filtered_cmd and filtered_missing_paths
+                    else {}
+                ),
             }
         )
-    created = [rel for rel in _snapshot_untracked_hashes(cwd) if rel not in before]
-    for rel in created:
-        p = cwd / rel
-        if p.is_file() or p.is_symlink():
-            p.unlink(missing_ok=True)
-    if created and results:
-        results[-1]["cleaned_artifacts"] = created[:20]
-    return results
+        if timed_out:
+            break
 
 
 _PROBE_SKIP_TOP_DIRS = frozenset({
@@ -1637,8 +2619,8 @@ def _snapshot_probe_worktree_state(cwd: Path) -> tuple[dict[str, bytes | None], 
             data = None
         files_snap[rel] = data
 
-    res = subprocess.run(
-        ["git", "ls-files", "--others", "-z"],
+    res = _git_raw(
+        ["ls-files", "--others", "-z"],
         cwd=str(cwd),
         capture_output=True,
         check=False,
@@ -1712,6 +2694,16 @@ def _restore_probe_worktree_state(
     return removed
 
 
+_COMPILER_CLI_CONFIG_ERROR_RE = re.compile(
+    r"(?:"
+    r"Syntax:\s+tsc\s+\[options\]"
+    r"|Initializes a TypeScript project and creates a tsconfig\.json"
+    r"|error TS(?:5023|5024|5042|5058|5083|6053|18002|18003)\b"
+    r")",
+    re.I,
+)
+
+
 def _extract_short_error_tail(output: str, max_lines: int = 3) -> str:
     """Return a compact 3-line summary of the failure from ANSI-stripped test output."""
     clean = _ANSI_ESCAPE_RE.sub("", output or "")
@@ -1724,6 +2716,7 @@ def _extract_short_error_tail(output: str, max_lines: int = 3) -> str:
         if re.match(r"^(?:FAILED|ERROR)\b", ln)
         or ln.startswith("E   ")
         or re.search(r"\b(?:[A-Za-z]+Error|Exception|AssertionError):", ln)
+        or _COMPILER_CLI_CONFIG_ERROR_RE.search(ln)
     ]
     chosen = priority[-max_lines:] if priority else non_empty[-max_lines:]
     return "\n".join(ln[:180] for ln in chosen)
@@ -1793,6 +2786,29 @@ def _extract_failing_test_nodes_and_files(output: str, cwd: Path) -> tuple[list[
                 break
 
     return nodes, files
+
+
+def _resolve_pytest_runner_for_subdir(runner_prefix: str, root_cwd: Path) -> str:
+    """Resolve repo-relative runner executables (e.g. `.venv/bin/pytest`) without dereferencing venv symlinks."""
+    try:
+        tokens = shlex.split(runner_prefix)
+    except ValueError:
+        return runner_prefix
+    if not tokens:
+        return runner_prefix
+    changed = False
+    for idx, tok in enumerate(tokens):
+        if idx > 0 and tokens[idx - 1] != "run":
+            if all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t) for t in tokens[:idx]):
+                pass
+            else:
+                continue
+        if "/" in tok and not os.path.isabs(tok):
+            cand = os.path.abspath(os.path.join(str(root_cwd), tok))
+            if os.path.lexists(cand):
+                tokens[idx] = cand
+                changed = True
+    return shlex.join(tokens) if changed else runner_prefix
 
 
 def _extract_pytest_runner_prefix(cmd: str) -> str | None:
@@ -1890,6 +2906,68 @@ def _run_bounded_probe_cmd(
     return (None if timed_out else proc.returncode), timed_out, (out or "")
 
 
+_LINTER_OR_STATIC_CHECK_CMD_RE = re.compile(
+    r"\b(?:"
+    r"go\s+vet"
+    r"|golangci-lint"
+    r"|staticcheck"
+    r"|flake8"
+    r"|ruff(?:\s+check)?"
+    r"|mypy"
+    r"|pyright"
+    r"|pylint"
+    r"|bandit"
+    r"|eslint"
+    r"|biome"
+    r"|stylelint"
+    r"|tsc"
+    r"|cargo\s+clippy"
+    r"|rubocop"
+    r"|shellcheck"
+    r")\b",
+    re.I,
+)
+
+_TEST_RUNNER_CMD_RE = re.compile(
+    r"\b(?:"
+    r"pytest|py\.test|unittest|go\s+test|jest|vitest|mocha|ava|cargo\s+test"
+    r"|npm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|rspec"
+    r")\b",
+    re.I,
+)
+
+
+def _is_linter_or_static_check_cmd(cmd: str) -> bool:
+    if not cmd or _TEST_RUNNER_CMD_RE.search(cmd):
+        return False
+    return bool(_LINTER_OR_STATIC_CHECK_CMD_RE.search(cmd))
+
+
+def _extract_linter_diagnostic_files(output: str, cwd: Path) -> list[str]:
+    """Extract existing relative file paths from `path:line[:col]` or `path(line,col)` linter/compiler output."""
+    clean = _ANSI_ESCAPE_RE.sub("", output or "")
+    files: list[str] = []
+    cwd_res = cwd.resolve()
+
+    def _add_cand(raw_cand: str) -> None:
+        norm = raw_cand.strip().lstrip("./").replace("\\", "/")
+        if not norm or norm.startswith("-"):
+            return
+        try:
+            p = (cwd / norm).resolve()
+            rel_norm = p.relative_to(cwd_res).as_posix()
+        except (ValueError, OSError):
+            return
+        if p.is_file() and rel_norm not in files:
+            files.append(rel_norm)
+
+    for m in re.finditer(r"(?:^|[\s(])([A-Za-z0-9_./\\-]+?\.[A-Za-z0-9]+):(\d+)(?::\d+)?(?::|\b)", clean, re.M):
+        _add_cand(m.group(1))
+    for m in re.finditer(r"(?:^|[\s])([A-Za-z0-9_./\\-]+?\.[A-Za-z0-9]+)\((\d+),\d+\):", clean, re.M):
+        _add_cand(m.group(1))
+    return files
+
+
 def probe_baseline_acceptance(
     cmds: list[str],
     cwd: Path,
@@ -1924,7 +3002,14 @@ def probe_baseline_acceptance(
                 probes.append({"command": cmd, "exit_code": 0, "timed_out": False, "passed": True, "counts": counts})
                 continue
             nodes, files = _extract_failing_test_nodes_and_files(out, cwd)
+            if not files:
+                files = _extract_linter_diagnostic_files(out, cwd)
             short_tail = _extract_short_error_tail(out, max_lines=3)
+            clean_probe_out = _ANSI_ESCAPE_RE.sub("", out or "")
+            is_cli_cfg_err = bool(
+                _COMPILER_CLI_CONFIG_ERROR_RE.search(clean_probe_out)
+                and not re.search(r"\berror TS(?:1|2|4|7)\d{3}\b", clean_probe_out)
+            )
             entry: dict[str, Any] = {
                 "command": cmd,
                 "exit_code": rc,
@@ -1934,6 +3019,7 @@ def probe_baseline_acceptance(
                 "error_tail": short_tail,
                 "failing_nodes": nodes[:20],
                 "failing_files": files[:10],
+                **({"compiler_cli_config_error": True} if is_cli_cfg_err else {}),
             }
             pytest_runner = _extract_pytest_runner_prefix(cmd)
             if pytest_runner and files:
@@ -1949,8 +3035,9 @@ def probe_baseline_acceptance(
                     sub_rel = cand_dirs[0]
                     sub_dir = cwd / sub_rel
                     if sub_dir.is_dir():
+                        sub_runner = _resolve_pytest_runner_for_subdir(pytest_runner, cwd)
                         sub_rc, sub_to, sub_out = _run_bounded_probe_cmd(
-                            f"{pytest_runner} -q",
+                            f"{sub_runner} -q",
                             cwd=sub_dir,
                             exec_env=exec_env,
                             timeout_s=min(10.0, rem_after),
@@ -1973,6 +3060,113 @@ def probe_baseline_acceptance(
     return probes
 
 
+_PYTEST_NOT_FOUND_RE = re.compile(r"file or directory not found:\s*([^\s'\"`]+)", re.I)
+
+
+def remap_nonexistent_pytest_acceptance_cmds(
+    cmds: list[str],
+    cwd: Path,
+    probes: list[dict[str, Any]] | None,
+    *,
+    allowed_paths: list[str] | None = None,
+    prompt_text: str = "",
+    remap_details: list[dict[str, str]] | None = None,
+) -> tuple[list[str], bool]:
+    """Rewrite nonexistent `exit_code == 4` pytest target paths to unique tracked basename matches."""
+    if not cmds or not probes or not cwd.is_dir():
+        return list(cmds), False
+    probe_by_cmd = {
+        str(p.get("command") or "").strip(): p
+        for p in probes
+        if isinstance(p, dict) and not p.get("passed") and p.get("exit_code") == 4
+    }
+    if not probe_by_cmd:
+        return list(cmds), False
+    norm_prompt = prompt_text.replace("\\", "/") if prompt_text else ""
+    tracked: list[str] | None = None
+    remapped_any = False
+    updated_cmds: list[str] = []
+    for cmd in cmds:
+        pr = probe_by_cmd.get(cmd.strip())
+        if not pr or "pytest" not in cmd:
+            updated_cmds.append(cmd)
+            continue
+        tail = str(pr.get("error_tail") or "")
+        missing_tokens = list(dict.fromkeys(_PYTEST_NOT_FOUND_RE.findall(tail)))
+        if not missing_tokens:
+            try:
+                toks = shlex.split(cmd)
+            except ValueError:
+                toks = cmd.split()
+            for tok in toks:
+                if tok.startswith("-"):
+                    continue
+                base_tok = tok.split("::", 1)[0].strip()
+                if base_tok.endswith(".py") and not (cwd / base_tok).exists():
+                    missing_tokens.append(tok)
+        new_cmd = cmd
+        for raw_missing in missing_tokens:
+            file_part, sep, node_part = raw_missing.partition("::")
+            clean_missing = file_part.replace("\\", "/").strip("/")
+            if not clean_missing or (cwd / clean_missing).exists():
+                continue
+            if allowed_paths and _matches_allowed_paths(clean_missing, allowed_paths):
+                continue
+            target_bname = Path(clean_missing).name
+            if not target_bname:
+                continue
+            if norm_prompt:
+                if re.search(
+                    r"(?<![A-Za-z0-9_./-])" + re.escape(clean_missing) + r"(?![A-Za-z0-9_./-])",
+                    norm_prompt,
+                ):
+                    continue
+                if re.search(
+                    r"\b(?:create|add|write|new)\b[^.\n]{0,120}\b" + re.escape(target_bname) + r"\b",
+                    norm_prompt,
+                    re.I,
+                ):
+                    continue
+            if tracked is None:
+                tracked = _list_tracked_repo_files(cwd)
+            matches = [tf for tf in tracked if Path(tf).name == target_bname and (cwd / tf).is_file()]
+            chosen_tf: str | None = None
+            if len(matches) == 1:
+                chosen_tf = matches[0]
+            elif len(matches) > 1:
+                miss_parts = list(reversed(Path(clean_missing).parts[:-1]))
+                ranked: list[tuple[int, int, str]] = []
+                for tf in matches:
+                    tf_parts = list(reversed(Path(tf).parts[:-1]))
+                    shared = 0
+                    for a_p, b_p in zip(miss_parts, tf_parts):
+                        if a_p == b_p:
+                            shared += 1
+                        else:
+                            break
+                    ranked.append((-shared, len(Path(tf).parts), tf))
+                ranked.sort()
+                if len(ranked) >= 2 and ranked[0][0] < ranked[1][0]:
+                    chosen_tf = ranked[0][2]
+            if chosen_tf:
+                replacement = f"{chosen_tf}{sep}{node_part}" if sep else chosen_tf
+                if raw_missing in new_cmd:
+                    prev_cmd = new_cmd
+                    new_cmd = new_cmd.replace(raw_missing, replacement, 1)
+                    remapped_any = True
+                    if remap_details is not None:
+                        remap_details.append(
+                            {
+                                "original_command": prev_cmd,
+                                "remapped_command": new_cmd,
+                                "missing_target": clean_missing,
+                                "remapped_target": chosen_tf,
+                            }
+                        )
+        updated_cmds.append(new_cmd)
+    return updated_cmds, remapped_any
+
+
 def evaluate_post_worker_baseline_failures(
     acceptance_results: list[dict[str, Any]],
     baseline_probe: list[dict[str, Any]] | None,
@@ -1981,16 +3175,36 @@ def evaluate_post_worker_baseline_failures(
     *,
     timeout: float = 30.0,
 ) -> list[str]:
-    """Account for pre-existing clean-HEAD `cwd` or untouched baseline test failures without hiding regressions."""
-    if not acceptance_results or not baseline_probe or not files_changed or not cwd.is_dir():
+    """Account for pre-existing clean-HEAD `cwd` or untouched baseline test/linter failures without hiding regressions."""
+    from server.verify import check_side_effects, snapshot_workspace
+
+    if not acceptance_results or not files_changed or not cwd.is_dir():
         return []
     probe_by_cmd = {
         str(p.get("command") or "").strip(): p
-        for p in baseline_probe
+        for p in (baseline_probe or [])
         if isinstance(p, dict) and not p.get("passed") and not p.get("timed_out") and p.get("exit_code") not in (None, 0)
     }
-    if not probe_by_cmd:
-        return []
+    any_real_test_passed = any(
+        isinstance(x, dict)
+        and x.get("passed") is True
+        and not x.get("timed_out")
+        and not x.get("vacuous")
+        and not x.get("no_tests_collected")
+        and not x.get("runner_incompatible_skipped")
+        and not x.get("compile_smoke")
+        and not x.get("auto_import_smoke")
+        and (
+            int((x.get("counts") or {}).get("passed") or 0) > 0
+            or bool(_TEST_RUNNER_CMD_RE.search(str(x.get("command") or "")))
+        )
+        for x in acceptance_results
+    )
+    changed_norm = {
+        str(f).strip().lstrip("./").replace("\\", "/")
+        for f in files_changed
+        if f
+    }
 
     exec_env = _build_workdir_exec_env(cwd)
     warnings: list[str] = []
@@ -2000,9 +3214,63 @@ def evaluate_post_worker_baseline_failures(
             continue
         cmd = str(r.get("command") or "").strip()
         probe = probe_by_cmd.get(cmd)
+        post_tail = str(r.get("output_tail") or "")
+        r_counts = r.get("counts") or {}
+        has_zero_test_counts = (
+            int(r_counts.get("passed") or 0) == 0
+            and int(r_counts.get("failed") or 0) == 0
+            and int(r_counts.get("errors") or 0) == 0
+        )
+
+        # Case 2b ([R5-2]): Untouched baseline linter / static-check failure (e.g. `go vet ./pkg/...`,
+        # `golangci-lint`, `flake8`, `ruff`, `mypy`, `eslint`) where the command ALSO failed on clean HEAD
+        # (`probe is not None`), every `path:line` diagnostic is a subset of the clean-HEAD diagnostics and
+        # outside `files_changed`, and at least one real test-runner command passed.
+        if (
+            probe is not None
+            and any_real_test_passed
+            and has_zero_test_counts
+            and _is_linter_or_static_check_cmd(cmd)
+            and r.get("exit_code") not in (None, 0)
+        ):
+            diag_files = _extract_linter_diagnostic_files(post_tail, cwd)
+            probe_diag_files = [
+                str(pf).strip().lstrip("./").replace("\\", "/")
+                for pf in (probe.get("failing_files") or [])
+                if pf
+            ]
+            probe_err_tail = str(probe.get("error_tail") or "").strip()
+            matches_clean_head_diag = (
+                set(diag_files) <= set(probe_diag_files)
+                if probe_diag_files
+                else (bool(probe_err_tail) and all(df in probe_err_tail for df in diag_files))
+            )
+            untouched_diag = (
+                bool(diag_files)
+                and matches_clean_head_diag
+                and all(df not in changed_norm for df in diag_files)
+            )
+            identical_clean_head_err = bool(
+                not diag_files
+                and probe.get("exit_code") == r.get("exit_code")
+                and probe_err_tail
+                and probe_err_tail in post_tail
+            )
+            if untouched_diag or identical_clean_head_err:
+                r["original_exit_code"] = r.get("exit_code")
+                r["exit_code"] = 0
+                r["passed"] = True
+                r["baseline_neutralized"] = True
+                r["preexisting_baseline_failure_ignored"] = True
+                warnings.append(
+                    f"Untouched baseline linter/static-check failure in `{cmd}` neutralized: "
+                    f"diagnostic file(s) {diag_files or ['<clean-HEAD match>']} are outside `files_changed` "
+                    "and matched clean-HEAD baseline diagnostics while test-runner acceptance passed."
+                )
+                continue
+
         if not probe:
             continue
-        post_tail = str(r.get("output_tail") or "")
         post_nodes, post_files = _extract_failing_test_nodes_and_files(post_tail, cwd)
         pytest_runner = _extract_pytest_runner_prefix(cmd)
 
@@ -2015,15 +3283,20 @@ def evaluate_post_worker_baseline_failures(
                 f == passing_cwd or f.startswith(f"{passing_cwd}/") for f in post_files
             ):
                 before_files, before_dirs = _snapshot_probe_worktree_state(cwd)
+                # Post-worker probes run on top of the worker's edits, so tracked files cannot be reset
+                # wholesale; snapshot the change set instead and undo whatever the probe touched.
+                probe_snapshot = snapshot_workspace(cwd)
                 try:
+                    sub_runner = _resolve_pytest_runner_for_subdir(pytest_runner, cwd)
                     sub_rc, sub_to, sub_out = _run_bounded_probe_cmd(
-                        f"{pytest_runner} -q",
+                        f"{sub_runner} -q",
                         cwd=sub_dir,
                         exec_env=exec_env,
                         timeout_s=min(20.0, timeout),
                     )
                 finally:
                     _restore_probe_worktree_state(cwd, before_files, before_dirs, reset_tracked=False)
+                    check_side_effects(probe_snapshot)
                 sub_counts = _parse_test_counts(sub_out)
                 sub_ok = (
                     not sub_to
@@ -2035,6 +3308,7 @@ def evaluate_post_worker_baseline_failures(
                 if sub_ok:
                     rest_cmd = f"{_strip_pytest_exitfirst_flags(cmd)} --ignore={shlex.quote(passing_cwd)}"
                     before_files2, before_dirs2 = _snapshot_probe_worktree_state(cwd)
+                    probe_snapshot2 = snapshot_workspace(cwd)
                     try:
                         rest_rc, rest_to, rest_out = _run_bounded_probe_cmd(
                             rest_cmd,
@@ -2044,6 +3318,7 @@ def evaluate_post_worker_baseline_failures(
                         )
                     finally:
                         _restore_probe_worktree_state(cwd, before_files2, before_dirs2, reset_tracked=False)
+                        check_side_effects(probe_snapshot2)
                     rest_counts = _parse_test_counts(rest_out)
                     rest_ok = (
                         not rest_to
@@ -2066,7 +3341,25 @@ def evaluate_post_worker_baseline_failures(
                         )
                         continue
 
-        # Case 2: Non-subdir clean-HEAD failures remain failing: NEVER flip `passed` to True
+        # Case 2: Pre-existing clean-HEAD compiler CLI config/help error (e.g. `tsc --noEmit` without root
+        # tsconfig.json) alongside at least one passing test-runner command: ignore so real passing tests
+        # are not blocked by a missing root compiler config.
+        if (
+            _is_compiler_cli_config_or_help_failure(r)
+            and _is_compiler_cli_config_or_help_failure(probe)
+            and any_real_test_passed
+        ):
+            r["original_exit_code"] = r.get("exit_code")
+            r["exit_code"] = 0
+            r["passed"] = True
+            r["preexisting_baseline_failure_ignored"] = True
+            warnings.append(
+                f"Baseline compiler CLI config failure in `{cmd}` ignored: `{cmd}` already failed on clean HEAD "
+                "without test failures while test-runner acceptance passed."
+            )
+            continue
+
+        # Case 3: Non-subdir clean-HEAD failures remain failing: NEVER flip `passed` to True
         # (an unfixed TDD acceptance test must never auto-apply even if the worker also added
         # unrelated passing tests). Record an informational diagnostic for the Lead only.
         base_nodes = [str(n) for n in (probe.get("failing_nodes") or []) if n]
@@ -2077,6 +3370,40 @@ def evaluate_post_worker_baseline_failures(
             )
 
     return warnings
+
+
+def _is_compiler_cli_config_or_help_failure(res: dict[str, Any]) -> bool:
+    if not isinstance(res, dict) or res.get("passed") or res.get("timed_out"):
+        return False
+    counts = res.get("counts") or {}
+    if (
+        int(counts.get("passed") or 0) > 0
+        or int(counts.get("failed") or 0) > 0
+        or int(counts.get("errors") or 0) > 0
+    ):
+        return False
+    tail = str(res.get("output_tail") or res.get("error_tail") or "")
+    if re.search(r"\berror TS(?:1|2|4|7)\d{3}\b", tail):
+        return False
+    return bool(res.get("compiler_cli_config_error")) or bool(_COMPILER_CLI_CONFIG_ERROR_RE.search(tail))
+
+
+def _only_compiler_cli_config_failures(acc_results: list[dict[str, Any]]) -> bool:
+    if not acc_results:
+        return False
+    has_passing_test_runner = any(
+        isinstance(r, dict)
+        and r.get("passed") is True
+        and int(r.get("exit_code") if r.get("exit_code") is not None else 0) == 0
+        and int((r.get("counts") or {}).get("passed") or 0) > 0
+        and not r.get("compile_smoke")
+        and not r.get("auto_import_smoke")
+        for r in acc_results
+    )
+    if not has_passing_test_runner:
+        return False
+    failing = [r for r in acc_results if isinstance(r, dict) and not r.get("passed")]
+    return bool(failing) and all(_is_compiler_cli_config_or_help_failure(r) for r in failing)
 
 
 _DESCRIPTOR_CALL_NAMES = frozenset({"property", "classmethod", "staticmethod", "cached_property"})
@@ -2556,6 +3883,294 @@ def detect_class_attribute_shadowing(
     return warnings
 
 
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test", "__tests__"})
+_TEST_FILENAME_RE = re.compile(
+    r"^(?:test_.+\.(?:py|rb|rs|c|cc|cpp|sh)|.+_(?:test|spec)\.(?:py|go|rs|ts|tsx|js|jsx|rb)|.+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)|.+Test\.(?:java|kt))$"
+)
+_NEW_TEST_BLOCK_LINE_RE = re.compile(
+    r"^\+\s*(?:(?:async\s+)?def\s+test_\w+|func\s+Test\w+|(?:it|test|describe)\s*\(|#\[test\]|@Test\b|name:\s*[\"'])"
+)
+_STUB_OR_MOCK_MUTATION_RE = re.compile(
+    r"(?:\b(?:httpmock|Mockito|mockito|GoMock|gomock|Sinon|sinon|nock|respx|mocker|monkeypatch|MagicMock|AsyncMock|Mock|mock|mocks|mocked|unmock|Stub|stub|stubs|stubbed)\b"
+    r"|\b(?:mock|stub|Mock|Stub)_[A-Za-z0-9_]+\b"
+    r"|\b[A-Za-z0-9_]+_(?:mock|stub|mocks|stubs)\b"
+    r"|\b(?:mock|stub|Mock|Stub)[A-Z][A-Za-z0-9_]*\b"
+    r"|\b[a-z][A-Za-z0-9_]*(?:Mock|Stub|Mocks|Stubs)\b"
+    r"|\b(?:patch|spyOn)\s*\(|\bresponses\.add\b)"
+)
+_EXISTING_TEST_EXPECTATION_RE = re.compile(
+    r"(?:\b(?:wantStdout|wantStderr|wantOut|wantErr|expectedOutput|expectedStdout|expectedStderr|expectedError)\s*[:=]"
+    r"|\bassert(?:Equal|Equals|StrictEqual|DeepEqual|That|True|False)?\b"
+    r"|\bexpect\s*\([^)]*\)\s*\.\s*(?:toEqual|toStrictEqual|toBe|toMatch|toThrow)\b)"
+)
+_TEST_FUNC_HEADER_RE = re.compile(
+    r"(?:(?:async\s+)?def\s+(test_\w+)|func\s+(Test\w+)|(?:it|test)\s*\(\s*(['\"`][^'\"`]+['\"`])|(?:public\s+)?void\s+(test\w+))"
+)
+_SUBTEST_CASE_RE = re.compile(r"^\s*name\s*:\s*(['\"`][^'\"`]+['\"`])")
+_EXPLICIT_TESTS_ONLY_RE = re.compile(
+    r"\b(?:only|solely)\s+(?:add|write|create|update)\s+(?:unit\s+|integration\s+|regression\s+)?tests?\b"
+    r"|\bwithout\s+modifying\s+(?:any\s+)?(?:production|source|implementation)\b"
+    r"|\bdo\s+not\s+modify\s+(?:any\s+)?(?:production|source|implementation)\b",
+    re.I,
+)
+_EXPLICIT_EXISTING_TEST_UPDATE_RE = re.compile(
+    r"\b(?:update|modify|adjust|adapt|rewrite|sync)\s+"
+    r"(?:the\s+|any\s+|all\s+)?(?:existing\s+|affected\s+|corresponding\s+|related\s+)?"
+    r"(?:unit\s+|integration\s+|regression\s+)?(?:test(?:s|\s+files?|\s+cases?|\s+expectations?|\s+assertions?|\s+snapshots?)|test_\w+\.py|\S+_test\.go|\S+\.(?:test|spec)\.[jt]sx?)\b"
+    r"|\b(?:change|fix)\s+(?:the\s+|any\s+|all\s+)?existing\s+(?:unit\s+|integration\s+|regression\s+)?test(?:s|\s+expectations?|\s+assertions?|\s+cases?|\s+files?)\b"
+    r"|\btests?\s+to\s+expect\b",
+    re.I,
+)
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.;:!?\n]|\b(?:but|however)\b", re.I)
+_CLAUSE_NEGATION_RE = re.compile(
+    r"\b(?:do\s+not|don['\u2019]t|does\s+not|doesn['\u2019]t|did\s+not|didn['\u2019]t"
+    r"|never|must\s+not|mustn['\u2019]t|should\s+not|shouldn['\u2019]t"
+    r"|can\s*not|cannot|can['\u2019]t|avoid|refrain\s+from|without|no|not"
+    r"|rather\s+than|instead\s+of|forbid\w*|prohibit\w*)\b",
+    re.I,
+)
+_TEST_AUTHORING_INTENT_RE = re.compile(
+    r"\b(?:write|add|create|expand|increase|improve)\s+"
+    r"(?:a\s+|an\s+|new\s+|more\s+|missing\s+|additional\s+)?"
+    r"(?:(?:unit|integration|regression|edge[- ]case|table[- ]driven|parameterized|parametrized)\s+)*tests?\b"
+    r"|\b(?:increase|improve|expand|add)\s+(?:unit\s+|branch\s+|line\s+)?test\s+coverage\b",
+    re.I,
+)
+_PROD_CHANGE_INTENT_RE = re.compile(
+    r"\b(?:fix|implement|refactor|support|resolve|repair|patch|migrate|convert|replace"
+    r"|make|handle|change|ensure|rename|remove|delete|allow|enable|disable|expose|export|preserve|prevent|avoid)\b"
+    r"|\badd\s+(?:a\s+|an\s+|the\s+)?(?:--?[A-Za-z0-9_-]+|[A-Za-z0-9_-]+\s+(?:flag|option|parameter|argument|field|method|function|endpoint|command|subcommand|route|header|hook|handler|helper|class|module|config|setting|support))\b"
+    r"|\bupdate\s+(?:the\s+)?(?:implementation|function|method|class|handler|logic|module|behavior)\b",
+    re.I,
+)
+
+
+def _prompt_requests_test_authoring(prompt_text: str) -> bool:
+    """Return True when the prompt explicitly asks for test-only edits or ordinary test/coverage authoring."""
+    if not prompt_text:
+        return False
+    if _EXPLICIT_TESTS_ONLY_RE.search(prompt_text):
+        return True
+    if _TEST_AUTHORING_INTENT_RE.search(prompt_text) and not _PROD_CHANGE_INTENT_RE.search(prompt_text):
+        return True
+    return False
+
+
+_FORBID_EXISTING_TEST_UPDATE_RE = re.compile(
+    r"\b(?:do\s+not|don['\u2019]t|never|must\s+not|should\s+not|cannot|can['\u2019]t|without|avoid|refrain\s+from)\s+"
+    r"(?:ever\s+)?(?:update|updating|modify|modifying|alter|altering|change|changing|rewrite|rewriting|edit|editing|touch|touching|weaken|weakening)\s+"
+    r"(?:the\s+|any\s+|all\s+)?(?:pre-?existing\s+|existing\s+)?(?:unit\s+|integration\s+|regression\s+)?test",
+    re.I,
+)
+
+
+def _prompt_forbids_existing_test_updates(prompt_text: str) -> bool:
+    """Return True when the prompt explicitly forbids modifying/rewriting existing tests."""
+    if not prompt_text:
+        return False
+    return bool(_FORBID_EXISTING_TEST_UPDATE_RE.search(prompt_text))
+
+
+def _prompt_requests_existing_test_updates(prompt_text: str) -> bool:
+    """Return True when the prompt explicitly instructs updating existing test expectations/assertions (not negated)."""
+    if not prompt_text:
+        return False
+    for m in _EXPLICIT_EXISTING_TEST_UPDATE_RE.finditer(prompt_text):
+        prefix = prompt_text[: m.start()]
+        clause_parts = _CLAUSE_BOUNDARY_RE.split(prefix)
+        local_clause = clause_parts[-1] if clause_parts else prefix
+        if _CLAUSE_NEGATION_RE.search(local_clause):
+            continue
+        return True
+    return False
+
+
+def _unexempted_stub_mutation_warnings(warnings: list[str] | None, prompt_text: str) -> list[str]:
+    """Filter test-mutation warnings against explicit prompt intent."""
+    if not warnings:
+        return []
+    if _prompt_requests_test_authoring(prompt_text):
+        return []
+    if _prompt_requests_existing_test_updates(prompt_text):
+        return [w for w in warnings if not str(w).startswith("ExistingTestExpectationsModified:")]
+    return list(warnings)
+
+
+def _is_test_file_path(rel_path: str) -> bool:
+    """Return True when `rel_path` is a unit/integration/spec test file across supported languages."""
+    norm = rel_path.replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    parts = norm.split("/")
+    if any(seg in _TEST_DIR_SEGMENTS for seg in parts[:-1]):
+        return True
+    return bool(_TEST_FILENAME_RE.match(parts[-1]))
+
+
+def detect_existing_test_stub_mutations(
+    worktree_root: Path,
+    diff_text: str,
+    files_changed: list[str],
+    *,
+    baseline_ref: str = "HEAD",
+) -> list[str]:
+    """Warn when a worker alters mock/stub expectations across >= 3 existing test blocks in a pre-existing test file."""
+    if not files_changed or not diff_text.strip() or not worktree_root.is_dir():
+        return []
+    test_targets = {
+        rel.replace("\\", "/").strip("/")
+        for rel in files_changed
+        if _is_test_file_path(rel)
+    }
+    if not test_targets:
+        return []
+
+    preexisting_tests: set[str] = set()
+    for rel in test_targets:
+        cat_res = _run_git(["cat-file", "-e", f"{baseline_ref}:{rel}"], cwd=worktree_root, check=False)
+        if cat_res.returncode == 0:
+            preexisting_tests.add(rel)
+    if not preexisting_tests:
+        return []
+
+    file_chunks: dict[str, list[str]] = {}
+    cur_rel: str | None = None
+    for dline in diff_text.splitlines():
+        if dline.startswith("diff --git "):
+            hdr = parse_diff_git_header(dline)
+            cpath = ((hdr[1] or hdr[0]) if hdr else "").replace("\\", "/").strip("/")
+            cur_rel = cpath if cpath in preexisting_tests else None
+            if cur_rel is not None:
+                file_chunks.setdefault(cur_rel, [])
+            continue
+        if cur_rel is not None:
+            file_chunks[cur_rel].append(dline)
+
+    from collections import Counter
+
+    warnings: list[str] = []
+    for rel in sorted(file_chunks):
+        lines = file_chunks[rel]
+        hunks: list[tuple[int, str, list[str]]] = []
+        cur_old_len = 0
+        cur_hdr_ctx = ""
+        cur_hunk: list[str] | None = None
+        for ln in lines:
+            m_hunk = re.match(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$", ln)
+            if m_hunk:
+                if cur_hunk is not None:
+                    hunks.append((cur_old_len, cur_hdr_ctx, cur_hunk))
+                cur_old_len = int(m_hunk.group(2)) if m_hunk.group(2) is not None else 1
+                cur_hdr_ctx = (m_hunk.group(5) or "").strip()
+                cur_hunk = []
+                continue
+            if cur_hunk is not None and not ln.startswith(("--- ", "+++ ")):
+                cur_hunk.append(ln)
+        if cur_hunk is not None:
+            hunks.append((cur_old_len, cur_hdr_ctx, cur_hunk))
+
+        mutated_stub_blocks = 0
+        mutated_expectation_funcs: set[str] = set()
+        for hunk_idx, (old_len, hdr_ctx, hlines) in enumerate(hunks):
+            if old_len <= 0:
+                continue
+            m_hdr_fn = _TEST_FUNC_HEADER_RE.search(hdr_ctx)
+            base_fn_id = (
+                f"fn:{next(g for g in m_hdr_fn.groups() if g)}"
+                if m_hdr_fn
+                else f"hunk:{hunk_idx}"
+            )
+            cur_block_id = base_fn_id
+            clusters: list[tuple[str, list[str]]] = []
+            cur_cluster: list[str] = []
+            cur_cluster_block_id = cur_block_id
+            for hl in hlines:
+                body = hl[1:] if hl else ""
+                if hl.startswith((" ", "-")):
+                    m_fn = _TEST_FUNC_HEADER_RE.search(body)
+                    if m_fn and not hl.startswith("+"):
+                        if cur_cluster and hl.startswith(" "):
+                            clusters.append((cur_cluster_block_id, cur_cluster))
+                            cur_cluster = []
+                        base_fn_id = f"fn:{next(g for g in m_fn.groups() if g)}"
+                        cur_block_id = base_fn_id
+                    else:
+                        m_sub = _SUBTEST_CASE_RE.match(body)
+                        if m_sub:
+                            if cur_cluster and hl.startswith(" "):
+                                clusters.append((cur_cluster_block_id, cur_cluster))
+                                cur_cluster = []
+                            cur_block_id = f"{base_fn_id}::{m_sub.group(1)}"
+                if hl.startswith(("+", "-")):
+                    if not cur_cluster:
+                        cur_cluster_block_id = cur_block_id
+                    cur_cluster.append(hl)
+                elif cur_cluster:
+                    clusters.append((cur_cluster_block_id, cur_cluster))
+                    cur_cluster = []
+            if cur_cluster:
+                clusters.append((cur_cluster_block_id, cur_cluster))
+            for block_id, cluster in clusters:
+                if not any(cl.startswith("-") for cl in cluster):
+                    continue
+                if any(cl.startswith("+") and _NEW_TEST_BLOCK_LINE_RE.search(cl) for cl in cluster):
+                    continue
+                if any(_STUB_OR_MOCK_MUTATION_RE.search(cl[1:]) for cl in cluster):
+                    mutated_stub_blocks += 1
+                minus_exp = [
+                    cl[1:].strip()
+                    for cl in cluster
+                    if cl.startswith("-") and _EXISTING_TEST_EXPECTATION_RE.search(cl[1:])
+                ]
+                plus_exp = [
+                    cl[1:].strip()
+                    for cl in cluster
+                    if cl.startswith("+") and _EXISTING_TEST_EXPECTATION_RE.search(cl[1:])
+                ]
+                if minus_exp:
+                    minus_counts = Counter(minus_exp)
+                    plus_counts = Counter(plus_exp)
+                    if any(plus_counts[m] < cnt for m, cnt in minus_counts.items()):
+                        mutated_expectation_funcs.add(block_id)
+        if mutated_stub_blocks >= 3:
+            warnings.append(
+                f"ExistingTestStubsModified: {rel} modified mock/stub expectations across {mutated_stub_blocks} "
+                f"pre-existing test blocks; inspect get_diff (focus_symbols) to verify no unrequested API/HTTP "
+                f"calls or breaking contract changes were masked."
+            )
+        elif len(mutated_expectation_funcs) >= 2:
+            warnings.append(
+                f"ExistingTestExpectationsModified: {rel} altered pre-existing test expectations across "
+                f"{len(mutated_expectation_funcs)} test functions; verify production code matches the specification "
+                f"rather than rewriting existing test assertions."
+            )
+    return warnings
+
+
+def _receipt_owner_pid_alive(receipt: dict[str, Any]) -> bool:
+    """Return True if `receipt['owner_instance_id']` encodes a live OS PID (or True if unknown)."""
+    owner = str(receipt.get("owner_instance_id") or "").strip()
+    if not owner or "-" not in owner:
+        return True
+    parts = owner.split("-")
+    pid_part = parts[1] if parts[0] == "inst" and len(parts) >= 3 else parts[0]
+    try:
+        pid = int(pid_part)
+    except ValueError:
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
 import builtins as _py_builtins
 
 _PROMPT_SYMBOL_STOPLIST = frozenset({
@@ -2576,7 +4191,7 @@ _PROMPT_SYMBOL_STOPLIST = frozenset({
     "allowed_paths", "files_changed", "acceptance", "acceptance_passed", "acceptance_results",
     "scope_violations", "scope_violation", "missing_prompt_symbols", "auto_apply", "in_place",
     "follow_up_prompt", "job_id", "timeout_seconds", "max_tool_calls", "max_total_tokens",
-    "thinking_level", "allow_scope_violations", "force_retry", "resume_job_id",
+    "thinking_level", "allow_scope_violations", "include_paths", "force_retry", "resume_job_id",
 } | {name for name in dir(_py_builtins) if not name.startswith("_")})
 
 
@@ -2882,8 +4497,8 @@ def detect_project_test_runner(cwd: Path) -> dict[str, Any]:
 
 def _list_tracked_repo_files(cwd: Path) -> list[str]:
     try:
-        tracked_res = subprocess.run(
-            ["git", "ls-files"],
+        tracked_res = _git_raw(
+            ["ls-files"],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -2928,7 +4543,7 @@ def discover_related_test_commands(
     files_changed: list[str],
     existing_cmds: list[str],
     *,
-    max_files: int = 4,
+    max_files: int = 6,
 ) -> list[str]:
     """Discover targeted unit/regression test commands across Python, Node/TS, Go, Rust, and JVM
     for modified source or test files that are not already covered by `existing_cmds`."""
@@ -2967,6 +4582,8 @@ def discover_related_test_commands(
         if not skip_py:
             discovered_py: list[str] = []
             stems_to_check: list[str] = []
+            pkg_test_names: set[str] = set()
+            mirrored_test_dirs: list[str] = []
             for norm in py_changed:
                 bname = Path(norm).name
                 if bname.startswith("test_") or bname.endswith("_test.py"):
@@ -2981,6 +4598,27 @@ def discover_related_test_commands(
                 stem = Path(norm).stem
                 if stem and stem not in stems_to_check:
                     stems_to_check.append(stem)
+                dir_parts = list(parts[:-1])
+                if dir_parts and dir_parts[0] in ("src", "lib", "python"):
+                    dir_parts = dir_parts[1:]
+                for pkg_seg in dir_parts:
+                    if pkg_seg and pkg_seg.isidentifier():
+                        pkg_test_names.add(f"test_{pkg_seg}.py")
+                        pkg_test_names.add(f"{pkg_seg}_test.py")
+                if dir_parts:
+                    rel_pkg = "/".join(dir_parts)
+                    for t_root in ("tests", "test"):
+                        for cand_mir in (f"{t_root}/{rel_pkg}", *( [f"{t_root}/{'/'.join(dir_parts[1:])}"] if len(dir_parts) > 1 else [] )):
+                            if cand_mir not in mirrored_test_dirs:
+                                mirrored_test_dirs.append(cand_mir)
+
+            def _is_py_test_covered(tf_rel: str) -> bool:
+                tf_bname = Path(tf_rel).name
+                return any(
+                    re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_bname)}(?:$|[\s\"':])", c)
+                    or re.search(rf"(?:^|[\s\"'=]){re.escape(tf_rel)}(?:$|[\s\"':])", c)
+                    for c in pytest_cmds
+                )
 
             if stems_to_check and len(discovered_py) < max_files:
                 for stem in stems_to_check:
@@ -2988,16 +4626,44 @@ def discover_related_test_commands(
                     for tf in _get_tracked():
                         tf_name = Path(tf).name
                         if tf_name in target_names and tf not in discovered_py:
-                            already_covered = any(
-                                re.search(rf"(?:^|[\s/\"'=]){re.escape(tf_name)}(?:$|[\s\"':])", c)
-                                for c in pytest_cmds
-                            )
-                            if not already_covered and (cwd / tf).is_file():
+                            if not _is_py_test_covered(tf) and (cwd / tf).is_file():
                                 discovered_py.append(tf)
                                 if len(discovered_py) >= max_files:
                                     break
                     if len(discovered_py) >= max_files:
                         break
+
+            # Include sibling package-level test files (e.g. tests/<pkg>/<subpkg>/test_<subpkg>.py)
+            # and compact mirrored test directories (<= 8 test files) so package round-trip suites run.
+            if (pkg_test_names or mirrored_test_dirs) and len(discovered_py) < max_files:
+                tracked_list = _get_tracked()
+                for tf in tracked_list:
+                    if len(discovered_py) >= max_files:
+                        break
+                    tf_parent = Path(tf).parent.as_posix()
+                    tf_name = Path(tf).name
+                    if tf_name in pkg_test_names and (
+                        tf_parent in mirrored_test_dirs
+                        or tf.startswith(("tests/", "test/"))
+                    ):
+                        if tf not in discovered_py and not _is_py_test_covered(tf) and (cwd / tf).is_file():
+                            discovered_py.append(tf)
+                for mdir in mirrored_test_dirs:
+                    if len(discovered_py) >= max_files:
+                        break
+                    dir_tests = [
+                        tf
+                        for tf in tracked_list
+                        if Path(tf).parent.as_posix() == mdir
+                        and (Path(tf).name.startswith("test_") or Path(tf).name.endswith("_test.py"))
+                        and (cwd / tf).is_file()
+                    ]
+                    if 0 < len(dir_tests) <= 8:
+                        for tf in dir_tests:
+                            if len(discovered_py) >= max_files:
+                                break
+                            if tf not in discovered_py and not _is_py_test_covered(tf):
+                                discovered_py.append(tf)
 
             if discovered_py:
                 discovered_py = discovered_py[:max_files]
@@ -3560,12 +5226,12 @@ def _symbols_defined_in_baseline(
         return set()
     owner_map = {sym: own for sym, own in (owners or {}).items() if sym in symbols}
     search_terms = list(dict.fromkeys(list(symbols) + list(owner_map.values())))
-    cmd = ["git", "grep", "--no-color", "-I", "-z", "-w", "-F"]
+    cmd = ["grep", "--no-color", "-I", "-z", "-w", "-F"]
     for term in search_terms:
         cmd.extend(["-e", term])
     cmd.extend([ref, "--"])
     try:
-        res = subprocess.run(
+        res = _git_raw(
             cmd,
             cwd=str(repo_root),
             capture_output=True,
@@ -3625,8 +5291,8 @@ def _hash_path(p: Path) -> str | None:
 
 def _snapshot_untracked_hashes(root: Path) -> dict[str, str | None]:
     """Fingerprint every untracked, non-ignored file so in_place jobs can skip ones they did not touch."""
-    res = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+    res = _git_raw(
+        ["ls-files", "--others", "--exclude-standard", "-z"],
         cwd=str(root),
         capture_output=True,
         check=False,
@@ -3682,10 +5348,12 @@ class JobManager:
         store: ReceiptStore | None = None,
         worker_backend: Callable[[dict[str, Any]], Any] | None = None,
         max_workers: int = 4,
+        ask_backend: Any = None,
     ) -> None:
         self.workspace_root = resolve_workspace_root(workspace_root)
         self.store = store or ReceiptStore(workspace_root=self.workspace_root)
         self.worker_backend = worker_backend
+        self.ask_backend = ask_backend
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cc-agy-job")
         self._lock = threading.Lock()
         self._apply_lock = threading.Lock()
@@ -3696,8 +5364,11 @@ class JobManager:
         self._raw_projects: dict[str, str] = {}
         self._raw_api_keys: dict[str, str] = {}
         self._wait_sliced_auto_apply: dict[str, bool | None] = {}
+        self._qa_bg_threads: list[threading.Thread] = []
         self._sparse_worktrees: dict[str, int] = {}
         self._in_place_job: str | None = None
+        self._instance_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._owned_job_ids: set[str] = set()
         self._created_at = time.monotonic()
         self._created_at_epoch = time.time()
         self._ensure_baseline_recorded()
@@ -3707,8 +5378,9 @@ class JobManager:
         timeout_seconds: float,
         *,
         elapsed_seconds: float = 0.0,
+        allow_retry_grace: bool = False,
     ) -> float:
-        """Clamp synchronous blocking wait slices (default <=240s) so the host prompt cache never expires."""
+        """Clamp synchronous blocking wait slices (default <=240s, <=275s on auto-retry) so the host 5m prompt cache never expires."""
         full_wait = max(0.5, float(timeout_seconds) + 30.0)
         raw_slice = os.environ.get("CC_AGY_MAX_WAIT_SLICE_SECONDS", "").strip()
         if raw_slice:
@@ -3722,7 +5394,10 @@ class JobManager:
             max_slice = DEFAULT_MAX_WAIT_SLICE_SECONDS
         else:
             return full_wait
-        remaining_slice = max(0.05, max_slice - max(0.0, float(elapsed_seconds)))
+        elapsed_clamped = max(0.0, float(elapsed_seconds))
+        if allow_retry_grace and not raw_slice and max_slice >= 200.0:
+            max_slice = min(275.0, max(max_slice, elapsed_clamped + 45.0))
+        remaining_slice = max(0.05, max_slice - elapsed_clamped)
         return min(full_wait, remaining_slice)
 
     def _is_bounded_lead_session(self) -> bool:
@@ -3764,6 +5439,88 @@ class JobManager:
         else:
             return None
         return target if target != current_model else None
+
+    def _same_model_retry_limit(self) -> int:
+        """Plugin-side retries on the same worker model before handing a failed turn back to the Lead.
+
+        Defaults to 1 in the economy profile (which has no Argon escalation) and 0 elsewhere;
+        `CC_AGY_SAME_MODEL_RETRIES` overrides it.
+        """
+        raw = os.environ.get("CC_AGY_SAME_MODEL_RETRIES", "").strip()
+        if raw and not raw.startswith("${"):
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                pass
+        return 1 if resolve_cost_profile() == "economy" else 0
+
+    def _session_deadline_budget(self) -> tuple[float | None, float, float]:
+        """Return `(session_deadline, session_elapsed, remaining_worker_budget)` when `CC_AGY_SESSION_DEADLINE_SECONDS` is set."""
+        raw_deadline = os.environ.get("CC_AGY_SESSION_DEADLINE_SECONDS", "").strip()
+        if not raw_deadline:
+            return None, 0.0, float("inf")
+        try:
+            session_deadline = float(raw_deadline)
+        except ValueError:
+            session_deadline = 1500.0
+        if session_deadline <= 0:
+            return None, 0.0, float("inf")
+        raw_reserve = os.environ.get("CC_AGY_DEADLINE_RESERVE_SECONDS", "").strip()
+        try:
+            reserve_sec = max(15.0, float(raw_reserve)) if raw_reserve else 120.0
+        except ValueError:
+            reserve_sec = 120.0
+        elapsed = max(0.0, time.monotonic() - self._created_at)
+        remaining_worker = (session_deadline - reserve_sec) - elapsed
+        return session_deadline, elapsed, remaining_worker
+
+    def _same_model_retry_reason(self, receipt: dict[str, Any]) -> str | None:
+        """Return why a finished worker turn should get a plugin-side same-model retry, or None.
+
+        Only voluntary status='ok' turns using < 60% of the tool-call budget with failed acceptance checks
+        or vacuous acceptance qualify. Checkpoints (MAX_TOOL_CALLS_EXCEEDED), high-call-count slices,
+        compiler CLI config/help errors alongside passing test runners, errors, timeouts, quota hits,
+        questions, scope violations, spec conflicts, and Lead escalations are left to the Lead.
+        """
+        limit = self._same_model_retry_limit()
+        if limit <= 0:
+            return None
+        used = sum(1 for s in (receipt.get("prompt_sources") or []) if s == "plugin_retry")
+        if used >= limit:
+            return None
+        if (
+            receipt.get("escalate_to_lead")
+            or (receipt.get("escalation") or {}).get("escalate_to_lead")
+            or receipt.get("applied")
+        ):
+            return None
+        session_deadline, session_elapsed, remaining_worker = self._session_deadline_budget()
+        if session_deadline is not None and (
+            session_elapsed > 0.55 * session_deadline or remaining_worker < 180.0
+        ):
+            return None
+        status = str(receipt.get("status") or "")
+        if status != "ok":
+            return None
+        if not receipt.get("files_changed"):
+            return None
+        tool_calls_used = int(
+            receipt.get("tool_call_count") or len(receipt.get("tool_calls") or [])
+        )
+        max_tool_calls = int((receipt.get("budget") or {}).get("max_tool_calls") or 100)
+        call_cap = min(60, max(1, int(0.6 * max_tool_calls)))
+        if tool_calls_used >= call_cap:
+            return None
+        acc_results = [
+            r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)
+        ]
+        if acc_results and _only_compiler_cli_config_failures(acc_results):
+            return None
+        if receipt.get("acceptance_passed") is False:
+            return "acceptance_failed"
+        if receipt.get("vacuous_acceptance"):
+            return "vacuous_acceptance"
+        return None
 
     def _session_since_epoch(self) -> float:
         session_since = self._created_at_epoch - 1.0
@@ -4257,8 +6014,8 @@ class JobManager:
             shutil.rmtree(wt_dir, ignore_errors=True)
         wt_dir.mkdir(parents=True, exist_ok=True)
 
-        ls_res = subprocess.run(
-            ["git", "ls-files", "-co", "--exclude-standard", "-z"],
+        ls_res = _git_raw(
+            ["ls-files", "-co", "--exclude-standard", "-z"],
             cwd=str(self.workspace_root),
             capture_output=True,
             check=False,
@@ -4314,9 +6071,8 @@ class JobManager:
             # or compiled Cython/C extension (`*.so`, `*.pyd`) files generated during editable install
             # so they are present in baseline_sha and importable inside the worktree.
             copied_ignored_rels: list[str] = []
-            ign_ver_res = subprocess.run(
+            ign_ver_res = _git_raw(
                 [
-                    "git",
                     "ls-files",
                     "-o",
                     "-i",
@@ -4380,8 +6136,8 @@ class JobManager:
                 alt_file.write_text(str(host_objects_dir.resolve()) + "\n", encoding="utf-8")
                 # In sparse mode, NEVER read-tree the full host HEAD (which would mark omitted files as deleted!).
                 if not sparse_used:
-                    lsv_res = subprocess.run(
-                        ["git", "ls-files", "-v", "-z"],
+                    lsv_res = _git_raw(
+                        ["ls-files", "-v", "-z"],
                         cwd=str(self.workspace_root),
                         capture_output=True,
                         check=False,
@@ -4396,8 +6152,8 @@ class JobManager:
                         rt_res = _run_git(["read-tree", host_head_sha], cwd=wt_dir, check=False)
                         if rt_res.returncode == 0:
                             # Remove index entries that were excluded from worktree copy or are submodule gitlinks (160000).
-                            wt_ls = subprocess.run(
-                                ["git", "ls-files", "-s", "-z"],
+                            wt_ls = _git_raw(
+                                ["ls-files", "-s", "-z"],
                                 cwd=str(wt_dir),
                                 capture_output=True,
                                 check=False,
@@ -4437,8 +6193,8 @@ class JobManager:
                                         cwd=wt_dir,
                                         check=False,
                                     )
-                            delta_res = subprocess.run(
-                                ["git", "status", "--porcelain", "-z"],
+                            delta_res = _git_raw(
+                                ["status", "--porcelain", "-z"],
                                 cwd=str(self.workspace_root),
                                 capture_output=True,
                                 check=False,
@@ -4534,14 +6290,25 @@ class JobManager:
     ) -> dict[str, str | None]:
         """Compute baseline SHA-256 hashes only for the files touched by the worker."""
         hashes: dict[str, str | None] = dict(prior_hashes or {})
-        if not wt_dir.exists():
+        git_cwd = wt_dir if wt_dir.exists() else (self.workspace_root if self.workspace_root.exists() else None)
+        if git_cwd is None:
             return hashes
+        ref_sha = baseline_sha
+        if git_cwd != wt_dir:
+            chk = _git_raw(
+                ["cat-file", "-e", f"{baseline_sha}^{{commit}}"],
+                cwd=str(git_cwd),
+                capture_output=True,
+                check=False,
+            )
+            if chk.returncode != 0:
+                ref_sha = "HEAD"
         for rel in files_changed:
             if rel in hashes:
                 continue
-            show_res = subprocess.run(
-                ["git", "show", f"{baseline_sha}:{rel}"],
-                cwd=str(wt_dir),
+            show_res = _git_raw(
+                ["show", f"{ref_sha}:{rel}"],
+                cwd=str(git_cwd),
                 capture_output=True,
                 check=False,
             )
@@ -4556,6 +6323,7 @@ class JobManager:
         wt_dir: Path,
         baseline_sha: str,
         allowed_paths: list[str] | None = None,
+        prompt_text: str = "",
     ) -> tuple[str, list[str], list[str]]:
         """Collect unified binary diff with `--no-renames` against `baseline_sha`.
 
@@ -4590,23 +6358,55 @@ class JobManager:
                     symlink_escapes.append(rel)
 
         _run_git(["reset", "-q", baseline_sha], cwd=wt_dir, check=False)
+        tracked_res = _run_git(
+            ["diff", "--name-only", "--no-renames", baseline_sha],
+            cwd=wt_dir,
+            check=False,
+        )
+        tracked_changed = [
+            ln.strip()
+            for ln in (tracked_res.stdout.splitlines() if tracked_res.returncode == 0 else [])
+            if ln.strip()
+        ]
         untracked_to_stage: list[str] = []
+        excluded_runtime_artifacts: list[str] = []
+        preserved_runtime_artifacts: list[str] = []
         others_res = _run_git(
             ["ls-files", "--others", "--exclude-standard"],
             cwd=wt_dir,
             check=False,
         )
-        if others_res.returncode == 0 and others_res.stdout.strip():
-            for line in others_res.stdout.splitlines():
-                rel_u = line.strip()
-                if not rel_u:
-                    continue
-                if _is_ephemeral_build_or_test_artifact(rel_u, root=wt_dir):
-                    eph_p = wt_dir / rel_u
-                    if eph_p.is_file() and not eph_p.is_symlink():
-                        eph_p.unlink(missing_ok=True)
-                    continue
-                untracked_to_stage.append(rel_u)
+        raw_untracked = [
+            ln.strip()
+            for ln in (others_res.stdout.splitlines() if others_res.returncode == 0 else [])
+            if ln.strip()
+        ]
+        ref_candidates = list(dict.fromkeys([
+            *tracked_changed,
+            *[u for u in raw_untracked if not _is_ephemeral_build_or_test_artifact(u, root=wt_dir)],
+        ]))
+        for rel_u in raw_untracked:
+            explicitly_kept_rt = _explicitly_targets_runtime_artifact(
+                rel_u,
+                allowed_paths,
+                prompt_text=prompt_text,
+                ref_files=ref_candidates,
+                root=wt_dir,
+            )
+            if not explicitly_kept_rt and _is_ephemeral_build_or_test_artifact(rel_u, root=wt_dir):
+                eph_p = wt_dir / rel_u
+                if _is_untracked_runtime_artifact_name(rel_u):
+                    excluded_runtime_artifacts.append(rel_u)
+                elif (
+                    eph_p.is_file()
+                    and not eph_p.is_symlink()
+                    and not rel_u.lower().endswith(_UNTRACKED_MODEL_OR_DATA_DUMP_SUFFIXES)
+                ):
+                    eph_p.unlink(missing_ok=True)
+                continue
+            if explicitly_kept_rt:
+                preserved_runtime_artifacts.append(rel_u)
+            untracked_to_stage.append(rel_u)
 
         ign_res = _run_git(
             ["ls-files", "--others", "--ignored", "--exclude-standard"],
@@ -4617,18 +6417,33 @@ class JobManager:
         if ign_res.returncode == 0 and ign_res.stdout.strip():
             for line in ign_res.stdout.splitlines():
                 rel_i = line.strip()
-                if (
-                    rel_i
-                    and not _is_ignored_build_artifact(rel_i, root=wt_dir)
-                    and rel_i not in untracked_to_stage
-                ):
+                if not rel_i or rel_i in untracked_to_stage:
+                    continue
+                explicitly_kept_ign = _explicitly_targets_runtime_artifact(
+                    rel_i,
+                    allowed_paths,
+                    prompt_text=prompt_text,
+                    ref_files=ref_candidates,
+                    root=wt_dir,
+                )
+                if explicitly_kept_ign or not _is_ignored_build_artifact(rel_i, root=wt_dir):
                     if allowed_paths and not _matches_allowed_paths(rel_i, allowed_paths):
                         dropped_ignored.append(rel_i)
                         continue
+                    if explicitly_kept_ign and rel_i not in preserved_runtime_artifacts:
+                        preserved_runtime_artifacts.append(rel_i)
                     untracked_to_stage.append(rel_i)
+                elif _is_untracked_runtime_artifact_name(rel_i) and rel_i not in excluded_runtime_artifacts:
+                    excluded_runtime_artifacts.append(rel_i)
         if not hasattr(self, "_dropped_ignored_by_wt"):
             self._dropped_ignored_by_wt: dict[str, list[str]] = {}
         self._dropped_ignored_by_wt[str(wt_dir)] = dropped_ignored
+        if not hasattr(self, "_excluded_runtime_artifacts_by_wt"):
+            self._excluded_runtime_artifacts_by_wt: dict[str, list[str]] = {}
+        self._excluded_runtime_artifacts_by_wt[str(wt_dir)] = excluded_runtime_artifacts
+        if not hasattr(self, "_preserved_runtime_artifacts_by_wt"):
+            self._preserved_runtime_artifacts_by_wt: dict[str, list[str]] = {}
+        self._preserved_runtime_artifacts_by_wt[str(wt_dir)] = preserved_runtime_artifacts
 
         if untracked_to_stage:
             _run_git(["add", "-f", "-N", "--", *untracked_to_stage], cwd=wt_dir, check=False)
@@ -4871,6 +6686,7 @@ class JobManager:
         prompt_sources: list[str] | None = None,
         recorded_budget: dict[str, int | None] | None = None,
         baseline_acceptance_probe: list[dict[str, Any]] | None = None,
+        acceptance_remapped: list[dict[str, str]] | None = None,
         agy_conversation_id: str | None = None,
         agy_prior_conversation_usage: dict[str, Any] | None = None,
         agy_prior_conversation_turns: int | None = None,
@@ -4909,9 +6725,30 @@ class JobManager:
         progress_path = self.store.progress_path(job_id)
         progress_before = len(read_progress(progress_path, limit=10**6))
 
-        host_git_dir = self.workspace_root / ".git"
-        hooks_snap = _snapshot_directory_tree(host_git_dir / "hooks")
-        config_snap = _snapshot_directory_tree(host_git_dir / "config")
+        from server.verify import _git_dirs as _resolve_git_dirs
+
+        _PROTECTED_GIT_SUBPATHS = ("hooks", "config", "config.worktree", "info")
+        resolved_host_git_dirs = list(_resolve_git_dirs(self.workspace_root).values()) or [self.workspace_root / ".git"]
+        host_git_dir_modes: list[tuple[Path, int | None]] = [
+            (gd, (gd.lstat().st_mode & 0o7777) if (gd.is_dir() and not gd.is_symlink()) else None)
+            for gd in resolved_host_git_dirs
+        ]
+        host_git_snaps: list[tuple[Path, dict[str, bytes]]] = [
+            (gd / sub, _snapshot_directory_tree(gd / sub))
+            for gd in resolved_host_git_dirs
+            for sub in _PROTECTED_GIT_SUBPATHS
+        ]
+        wt_git_dir = wt_dir / ".git"
+        wt_git_dir_mode: int | None = (
+            (wt_git_dir.lstat().st_mode & 0o7777)
+            if (not in_place and wt_git_dir.is_dir() and not wt_git_dir.is_symlink())
+            else None
+        )
+        wt_git_snaps: list[tuple[Path, dict[str, bytes]]] = (
+            [(wt_git_dir / sub, _snapshot_directory_tree(wt_git_dir / sub)) for sub in _PROTECTED_GIT_SUBPATHS]
+            if (not in_place and wt_git_dir.exists())
+            else []
+        )
         orig_branch, pre_branches = self._snapshot_branches() if in_place else (None, [])
         worker_out: dict[str, Any] = {}
         active_agy_conv_id: str | None = agy_conversation_id
@@ -5129,13 +6966,44 @@ class JobManager:
         finally:
             self._unlink_checks_node_modules(worker_nm_links)
             try:
-                hooks_tampered = _restore_directory_tree(host_git_dir / "hooks", hooks_snap)
-                config_tampered = _restore_directory_tree(host_git_dir / "config", config_snap)
+                def _restore_git_snap_group(
+                    dir_modes: list[tuple[Path, int | None]],
+                    snaps: list[tuple[Path, dict[str, bytes]]],
+                ) -> bool:
+                    tampered = False
+                    for gd, orig_mode in dir_modes:
+                        if gd.is_symlink():
+                            tampered = True
+                        elif orig_mode is not None and gd.is_dir():
+                            try:
+                                now_m = gd.lstat().st_mode & 0o7777
+                                if now_m != orig_mode:
+                                    tampered = True
+                                os.chmod(gd, orig_mode | 0o700)
+                            except OSError:
+                                tampered = True
+                    for snap_path, snap_data in snaps:
+                        try:
+                            if _restore_directory_tree(snap_path, snap_data):
+                                tampered = True
+                        except OSError:
+                            tampered = True
+                    for gd, orig_mode in dir_modes:
+                        if orig_mode is not None and gd.is_dir() and not gd.is_symlink():
+                            try:
+                                os.chmod(gd, orig_mode)
+                            except OSError:
+                                tampered = True
+                    return tampered
+
+                host_git_tampered = _restore_git_snap_group(host_git_dir_modes, host_git_snaps)
+                if wt_git_snaps:
+                    _restore_git_snap_group([(wt_git_dir, wt_git_dir_mode)], wt_git_snaps)
                 nm_tampered = (
                     host_nm_snap is not None
                     and not _verify_host_nm_metadata_unchanged(self.workspace_root, host_nm_snap)
                 )
-                if hooks_tampered or config_tampered:
+                if host_git_tampered:
                     status = "security_violation"
                     error_msg = "Worker attempted to modify host .git/hooks or .git/config; restored."
                 elif nm_tampered:
@@ -5154,7 +7022,10 @@ class JobManager:
                     )
                 else:
                     diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
-                        wt_dir, baseline_sha, allowed_paths=allowed_paths
+                        wt_dir,
+                        baseline_sha,
+                        allowed_paths=allowed_paths,
+                        prompt_text="\n".join(recorded_prompts) if recorded_prompts else "",
                     )
                     baseline_file_hashes = self._compute_changed_baseline_hashes(
                         wt_dir, baseline_sha, files_changed, baseline_file_hashes
@@ -5194,6 +7065,68 @@ class JobManager:
                 # pre-existing baseline tests passing with zero edits is vacuous (e.g. an early tool-budget checkpoint).
                 vacuous_acceptance = True
                 effective_acceptance = []
+            active_acceptance_remapped = list(acceptance_remapped or [])
+            if effective_acceptance and active_acceptance_remapped:
+                restored_cmds: list[str] = []
+                still_remapped: list[dict[str, str]] = []
+                remap_by_new = {
+                    str(item.get("remapped_command") or "").strip(): item
+                    for item in active_acceptance_remapped
+                    if isinstance(item, dict) and item.get("remapped_command")
+                }
+                for ecmd in effective_acceptance:
+                    rm_entry = remap_by_new.get(ecmd.strip())
+                    orig_missing = str((rm_entry or {}).get("missing_target") or "").strip()
+                    orig_cmd_str = str((rm_entry or {}).get("original_command") or "").strip()
+                    if rm_entry and orig_missing and orig_cmd_str and (target_acc_cwd / orig_missing).exists():
+                        restored_cmds.append(orig_cmd_str)
+                    else:
+                        restored_cmds.append(ecmd)
+                        if rm_entry:
+                            still_remapped.append(rm_entry)
+                effective_acceptance = restored_cmds
+                active_acceptance_remapped = still_remapped
+            has_timed_out_baseline_cmd = False
+            if effective_acceptance and runnable_acc_status and files_changed and baseline_acceptance_probe:
+                timed_out_baseline_cmds = {
+                    str(bp.get("command") or "").strip()
+                    for bp in baseline_acceptance_probe
+                    if isinstance(bp, dict) and bp.get("timed_out") is True and bp.get("command")
+                }
+                if timed_out_baseline_cmds:
+                    scoped_acceptance: list[str] = []
+                    for orig_cmd in effective_acceptance:
+                        if orig_cmd.strip() not in timed_out_baseline_cmds:
+                            if orig_cmd not in scoped_acceptance:
+                                scoped_acceptance.append(orig_cmd)
+                            continue
+                        related_cmds = discover_related_test_commands(target_acc_cwd, files_changed, [])
+                        py_test_edits = [
+                            rel
+                            for rel in files_changed
+                            if rel.endswith(".py")
+                            and _is_test_file_path(rel)
+                            and (target_acc_cwd / rel).is_file()
+                        ]
+                        if py_test_edits and "pytest" in orig_cmd:
+                            runner_pref = _extract_pytest_runner_prefix(orig_cmd) or "pytest"
+                            uncovered_py_edits = [
+                                rel
+                                for rel in py_test_edits
+                                if not any(rel in rc or Path(rel).name in rc for rc in related_cmds)
+                            ]
+                            if uncovered_py_edits:
+                                quoted_py = " ".join(shlex.quote(p) for p in uncovered_py_edits)
+                                related_cmds.append(f"{runner_pref} -q {quoted_py}")
+                        if related_cmds:
+                            for rcmd in related_cmds:
+                                if rcmd not in scoped_acceptance:
+                                    scoped_acceptance.append(rcmd)
+                        else:
+                            has_timed_out_baseline_cmd = True
+                            if orig_cmd not in scoped_acceptance:
+                                scoped_acceptance.append(orig_cmd)
+                    effective_acceptance = scoped_acceptance
             if effective_acceptance and runnable_acc_status:
                 if not in_place and files_changed:
                     _invalidate_python_bytecode_for_paths(target_acc_cwd, files_changed)
@@ -5211,8 +7144,61 @@ class JobManager:
                     if reused_acc is not None:
                         acceptance_results = reused_acc
                     else:
-                        acceptance_results = run_acceptance(effective_acceptance, target_acc_cwd)
-                    if not auto_default_acceptance and baseline_acceptance_probe and files_changed:
+                        acc_timeout_override = 45.0 if has_timed_out_baseline_cmd else None
+                        sess_dl, sess_el, _ = self._session_deadline_budget()
+                        acc_wall_budget = max(5.0, (sess_dl - 15.0) - sess_el) if sess_dl is not None else None
+                        acceptance_results = run_acceptance(
+                            effective_acceptance,
+                            target_acc_cwd,
+                            timeout=acc_timeout_override,
+                            total_wall_budget=acc_wall_budget,
+                            restore_tracked=not in_place,
+                            change_set=list(files_changed or []),
+                            quarantine_dir=(self.store.data_dir / "quarantine" / job_id) if in_place else None,
+                        )
+                    norm_prompt_for_missing = "\n".join(str(p) for p in (recorded_prompts or []) if p).replace("\\", "/")
+                    for r_item in acceptance_results:
+                        if not isinstance(r_item, dict):
+                            continue
+                        fmp: list[str] = []
+                        for raw_mp in (r_item.get("filtered_missing_paths") or []):
+                            clean_mp = str(raw_mp or "").replace("\\", "/").strip("/")
+                            if not clean_mp:
+                                continue
+                            bname_mp = Path(clean_mp).name
+                            in_allowed = bool(allowed_paths and _matches_allowed_paths(clean_mp, allowed_paths))
+                            in_prompt = bool(
+                                norm_prompt_for_missing
+                                and (
+                                    re.search(
+                                        r"(?<![A-Za-z0-9_./-])" + re.escape(clean_mp) + r"(?![A-Za-z0-9_./-])",
+                                        norm_prompt_for_missing,
+                                    )
+                                    or (
+                                        bname_mp
+                                        and re.search(
+                                            r"\b(?:create|add|write|new)\b[^.\n]{0,120}\b" + re.escape(bname_mp) + r"\b",
+                                            norm_prompt_for_missing,
+                                            re.I,
+                                        )
+                                    )
+                                )
+                            )
+                            if in_allowed or in_prompt:
+                                fmp.append(clean_mp)
+                        if fmp:
+                            r_item["passed"] = False
+                            r_item["missing_allowed_test_files"] = fmp
+                            prev_t = str(r_item.get("output_tail") or "").rstrip()
+                            r_item["output_tail"] = (
+                                f"{prev_t}\nERROR: required test file(s) not created: {fmp}\n"
+                                if prev_t
+                                else f"ERROR: required test file(s) not created: {fmp}\n"
+                            )
+                    any_acc_timed_out = any(
+                        isinstance(r, dict) and r.get("timed_out") is True for r in acceptance_results
+                    )
+                    if not any_acc_timed_out and not auto_default_acceptance and files_changed:
                         baseline_acceptance_warnings = evaluate_post_worker_baseline_failures(
                             acceptance_results,
                             baseline_acceptance_probe,
@@ -5257,7 +7243,8 @@ class JobManager:
                                 dr["passed"] = True
                                 dr["runner_incompatible_skipped"] = True
                     elif (
-                        files_changed
+                        not any_acc_timed_out
+                        and files_changed
                         and os.environ.get("CC_AGY_AUTO_REGRESSION_TESTS", "1").strip().lower()
                         not in ("0", "false", "no")
                     ):
@@ -5267,19 +7254,32 @@ class JobManager:
                             effective_acceptance,
                         )
                         if extra_reg_cmds:
-                            extra_res = run_acceptance(extra_reg_cmds, target_acc_cwd)
+                            sess_dl2, sess_el2, _ = self._session_deadline_budget()
+                            reg_wall = max(5.0, (sess_dl2 - 15.0) - sess_el2) if sess_dl2 is not None else None
+                            extra_res = run_acceptance(
+                                extra_reg_cmds, target_acc_cwd, total_wall_budget=reg_wall,
+                                restore_tracked=not in_place, change_set=list(files_changed or []),
+                                quarantine_dir=(self.store.data_dir / "quarantine" / job_id) if in_place else None,
+                            )
                             for er in extra_res:
                                 er["auto_discovered_regression"] = True
                             acceptance_results.extend(extra_res)
+                            if any(isinstance(r, dict) and r.get("timed_out") is True for r in extra_res):
+                                any_acc_timed_out = True
                     if (
-                        not auto_default_acceptance
+                        not any_acc_timed_out
+                        and not auto_default_acceptance
                         and files_changed
                         and os.environ.get("CC_AGY_AUTO_IMPORT_CHECK", "").strip().lower()
                         in ("1", "true", "yes", "on", "always")
                     ):
                         import_cmds = build_import_smoke_command(target_acc_cwd, files_changed)
                         if import_cmds:
-                            imp_res = run_acceptance(import_cmds, target_acc_cwd)
+                            imp_res = run_acceptance(
+                                import_cmds, target_acc_cwd, restore_tracked=not in_place,
+                                change_set=list(files_changed or []),
+                                quarantine_dir=(self.store.data_dir / "quarantine" / job_id) if in_place else None,
+                            )
                             for ir in imp_res:
                                 ir["auto_import_smoke"] = True
                             acceptance_results.extend(imp_res)
@@ -5301,7 +7301,10 @@ class JobManager:
                         )
                     else:
                         diff_text, files_changed, symlink_escapes = self._collect_worktree_diff(
-                            wt_dir, baseline_sha, allowed_paths=allowed_paths
+                            wt_dir,
+                            baseline_sha,
+                            allowed_paths=allowed_paths,
+                            prompt_text="\n".join(recorded_prompts) if recorded_prompts else "",
                         )
                         baseline_file_hashes = self._compute_changed_baseline_hashes(
                             wt_dir, baseline_sha, files_changed, baseline_file_hashes
@@ -5327,7 +7330,7 @@ class JobManager:
                     error_msg = (
                         f"Worker modified files outside allowed_paths {allowed_paths}: "
                         f"{scope_violations}. Review the diff with get_diff and either call "
-                        f"delegate_apply(job_id, allow_scope_violations=True) to approve, or call "
+                        f"delegate_apply(job_id, allow_scope_violations=True, include_paths=[...]) to approve, or call "
                         f"delegate_continue(job_id, follow_up_prompt=..., allowed_paths=...) to adjust scope."
                     )
 
@@ -5359,6 +7362,46 @@ class JobManager:
                 if files_changed
                 else []
             )
+            prompt_text_joined = "\n".join(recorded_prompts) if recorded_prompts else ""
+            existing_rec_for_intent: dict[str, Any] = {}
+            prior_raw_user_prompt = ""
+            try:
+                existing_rec_for_intent = self.store.read_receipt(job_id) or {}
+                prior_raw_user_prompt = str(existing_rec_for_intent.get("raw_user_prompt") or "")
+            except Exception:
+                prior_raw_user_prompt = ""
+            task_intent_text = "\n".join(
+                s for s in [prior_raw_user_prompt, *(recorded_prompts[:1])] if s
+            )
+            prompt_requests_tests = _prompt_requests_test_authoring(task_intent_text or prompt_text_joined)
+            allowed_only_tests = bool(
+                allowed_paths and all(_is_test_file_path(ap) for ap in allowed_paths)
+            )
+            raw_stub_warnings = (
+                detect_existing_test_stub_mutations(
+                    self.workspace_root if in_place else wt_dir,
+                    diff_text,
+                    files_changed,
+                    baseline_ref=baseline_sha or "HEAD",
+                )
+                if (files_changed and not allowed_only_tests)
+                else []
+            )
+            stub_mutation_warnings = _unexempted_stub_mutation_warnings(
+                raw_stub_warnings,
+                task_intent_text or prompt_text_joined,
+            )
+            for sw in stub_mutation_warnings:
+                if sw not in contract_warnings:
+                    contract_warnings.append(sw)
+
+            test_only_diff = bool(
+                is_mutating_job
+                and files_changed
+                and all(_is_test_file_path(f) for f in files_changed)
+                and not allowed_only_tests
+                and not prompt_requests_tests
+            )
 
             with self._lock:
                 if job_id in self._cancelled:
@@ -5369,6 +7412,7 @@ class JobManager:
             no_tests_re = re.compile(r"\bno tests ran\b|\bcollected 0 items\b|\bRan 0 tests\b", re.I)
             real_acc_passed_on_job = (
                 bool(acceptance_results)
+                and not test_only_diff
                 and all(isinstance(r, dict) and r.get("passed") is True for r in acceptance_results)
                 and any(
                     isinstance(r, dict)
@@ -5383,7 +7427,21 @@ class JobManager:
                 )
             )
             recovered_from_timeout = False
+            recovered_from_checkpoint = False
             timeout_note: str | None = None
+            _qa_flag_chk = env_flag("CC_AGY_BALANCED_QA_REVIEW")
+            _esc_dl_chk, _, _rem_b_chk = self._session_deadline_budget()
+            _qa_will_audit_checkpoint = (
+                not in_place
+                and not existing_rec_for_intent.get("escalated_from_model")
+                and not existing_rec_for_intent.get("skip_balanced_qa")
+                and not existing_rec_for_intent.get("qa_review")
+                and "flash" in (model or "").lower()
+                and resolve_cost_profile() == "balanced"
+                and _qa_flag_chk is not False
+                and (self.worker_backend is None or _qa_flag_chk is True)
+                and (_esc_dl_chk is None or _rem_b_chk >= 90.0)
+            )
             if (
                 status == "timeout"
                 and files_changed
@@ -5397,6 +7455,29 @@ class JobManager:
                 status = "ok"
                 recovered_from_timeout = True
                 timeout_note = error_msg
+                error_msg = None
+            elif (
+                status == "checkpoint"
+                and stop_reason == "MAX_TOOL_CALLS_EXCEEDED"
+                and files_changed
+                and not test_only_diff
+                and not vacuous_acceptance
+                and not scope_violations
+                and not symlink_escapes
+                and not missing_prompt_symbols
+                and not contract_warnings
+                and not external_tamper
+                and real_acc_passed_on_job
+                and (self._resolve_escalation_target_model(model) is None or _qa_will_audit_checkpoint)
+                and not all(
+                    re.match(r"^\s*(?:grep|egrep|fgrep|rg|test|\[|ls|stat)\b", str(r.get("command") or ""))
+                    for r in acceptance_results
+                    if isinstance(r, dict)
+                )
+                and env_flag("CC_AGY_PROMOTE_VERIFIED_CHECKPOINT") is not False
+            ):
+                status = "ok"
+                recovered_from_checkpoint = True
                 error_msg = None
 
             finished_at = round(time.time(), 3)
@@ -5422,7 +7503,7 @@ class JobManager:
                 vacuous_acceptance = True
             computed_acc_passed = (
                 False
-                if vacuous_acceptance and acceptance_results
+                if (vacuous_acceptance and acceptance_results)
                 else (all(r.get("passed") for r in acceptance_results) if acceptance_results else None)
             )
             receipt_payload = {
@@ -5474,11 +7555,14 @@ class JobManager:
                 "acceptance_results": acceptance_results,
                 "acceptance_passed": computed_acc_passed,
                 **({"vacuous_acceptance": True} if vacuous_acceptance else {}),
+                **({"test_only_diff": True} if test_only_diff else {}),
                 **({"spec_conflict": spec_conflict_msg} if spec_conflict_msg else {}),
                 "missing_prompt_symbols": missing_prompt_symbols,
                 "contract_warnings": contract_warnings,
+                **({"stub_mutation_warnings": stub_mutation_warnings} if stub_mutation_warnings else {}),
                 **({"baseline_acceptance_probe": baseline_acceptance_probe} if baseline_acceptance_probe else {}),
                 **({"baseline_acceptance_warnings": baseline_acceptance_warnings} if baseline_acceptance_warnings else {}),
+                **({"acceptance_remapped": active_acceptance_remapped} if active_acceptance_remapped else {}),
                 "external_worktree_tamper": external_tamper,
                 "preloaded_files": list(preloaded_files or []),
                 **({"agy_conversation_id": active_agy_conv_id} if active_agy_conv_id else {}),
@@ -5497,10 +7581,18 @@ class JobManager:
                     if recovered_from_timeout
                     else {}
                 ),
+                **({"recovered_from_checkpoint": True} if recovered_from_checkpoint else {}),
             }
             dropped_ign = getattr(self, "_dropped_ignored_by_wt", {}).pop(str(wt_dir), [])
             if dropped_ign:
                 receipt_payload["dropped_out_of_scope_ignored"] = dropped_ign
+            excl_art = getattr(self, "_excluded_runtime_artifacts_by_wt", {}).pop(str(wt_dir), [])
+            if excl_art:
+                receipt_payload["excluded_runtime_artifacts"] = excl_art
+                self._archive_omitted_worktree_files(job_id, wt_dir, excl_art)
+            pres_art = getattr(self, "_preserved_runtime_artifacts_by_wt", {}).pop(str(wt_dir), [])
+            if pres_art:
+                receipt_payload["preserved_runtime_artifacts"] = pres_art
             with self._lock:
                 sparse_count = self._sparse_worktrees.get(job_id)
             if sparse_count is not None:
@@ -5568,9 +7660,31 @@ class JobManager:
                 "spec_files",
                 "context_files",
                 "baseline_acceptance_probe",
+                "prior_attempts",
+                "cumulative_max_tool_calls",
+                "cumulative_max_total_tokens",
+                "explicit_max_tool_calls",
+                "explicit_max_total_tokens",
+                "explicit_thinking_level",
+                "skip_balanced_qa",
+                "qa_review",
+                "owner_instance_id",
             ):
                 if prior_disk_rec.get(ctx_key) and not receipt_payload.get(ctx_key):
-                    receipt_payload[ctx_key] = prior_disk_rec[ctx_key]
+                    if (
+                        ctx_key == "qa_review"
+                        and isinstance(prior_disk_rec["qa_review"], dict)
+                        and prior_disk_rec["qa_review"].get("passed") is False
+                        and prior_disk_rec["qa_review"].get("resumed")
+                        and receipt_payload.get("status") == "ok"
+                        and receipt_payload.get("acceptance_passed") is True
+                    ):
+                        receipt_payload["qa_review"] = {
+                            **prior_disk_rec["qa_review"],
+                            "resolved_by_escalation": True,
+                        }
+                    else:
+                        receipt_payload[ctx_key] = prior_disk_rec[ctx_key]
             if prior_disk_rec.get("applied") and not in_place:
                 for preserve_key in (
                     "applied",
@@ -5584,6 +7698,11 @@ class JobManager:
                 ):
                     if preserve_key in prior_disk_rec:
                         receipt_payload[preserve_key] = prior_disk_rec[preserve_key]
+            try:
+                Path(f"{progress_path}.live").unlink(missing_ok=True)
+                progress_path.with_suffix(".live.json").unlink(missing_ok=True)
+            except OSError:
+                pass
             saved = self.store.write_receipt(
                 job_id,
                 receipt_payload,
@@ -5819,6 +7938,7 @@ class JobManager:
         spec_files: list[str] | None = None,
         context_files: list[str] | None = None,
         checklist: list[str] | None = None,
+        _skip_balanced_qa: bool = False,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
 
@@ -5827,8 +7947,12 @@ class JobManager:
         With in_place=True the worker edits the real working tree directly (requires a clean tracked tree,
         one in_place job at a time, and no allowed_paths); the job is recorded as applied as soon as it finishes.
         """
+        rpc_started_mono = time.monotonic()
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("MCP server is shutting down; refusing to start new worker job.")
         enforce_daily_budget(self.store, workspace_root=self.workspace_root)
         if wait and not in_place and self._is_bounded_lead_session():
             delegate_receipts = [
@@ -6052,6 +8176,7 @@ class JobManager:
             )
 
         baseline_probe: list[dict[str, Any]] = []
+        acceptance_remapped: list[dict[str, str]] = []
         if (
             acceptance_cmds
             and not in_place
@@ -6069,6 +8194,23 @@ class JobManager:
                     total_timeout=total_probe_limit,
                     reset_tracked=True,
                 )
+                remapped_cmds, did_remap = remap_nonexistent_pytest_acceptance_cmds(
+                    acceptance_cmds,
+                    wt_dir,
+                    baseline_probe,
+                    allowed_paths=validated_paths,
+                    prompt_text=f"{prompt}\n{raw_user_prompt_text}",
+                    remap_details=acceptance_remapped,
+                )
+                if did_remap:
+                    acceptance_cmds = remapped_cmds
+                    baseline_probe = probe_baseline_acceptance(
+                        acceptance_cmds,
+                        wt_dir,
+                        per_cmd_timeout=per_probe_limit,
+                        total_timeout=total_probe_limit,
+                        reset_tracked=True,
+                    )
             finally:
                 self._unlink_checks_node_modules(probe_nm_link)
 
@@ -6119,6 +8261,7 @@ class JobManager:
             "baseline_commit_sha": baseline_sha,
             "baseline_file_hashes": baseline_hashes,
             "started_at_epoch": started_at,
+            "owner_instance_id": self._instance_id,
             "usage": {
                 "prompt_token_count": 0,
                 "cached_content_token_count": 0,
@@ -6136,12 +8279,17 @@ class JobManager:
             "acceptance": acceptance_cmds,
             "timeout_seconds": timeout_seconds,
             "budget": {"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
+            "explicit_max_tool_calls": bool(max_tool_calls is not None),
+            "explicit_max_total_tokens": bool(max_total_tokens is not None),
+            "explicit_thinking_level": bool(thinking_level is not None and str(thinking_level).strip()),
+            **({"skip_balanced_qa": True} if _skip_balanced_qa else {}),
             "preloaded_files": preloaded_rel_paths,
             **({"raw_user_prompt": raw_user_prompt_text} if raw_user_prompt_text else {}),
             **({"checklist": clean_checklist} if clean_checklist else {}),
             **({"spec_files": spec_rel_list} if spec_rel_list else {}),
             **({"context_files": ctx_rel_list} if ctx_rel_list else {}),
             **({"baseline_acceptance_probe": baseline_probe} if baseline_probe else {}),
+            **({"acceptance_remapped": acceptance_remapped} if acceptance_remapped else {}),
             "error": None,
         }
         if sparse_init_count is not None:
@@ -6157,45 +8305,60 @@ class JobManager:
             api_key=resolved_key,
         )
 
-        fut = self._executor.submit(
-            self._execute_job,
-            job_id=job_id,
-            worker_prompts=[worker_prompt],
-            recorded_prompts=[prompt.strip()],
-            model=chosen_model,
-            auth_mode=auth_mode,
-            api_key=resolved_key,
-            project=resolved_project,
-            location=resolved_location,
-            reroute_note=reroute_note,
-            allowed_paths=validated_paths,
-            timeout_seconds=timeout_seconds,
-            enabled_tools=enabled_tools,
-            disabled_tools=disabled_tools,
-            enable_subagents=enable_subagents,
-            wt_dir=wt_dir,
-            baseline_sha=baseline_sha,
-            baseline_file_hashes=baseline_hashes,
-            started_at=started_at,
-            scrub_receipt=scrub_receipt,
-            in_place=in_place,
-            pre_untracked=pre_untracked,
-            thinking_level=resolved_thinking or "DEFAULT",
-            plan=plan_steps,
-            acceptance=acceptance_cmds,
-            max_tool_calls=budget_calls,
-            max_total_tokens=budget_tokens,
-            preloaded_files=preloaded_rel_paths,
-            prompt_sources=["lead"],
-            recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
-            baseline_acceptance_probe=baseline_probe,
-        )
         with self._lock:
+            if self._shutting_down:
+                if in_place:
+                    self._release_in_place_slot(job_id)
+                elif wt_dir.exists():
+                    self._cleanup_worktree(wt_dir)
+                try:
+                    self.store.receipt_path(job_id).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError("MCP server is shutting down; refusing to start new worker job.")
+            fut = self._executor.submit(
+                self._execute_job,
+                job_id=job_id,
+                worker_prompts=[worker_prompt],
+                recorded_prompts=[prompt.strip()],
+                model=chosen_model,
+                auth_mode=auth_mode,
+                api_key=resolved_key,
+                project=resolved_project,
+                location=resolved_location,
+                reroute_note=reroute_note,
+                allowed_paths=validated_paths,
+                timeout_seconds=timeout_seconds,
+                enabled_tools=enabled_tools,
+                disabled_tools=disabled_tools,
+                enable_subagents=enable_subagents,
+                wt_dir=wt_dir,
+                baseline_sha=baseline_sha,
+                baseline_file_hashes=baseline_hashes,
+                started_at=started_at,
+                scrub_receipt=scrub_receipt,
+                in_place=in_place,
+                pre_untracked=pre_untracked,
+                thinking_level=resolved_thinking or "DEFAULT",
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=budget_calls,
+                max_total_tokens=budget_tokens,
+                preloaded_files=preloaded_rel_paths,
+                prompt_sources=["lead"],
+                recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
+                baseline_acceptance_probe=baseline_probe,
+                acceptance_remapped=acceptance_remapped,
+            )
             self._futures[job_id] = fut
+            self._owned_job_ids.add(job_id)
 
         if wait:
-            wait_started_mono = time.monotonic()
-            wait_slice = self._resolve_wait_slice_seconds(timeout_seconds)
+            setup_elapsed = max(0.0, time.monotonic() - rpc_started_mono)
+            wait_slice = self._resolve_wait_slice_seconds(
+                timeout_seconds,
+                elapsed_seconds=setup_elapsed,
+            )
             self._wait_for_future_or_cancel(job_id, fut, timeout=wait_slice)
             receipt = self.store.read_receipt(job_id)
             if not fut.done() or receipt.get("status") == "running":
@@ -6207,7 +8370,7 @@ class JobManager:
                 receipt,
                 auto_apply=auto_apply,
                 in_place=in_place,
-                wait_elapsed=time.monotonic() - wait_started_mono,
+                wait_elapsed=max(0.0, time.monotonic() - rpc_started_mono),
                 timeout_seconds=timeout_seconds,
             )
 
@@ -6324,40 +8487,93 @@ class JobManager:
         )
         with self._lock:
             is_cancelled_now = (job_id in self._cancelled) or bool(receipt.get("cancelled"))
-        needs_turn1_escalation = (
-            worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
-            or bool(receipt.get("vacuous_acceptance"))
-            or receipt.get("status") in ("checkpoint", "needs_input")
+            shutting_down_now = self._shutting_down
+        if shutting_down_now:
+            return self._digest_with_progress(receipt)
+        acc_results_list = [
+            r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)
+        ]
+        only_cli_cfg_err = (
+            receipt.get("status") == "ok"
+            and not receipt.get("vacuous_acceptance")
+            and bool(receipt.get("files_changed"))
+            and bool(acc_results_list)
+            and _only_compiler_cli_config_failures(acc_results_list)
         )
+        prompt_text_for_intent = "\n".join(
+            str(x)
+            for x in [
+                receipt.get("raw_user_prompt") or "",
+                *((receipt.get("prompts") or [])[:1]),
+            ]
+            if x
+        )
+        unexempted_stub_warns = _unexempted_stub_mutation_warnings(
+            receipt.get("stub_mutation_warnings"),
+            prompt_text_for_intent,
+        )
+        has_stub_mutation_for_esc = bool(unexempted_stub_warns)
+        needs_turn1_escalation = (
+            (
+                worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+                or bool(receipt.get("vacuous_acceptance"))
+                or receipt.get("status") in ("checkpoint", "needs_input")
+                or has_stub_mutation_for_esc
+            )
+            and not only_cli_cfg_err
+        )
+        esc_session_deadline, _esc_elapsed, rem_esc_budget = self._session_deadline_budget()
+        has_escalation_time = esc_session_deadline is None or rem_esc_budget >= 120.0
         if (
             self._is_bounded_lead_session()
             and allow_turn1_inplace_escalation
             and not in_place
             and not is_cancelled_now
+            and not receipt.get("applied")
+            and (receipt.get("escalation") or {}).get("reason") != "quota_or_rate_limit"
             and not receipt.get("escalated_from_model")
             and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is not None
             and needs_turn1_escalation
+            and has_escalation_time
             and receipt.get("status") not in ("cancelled", "interrupted", "spec_conflict")
         ):
             acc_failures = [
                 f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
-                for r in (receipt.get("acceptance_results") or [])
-                if isinstance(r, dict) and not r.get("passed")
+                for r in acc_results_list
+                if not r.get("passed")
             ]
-            fail_detail = (
-                "\n\nFailing acceptance commands from the Flash attempt:\n" + "\n\n".join(acc_failures)
-                if acc_failures
-                else f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
+            stub_warn_list = [str(w) for w in unexempted_stub_warns if w]
+            if acc_failures:
+                fail_detail = "\n\nFailing acceptance commands from the Flash attempt:\n" + "\n\n".join(acc_failures)
+            elif stub_warn_list:
+                fail_detail = "\n\nPre-existing test mutation warnings from the Flash attempt:\n" + "\n".join(
+                    f"- {w}" for w in stub_warn_list
+                )
+            else:
+                fail_detail = (
+                    f"\n\nPrior Flash attempt ended with status={receipt.get('status')!r}, error={receipt.get('error')!r}."
+                )
+            prior_flash_summary = " ".join(str(receipt.get("summary") or "").split())[:500]
+            flash_summary_note = (
+                f"\n\nPrior Flash diagnostic summary:\n{prior_flash_summary}"
+                if prior_flash_summary
+                else ""
             )
+            esc_target_name = self._resolve_escalation_target_model(str(receipt.get("model") or "")) or "Gemini 4 Argon"
             worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+            if esc_session_deadline is not None:
+                worker_timeout = min(worker_timeout, max(60.0, rem_esc_budget))
             try:
                 return self.delegate_continue(
                     job_id=job_id,
                     follow_up_prompt=(
-                        "The initial Gemini Flash attempt did not complete all requirements or failed acceptance tests. "
-                        "You are now escalated to Gemini 4 Argon. Inspect the existing changes in the worktree, "
+                        "The initial Gemini Flash attempt did not complete all requirements or failed verification checks. "
+                        f"You are now escalated to {esc_target_name}. Inspect the existing changes in the worktree, "
                         "complete all requirements from the original task specification, and ensure all acceptance "
-                        "and unit tests pass." + fail_detail
+                        "and unit tests pass. When a test fails, trace and fix the root cause in production code "
+                        "(including imported helper or caller modules) rather than weakening test inputs or altering "
+                        "pre-existing test expectations (unless the specification explicitly requires updating existing "
+                        "test expectations)." + flash_summary_note + fail_detail
                     ),
                     allowed_paths=receipt.get("allowed_paths"),
                     acceptance=receipt.get("acceptance"),
@@ -6374,6 +8590,94 @@ class JobManager:
                 digest["budget_exceeded"] = True
                 digest["budget_exceeded_note"] = str(exc)
                 return digest
+        retry_reason = (
+            self._same_model_retry_reason(receipt)
+            if (
+                self._is_bounded_lead_session()
+                and allow_turn1_inplace_escalation
+                and not in_place
+                and not is_cancelled_now
+                and self._resolve_escalation_target_model(str(receipt.get("model") or "")) is None
+            )
+            else None
+        )
+        if retry_reason:
+            # Economy has no Argon escalation: give the same worker one more turn inside the plugin so the
+            # Opus Lead is not woken (and billed) just to say "keep going".
+            acc_failures = [
+                f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
+                for r in (receipt.get("acceptance_results") or [])
+                if isinstance(r, dict) and not r.get("passed")
+            ]
+            if retry_reason == "tool_call_checkpoint":
+                if receipt.get("acceptance_passed") is True and receipt.get("files_changed"):
+                    lead_in = (
+                        "Your previous turn hit its tool-call limit after modifying "
+                        f"{receipt.get('files_changed')} and passing the configured acceptance command. "
+                        "Check in <=2 calls (`git status --short` or targeted test) whether every requirement "
+                        "and unit test from the original task is already complete; if anything is still missing, "
+                        "add only that missing piece and run the acceptance check, otherwise stop immediately."
+                    )
+                else:
+                    lead_in = (
+                        "Your previous turn hit its tool-call limit before you finished. Continue in the same "
+                        "worktree: run `git diff` to see what you already changed, finish every remaining "
+                        "requirement from the original task, and make the acceptance checks pass."
+                    )
+            elif retry_reason == "vacuous_acceptance":
+                lead_in = (
+                    "Your previous turn did not produce a verifiable change (no modified files, or the "
+                    "acceptance checks collected 0 tests). Re-read the original task, make the required "
+                    "edits in this worktree, and make sure the acceptance checks actually run them. If the "
+                    "task truly needs no change, say so and stop without editing."
+                )
+            else:
+                lead_in = (
+                    "Your previous turn finished but the acceptance checks failed. Fix the failures below "
+                    "in this worktree without discarding correct work, and complete every requirement "
+                    "from the original task."
+                )
+            fail_detail = (
+                "\n\nFailing acceptance commands:\n" + "\n\n".join(acc_failures) if acc_failures else ""
+            )
+            worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+            session_deadline, _sess_elapsed, rem_worker_budget = self._session_deadline_budget()
+            if session_deadline is not None:
+                worker_timeout = min(worker_timeout, 240.0, max(45.0, 0.5 * rem_worker_budget))
+            elif resolve_cost_profile() == "economy":
+                worker_timeout = min(worker_timeout, 240.0)
+            try:
+                return self.delegate_continue(
+                    job_id=job_id,
+                    follow_up_prompt=lead_in + fail_detail,
+                    allowed_paths=receipt.get("allowed_paths"),
+                    acceptance=receipt.get("acceptance"),
+                    timeout_seconds=worker_timeout,
+                    wait=True,
+                    scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                    auto_apply=auto_apply,
+                    _wait_elapsed=wait_elapsed,
+                    _wait_budget=wait_budget,
+                    _prompt_source="plugin_retry",
+                )
+            except BudgetExceededError as exc:
+                digest = self._digest_with_progress(receipt)
+                digest["budget_exceeded"] = True
+                digest["budget_exceeded_note"] = str(exc)
+                return digest
+        qa_escalated_digest = self._maybe_run_balanced_pre_apply_qa(
+            job_id,
+            receipt,
+            auto_apply=auto_apply,
+            in_place=in_place,
+            is_cancelled_now=is_cancelled_now,
+            wait_elapsed=wait_elapsed,
+            timeout_seconds=timeout_seconds,
+            wait_budget=wait_budget,
+        )
+        if qa_escalated_digest is not None:
+            return qa_escalated_digest
+        receipt = self.store.read_receipt(job_id)
         digest = self._digest_with_progress(receipt)
         return self._maybe_auto_apply_digest(
             job_id,
@@ -6381,6 +8685,590 @@ class JobManager:
             auto_apply=auto_apply,
             in_place=in_place,
         )
+
+    def record_qa_review_on_receipt(
+        self,
+        job_id: str,
+        *,
+        qa_model: str,
+        qa_meta: dict[str, Any],
+        qa_usage: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Merge a 1-shot QA review's usage and metadata onto `job-*.json` without creating a separate receipt."""
+        safe_id = validate_job_id(job_id)
+        receipt = self.store.read_receipt(safe_id)
+        prior_model = str(receipt.get("model") or "gemini-3.8-flash")
+        u = dict(receipt.get("usage") or {})
+        pq = int((qa_usage or {}).get("prompt_token_count") or 0)
+        cq = int((qa_usage or {}).get("cached_content_token_count") or 0)
+        oq = int((qa_usage or {}).get("candidates_token_count") or 0)
+        tq = int((qa_usage or {}).get("thoughts_token_count") or 0)
+        tot_q = max(int((qa_usage or {}).get("total_token_count") or 0), pq + oq + tq)
+        if pq > 0 or oq > 0 or tq > 0 or tot_q > 0:
+            if not u.get("requests") and any(
+                int(u.get(k) or 0) > 0
+                for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count")
+            ):
+                u["requests"] = [
+                    {
+                        "prompt_token_count": int(u.get("prompt_token_count") or 0),
+                        "cached_content_token_count": int(u.get("cached_content_token_count") or 0),
+                        "candidates_token_count": int(u.get("candidates_token_count") or 0),
+                        "thoughts_token_count": int(u.get("thoughts_token_count") or 0),
+                        "total_token_count": int(u.get("total_token_count") or 0),
+                        "model": prior_model,
+                    }
+                ]
+            elif isinstance(u.get("requests"), list):
+                tagged = [
+                    ({**r, "model": r.get("model") or prior_model} if isinstance(r, dict) else r)
+                    for r in u["requests"]
+                ]
+                sp = sum(int(r.get("prompt_token_count") or 0) for r in tagged if isinstance(r, dict))
+                sc = sum(int(r.get("cached_content_token_count") or 0) for r in tagged if isinstance(r, dict))
+                so = sum(int(r.get("candidates_token_count") or 0) for r in tagged if isinstance(r, dict))
+                st = sum(int(r.get("thoughts_token_count") or 0) for r in tagged if isinstance(r, dict))
+                rp = max(0, int(u.get("prompt_token_count") or 0) - sp)
+                rc = min(rp, max(0, int(u.get("cached_content_token_count") or 0) - sc))
+                ro = max(0, int(u.get("candidates_token_count") or 0) - so)
+                rt = max(0, int(u.get("thoughts_token_count") or 0) - st)
+                if rp > 0 or ro > 0 or rt > 0:
+                    tagged.append(
+                        {
+                            "prompt_token_count": rp,
+                            "cached_content_token_count": rc,
+                            "candidates_token_count": ro,
+                            "thoughts_token_count": rt,
+                            "total_token_count": rp + ro + rt,
+                            "model": prior_model,
+                        }
+                    )
+                u["requests"] = tagged
+            else:
+                u["requests"] = []
+            u["requests"].append(
+                {
+                    "per_call": True,
+                    "single_request": True,
+                    "kind": "qa_review",
+                    "model": qa_model,
+                    "prompt_token_count": pq,
+                    "cached_content_token_count": cq,
+                    "candidates_token_count": oq,
+                    "thoughts_token_count": tq,
+                    "total_token_count": tot_q,
+                }
+            )
+            u["prompt_token_count"] = int(u.get("prompt_token_count") or 0) + pq
+            u["cached_content_token_count"] = int(u.get("cached_content_token_count") or 0) + cq
+            u["candidates_token_count"] = int(u.get("candidates_token_count") or 0) + oq
+            u["thoughts_token_count"] = int(u.get("thoughts_token_count") or 0) + tq
+            u["total_token_count"] = int(u.get("total_token_count") or 0) + tot_q
+            receipt["usage"] = u
+            precomputed = receipt.get("precomputed_cost")
+            if isinstance(precomputed, dict) and "total_cost_cents" in precomputed:
+                # Receipts that price their own calls (batch jobs) ignore usage when costed, so the QA
+                # review's spend has to be added to the precomputed total or it never shows up.
+                from server.regions import estimate_cost_usd
+
+                qa_cost = estimate_cost_usd(
+                    qa_model,
+                    {"prompt_token_count": pq, "cached_content_token_count": cq, "candidates_token_count": oq,
+                     "thoughts_token_count": tq, "total_token_count": tot_q},
+                    single_request=True,
+                )
+                qa_cents = float(qa_cost.get("total_cost_cents") or 0.0)
+                total_cents = float(precomputed.get("total_cost_cents") or 0.0) + qa_cents
+                receipt["precomputed_cost"] = {
+                    **precomputed,
+                    "total_cost_cents": round(total_cents, 4),
+                    "total_cost_usd": round(total_cents / 100.0, 6),
+                    "pricing_known": bool(precomputed.get("pricing_known", True))
+                    and bool(qa_cost.get("pricing_known", True)),
+                }
+        receipt["qa_review"] = dict(qa_meta)
+        with self._lock:
+            raw_key = self._raw_api_keys.get(safe_id)
+        return self.store.write_receipt(
+            safe_id,
+            receipt,
+            scrub=bool(receipt.get("scrub_receipt", False)),
+            workspace_root=str(self.workspace_root),
+            api_key=raw_key,
+        )
+
+    def _maybe_run_balanced_pre_apply_qa(
+        self,
+        job_id: str,
+        receipt: dict[str, Any],
+        *,
+        auto_apply: bool | None,
+        in_place: bool,
+        is_cancelled_now: bool,
+        wait_elapsed: float = 0.0,
+        timeout_seconds: float | None = None,
+        wait_budget: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Run a 1-shot pre-apply QA diff audit on un-escalated Flash passes in `balanced`."""
+        qa_flag = env_flag("CC_AGY_BALANCED_QA_REVIEW")
+        if qa_flag is False:
+            return None
+        if resolve_cost_profile() != "balanced":
+            return None
+        if self.worker_backend is not None and qa_flag is not True:
+            return None
+        if (
+            in_place
+            or is_cancelled_now
+            or receipt.get("applied")
+            or receipt.get("skip_balanced_qa")
+            or receipt.get("qa_review")
+            or receipt.get("escalated_from_model")
+            or receipt.get("status") != "ok"
+            or receipt.get("acceptance_passed") is not True
+            or not receipt.get("files_changed")
+        ):
+            return None
+        cur_model = str(receipt.get("model") or "")
+        if "flash" not in cur_model.lower():
+            return None
+        qa_model = self._resolve_escalation_target_model(cur_model)
+        if not qa_model:
+            return None
+        qa_started_mono = time.monotonic()
+        esc_deadline, _esc_elapsed, rem_budget = self._session_deadline_budget()
+        if esc_deadline is not None and rem_budget < 90.0:
+            return None
+        diff_path = self.store.diff_path(job_id)
+        diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
+        if not diff_text.strip():
+            return None
+
+        from server.genai_ask import ask_gemini
+        from server.review_bundle import build_review_evidence_dir
+
+        wt_candidate = Path(str(receipt.get("worktree_dir") or ""))
+        if not wt_candidate.is_dir():
+            wt_candidate = self.store.worktree_path(job_id)
+        target_wt = wt_candidate if wt_candidate.is_dir() else self.workspace_root
+
+        raw_user_spec = str(receipt.get("raw_user_prompt") or "").strip()
+        lead_brief = str((receipt.get("prompts") or [""])[0] or "").strip()
+        spec_sections: list[str] = []
+        if raw_user_spec and raw_user_spec != lead_brief:
+            spec_sections.append(f"### Original User Specification\n{raw_user_spec}")
+            if lead_brief:
+                spec_sections.append(f"### Lead Delegation Brief (Summary: Original User Specification Takes Precedence)\n{lead_brief}")
+        elif lead_brief or raw_user_spec:
+            spec_sections.append(lead_brief or raw_user_spec)
+        spec_rel_files = [str(p) for p in (receipt.get("spec_files") or []) if p]
+        for rel_sp in spec_rel_files[:4]:
+            cand_sp = (target_wt / rel_sp).resolve()
+            if cand_sp.is_relative_to(target_wt.resolve()) and cand_sp.is_file():
+                sp_txt, _, _ = truncate_to_token_budget(
+                    cand_sp.read_text(encoding="utf-8", errors="replace"),
+                    1500,
+                )
+                spec_sections.append(f"### Spec File: {rel_sp}\n{sp_txt}")
+        checklist_items = [str(c) for c in (receipt.get("checklist") or []) if c]
+        if checklist_items:
+            spec_sections.append("### Checklist\n" + "\n".join(f"- {c}" for c in checklist_items))
+        warn_items = [
+            str(w)
+            for w in [*(receipt.get("stub_mutation_warnings") or []), *(receipt.get("contract_warnings") or [])]
+            if w
+        ]
+        if receipt.get("recovered_from_checkpoint"):
+            warn_items.append(
+                "Worker hit MAX_TOOL_CALLS_EXCEEDED right as acceptance tests passed; verify that every "
+                "requirement, edge case, and caller in the Original User Specification is completely implemented."
+            )
+        if warn_items:
+            spec_sections.append("### Automated Diff Warnings\n" + "\n".join(f"- {w}" for w in warn_items))
+        full_spec_text = "\n\n".join(spec_sections).strip()
+
+        acc_results = [r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)]
+        test_out_lines = [
+            f"$ {r.get('command', '')} (exit {r.get('exit_code', 0)})\n{r.get('output_tail', '')}".strip()
+            for r in acc_results
+        ]
+        test_out_str = "\n\n".join(test_out_lines)
+        review_bundle = build_review_evidence_dir(
+            target_wt,
+            task_prompt=full_spec_text,
+            diff_text=diff_text,
+            test_output=test_out_str,
+            files_changed=list(receipt.get("files_changed") or []),
+        )
+        qa_diff, qa_truncated, _qa_orig = truncate_to_token_budget(diff_text, QA_REVIEW_MAX_TOKENS)
+        slices_text = str(review_bundle.get("enclosing_slices") or "")
+        slices_tok = int(review_bundle.get("enclosing_slices_tokens") or 0)
+        slices_block = (
+            f"\n\n## Enclosing Modified Functions & Classes\n{slices_text}"
+            if (slices_text and not qa_truncated and (_qa_orig + slices_tok) <= QA_REVIEW_MAX_TOKENS)
+            else ""
+        )
+        acc_block, _, _ = truncate_to_token_budget(test_out_str, 1500) if test_out_str else ("", False, 0)
+        acc_section = f"\n\n## Acceptance Command Output\n```\n{acc_block}\n```" if acc_block else ""
+        qa_prompt = (
+            f"## Task Specification\n{full_spec_text}\n\n"
+            f"## Candidate Git Diff{' (truncated)' if qa_truncated else ''}\n```diff\n{qa_diff}\n```"
+            f"{acc_section}{slices_block}"
+        )
+        qa_system = build_qa_diff_audit_system(
+            verification=classify_verification(acc_results, receipt.get("acceptance_passed")),
+            prompt=full_spec_text,
+        )
+        with self._lock:
+            raw_proj = self._raw_projects.get(job_id)
+            raw_key = self._raw_api_keys.get(job_id)
+        eff_proj = raw_proj or (
+            str(receipt.get("vertex_project"))
+            if receipt.get("vertex_project") and receipt.get("vertex_project") != "[REDACTED]"
+            else None
+        )
+        raw_qa_thinking = (
+            os.environ.get("CC_AGY_QA_THINKING_LEVEL")
+            or os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL")
+            or ""
+        ).strip().upper()
+        if raw_qa_thinking in ("0", "OFF"):
+            raw_qa_thinking = "ZERO"
+        qa_model_low = str(qa_model).strip().lower()
+        if raw_qa_thinking in ("ZERO", "MINIMAL", "LOW", "MEDIUM", "HIGH"):
+            qa_thinking = raw_qa_thinking
+        elif qa_model_low.endswith("-zero"):
+            qa_thinking = "ZERO"
+        elif qa_model_low.endswith("-high"):
+            qa_thinking = "HIGH"
+        elif qa_model_low.endswith("-medium"):
+            qa_thinking = "MEDIUM"
+        else:
+            qa_thinking = "LOW"
+        qa_timeout_ms = max(5_000, _env_int("CC_AGY_QA_TIMEOUT_MS", 90_000))
+
+        def _should_escalate_qa(
+            p_qa: dict[str, Any],
+            q_err: str | None,
+            rem_sec: float,
+            has_dl: bool,
+        ) -> bool:
+            if p_qa["passed"] is False:
+                return (not has_dl) or rem_sec >= 120.0
+            if (
+                p_qa["passed"] is None
+                and not is_quota_or_rate_limit_error(q_err or "")
+                and (
+                    bool(receipt.get("recovered_from_checkpoint"))
+                    or max(int(receipt.get("tool_call_count") or 0), len(receipt.get("tool_calls") or [])) >= 15
+                )
+            ):
+                return (not has_dl) or rem_sec >= 180.0
+            return False
+
+        def _invoke_qa_once() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str | None]:
+            err_s: str | None = None
+            agg_u: dict[str, int] = {
+                "prompt_token_count": 0,
+                "cached_content_token_count": 0,
+                "candidates_token_count": 0,
+                "thoughts_token_count": 0,
+                "total_token_count": 0,
+            }
+            res_q: dict[str, Any] = {}
+            parsed_q: dict[str, Any] = {"verdict": "ERROR", "passed": None, "issues": []}
+            for _qa_try in range(2):
+                err_s = None
+                try:
+                    res_q = ask_gemini(
+                        prompt=qa_prompt,
+                        model=qa_model,
+                        system_instruction=qa_system,
+                        thinking_level=qa_thinking,
+                        timeout_ms=qa_timeout_ms,
+                        api_key=raw_key,
+                        project=eff_proj,
+                        location=receipt.get("vertex_location"),
+                        workspace_root=self.workspace_root,
+                        store=self.store,
+                        scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                        backend=self.ask_backend,
+                        record_receipt=False,
+                    )
+                    cur_u = dict(res_q.get("usage") or {})
+                    for _uk in agg_u:
+                        agg_u[_uk] += int(cur_u.get(_uk) or 0)
+                    parsed_q = parse_qa_audit_verdict(str(res_q.get("text") or ""))
+                    break
+                except Exception as qa_exc:
+                    err_s = f"{type(qa_exc).__name__}: {qa_exc}"
+                    res_q = {}
+                    partial_u = getattr(qa_exc, "partial_usage", None)
+                    if isinstance(partial_u, dict):
+                        for _uk in agg_u:
+                            agg_u[_uk] += int(partial_u.get(_uk) or 0)
+                    parsed_q = {"verdict": "ERROR", "passed": None, "issues": []}
+                    with self._lock:
+                        cancelled_retry = (job_id in self._cancelled) or self._shutting_down
+                    _dl_r, _, _rem_r = self._session_deadline_budget()
+                    if (
+                        _qa_try == 0
+                        and not cancelled_retry
+                        and not is_quota_or_rate_limit_error(err_s)
+                        and (_dl_r is None or _rem_r >= 150.0)
+                    ):
+                        continue
+                    break
+            u_dict: dict[str, Any] = dict(agg_u) if any(agg_u.values()) else {}
+            return res_q, u_dict, parsed_q, err_s
+
+        def _build_qa_followup(parsed_q: dict[str, Any]) -> str:
+            if parsed_q["issues"]:
+                issues_block = "\n".join(parsed_q["issues"])
+                return (
+                    f"A pre-apply QA diff audit ({qa_model}) identified the following blockers against the task specification:\n"
+                    f"{issues_block}\n\n"
+                    f"{review_bundle['pointer_prompt']}\n\n"
+                    "Fix each issue above cleanly in production code (including imported helper/caller modules) "
+                    "without weakening test inputs or altering pre-existing test expectations (unless explicitly "
+                    "required by the specification), and verify all tests pass."
+                )
+            if parsed_q.get("verdict") == "ERROR":
+                return (
+                    f"A pre-apply QA diff audit ({qa_model}) timed out or errored before verifying Flash's candidate patch.\n\n"
+                    f"{review_bundle['pointer_prompt']}\n\n"
+                    "Audit the candidate diff against every requirement and edge case in the Original User Request, "
+                    "fix any missing branches or bugs in production code without weakening pre-existing test "
+                    "expectations (unless explicitly required by the specification), and ensure all tests pass."
+                )
+            return (
+                f"A pre-apply QA diff audit ({qa_model}) returned VERDICT: NEEDS_FIXES against the task specification.\n\n"
+                f"{review_bundle['pointer_prompt']}\n\n"
+                "Verify every requirement and edge case in the original task specification, fix any root causes in "
+                "production code without weakening pre-existing test expectations (unless explicitly required by "
+                "the specification), and ensure all tests pass."
+            )
+
+        slice_target = float(wait_budget) if wait_budget is not None else float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+        full_wait_cap = max(0.5, slice_target + 30.0)
+        rem_qa_slice = self._resolve_wait_slice_seconds(
+            slice_target,
+            elapsed_seconds=wait_elapsed,
+            allow_retry_grace=False,
+        )
+        saved_turn1_status = str(receipt.get("status") or "ok")
+
+        if rem_qa_slice < full_wait_cap:
+            qa_fut: Future[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str | None]] = Future()
+
+            def _qa_runner() -> None:
+                if not qa_fut.set_running_or_notify_cancel():
+                    return
+                qa_fut.set_result(_invoke_qa_once())
+
+            qa_thread = threading.Thread(target=_qa_runner, name=f"cc-agy-qa-{job_id}", daemon=True)
+            with self._lock:
+                self._qa_bg_threads = [t for t in self._qa_bg_threads if t.is_alive()] + [qa_thread]
+            qa_thread.start()
+            self._wait_for_future_or_cancel(job_id, qa_fut, timeout=rem_qa_slice)
+            if not qa_fut.done():
+                chain_fut: Future[dict[str, Any]] = Future()
+                chain_fut.set_running_or_notify_cancel()
+                running_rec = self.store.read_receipt(job_id)
+                running_rec["status"] = "running"
+                with self._lock:
+                    raw_k_slice = self._raw_api_keys.get(job_id)
+                    self._futures[job_id] = chain_fut
+                    self._wait_sliced_auto_apply[job_id] = auto_apply
+                running_saved = self.store.write_receipt(
+                    job_id,
+                    running_rec,
+                    scrub=bool(running_rec.get("scrub_receipt", False)),
+                    workspace_root=str(self.workspace_root),
+                    api_key=raw_k_slice,
+                )
+
+                def _finish_sliced_qa() -> None:
+                    try:
+                        q_res, q_usage, p_qa, q_err = qa_fut.result()
+                        with self._lock:
+                            cancelled_bg = (job_id in self._cancelled) or self._shutting_down
+                        cur_rec = self.store.read_receipt(job_id)
+                        cur_rec["status"] = "cancelled" if cancelled_bg else saved_turn1_status
+                        with self._lock:
+                            rk = self._raw_api_keys.get(job_id)
+                        self.store.write_receipt(
+                            job_id,
+                            cur_rec,
+                            scrub=bool(cur_rec.get("scrub_receipt", False)),
+                            workspace_root=str(self.workspace_root),
+                            api_key=rk,
+                        )
+                        esc_dl_bg, _, rem_bg = self._session_deadline_budget()
+                        do_esc = (
+                            not cancelled_bg
+                            and _should_escalate_qa(p_qa, q_err, rem_bg, esc_dl_bg is not None)
+                        )
+                        q_meta: dict[str, Any] = {
+                            "model": qa_model,
+                            "job_id": q_res.get("job_id"),
+                            "verdict": p_qa["verdict"],
+                            "passed": p_qa["passed"],
+                            "issues": p_qa["issues"],
+                            "resumed": bool(do_esc),
+                            "review_dir": review_bundle["review_dir"],
+                            "pointer_prompt_tokens": review_bundle["pointer_prompt_tokens"],
+                            "usage": q_usage or None,
+                            "cost": q_res.get("cost"),
+                        }
+                        if q_err:
+                            q_meta["error"] = q_err
+                        merged_rec = self.record_qa_review_on_receipt(
+                            job_id,
+                            qa_model=qa_model,
+                            qa_meta=q_meta,
+                            qa_usage=q_usage,
+                        )
+                        if cancelled_bg:
+                            if not in_place and target_wt != self.workspace_root and target_wt.exists():
+                                self._cleanup_worktree(target_wt)
+                            chain_fut.set_result(merged_rec)
+                            return
+                        if not do_esc:
+                            chain_fut.set_result(merged_rec)
+                            return
+                        wt_to = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+                        if esc_dl_bg is not None:
+                            wt_to = min(wt_to, max(60.0, rem_bg))
+                        with self._lock:
+                            if self._futures.get(job_id) is chain_fut:
+                                self._futures.pop(job_id, None)
+                        try:
+                            cont_bg = self.delegate_continue(
+                                job_id=job_id,
+                                follow_up_prompt=_build_qa_followup(p_qa),
+                                allowed_paths=receipt.get("allowed_paths"),
+                                acceptance=receipt.get("acceptance"),
+                                timeout_seconds=wt_to,
+                                wait=False,
+                                scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                                auto_apply=auto_apply,
+                                _prompt_source="plugin_qa_review",
+                            )
+                        except Exception:
+                            q_meta["resumed"] = False
+                            fallback_rec = self.record_qa_review_on_receipt(
+                                job_id,
+                                qa_model=qa_model,
+                                qa_meta=q_meta,
+                                qa_usage=None,
+                            )
+                            chain_fut.set_result(fallback_rec)
+                            return
+                        if cont_bg.get("continued") is False:
+                            q_meta["resumed"] = False
+                            fallback_rec = self.record_qa_review_on_receipt(
+                                job_id,
+                                qa_model=qa_model,
+                                qa_meta=q_meta,
+                                qa_usage=None,
+                            )
+                            chain_fut.set_result(fallback_rec)
+                            return
+                        with self._lock:
+                            self._wait_sliced_auto_apply[job_id] = auto_apply
+                            next_fut = self._futures.get(job_id)
+                        if next_fut is not None and next_fut is not chain_fut:
+                            try:
+                                chain_fut.set_result(next_fut.result())
+                            except Exception as nf_exc:
+                                chain_fut.set_exception(nf_exc)
+                        else:
+                            chain_fut.set_result(self.store.read_receipt(job_id))
+                    except Exception as bg_exc:
+                        if not chain_fut.done():
+                            chain_fut.set_exception(bg_exc)
+
+                chain_thread = threading.Thread(
+                    target=_finish_sliced_qa,
+                    name=f"cc-agy-qa-chain-{job_id}",
+                    daemon=True,
+                )
+                with self._lock:
+                    self._qa_bg_threads = [t for t in self._qa_bg_threads if t.is_alive()] + [chain_thread]
+                chain_thread.start()
+                return self._digest_with_progress(running_saved)
+            qa_res, qa_usage, parsed_qa, qa_error = qa_fut.result()
+        else:
+            qa_res, qa_usage, parsed_qa, qa_error = _invoke_qa_once()
+
+        will_escalate = _should_escalate_qa(parsed_qa, qa_error, rem_budget, esc_deadline is not None)
+        qa_meta: dict[str, Any] = {
+            "model": qa_model,
+            "job_id": qa_res.get("job_id"),
+            "verdict": parsed_qa["verdict"],
+            "passed": parsed_qa["passed"],
+            "issues": parsed_qa["issues"],
+            "resumed": bool(will_escalate),
+            "review_dir": review_bundle["review_dir"],
+            "pointer_prompt_tokens": review_bundle["pointer_prompt_tokens"],
+            "usage": qa_usage or None,
+            "cost": qa_res.get("cost"),
+        }
+        if qa_error:
+            qa_meta["error"] = qa_error
+
+        self.record_qa_review_on_receipt(
+            job_id,
+            qa_model=qa_model,
+            qa_meta=qa_meta,
+            qa_usage=qa_usage,
+        )
+        if not will_escalate:
+            return None
+
+        followup = _build_qa_followup(parsed_qa)
+        post_qa_elapsed = max(0.0, float(wait_elapsed) + max(0.0, time.monotonic() - qa_started_mono))
+        esc_deadline_after_qa, _esc_elapsed_after_qa, rem_budget_after_qa = self._session_deadline_budget()
+        worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
+        if esc_deadline_after_qa is not None:
+            worker_timeout = min(worker_timeout, max(60.0, rem_budget_after_qa))
+        try:
+            cont_digest = self.delegate_continue(
+                job_id=job_id,
+                follow_up_prompt=followup,
+                allowed_paths=receipt.get("allowed_paths"),
+                acceptance=receipt.get("acceptance"),
+                timeout_seconds=worker_timeout,
+                wait=True,
+                scrub_receipt=bool(receipt.get("scrub_receipt", False)),
+                auto_apply=auto_apply,
+                _wait_elapsed=post_qa_elapsed,
+                _wait_budget=wait_budget,
+                _prompt_source="plugin_qa_review",
+            )
+            if cont_digest.get("continued") is False:
+                qa_meta["resumed"] = False
+                self.record_qa_review_on_receipt(
+                    job_id,
+                    qa_model=qa_model,
+                    qa_meta=qa_meta,
+                    qa_usage=None,
+                )
+                cont_digest["qa_review"] = dict(qa_meta)
+            return cont_digest
+        except BudgetExceededError as exc:
+            qa_meta["resumed"] = False
+            updated_rec = self.record_qa_review_on_receipt(
+                job_id,
+                qa_model=qa_model,
+                qa_meta=qa_meta,
+                qa_usage=None,
+            )
+            digest = self._digest_with_progress(updated_rec)
+            digest["budget_exceeded"] = True
+            digest["budget_exceeded_note"] = str(exc)
+            return digest
 
     def delegate_result(
         self,
@@ -6511,6 +9399,14 @@ class JobManager:
             if current_chunk and keep_chunk:
                 filtered_chunks.append("".join(current_chunk))
             full_diff = "".join(filtered_chunks)
+            if not full_diff:
+                omitted_diff_path = diff_path.with_suffix(".omitted.diff")
+                if omitted_diff_path.is_file():
+                    omitted_raw = omitted_diff_path.read_text(encoding="utf-8", errors="replace")
+                    for rel_c, chunk in _split_diff_by_file(omitted_raw):
+                        if rel_c and _matches_file_filter(rel_c, file_filter):
+                            filtered_chunks.append(chunk)
+                    full_diff = "".join(filtered_chunks)
 
         if focus_symbols and full_diff:
             full_diff = self._filter_diff_by_symbols(full_diff, focus_symbols)
@@ -6558,6 +9454,8 @@ class JobManager:
         *,
         cleanup_worktree: bool = True,
         allow_scope_violations: bool = False,
+        include_paths: list[str] | None = None,
+        include_unverified_new_tests: bool = False,
     ) -> dict[str, Any]:
         """Apply a verified worker job's changes to the main workspace with serialized conflict detection."""
         safe_id = validate_job_id(job_id)
@@ -6575,9 +9473,36 @@ class JobManager:
                         safe_id,
                         cleanup_worktree=cleanup_worktree,
                         allow_scope_violations=allow_scope_violations,
+                        include_paths=include_paths,
+                        include_unverified_new_tests=include_unverified_new_tests,
                     )
                 finally:
                     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _omitted_dir(self, safe_id: str) -> Path:
+        d = self.store.data_dir / "omitted" / safe_id
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return d
+
+    def _archive_omitted_worktree_files(self, safe_id: str, wt_dir: Path, rel_paths: list[str]) -> None:
+        if not rel_paths or not wt_dir.exists():
+            return
+        odir = self._omitted_dir(safe_id)
+        wt_res = wt_dir.resolve()
+        odir_res = odir.resolve()
+        for rel in rel_paths:
+            src = wt_dir / rel
+            dst = odir / rel
+            try:
+                if not src.exists() or src.is_symlink():
+                    continue
+                if not src.resolve().is_relative_to(wt_res) or not dst.resolve().is_relative_to(odir_res):
+                    continue
+                if src.is_file():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+            except OSError:
+                continue
 
     def _delegate_apply_locked(
         self,
@@ -6585,9 +9510,107 @@ class JobManager:
         *,
         cleanup_worktree: bool = True,
         allow_scope_violations: bool = False,
+        include_paths: list[str] | None = None,
+        include_unverified_new_tests: bool = False,
     ) -> dict[str, Any]:
         receipt = self.store.read_receipt(safe_id)
+        include_paths_norm: list[str] = validate_allowed_paths(include_paths or [])
         if receipt.get("applied"):
+            wt_prev = Path(str(receipt.get("worktree_dir") or ""))
+            odir_prev = self.store.data_dir / "omitted" / safe_id
+            prev_applied = list(receipt.get("applied_files") or [])
+            prev_omitted = list(receipt.get("omitted_untracked_out_of_scope") or [])
+            prev_excl = list(receipt.get("excluded_runtime_artifacts") or [])
+            prev_omitted_tests = list(receipt.get("omitted_unverified_new_test_files") or [])
+            if include_paths_norm or include_unverified_new_tests:
+                recoverable = list(
+                    dict.fromkeys(
+                        [*prev_omitted, *prev_excl, *prev_omitted_tests, *(receipt.get("files_changed") or [])]
+                    )
+                )
+                to_recover = [
+                    f
+                    for f in recoverable
+                    if (
+                        (include_paths_norm and _matches_allowed_paths(f, include_paths_norm))
+                        or (include_unverified_new_tests and f in prev_omitted_tests)
+                    )
+                    and (f not in prev_applied or not (self.workspace_root / f).exists())
+                ]
+                if to_recover:
+                    allowed_prev = validate_allowed_paths(receipt.get("allowed_paths") or [])
+                    for rel_inc in to_recover:
+                        if not allow_scope_violations and allowed_prev and not _matches_allowed_paths(rel_inc, allowed_prev):
+                            raise ValueError(
+                                f"Refusing to apply out-of-scope file {rel_inc!r} (allowed_paths={allowed_prev}). "
+                                f"Pass allow_scope_violations=True to delegate_apply if you have reviewed the diff and want to apply it."
+                            )
+                        dst_inc = self._safe_destination(rel_inc)
+                        if not dst_inc.resolve().is_relative_to(self.workspace_root.resolve()) and not dst_inc.is_symlink():
+                            raise ValueError(f"Path traversal blocked for {rel_inc!r}")
+                        src_inc = (wt_prev / rel_inc) if (wt_prev.exists() and (wt_prev / rel_inc).exists()) else (odir_prev / rel_inc)
+                        if not src_inc.exists() or not src_inc.is_file():
+                            continue
+                        inc_snap = self._snapshot_pre_apply(safe_id, [rel_inc])
+                        pre_map = dict(receipt.get("pre_apply") or {})
+                        pre_map.update(inc_snap)
+                        receipt["pre_apply"] = pre_map
+                        dst_inc.parent.mkdir(parents=True, exist_ok=True)
+                        if dst_inc.is_symlink():
+                            dst_inc.unlink()  # replace a link at the path; never copy through it
+                        shutil.copy2(src_inc, dst_inc)
+                        if rel_inc not in prev_applied:
+                            prev_applied.append(rel_inc)
+                        hashes_map = dict(receipt.get("applied_file_hashes") or {})
+                        hashes_map[rel_inc] = sha256_bytes(dst_inc.read_bytes())
+                        receipt["applied_file_hashes"] = hashes_map
+                        prov_map = dict(receipt.get("provenance") or {})
+                        prov_files = list(prov_map.get("files_changed") or [])
+                        if rel_inc not in prov_files:
+                            prov_files.append(rel_inc)
+                        prov_map["files_changed"] = prov_files
+                        try:
+                            raw_inc_bytes = dst_inc.read_bytes()
+                            if b"\x00" in raw_inc_bytes[:8192]:
+                                bin_list = list(prov_map.get("binary_files") or [])
+                                if rel_inc not in bin_list:
+                                    bin_list.append(rel_inc)
+                                prov_map["binary_files"] = bin_list
+                            else:
+                                inc_lines = raw_inc_bytes.decode("utf-8", errors="replace").splitlines()
+                                per_file_map = dict(prov_map.get("per_file") or {})
+                                per_file_map[rel_inc] = {
+                                    "added_line_sha256": [sha256_bytes(ln.encode("utf-8")) for ln in inc_lines],
+                                    "removed_line_sha256": [],
+                                }
+                                prov_map["per_file"] = per_file_map
+                        except OSError:
+                            pass
+                        receipt["provenance"] = prov_map
+                        if rel_inc not in (receipt.get("files_changed") or []):
+                            receipt["files_changed"] = [*list(receipt.get("files_changed") or []), rel_inc]
+                    receipt["applied_files"] = prev_applied
+                    rem_omitted = [f for f in prev_omitted if f not in set(to_recover)]
+                    if rem_omitted:
+                        receipt["omitted_untracked_out_of_scope"] = rem_omitted
+                    else:
+                        receipt.pop("omitted_untracked_out_of_scope", None)
+                    rem_excl = [f for f in prev_excl if f not in set(to_recover)]
+                    if rem_excl:
+                        receipt["excluded_runtime_artifacts"] = rem_excl
+                    else:
+                        receipt.pop("excluded_runtime_artifacts", None)
+                    rem_omitted_tests = [f for f in prev_omitted_tests if f not in set(to_recover)]
+                    if rem_omitted_tests:
+                        receipt["omitted_unverified_new_test_files"] = rem_omitted_tests
+                    else:
+                        receipt.pop("omitted_unverified_new_test_files", None)
+                    self.store.write_receipt(
+                        safe_id,
+                        receipt,
+                        scrub=bool(receipt.get("scrub_receipt", False)),
+                        workspace_root=str(self.workspace_root),
+                    )
             prov = receipt.get("provenance") or {}
             acc_list_prev = receipt.get("acceptance_results")
             real_prev = (
@@ -6613,6 +9636,16 @@ class JobManager:
                 "diff_sha256": prov.get("diff_sha256"),
                 "acceptance_passed": receipt.get("acceptance_passed"),
                 **({"real_acceptance_passed": True} if real_prev else {}),
+                **(
+                    {"omitted_untracked_out_of_scope": list(receipt["omitted_untracked_out_of_scope"])}
+                    if receipt.get("omitted_untracked_out_of_scope")
+                    else {}
+                ),
+                **(
+                    {"omitted_unverified_new_test_files": list(receipt["omitted_unverified_new_test_files"])}
+                    if receipt.get("omitted_unverified_new_test_files")
+                    else {}
+                ),
             }
 
         status = receipt.get("status")
@@ -6620,8 +9653,9 @@ class JobManager:
         baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
         if status == "running" and self._futures.get(safe_id) is None and wt_dir.exists():
             orphan_allowed = validate_allowed_paths(receipt.get("allowed_paths") or [])
+            orphan_prompt = "\n".join(str(p) for p in (receipt.get("prompts") or []) if p)
             rec_diff, rec_files, rec_escapes = self._collect_worktree_diff(
-                wt_dir, baseline_sha, allowed_paths=orphan_allowed
+                wt_dir, baseline_sha, allowed_paths=orphan_allowed, prompt_text=orphan_prompt
             )
             if rec_files and not rec_escapes:
                 orphan_violations = [
@@ -6656,23 +9690,96 @@ class JobManager:
                 f"(or timeout jobs with clean edits, or scope_violation jobs with allow_scope_violations=True) can be applied."
             )
 
+        omitted_unverified_new_tests: list[str] = list(receipt.get("omitted_unverified_new_test_files") or [])
+        if include_unverified_new_tests and omitted_unverified_new_tests:
+            for rel_ot in list(omitted_unverified_new_tests):
+                if rel_ot not in (receipt.get("files_changed") or []):
+                    receipt["files_changed"] = [*list(receipt.get("files_changed") or []), rel_ot]
+            omitted_unverified_new_tests = []
+            receipt.pop("omitted_unverified_new_test_files", None)
+        elif (
+            receipt.get("acceptance_passed") is not True
+            and not include_unverified_new_tests
+            and (
+                receipt.get("acceptance_passed") is False
+                or status != "ok"
+                or bool(receipt.get("acceptance_commands"))
+                or bool(receipt.get("acceptance_results"))
+            )
+        ):
+            newly_omitted_tests = self._filter_unverified_new_tests_for_salvage(
+                receipt,
+                wt_dir,
+                exclude_paths=include_paths_norm,
+            )
+            if newly_omitted_tests:
+                omitted_unverified_new_tests = list(
+                    dict.fromkeys([*omitted_unverified_new_tests, *newly_omitted_tests])
+                )
+
         diff_path = self.store.diff_path(safe_id)
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
+        allowed_paths: list[str] = validate_allowed_paths(receipt.get("allowed_paths") or [])
+        prompt_text_apply = "\n".join(str(p) for p in (receipt.get("prompts") or []) if p)
         raw_files_changed: list[str] = list(receipt.get("files_changed") or [])
+        for rel_excl in list(receipt.get("excluded_runtime_artifacts") or []):
+            if include_paths_norm and _matches_allowed_paths(rel_excl, include_paths_norm) and rel_excl not in raw_files_changed:
+                raw_files_changed.append(rel_excl)
+        for rel_ot in list(omitted_unverified_new_tests):
+            if include_paths_norm and _matches_allowed_paths(rel_ot, include_paths_norm) and rel_ot not in raw_files_changed:
+                raw_files_changed.append(rel_ot)
+        ref_root_apply = wt_dir if wt_dir.exists() else self.workspace_root
         files_changed = [
             f
             for f in raw_files_changed
-            if not _is_ephemeral_build_or_test_artifact(
-                f, root=wt_dir if wt_dir.exists() else self.workspace_root
+            if _explicitly_targets_runtime_artifact(
+                f,
+                allowed_paths,
+                prompt_text=prompt_text_apply,
+                ref_files=raw_files_changed,
+                root=ref_root_apply,
+            )
+            or (include_paths_norm and _matches_allowed_paths(f, include_paths_norm))
+            or not _is_ephemeral_build_or_test_artifact(
+                f, root=ref_root_apply
             )
         ]
-        allowed_paths: list[str] = validate_allowed_paths(receipt.get("allowed_paths") or [])
         baseline_hashes: dict[str, str | None] = self._compute_changed_baseline_hashes(
             wt_dir,
             baseline_sha,
             files_changed,
             dict(receipt.get("baseline_file_hashes") or {}),
         )
+        omitted_untracked_out_of_scope: list[str] = []
+        if allow_scope_violations and allowed_paths:
+            in_scope_changed = [f for f in files_changed if _matches_allowed_paths(f, allowed_paths)]
+            untracked_oos = [
+                f
+                for f in files_changed
+                if not _matches_allowed_paths(f, allowed_paths)
+                and not (include_paths_norm and _matches_allowed_paths(f, include_paths_norm))
+                and baseline_hashes.get(f) is None
+                and not (self.workspace_root / f).exists()
+                and not _is_tracked_in_git(self.workspace_root, f)
+                and not _is_referenced_by_files_or_prompt(
+                    f,
+                    in_scope_changed,
+                    ref_root_apply,
+                    prompt_text=prompt_text_apply,
+                )
+            ]
+            if untracked_oos:
+                omitted_untracked_out_of_scope = untracked_oos
+                self._archive_omitted_worktree_files(safe_id, wt_dir, omitted_untracked_out_of_scope)
+                omitted_set = set(omitted_untracked_out_of_scope)
+                files_changed = [f for f in files_changed if f not in omitted_set]
+                baseline_hashes = {k: v for k, v in baseline_hashes.items() if k not in omitted_set}
+                if diff_text:
+                    split_chunks = _split_diff_by_file(diff_text)
+                    if split_chunks:
+                        diff_text = "".join(
+                            chunk for rel_c, chunk in split_chunks if rel_c not in omitted_set
+                        )
 
         # 1. Pre-flight validation: scope, path traversal, symlinks, and baseline conflict check
         conflicted_files: list[str] = []
@@ -6726,8 +9833,8 @@ class JobManager:
                     raise ValueError(
                         f"Conflict detected: host file {rel_path!r} was modified or deleted since job '{safe_id}' started."
                     )
-                base_show = subprocess.run(
-                    ["git", "show", f"{baseline_sha}:{rel_path}"],
+                base_show = _git_raw(
+                    ["show", f"{baseline_sha}:{rel_path}"],
                     cwd=str(wt_dir),
                     capture_output=True,
                     check=False,
@@ -6749,8 +9856,8 @@ class JobManager:
                     f_cur.write_bytes(dst_raw.read_bytes())
                     f_base.write_bytes(base_show.stdout)
                     f_wrk.write_bytes(src_raw.read_bytes())
-                    merge_res = subprocess.run(
-                        ["git", "merge-file", "-p", str(f_cur), str(f_base), str(f_wrk)],
+                    merge_res = _git_raw(
+                        ["merge-file", "-p", str(f_cur), str(f_base), str(f_wrk)],
                         capture_output=True,
                         check=False,
                     )
@@ -6769,31 +9876,74 @@ class JobManager:
         pre_apply = self._snapshot_pre_apply(safe_id, files_changed)
 
         applied_files: list[str] = []
-        if wt_dir.exists():
-            for rel_path in files_changed:
-                src_raw = wt_dir / rel_path
-                dst_raw = self.workspace_root / rel_path
-                if rel_path in merged_payloads:
-                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
-                    dst_raw.write_bytes(merged_payloads[rel_path])
-                    applied_files.append(rel_path)
-                elif src_raw.is_symlink():
-                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
-                    if dst_raw.exists() or dst_raw.is_symlink():
+        odir_apply = self.store.data_dir / "omitted" / safe_id
+        if wt_dir.exists() or odir_apply.exists():
+            # All-or-nothing: if any write fails part way, every file already touched goes back to its
+            # pre_apply backup before the error propagates, so the workspace is never half applied.
+            from pathlib import PurePosixPath
+
+            from server.batch_plan import is_protected_path
+            from server.writers import symlink_component
+
+            in_progress: str | None = None
+            ws_resolved = self.workspace_root.resolve()
+            try:
+                for rel_path in files_changed:
+                    in_progress = rel_path
+                    src_raw = (
+                        (wt_dir / rel_path)
+                        if (wt_dir.exists() and ((wt_dir / rel_path).exists() or (wt_dir / rel_path).is_symlink()))
+                        else (odir_apply / rel_path)
+                    )
+                    dst_raw = self.workspace_root / rel_path
+                    # Never write through links in the host tree. Git never tracks a path beyond a
+                    # symlinked directory, so a linked parent (even one pointing inside the workspace,
+                    # such as an alias of .git/hooks) means the path is not what the diff describes.
+                    # A link at the path itself is replaced (pre_apply recorded it).
+                    parent_rel = PurePosixPath(rel_path).parent.as_posix()
+                    if parent_rel not in ("", ".") and symlink_component(self.workspace_root, parent_rel) is not None:
+                        raise ValueError(f"refusing to apply {rel_path!r}: a parent directory in the workspace is a symlink")
+                    if not dst_raw.parent.resolve().is_relative_to(ws_resolved):
+                        raise ValueError(f"refusing to apply {rel_path!r}: its directory resolves outside the workspace")
+                    if src_raw.is_symlink():
+                        link_dest = (src_raw.parent / os.readlink(src_raw)).resolve()
+                        if wt_dir.exists() and link_dest.is_relative_to(wt_dir.resolve()):
+                            link_rel = link_dest.relative_to(wt_dir.resolve()).as_posix()
+                            if is_protected_path(link_rel):
+                                raise ValueError(f"refusing to apply symlink {rel_path!r}: it points at protected {link_rel!r}")
+                    if dst_raw.is_symlink() and not src_raw.is_symlink():
                         dst_raw.unlink()
-                    os.symlink(os.readlink(src_raw), dst_raw)
-                    applied_files.append(rel_path)
-                elif src_raw.exists() and src_raw.is_file():
-                    dst_raw.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_raw, dst_raw)
-                    applied_files.append(rel_path)
-                elif not src_raw.exists():
-                    if dst_raw.exists() or dst_raw.is_symlink():
-                        dst_raw.unlink()
-                    applied_files.append(rel_path)
+                    if rel_path in merged_payloads:
+                        dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                        dst_raw.write_bytes(merged_payloads[rel_path])
+                        applied_files.append(rel_path)
+                    elif src_raw.is_symlink():
+                        dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                        if dst_raw.exists() or dst_raw.is_symlink():
+                            dst_raw.unlink()
+                        os.symlink(os.readlink(src_raw), dst_raw)
+                        applied_files.append(rel_path)
+                    elif src_raw.exists() and src_raw.is_file():
+                        dst_raw.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_raw, dst_raw)
+                        applied_files.append(rel_path)
+                    elif wt_dir.exists() and not (wt_dir / rel_path).exists():
+                        if dst_raw.exists() or dst_raw.is_symlink():
+                            dst_raw.unlink()
+                        applied_files.append(rel_path)
+                in_progress = None
+            except BaseException as exc:
+                touched = list(dict.fromkeys([*applied_files, *([in_progress] if in_progress else [])]))
+                failed_restores = self._rollback_partial_apply(safe_id, pre_apply, touched)
+                if hasattr(exc, "add_note"):  # Python 3.11+; the plugin still supports 3.10
+                    exc.add_note(
+                        f"delegate_apply rolled back {len(touched)} already-written file(s) to their pre-apply state"
+                        + (f"; could not restore {failed_restores}" if failed_restores else "")
+                    )
+                raise
         elif diff_text.strip():
-            subprocess.run(
-                ["git", "apply", "--binary", "--whitespace=nowarn", "-"],
+            _git_raw(
+                ["apply", "--binary", "--whitespace=nowarn", "-"],
                 input=diff_text,
                 cwd=str(self.workspace_root),
                 capture_output=True,
@@ -6819,7 +9969,26 @@ class JobManager:
             if dst_p.is_symlink():
                 applied_file_hashes[fpath] = f"symlink:{os.readlink(dst_p)}"
             elif dst_p.exists() and dst_p.is_file():
-                applied_file_hashes[fpath] = sha256_bytes(dst_p.read_bytes())
+                raw_applied_bytes = dst_p.read_bytes()
+                applied_file_hashes[fpath] = sha256_bytes(raw_applied_bytes)
+                if (
+                    baseline_hashes.get(fpath) is None
+                    and fpath not in (applied_prov.get("per_file") or {})
+                    and fpath not in (applied_prov.get("binary_files") or [])
+                ):
+                    if b"\x00" in raw_applied_bytes[:8192]:
+                        bin_list = list(applied_prov.get("binary_files") or [])
+                        if fpath not in bin_list:
+                            bin_list.append(fpath)
+                        applied_prov["binary_files"] = bin_list
+                    else:
+                        inc_lines = raw_applied_bytes.decode("utf-8", errors="replace").splitlines()
+                        per_file_map = dict(applied_prov.get("per_file") or {})
+                        per_file_map[fpath] = {
+                            "added_line_sha256": [sha256_bytes(ln.encode("utf-8")) for ln in inc_lines],
+                            "removed_line_sha256": [],
+                        }
+                        applied_prov["per_file"] = per_file_map
             else:
                 applied_file_hashes[fpath] = None
 
@@ -6830,6 +9999,52 @@ class JobManager:
         receipt["baseline_file_hashes"] = baseline_hashes
         receipt["provenance"] = applied_prov
         receipt["pre_apply"] = {k: v for k, v in pre_apply.items() if k in applied_files}
+        if omitted_untracked_out_of_scope:
+            receipt["omitted_untracked_out_of_scope"] = omitted_untracked_out_of_scope
+        if omitted_unverified_new_tests:
+            rem_omitted_tests_init = [
+                f for f in omitted_unverified_new_tests if f not in set(applied_files)
+            ]
+            if rem_omitted_tests_init:
+                receipt["omitted_unverified_new_test_files"] = rem_omitted_tests_init
+                omitted_unverified_new_tests = rem_omitted_tests_init
+            else:
+                receipt.pop("omitted_unverified_new_test_files", None)
+                omitted_unverified_new_tests = []
+        if receipt.get("excluded_runtime_artifacts"):
+            rem_excl_init = [
+                f for f in list(receipt.get("excluded_runtime_artifacts") or []) if f not in set(applied_files)
+            ]
+            if rem_excl_init:
+                receipt["excluded_runtime_artifacts"] = rem_excl_init
+            else:
+                receipt.pop("excluded_runtime_artifacts", None)
+        failing_new_test_files: list[str] = []
+        acc_list_apply = receipt.get("acceptance_results")
+        if receipt.get("acceptance_passed") is False and isinstance(acc_list_apply, list):
+            new_test_candidates = [
+                f
+                for f in applied_files
+                if _is_test_file_path(f)
+                and baseline_hashes.get(f) is None
+                and (pre_apply.get(f) or {}).get("state") == "absent"
+            ]
+            for ntf in new_test_candidates:
+                ntf_name = Path(ntf).name
+                if any(
+                    isinstance(r, dict)
+                    and (not r.get("passed") or r.get("timed_out"))
+                    and (
+                        ntf in str(r.get("command") or "")
+                        or ntf_name in str(r.get("command") or "")
+                        or ntf in str(r.get("output_tail") or "")
+                        or ntf_name in str(r.get("output_tail") or "")
+                    )
+                    for r in acc_list_apply
+                ):
+                    failing_new_test_files.append(ntf)
+            if failing_new_test_files:
+                receipt["failing_new_test_files"] = failing_new_test_files
         self.store.write_receipt(
             safe_id,
             receipt,
@@ -6837,7 +10052,6 @@ class JobManager:
             workspace_root=str(self.workspace_root),
         )
 
-        acc_list_apply = receipt.get("acceptance_results")
         real_apply_pass = (
             receipt.get("acceptance_passed") is True
             and isinstance(acc_list_apply, list)
@@ -6858,6 +10072,35 @@ class JobManager:
             "applied": True,
             "applied_files": applied_files,
             **({"kept_host_copy": skipped_ignored_conflicts} if skipped_ignored_conflicts else {}),
+            **(
+                {"omitted_untracked_out_of_scope": omitted_untracked_out_of_scope}
+                if omitted_untracked_out_of_scope
+                else {}
+            ),
+            **(
+                {
+                    "omitted_unverified_new_test_files": omitted_unverified_new_tests,
+                    "omitted_unverified_new_tests_warning": (
+                        f"Omitted unverified newly created test file(s) {omitted_unverified_new_tests} "
+                        "because they failed or timed out during verification. "
+                        f"Inspect with get_diff(job_id={safe_id!r}, file_filter=...) or pass "
+                        "include_unverified_new_tests=True / include_paths=[...] to delegate_apply if needed."
+                    ),
+                }
+                if omitted_unverified_new_tests
+                else {}
+            ),
+            **(
+                {
+                    "failing_new_test_files": failing_new_test_files,
+                    "failing_new_tests_warning": (
+                        f"Newly created test file(s) {failing_new_test_files} failed in acceptance_results. "
+                        "Inspect and fix or remove broken worker-authored test assertions before concluding."
+                    ),
+                }
+                if failing_new_test_files
+                else {}
+            ),
             "diff_sha256": applied_prov["diff_sha256"],
             "acceptance_passed": receipt.get("acceptance_passed"),
             **({"real_acceptance_passed": True} if real_apply_pass else {}),
@@ -6881,18 +10124,32 @@ class JobManager:
         except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
             prior = {}
         prior_failed = int(prior.get("failed_attempts") or 0)
-        failed = worker_turn_failed(payload.get("status"), payload.get("acceptance_passed"))
-        count = prior_failed + 1 if failed else 0
+        status = str(payload.get("status") or "")
+        acc_passed = payload.get("acceptance_passed")
+        failed = worker_turn_failed(status, acc_passed) or (
+            acc_passed is not True
+            and status in ("checkpoint", "timeout", "scope_violation", "failed", "error", "spec_conflict")
+        )
+        # A plugin same-model retry is the plugin's own extra turn: a failed retry must not use up the
+        # Lead's failure allowance, or the Lead's first targeted delegate_continue gets refused and
+        # the expensive fallback (Opus writing the code itself) becomes the only path.
+        sources = [str(s) for s in (payload.get("prompt_sources") or []) if s]
+        is_plugin_retry_turn = bool(sources) and sources[-1] == "plugin_retry"
+        if failed:
+            count = prior_failed if is_plugin_retry_turn else prior_failed + 1
+        else:
+            count = 0
         out: dict[str, Any] = {"failed_attempts": count}
         threshold = escalate_after_failures()
-        if str(payload.get("status") or "") == "error" and is_quota_or_rate_limit_error(str(payload.get("error") or "")):
+        if status == "error" and is_quota_or_rate_limit_error(str(payload.get("error") or "")):
+            out["escalate_to_lead"] = True
             out["escalation"] = {
                 "escalate_to_lead": True,
                 "reason": "quota_or_rate_limit",
                 "failed_attempts": count,
                 "threshold": threshold,
                 "last_status": payload.get("status"),
-                "last_acceptance_passed": payload.get("acceptance_passed"),
+                "last_acceptance_passed": acc_passed,
                 "recommendation": (
                     "Gemini hit a rate limit or quota error (429/503). Do not retry the worker right now: "
                     f"inspect get_diff(job_id={job_id!r}) and finish the change directly on the host agent, "
@@ -6900,18 +10157,96 @@ class JobManager:
                 ),
             }
             return out
-        if threshold and count >= threshold:
+        unverified_stop = (
+            acc_passed is not True
+            and status in ("ok", "checkpoint", "timeout", "scope_violation", "failed", "error", "spec_conflict")
+            and (
+                status != "ok"
+                or acc_passed is False
+                or bool(payload.get("vacuous_acceptance"))
+                or bool(payload.get("test_only_diff"))
+            )
+        )
+        session_lead_slices = 0
+        near_session_deadline = False
+        if (
+            unverified_stop
+            and threshold > 0
+            and (
+                self._is_bounded_lead_session()
+                or is_strict_mode_enabled()
+                or resolve_cost_profile() == "economy"
+            )
+        ):
+            session_lead_slices = sum(1 for s in sources if s == "lead")
+            session_deadline, session_elapsed, _rem_w = self._session_deadline_budget()
+            if session_deadline is not None and (session_deadline - session_elapsed) < 150.0:
+                near_session_deadline = True
+            session_since = self._session_since_epoch()
+            for r_prev in self.store.list_receipts(workspace_root=self.workspace_root):
+                if r_prev.get("kind", "delegate") != "delegate" or str(r_prev.get("job_id") or "") == job_id:
+                    continue
+                r_started = float(r_prev.get("started_at_epoch") or 0.0)
+                if r_started > 0.0 and r_started < session_since:
+                    continue
+                if r_prev.get("cancelled") or r_prev.get("status") == "cancelled":
+                    continue
+                if (
+                    r_prev.get("status") == "ok"
+                    and r_prev.get("acceptance_passed") is True
+                    and not r_prev.get("scope_violations")
+                    and not r_prev.get("vacuous_acceptance")
+                    and not r_prev.get("test_only_diff")
+                ):
+                    continue
+                session_lead_slices += sum(1 for s in (r_prev.get("prompt_sources") or []) if s == "lead")
+        should_escalate = bool(
+            threshold > 0
+            and (
+                count >= threshold
+                or (
+                    unverified_stop
+                    and (session_lead_slices >= max(2, threshold) or near_session_deadline)
+                )
+            )
+        )
+        if should_escalate:
+            eff_count = max(count, session_lead_slices) if session_lead_slices >= 2 else max(1, count)
+            has_partial_files = bool(payload.get("files_changed"))
+            recommendation = (
+                f"The Gemini worker failed {eff_count} attempt(s) in a row after modifying "
+                f"{len(payload.get('files_changed') or [])} file(s). Do NOT call delegate_cancel (which discards "
+                f"partial work): inspect get_diff(job_id={job_id!r}), then either call "
+                f"delegate_apply(job_id={job_id!r}, allow_scope_violations=true) to land the partial changes and "
+                f"finish with up to 3 targeted Edit calls on those files, or call "
+                f"delegate_continue(job_id={job_id!r}, follow_up_prompt=..., force_retry=true). "
+                "escalate_to_lead=true: Host Edit, Write, Read, Grep, Glob, and test commands are now unlocked "
+                "so you can apply small targeted fixes directly without spawning another worker. "
+                "delegate_continue refuses further Gemini attempts on this job unless force_retry=true."
+                if has_partial_files
+                else (
+                    f"The Gemini worker failed {eff_count} attempt(s) in a row without landing passing edits. "
+                    f"Stop delegating blindly: inspect why the worker stalled, then either apply up to 3 targeted "
+                    f"Edit calls directly on the target file(s) or call "
+                    f"delegate_continue(job_id={job_id!r}, follow_up_prompt=..., force_retry=true). "
+                    "escalate_to_lead=true: Host Edit, Write, Read, Grep, Glob, and test commands are now unlocked "
+                    "so you can apply small targeted fixes directly without spawning another worker. "
+                    "delegate_continue refuses further Gemini attempts on this job unless force_retry=true."
+                )
+            )
+            out["escalate_to_lead"] = True
             out["escalation"] = {
                 "escalate_to_lead": True,
-                "failed_attempts": count,
+                "failed_attempts": eff_count,
                 "threshold": threshold,
                 "last_status": payload.get("status"),
-                "last_acceptance_passed": payload.get("acceptance_passed"),
-                "recommendation": (
-                    f"The Gemini worker failed {count} attempts in a row. Stop delegating this task: as the Lead, "
-                    f"inspect get_diff(job_id={job_id!r}), then finish it yourself (or delegate_cancel and start over). "
-                    "delegate_continue refuses further Gemini attempts on this job unless force_retry=true."
+                "last_acceptance_passed": acc_passed,
+                **(
+                    {"reason": "session_deadline_near"}
+                    if near_session_deadline and eff_count < (threshold or 2)
+                    else {}
                 ),
+                "recommendation": recommendation,
             }
         return out
 
@@ -6938,6 +10273,64 @@ class JobManager:
             else:
                 snap[rel] = {"state": "absent", "sha256": None}
         return snap
+
+    def _safe_destination(self, rel: str) -> Path:
+        """Workspace path for a write, refusing one whose parent directory is a symlink (git never tracks
+        a path beyond a symlinked directory, so it cannot be what a job recorded; an alias of .git/hooks
+        would otherwise receive the write) or resolves outside the workspace."""
+        from pathlib import PurePosixPath
+
+        from server.writers import symlink_component
+
+        parent_rel = PurePosixPath(rel).parent.as_posix()
+        if parent_rel not in ("", ".") and symlink_component(self.workspace_root, parent_rel) is not None:
+            raise ValueError(f"refusing to write {rel!r}: a parent directory in the workspace is a symlink")
+        dst = self.workspace_root / rel
+        if not dst.parent.resolve().is_relative_to(self.workspace_root.resolve()):
+            raise ValueError(f"refusing to write {rel!r}: its directory resolves outside the workspace")
+        return dst
+
+    def _restore_pre_state(self, bdir: Path, rel: str, pre: dict[str, Any]) -> None:
+        """Put one workspace path back to a recorded pre-apply state (absent, symlink, file or git blob)."""
+        dst = self._safe_destination(rel)
+        state = pre.get("state")
+        if dst.is_symlink() or (dst.exists() and state in ("absent", "symlink")):
+            dst.unlink()
+        if state == "absent":
+            pass
+        elif state == "symlink":
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(pre.get("target")), dst)
+        elif state == "file":
+            data = (bdir / str(pre.get("backup"))).read_bytes()
+            if sha256_bytes(data) != pre.get("sha256"):
+                raise ValueError(f"Backup for {rel!r} is corrupt (hash mismatch); refusing to restore it.")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_file():
+                dst.unlink()  # replace rather than overwrite, so a read-only applied file is no obstacle
+            dst.write_bytes(data)
+            if pre.get("mode") is not None:
+                os.chmod(dst, int(pre["mode"]))
+        elif state == "git_blob":
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_file():
+                dst.unlink()
+            dst.write_bytes(pre["data"])
+
+    def _rollback_partial_apply(self, safe_id: str, pre_apply: dict[str, dict[str, Any]], rels: list[str]) -> list[str]:
+        """Best-effort undo of a failed apply; returns the paths that could not be restored."""
+        bdir = self.store.data_dir / "backups" / safe_id
+        failed: list[str] = []
+        for rel in reversed(rels):
+            pre = pre_apply.get(rel)
+            if not pre:
+                failed.append(rel)
+                continue
+            try:
+                self._restore_pre_state(bdir, rel, pre)
+            except (OSError, ValueError):
+                failed.append(rel)
+        return failed
 
     def delegate_revert(
         self,
@@ -6966,8 +10359,8 @@ class JobManager:
         if base_hash is None:
             return {"state": "absent", "sha256": None}
         sha = str(receipt.get("baseline_commit_sha") or "HEAD")
-        show = subprocess.run(["git", "show", f"{sha}:{rel}"], cwd=str(self.workspace_root),
-                              capture_output=True, check=False)
+        show = _git_raw(["show", f"{sha}:{rel}"], cwd=str(self.workspace_root),
+                        capture_output=True, check=False)
         if show.returncode != 0 or sha256_bytes(show.stdout) != base_hash:
             return {"state": "unknown", "sha256": base_hash}
         return {"state": "git_blob", "sha256": base_hash, "data": show.stdout}
@@ -6978,9 +10371,11 @@ class JobManager:
             raise ValueError(f"Receipt for job '{safe_id}' failed its HMAC check; refusing to revert from it.")
         if not receipt.get("applied"):
             raise ValueError(f"Job '{safe_id}' was never applied; nothing to revert (use delegate_cancel).")
-        if receipt.get("reverted"):
+        already = list(receipt.get("reverted_files") or [])
+        if receipt.get("reverted") and not receipt.get("revert_skipped"):
             return {"job_id": safe_id, "reverted": True, "already_reverted": True,
-                    "reverted_files": receipt.get("reverted_files", [])}
+                    "reverted_files": already}
+        already_set = set(already)
         applied_hashes: dict[str, str | None] = dict(receipt.get("applied_file_hashes") or {})
         pre_apply: dict[str, dict[str, Any]] = dict(receipt.get("pre_apply") or {})
         in_place = bool(receipt.get("in_place"))
@@ -6989,9 +10384,14 @@ class JobManager:
         plan: list[dict[str, Any]] = []
         dirty: list[dict[str, Any]] = []
         for rel in list(receipt.get("applied_files") or []):
-            dst = self.workspace_root / rel
-            if not dst.resolve().is_relative_to(self.workspace_root.resolve()) and not dst.is_symlink():
-                raise ValueError(f"Path traversal blocked for {rel!r}")
+            if rel in already_set:
+                # Restored by an earlier skip_dirty revert; only the files skipped then are left to do.
+                continue
+            try:
+                dst = self._safe_destination(rel)
+            except ValueError as exc:
+                dirty.append({"file": rel, "reason": str(exc)})
+                continue
             current = _hash_path(dst)
             expected = applied_hashes.get(rel)
             pre = pre_apply.get(rel) or (self._pre_state_for_in_place(receipt, rel) if in_place else {"state": "unknown"})
@@ -7026,32 +10426,15 @@ class JobManager:
 
         reverted: list[str] = []
         for item in plan:
-            rel, pre = item["file"], item["pre"]
-            dst = self.workspace_root / rel
-            state = pre.get("state")
-            if dst.is_symlink() or (dst.exists() and state in ("absent", "symlink")):
-                dst.unlink()
-            if state == "absent":
-                pass
-            elif state == "symlink":
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(str(pre.get("target")), dst)
-            elif state == "file":
-                data = (bdir / str(pre.get("backup"))).read_bytes()
-                if sha256_bytes(data) != pre.get("sha256"):
-                    raise ValueError(f"Backup for {rel!r} is corrupt (hash mismatch); refusing to restore it.")
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(data)
-                if pre.get("mode") is not None:
-                    os.chmod(dst, int(pre["mode"]))
-            elif state == "git_blob":
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(pre["data"])
-            reverted.append(rel)
+            self._restore_pre_state(bdir, item["file"], item["pre"])
+            reverted.append(item["file"])
 
-        receipt["reverted"] = True
+        # A skip_dirty revert is partial: the job stays revertable so the skipped files can be
+        # restored later, once they match what the job applied again.
+        receipt["reverted"] = not dirty
+        receipt["partially_reverted"] = bool(dirty)
         receipt["reverted_at_epoch"] = round(time.time(), 3)
-        receipt["reverted_files"] = reverted
+        receipt["reverted_files"] = list(dict.fromkeys([*already, *reverted]))
         receipt["revert_skipped"] = dirty
         self.store.write_receipt(
             safe_id,
@@ -7059,7 +10442,8 @@ class JobManager:
             scrub=bool(receipt.get("scrub_receipt", False)),
             workspace_root=str(self.workspace_root),
         )
-        return {"job_id": safe_id, "reverted": True, "reverted_files": reverted, "skipped_dirty": dirty}
+        return {"job_id": safe_id, "reverted": not dirty, "partially_reverted": bool(dirty),
+                "reverted_files": reverted, "skipped_dirty": dirty}
 
     def _should_auto_apply(self, auto_apply: bool | None) -> bool:
         if auto_apply is not None:
@@ -7098,6 +10482,75 @@ class JobManager:
         if digest.get("vacuous_acceptance"):
             digest["auto_apply_skipped"] = "acceptance checks were vacuous (no modified files or 0 tests collected)"
             return digest
+        if digest.get("test_only_diff"):
+            digest["auto_apply_skipped"] = (
+                "worker modified only test files without changing any production source files"
+            )
+            return digest
+        stub_warns = [str(w) for w in (digest.get("stub_mutation_warnings") or []) if w]
+        if stub_warns:
+            has_stub_mock_warn = any(w.startswith("ExistingTestStubsModified:") for w in stub_warns)
+            if has_stub_mock_warn:
+                digest["auto_apply_skipped"] = (
+                    "worker modified mock/stub expectations across >=3 existing test blocks; inspect get_diff before applying"
+                )
+                return digest
+            qa_verified = isinstance(qa_info, dict) and qa_info.get("passed") is True
+            escalated_authorized_test_update = False
+            if digest.get("escalated_from_model") and not qa_verified:
+                try:
+                    full_r = self.store.read_receipt(job_id) or {}
+                except Exception:
+                    full_r = {}
+                intent_txt = "\n".join(
+                    str(x)
+                    for x in [full_r.get("raw_user_prompt") or "", *((full_r.get("prompts") or [])[:1])]
+                    if x
+                )
+                rec_allowed = [
+                    str(ap).replace("\\", "/").strip("/")
+                    for ap in (full_r.get("allowed_paths") or digest.get("allowed_paths") or [])
+                    if ap
+                ]
+                changed_tests = [
+                    str(fc).replace("\\", "/").strip("/")
+                    for fc in (digest.get("files_changed") or [])
+                    if _is_test_file_path(str(fc))
+                ]
+                changed_prod = [
+                    str(fc).replace("\\", "/").strip("/")
+                    for fc in (digest.get("files_changed") or [])
+                    if not _is_test_file_path(str(fc))
+                ]
+                explicit_test_paths_allowed = bool(changed_tests) and all(
+                    ct in rec_allowed for ct in changed_tests
+                )
+                has_substantive_prod_edit = False
+                if changed_prod:
+                    dp = self.store.diff_path(job_id)
+                    dt = dp.read_text(encoding="utf-8", errors="replace") if dp.exists() else ""
+                    in_prod_file = False
+                    for dln in dt.splitlines():
+                        if dln.startswith("diff --git "):
+                            hdr = parse_diff_git_header(dln)
+                            cp = ((hdr[1] or hdr[0]) if hdr else "").replace("\\", "/").strip("/")
+                            in_prod_file = cp in changed_prod
+                            continue
+                        if in_prod_file and dln.startswith(("+", "-")) and not dln.startswith(("+++", "---")):
+                            code_s = dln[1:].strip()
+                            if code_s and not code_s.startswith(("#", "//", "/*", "*", "*/")):
+                                has_substantive_prod_edit = True
+                                break
+                escalated_authorized_test_update = (
+                    explicit_test_paths_allowed
+                    and has_substantive_prod_edit
+                    and not _prompt_forbids_existing_test_updates(intent_txt)
+                )
+            if not qa_verified and not escalated_authorized_test_update:
+                digest["auto_apply_skipped"] = (
+                    "worker altered pre-existing test expectations across >=2 test functions; inspect get_diff before applying"
+                )
+                return digest
         if digest.get("status") == "spec_conflict":
             digest["auto_apply_skipped"] = "worker reported a specification conflict requiring Lead resolution"
             return digest
@@ -7129,7 +10582,11 @@ class JobManager:
                         real_acc_passed = any(
                             isinstance(r, dict)
                             and r.get("passed") is True
-                            and not r.get("auto_discovered_default")
+                            and not r.get("compile_smoke")
+                            and (
+                                not r.get("auto_discovered_default")
+                                or int((r.get("counts") or {}).get("passed") or 0) > 0
+                            )
                             and not r.get("auto_discovered_regression")
                             and not r.get("no_tests_collected")
                             and not r.get("runner_incompatible_skipped")
@@ -7247,9 +10704,13 @@ class JobManager:
         _prompt_source: str = "lead",
     ) -> dict[str, Any]:
         """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
+        cont_started_mono = time.monotonic()
         safe_id = validate_job_id(job_id)
         if not follow_up_prompt or not follow_up_prompt.strip():
             raise ValueError("follow_up_prompt must be a non-empty string")
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("MCP server is shutting down; refusing to continue worker job.")
         timeout_seconds = self._clamp_worker_timeout(timeout_seconds)
         try:
             kind_probe = self.store.read_receipt(safe_id).get("kind")
@@ -7424,13 +10885,43 @@ class JobManager:
         model = prior_model
         escalated_from: str | None = None
         target_esc_model = self._resolve_escalation_target_model(model)
+        prior_acc_results = [
+            r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)
+        ]
+        prior_only_cli_cfg_err = (
+            receipt.get("status") == "ok"
+            and not receipt.get("vacuous_acceptance")
+            and bool(receipt.get("files_changed"))
+            and bool(prior_acc_results)
+            and _only_compiler_cli_config_failures(prior_acc_results)
+        )
+        prior_prompt_for_intent = "\n".join(
+            str(x)
+            for x in [
+                receipt.get("raw_user_prompt") or "",
+                *(prior_prompts[:1]),
+            ]
+            if x
+        )
+        prior_has_stub_mutation = bool(
+            _unexempted_stub_mutation_warnings(
+                receipt.get("stub_mutation_warnings"),
+                prior_prompt_for_intent,
+            )
+        )
         prior_turn_needs_escalation = (
-            worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
-            or bool(receipt.get("vacuous_acceptance"))
-            or receipt.get("status") in ("checkpoint", "needs_input", "scope_violation")
-            or bool(receipt.get("missing_prompt_symbols"))
-            or (isinstance(receipt.get("qa_review"), dict) and receipt["qa_review"].get("passed") is False)
-        ) and receipt.get("status") != "spec_conflict"
+            (
+                worker_turn_failed(receipt.get("status"), receipt.get("acceptance_passed"))
+                or bool(receipt.get("vacuous_acceptance"))
+                or receipt.get("status") in ("checkpoint", "needs_input", "scope_violation")
+                or bool(receipt.get("missing_prompt_symbols"))
+                or prior_has_stub_mutation
+                or _prompt_source == "plugin_qa_review"
+                or (isinstance(receipt.get("qa_review"), dict) and receipt["qa_review"].get("passed") is not True)
+            )
+            and receipt.get("status") != "spec_conflict"
+            and not prior_only_cli_cfg_err
+        )
         if target_esc_model and prior_turn_needs_escalation:
             escalated_from = str(receipt.get("escalated_from_model") or model)
             model = target_esc_model
@@ -7474,10 +10965,12 @@ class JobManager:
         else:
             acceptance_cmds = list(receipt.get("acceptance") or [])
         budget = receipt.get("budget") or {}
+        explicit_calls = bool(receipt.get("explicit_max_tool_calls"))
+        explicit_tokens = bool(receipt.get("explicit_max_total_tokens"))
         stored_calls = (budget.get("max_tool_calls") or 0) if "max_tool_calls" in budget else None
-        if escalated_from is not None:
+        if escalated_from is not None and not explicit_calls:
             prior_flash_default, _ = resolve_budget(None, None, model=escalated_from)
-            if stored_calls in (DEFAULT_FLASH_MAX_TOOL_CALLS, prior_flash_default):
+            if stored_calls in (DEFAULT_FLASH_MAX_TOOL_CALLS, 40, 55, 75, prior_flash_default):
                 stored_calls = None
         # A stored None means the lead disabled that cap; a missing key (older receipt) means defaults.
         budget_calls, budget_tokens = resolve_budget(
@@ -7485,20 +10978,38 @@ class JobManager:
             (budget.get("max_total_tokens") or 0) if "max_total_tokens" in budget else None,
             model=model,
         )
+        effective_max_calls = (
+            max(budget_calls, int(receipt.get("cumulative_max_tool_calls") or 0))
+            if budget_calls is not None
+            else None
+        )
+        effective_max_tokens = (
+            max(budget_tokens, int(receipt.get("cumulative_max_total_tokens") or 0))
+            if budget_tokens is not None
+            else None
+        )
         prior_calls_used = max(
             int(receipt.get("tool_call_count") or 0),
             len(receipt.get("tool_calls") or []),
         )
         prior_tokens_used = int((receipt.get("usage") or {}).get("total_token_count") or 0)
-        if not force_retry and _prompt_source != "lead" and (
-            (budget_tokens is not None and prior_tokens_used >= budget_tokens)
-            or (budget_calls is not None and prior_calls_used >= budget_calls)
+        if not force_retry and _prompt_source not in ("lead", "plugin_retry") and (
+            (
+                effective_max_tokens is not None
+                and prior_tokens_used >= effective_max_tokens
+                and (escalated_from is None or explicit_tokens)
+            )
+            or (
+                effective_max_calls is not None
+                and prior_calls_used >= effective_max_calls
+                and (escalated_from is None or explicit_calls)
+            )
         ):
             if receipt.get("status") not in ("ok", "error", "cancelled", "interrupted", "spec_conflict"):
                 receipt["status"] = "checkpoint"
             receipt["stop_reason"] = (
                 "MAX_TOTAL_TOKENS_EXCEEDED"
-                if (budget_tokens is not None and prior_tokens_used >= budget_tokens)
+                if (effective_max_tokens is not None and prior_tokens_used >= effective_max_tokens)
                 else "MAX_TOOL_CALLS_EXCEEDED"
             )
             receipt["budget_exhausted"] = True
@@ -7514,18 +11025,39 @@ class JobManager:
             return digest
 
         phase_budget_calls: int | None = budget_calls
-        if budget_calls is not None:
-            rem_calls = budget_calls - prior_calls_used
-            if rem_calls > 0:
+        if budget_calls is not None and effective_max_calls is not None:
+            rem_calls = effective_max_calls - prior_calls_used
+            # A same-model plugin retry, the turn right after one, or any same-model turn after a tool-call
+            # checkpoint gets a fresh `budget_calls` slice. Handing it the remainder gave a worker that
+            # stopped at 39 of 40 calls exactly 1 call to finish with, and let a plugin retry eat the Lead's
+            # own continue. Other continuations and escalations to another model keep the cumulative
+            # remainder.
+            fresh_slice = escalated_from is None and (
+                _prompt_source == "plugin_retry"
+                or (bool(prior_sources) and prior_sources[-1] == "plugin_retry")
+                or receipt.get("status") == "checkpoint"
+                or receipt.get("stop_reason") == "MAX_TOOL_CALLS_EXCEEDED"
+            )
+            if escalated_from is not None and not explicit_calls:
+                # Guarantee Argon at least 60 tool calls even after a 75-call Flash checkpoint
+                # (100 - 75 = 25 would starve Argon on multi-file tasks), while still bounding it.
+                phase_budget_calls = max(min(60, budget_calls), rem_calls)
+            elif rem_calls > 0 and not fresh_slice:
                 phase_budget_calls = rem_calls
             else:
-                # Explicit Lead continuation on a same-model checkpoint grants another slice of `budget_calls`.
                 phase_budget_calls = budget_calls
 
         phase_budget_tokens: int | None = budget_tokens
-        if budget_tokens is not None:
-            rem_tokens = budget_tokens - prior_tokens_used
-            phase_budget_tokens = rem_tokens if rem_tokens > 0 else budget_tokens
+        if budget_tokens is not None and effective_max_tokens is not None:
+            rem_tokens = effective_max_tokens - prior_tokens_used
+            if escalated_from is not None and not explicit_tokens:
+                phase_budget_tokens = max(min(2_500_000, budget_tokens), rem_tokens)
+            elif budget_calls is not None and effective_max_calls is not None and fresh_slice:
+                phase_budget_tokens = budget_tokens
+            elif rem_tokens > 0:
+                phase_budget_tokens = rem_tokens
+            else:
+                phase_budget_tokens = budget_tokens
 
         use_repo_map = os.environ.get("CC_AGY_REPO_MAP", "1").strip().lower() not in ("0", "false", "no")
         repo_map_text = (
@@ -7562,21 +11094,43 @@ class JobManager:
         )
         stored_ctx_paths = [str(p) for p in (receipt.get("context_files") or []) if isinstance(p, str)]
         cont_ctx_inlined: list[tuple[str, str]] = []
+        ctx_root = wt_dir if wt_dir.exists() else self.workspace_root
+        spec_set_cont = {r for r, _ in cont_spec_inlined}
         if stored_ctx_paths and (
             _prompt_source == "plugin_escalation"
             or escalated_from is not None
             or not receipt.get("files_changed")
         ):
-            ctx_root = wt_dir if wt_dir.exists() else self.workspace_root
-            spec_set_cont = {r for r, _ in cont_spec_inlined}
             cont_ctx_inlined = _load_safe_workspace_files(
                 ctx_root,
                 [p for p in stored_ctx_paths if p not in spec_set_cont],
                 max_total_tokens=4000,
             )
+        if receipt.get("files_changed") and wt_dir.exists():
+            inlined_rel_set = {r for r, _ in cont_ctx_inlined} | spec_set_cont
+            mod_impl_paths = [
+                str(p)
+                for p in (receipt.get("files_changed") or [])
+                if isinstance(p, str)
+                and p not in inlined_rel_set
+                and not _is_test_file_path(p)
+            ][:3]
+            if mod_impl_paths:
+                cont_ctx_inlined.extend(
+                    _load_safe_workspace_files(
+                        wt_dir,
+                        mod_impl_paths,
+                        max_total_tokens=3500,
+                    )
+                )
         prior_baseline_probe = (
             list(receipt.get("baseline_acceptance_probe"))
             if isinstance(receipt.get("baseline_acceptance_probe"), list)
+            else []
+        )
+        prior_acceptance_remapped = (
+            list(receipt.get("acceptance_remapped"))
+            if acceptance is None and isinstance(receipt.get("acceptance_remapped"), list)
             else []
         )
         with self._lock:
@@ -7719,11 +11273,79 @@ class JobManager:
                 )
             prior_usage_snapshot["requests"] = tagged_prior_reqs
         prior_tool_calls_snapshot = list(receipt.get("tool_calls") or [])
-        prior_thinking = receipt.get("thinking_level")
+        explicit_thinking = bool(receipt.get("explicit_thinking_level"))
+        if escalated_from is not None and not explicit_thinking:
+            prior_thinking = (
+                resolve_thinking_level(
+                    None,
+                    model=model,
+                    read_only=is_read_only_tool_set(enabled_tools, disabled_tools),
+                )
+                or "DEFAULT"
+            )
+        else:
+            prior_thinking = receipt.get("thinking_level")
         prior_preloaded = receipt.get("preloaded_files")
-
+        cumulative_max_calls = (
+            max(effective_max_calls, prior_calls_used + phase_budget_calls)
+            if (effective_max_calls is not None and phase_budget_calls is not None)
+            else budget_calls
+        )
+        cumulative_max_tokens = (
+            max(effective_max_tokens, prior_tokens_used + phase_budget_tokens)
+            if (effective_max_tokens is not None and phase_budget_tokens is not None)
+            else budget_tokens
+        )
+        prior_attempts = list(receipt.get("prior_attempts") or [])
+        prior_attempts.append(
+            {
+                "attempt": max(1, len(recorded_prompt_sources) - 1),
+                "model": prior_model,
+                "status": receipt.get("status"),
+                "stop_reason": receipt.get("stop_reason"),
+                "acceptance_passed": receipt.get("acceptance_passed"),
+                "tool_call_count": len(prior_tool_calls_snapshot),
+                "summary": str(receipt.get("summary") or "")[:1500],
+                "acceptance_results": list(receipt.get("acceptance_results") or [])[:5],
+            }
+        )
+        receipt["prior_attempts"] = prior_attempts[-5:]
+        receipt["prior_tool_call_count"] = len(prior_tool_calls_snapshot)
         receipt["status"] = "running"
         receipt["error"] = None
+        receipt["stop_reason"] = None
+        receipt["completed_at"] = None
+        receipt["finished_at_epoch"] = None
+        receipt["acceptance_passed"] = None
+        receipt["acceptance_results"] = []
+        receipt["summary"] = ""
+        receipt["summary_truncated"] = False
+        receipt["missing_prompt_symbols"] = []
+        receipt["contract_warnings"] = []
+        receipt.pop("budget_exhausted", None)
+        receipt.pop("vacuous_acceptance", None)
+        receipt.pop("test_only_diff", None)
+        receipt.pop("stub_mutation_warnings", None)
+        receipt.pop("recovered_from_timeout", None)
+        receipt.pop("recovered_from_checkpoint", None)
+        receipt["model"] = model
+        receipt["thinking_level"] = prior_thinking
+        receipt["prompts"] = recorded_prompts
+        receipt["prompt_sources"] = recorded_prompt_sources
+        receipt["attempt"] = len(recorded_prompt_sources)
+        receipt["attempt_started_at_epoch"] = round(time.time(), 3)
+        receipt["owner_instance_id"] = self._instance_id
+        receipt["budget"] = {
+            "max_tool_calls": budget_calls,
+            "max_total_tokens": budget_tokens,
+        }
+        receipt["explicit_max_tool_calls"] = explicit_calls
+        receipt["explicit_max_total_tokens"] = explicit_tokens
+        receipt["explicit_thinking_level"] = explicit_thinking
+        if cumulative_max_calls is not None and budget_calls is not None and cumulative_max_calls > budget_calls:
+            receipt["cumulative_max_tool_calls"] = cumulative_max_calls
+        if cumulative_max_tokens is not None and budget_tokens is not None and cumulative_max_tokens > budget_tokens:
+            receipt["cumulative_max_total_tokens"] = cumulative_max_tokens
         try:
             self.store.write_receipt(
                 safe_id,
@@ -7734,50 +11356,75 @@ class JobManager:
         except Exception:
             pass
 
-        fut = self._executor.submit(
-            self._execute_job,
-            job_id=safe_id,
-            worker_prompts=worker_prompts,
-            recorded_prompts=recorded_prompts,
-            model=model,
-            auth_mode=auth_mode,
-            api_key=resolved_key,
-            project=resolved_project,
-            location=resolved_location,
-            reroute_note=reroute_note,
-            allowed_paths=allowed_paths,
-            timeout_seconds=timeout_seconds,
-            enabled_tools=enabled_tools,
-            disabled_tools=disabled_tools,
-            enable_subagents=enable_subagents,
-            wt_dir=wt_dir,
-            baseline_sha=baseline_sha,
-            baseline_file_hashes=baseline_hashes,
-            started_at=started_at,
-            prior_usage=prior_usage_snapshot,
-            prior_tool_calls=prior_tool_calls_snapshot,
-            scrub_receipt=eff_scrub,
-            in_place=in_place,
-            pre_untracked=pre_untracked,
-            thinking_level=prior_thinking,
-            plan=plan_steps,
-            acceptance=acceptance_cmds,
-            max_tool_calls=phase_budget_calls,
-            max_total_tokens=phase_budget_tokens,
-            preloaded_files=prior_preloaded,
-            prompt_sources=recorded_prompt_sources,
-            recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
-            baseline_acceptance_probe=prior_baseline_probe,
-            agy_conversation_id=resumed_agy_conv_id,
-            agy_prior_conversation_usage=prior_agy_conv_usage,
-            agy_prior_conversation_turns=prior_agy_conv_turns,
-        )
         with self._lock:
+            if self._shutting_down:
+                if in_place:
+                    self._release_in_place_slot(safe_id)
+                receipt["status"] = "interrupted"
+                receipt["error"] = "MCP server is shutting down; continuation turn was not started."
+                try:
+                    self.store.write_receipt(
+                        safe_id,
+                        receipt,
+                        scrub=bool(receipt.get("scrub_receipt", False)),
+                        workspace_root=str(self.workspace_root),
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("MCP server is shutting down; refusing to continue worker job.")
+            fut = self._executor.submit(
+                self._execute_job,
+                job_id=safe_id,
+                worker_prompts=worker_prompts,
+                recorded_prompts=recorded_prompts,
+                model=model,
+                auth_mode=auth_mode,
+                api_key=resolved_key,
+                project=resolved_project,
+                location=resolved_location,
+                reroute_note=reroute_note,
+                allowed_paths=allowed_paths,
+                timeout_seconds=timeout_seconds,
+                enabled_tools=enabled_tools,
+                disabled_tools=disabled_tools,
+                enable_subagents=enable_subagents,
+                wt_dir=wt_dir,
+                baseline_sha=baseline_sha,
+                baseline_file_hashes=baseline_hashes,
+                started_at=started_at,
+                prior_usage=prior_usage_snapshot,
+                prior_tool_calls=prior_tool_calls_snapshot,
+                scrub_receipt=eff_scrub,
+                in_place=in_place,
+                pre_untracked=pre_untracked,
+                thinking_level=prior_thinking,
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=phase_budget_calls,
+                max_total_tokens=phase_budget_tokens,
+                preloaded_files=prior_preloaded,
+                prompt_sources=recorded_prompt_sources,
+                recorded_budget={
+                    "max_tool_calls": budget_calls,
+                    "max_total_tokens": budget_tokens,
+                },
+                baseline_acceptance_probe=prior_baseline_probe,
+                acceptance_remapped=prior_acceptance_remapped,
+                agy_conversation_id=resumed_agy_conv_id,
+                agy_prior_conversation_usage=prior_agy_conv_usage,
+                agy_prior_conversation_turns=prior_agy_conv_turns,
+            )
             self._futures[safe_id] = fut
+            self._owned_job_ids.add(safe_id)
 
         if wait:
             slice_target = float(_wait_budget) if _wait_budget is not None else float(timeout_seconds)
-            wait_slice = self._resolve_wait_slice_seconds(slice_target, elapsed_seconds=_wait_elapsed)
+            total_elapsed = max(0.0, float(_wait_elapsed) + max(0.0, time.monotonic() - cont_started_mono))
+            wait_slice = self._resolve_wait_slice_seconds(
+                slice_target,
+                elapsed_seconds=total_elapsed,
+                allow_retry_grace=(_prompt_source in ("plugin_retry", "plugin_escalation", "plugin_qa_review")),
+            )
             if _wait_budget is not None and wait_slice < 1.0 and float(_wait_budget) <= 30.0:
                 wait_slice = max(wait_slice, float(_wait_budget) - float(_wait_elapsed))
             self._wait_for_future_or_cancel(safe_id, fut, timeout=wait_slice)
@@ -7865,6 +11512,27 @@ class JobManager:
 
         receipt = self.store.read_receipt(safe_id)
         wt_dir = Path(str(receipt.get("worktree_dir") or ""))
+        if not receipt.get("applied") and not receipt.get("in_place") and wt_dir.exists() and not still_running:
+            baseline_sha = str(receipt.get("baseline_commit_sha") or "HEAD")
+            try:
+                rec_diff, rec_files, rec_escapes = self._collect_worktree_diff(
+                    wt_dir,
+                    baseline_sha,
+                    allowed_paths=receipt.get("allowed_paths"),
+                )
+                if rec_files and not rec_escapes:
+                    self.store.diff_path(safe_id).write_text(rec_diff, encoding="utf-8")
+                    receipt["files_changed"] = rec_files
+                    receipt["symlink_escapes"] = rec_escapes
+                    receipt["baseline_file_hashes"] = self._compute_changed_baseline_hashes(
+                        wt_dir,
+                        baseline_sha,
+                        rec_files,
+                        dict(receipt.get("baseline_file_hashes") or {}),
+                    )
+                    receipt["provenance"] = extract_diff_provenance(rec_diff)
+            except Exception:
+                pass
         # Only remove wt_dir immediately if the worker thread is not currently running inside it;
         # if it is still running, _execute_job's finally block removes wt_dir upon exit.
         if cleanup_worktree and wt_dir.exists() and not still_running:
@@ -7888,6 +11556,32 @@ class JobManager:
             "cancelled": True,
         }
 
+    def _read_live_worker_progress(self, job_id: str, receipt: dict[str, Any]) -> int:
+        """Return live cumulative tool_call_count while a worker phase is running."""
+        base_calls = int(receipt.get("prior_tool_call_count") or receipt.get("tool_call_count") or 0)
+        try:
+            prog_p = self.store.progress_path(job_id)
+            live_path = Path(f"{prog_p}.live")
+            if not live_path.is_file():
+                live_path = prog_p.with_suffix(".live.json")
+            if not live_path.is_file():
+                return int(receipt.get("tool_call_count") or 0)
+            live_data = json.loads(live_path.read_text(encoding="utf-8"))
+            if not isinstance(live_data, dict):
+                return int(receipt.get("tool_call_count") or 0)
+            phase_calls = int(live_data.get("straitjacket_calls") or 0)
+            save_dir_str = str(live_data.get("save_dir") or "").strip()
+            if save_dir_str:
+                save_p = Path(save_dir_str)
+                if save_p.is_dir():
+                    from server.agy_runner import extract_sqlite_session_telemetry
+
+                    sql_tel = extract_sqlite_session_telemetry(save_p)
+                    phase_calls = max(phase_calls, len(sql_tel.get("tool_calls") or []))
+            return max(int(receipt.get("tool_call_count") or 0), base_calls + phase_calls)
+        except Exception:
+            return int(receipt.get("tool_call_count") or 0)
+
     def _digest_with_progress(self, receipt: dict[str, Any], *, include_summary: bool = True) -> dict[str, Any]:
         """Compact digest plus the worker's latest report_to_lead signals (visible while it is running)."""
         digest = self._compact_digest(receipt, include_summary=include_summary)
@@ -7898,10 +11592,28 @@ class JobManager:
             except ValueError:
                 digest["progress"] = []
         if digest.get("status") == "running":
-            digest["poll_hint"] = (
-                "Still running. Poll again with delegate_result(wait=true) (waits up to 240s, which keeps "
-                "your prompt cache warm), or check progress with delegate_status."
+            if job_id:
+                digest["tool_call_count"] = self._read_live_worker_progress(job_id, receipt)
+            sources = list(receipt.get("prompt_sources") or [])
+            attempt_num = max(1, len(sources) or len(receipt.get("prompts") or []) or int(receipt.get("attempt") or 1))
+            max_calls = digest.get("cumulative_max_tool_calls") or (digest.get("budget") or {}).get("max_tool_calls")
+            calls_note = (
+                f"{digest.get('tool_call_count', 0)}/{max_calls} tool calls used"
+                if max_calls
+                else f"{digest.get('tool_call_count', 0)} tool calls used"
             )
+            if attempt_num > 1 and sources:
+                src_label = sources[-1]
+                digest["poll_hint"] = (
+                    f"Attempt {attempt_num} ({src_label}) is actively running ({calls_note}). "
+                    f"Do NOT read files, run host commands, or call delegate_apply yet. Poll again with "
+                    f"delegate_result(job_id={job_id!r}, wait=true) (waits up to 240s, which keeps your prompt cache warm)."
+                )
+            else:
+                digest["poll_hint"] = (
+                    f"Still running ({calls_note}). Poll again with delegate_result(wait=true) (waits up to 240s, "
+                    "which keeps your prompt cache warm), or check progress with delegate_status."
+                )
         elif (
             job_id
             and digest.get("status") in ("ok", "checkpoint", "needs_input", "timeout", "scope_violation")
@@ -7939,13 +11651,19 @@ class JobManager:
                     digest["diff_preview_complete"] = not was_trunc
             missing_syms = digest.get("missing_prompt_symbols") or []
             contract_warns = digest.get("contract_warnings") or []
+            stub_warns = digest.get("stub_mutation_warnings") or []
             extra_notes: list[str] = []
             if missing_syms:
                 extra_notes.append(
                     f" Note: prompt symbol(s) {missing_syms} were not found in the modified files; verify whether "
                     f"they are required and call delegate_continue(job_id={job_id!r}, follow_up_prompt=...) if missing."
                 )
-            if contract_warns:
+            if stub_warns:
+                extra_notes.append(
+                    f" Note: stub_mutation_warnings flagged existing test stub/mock expectation edits: inspect "
+                    f"get_diff(job_id={job_id!r}) to verify existing caller contracts were preserved before applying."
+                )
+            if contract_warns and len(contract_warns) > len(stub_warns):
                 extra_notes.append(
                     f" Note: contract_warnings flagged potential class-attribute shadowing: inspect with "
                     f"get_diff(job_id={job_id!r}, focus_symbols=[...]) and fix via "
@@ -7953,7 +11671,14 @@ class JobManager:
                 )
             missing_note = "".join(extra_notes)
             if not digest.get("applied"):
-                if (
+                if digest.get("test_only_diff"):
+                    digest["next_action"] = (
+                        f"Worker modified only test file(s) ({digest.get('files_changed')}) without changing any "
+                        f"production source file. Call delegate_continue(job_id={job_id!r}, follow_up_prompt=...) "
+                        f"instructing the worker to implement the production source fix, or call "
+                        f"delegate_apply(job_id={job_id!r}) if the task genuinely requested test changes only.{missing_note}"
+                    )
+                elif (
                     digest.get("status") == "ok"
                     and digest.get("acceptance_passed") is not False
                     and not digest.get("scope_violations")
@@ -8021,13 +11746,40 @@ class JobManager:
                 f"repository files yourself; immediately call delegate_continue(job_id={job_id!r}, "
                 "follow_up_prompt=...) instructing the worker to apply its changes directly with edit_file/create_file."
             )
+        if digest.get("escalate_to_lead") or (digest.get("escalation") or {}).get("escalate_to_lead"):
+            esc_hint = (
+                "escalate_to_lead=true: Host Edit, Write, Read, Grep, Glob, and test commands are now unlocked "
+                "so you can apply small targeted fixes directly without spawning another worker."
+            )
+            cur_na = str(digest.get("next_action") or "")
+            if cur_na:
+                cur_na = cur_na.replace(
+                    "Do NOT read or grep repository files yourself; immediately call ",
+                    "Call ",
+                )
+                if "escalate_to_lead=true" not in cur_na:
+                    digest["next_action"] = f"{cur_na} {esc_hint}"
+                else:
+                    digest["next_action"] = cur_na
+            else:
+                digest["next_action"] = esc_hint
         return digest
 
-    def salvage_unapplied_worktree(self) -> dict[str, Any] | None:
+    def salvage_unapplied_worktree(
+        self,
+        *,
+        owner_instance_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """If the workspace has zero applied jobs on shutdown, salvage the best unapplied worker job
         that produced clean file edits so bounded benchmark/CLI runs never exit with an empty patch."""
         all_receipts = self.store.list_receipts(workspace_root=self.workspace_root)
         if any(bool(r.get("applied")) for r in all_receipts):
+            return None
+        if any(
+            r.get("status") == "running"
+            and (r.get("owner_instance_id") == self._instance_id or _receipt_owner_pid_alive(r))
+            for r in all_receipts
+        ):
             return None
         candidates: list[dict[str, Any]] = []
         with self._lock:
@@ -8035,7 +11787,15 @@ class JobManager:
         for r in all_receipts:
             if r.get("kind", "delegate") != "delegate":
                 continue
-            if r.get("applied") or r.get("cancelled") or r.get("symlink_escapes") or not r.get("files_changed"):
+            if owner_instance_id is not None and r.get("owner_instance_id") != owner_instance_id:
+                continue
+            if (
+                r.get("applied")
+                or r.get("cancelled")
+                or r.get("symlink_escapes")
+                or r.get("external_worktree_tamper")
+                or not r.get("files_changed")
+            ):
                 continue
             if r.get("status") not in ("ok", "checkpoint", "needs_input", "timeout", "interrupted", "scope_violation"):
                 continue
@@ -8059,6 +11819,7 @@ class JobManager:
         )
         best = candidates[0]
         best_id = str(best["job_id"])
+        dropped_new_tests = self._filter_unverified_new_tests_for_salvage(best)
         try:
             lock_file_path = self.store.data_dir / ".apply.lock"
             with self._apply_lock:
@@ -8074,6 +11835,8 @@ class JobManager:
                         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             rec = self.store.read_receipt(best_id)
             rec["salvaged_on_shutdown"] = True
+            if dropped_new_tests:
+                rec["salvage_omitted_unverified_tests"] = dropped_new_tests
             self.store.write_receipt(
                 best_id,
                 rec,
@@ -8084,13 +11847,252 @@ class JobManager:
         except Exception:
             return None
 
+    def _filter_unverified_new_tests_for_salvage(
+        self,
+        receipt: dict[str, Any],
+        wt_path: Path | None = None,
+        *,
+        exclude_paths: list[str] | None = None,
+    ) -> list[str]:
+        """When applying or salvaging an unverified job that modified both implementation files and brand-new untracked
+        test files, smoke-check or omit newly created test files that fail or time out so a deadlocking or broken test
+        file is never dropped into the host workspace."""
+        if receipt.get("acceptance_passed") is True:
+            return []
+        files = [str(f) for f in (receipt.get("files_changed") or []) if f]
+        base_hashes = dict(receipt.get("baseline_file_hashes") or {})
+        excl_norm = validate_allowed_paths(exclude_paths or [])
+        new_test_files = [
+            f
+            for f in files
+            if _is_test_file_path(f)
+            and not (excl_norm and _matches_allowed_paths(f, excl_norm))
+            and base_hashes.get(f) is None
+            and not (self.workspace_root / f).exists()
+            and not _is_tracked_in_git(self.workspace_root, f)
+        ]
+        if not new_test_files or len(new_test_files) >= len(files):
+            return []
+        wt_p = wt_path if (wt_path is not None and str(wt_path)) else Path(str(receipt.get("worktree_dir") or ""))
+        acc_res = [r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)]
+        dropped: list[str] = []
+        nm_link = self._link_host_node_modules_for_checks(wt_p) if wt_p.is_dir() else None
+        try:
+            for ntf in new_test_files:
+                bname = Path(ntf).name
+                timed_out_in_acc = any(
+                    r.get("timed_out") is True
+                    and (
+                        ntf in str(r.get("effective_command") or r.get("command") or "")
+                        or bname in str(r.get("effective_command") or r.get("command") or "")
+                        or ntf in str(r.get("output_tail") or "")
+                        or bname in str(r.get("output_tail") or "")
+                    )
+                    for r in acc_res
+                )
+                if timed_out_in_acc:
+                    dropped.append(ntf)
+                    continue
+                failed_in_acc = False
+                ref_cwd_extract = wt_p if wt_p.is_dir() else self.workspace_root
+                for r in acc_res:
+                    if r.get("passed") is not False or r.get("timed_out"):
+                        continue
+                    out_tail = str(r.get("output_tail") or "")
+                    _, f_files = _extract_failing_test_nodes_and_files(out_tail, ref_cwd_extract)
+                    if any(ff == ntf or Path(ff).name == bname for ff in f_files):
+                        failed_in_acc = True
+                        break
+                    eff_c = str(r.get("effective_command") or r.get("command") or "")
+                    if (
+                        int(r.get("exit_code") or 0) not in (0, 4)
+                        and (ntf in eff_c or bname in eff_c)
+                    ):
+                        try:
+                            toks = shlex.split(eff_c)
+                        except ValueError:
+                            toks = []
+                        test_file_toks = [
+                            t.split("::", 1)[0]
+                            for t in toks
+                            if not t.startswith("-") and _is_test_file_path(t.split("::", 1)[0])
+                        ]
+                        if len(test_file_toks) == 1 and (
+                            test_file_toks[0] == ntf or Path(test_file_toks[0]).name == bname
+                        ):
+                            failed_in_acc = True
+                            break
+                if failed_in_acc:
+                    dropped.append(ntf)
+                    continue
+                already_passed = any(
+                    r.get("passed") is True
+                    and not r.get("timed_out")
+                    and not r.get("vacuous")
+                    and not r.get("no_tests_collected")
+                    and not r.get("runner_incompatible_skipped")
+                    and not r.get("compile_smoke")
+                    and not r.get("auto_import_smoke")
+                    and not r.get("baseline_neutralized")
+                    and (
+                        int((r.get("counts") or {}).get("passed") or 0) > 0
+                        or bool(_TEST_RUNNER_CMD_RE.search(str(r.get("effective_command") or r.get("command") or "")))
+                    )
+                    and (
+                        ntf in str(r.get("effective_command") or r.get("command") or "")
+                        or bname in str(r.get("effective_command") or r.get("command") or "")
+                    )
+                    for r in acc_res
+                )
+                if already_passed:
+                    continue
+                if not wt_p.is_dir() or not (wt_p / ntf).is_file():
+                    dropped.append(ntf)
+                    continue
+                smoke_cmd: str | None = None
+                used_fallback_sys_pytest = False
+                if ntf.endswith(".py"):
+                    acc_pytest_pref: str | None = None
+                    for raw_ac in [
+                        *(receipt.get("acceptance_commands") or []),
+                        *(r.get("effective_command") or r.get("command") for r in acc_res),
+                    ]:
+                        if not raw_ac:
+                            continue
+                        extracted_pref = _extract_pytest_runner_prefix(str(raw_ac))
+                        if extracted_pref:
+                            try:
+                                pref_toks = shlex.split(extracted_pref)
+                                for idx_t, pt in enumerate(pref_toks):
+                                    if pt.startswith("PYTHONPATH=") and "." not in pt.split("=", 1)[1].split(":"):
+                                        pref_toks[idx_t] = f"{pt}:."
+                                acc_pytest_pref = shlex.join(pref_toks)
+                            except ValueError:
+                                acc_pytest_pref = extracted_pref
+                            break
+                    if acc_pytest_pref:
+                        runner_pref = acc_pytest_pref
+                    elif (wt_p / ".venv" / "bin" / "pytest").is_file():
+                        runner_pref = ".venv/bin/pytest"
+                    elif (self.workspace_root / ".venv" / "bin" / "pytest").is_file():
+                        runner_pref = str(self.workspace_root / ".venv" / "bin" / "pytest")
+                    else:
+                        runner_pref = "python3 -m pytest"
+                        used_fallback_sys_pytest = True
+                    smoke_cmd = f"{runner_pref} -q {shlex.quote(ntf)}"
+                elif ntf.endswith(".go") and shutil.which("go"):
+                    rel_pkg = "./" + str(Path(ntf).parent).replace("\\", "/").strip(".")
+                    smoke_cmd = f"go test {shlex.quote(rel_pkg.rstrip('/') or '.')}"
+                elif ntf.endswith((".ts", ".tsx", ".js", ".jsx")):
+                    node_bins = _collect_workspace_node_bin_dirs(wt_p) + _collect_workspace_node_bin_dirs(
+                        self.workspace_root
+                    )
+                    if any((Path(b) / "vitest").is_file() for b in node_bins):
+                        smoke_cmd = f"vitest run {shlex.quote(ntf)}"
+                    elif any((Path(b) / "jest").is_file() for b in node_bins):
+                        smoke_cmd = f"jest {shlex.quote(ntf)} --watchAll=false"
+                    elif ntf.endswith((".js", ".mjs", ".cjs")) and (wt_p / "package.json").is_file():
+                        try:
+                            pkg_txt = (wt_p / "package.json").read_text(encoding="utf-8", errors="ignore")
+                        except OSError:
+                            pkg_txt = ""
+                        if "node --test" in pkg_txt:
+                            smoke_cmd = f"node --test {shlex.quote(ntf)}"
+                if smoke_cmd is not None:
+                    s_res = run_acceptance([smoke_cmd], wt_p, timeout=8.0, total_wall_budget=8.0)
+                    if (
+                        not s_res
+                        or not s_res[0].get("passed")
+                        or s_res[0].get("timed_out")
+                        or s_res[0].get("no_tests_collected")
+                    ):
+                        s0_out = str((s_res[0] if s_res else {}).get("output_tail") or "")
+                        if (
+                            used_fallback_sys_pytest
+                            and s_res
+                            and not s_res[0].get("timed_out")
+                            and re.search(r"\b(?:ModuleNotFoundError|ImportError)\b", s0_out)
+                        ):
+                            pass
+                        else:
+                            dropped.append(ntf)
+        finally:
+            self._unlink_checks_node_modules(nm_link)
+        if not dropped:
+            return []
+        jid = str(receipt.get("job_id") or "")
+        if jid and wt_p.is_dir():
+            self._archive_omitted_worktree_files(jid, wt_p, dropped)
+        kept_files = [f for f in files if f not in set(dropped)]
+        diff_p = self.store.diff_path(jid) if jid else None
+        if diff_p is not None and diff_p.is_file():
+            try:
+                orig_diff = diff_p.read_text(encoding="utf-8", errors="replace")
+                split_chunks = _split_diff_by_file(orig_diff)
+                kept_chunks = [chunk for rel_c, chunk in split_chunks if rel_c not in set(dropped)]
+                omitted_chunks = [chunk for rel_c, chunk in split_chunks if rel_c in set(dropped)]
+                if omitted_chunks:
+                    omitted_p = diff_p.with_suffix(".omitted.diff")
+                    prev_omitted_diff = (
+                        omitted_p.read_text(encoding="utf-8", errors="replace")
+                        if omitted_p.is_file()
+                        else ""
+                    )
+                    omitted_p.write_text(prev_omitted_diff + "".join(omitted_chunks), encoding="utf-8")
+                new_diff = "".join(kept_chunks)
+                diff_p.write_text(new_diff, encoding="utf-8")
+                receipt["provenance"] = extract_diff_provenance(new_diff)
+            except Exception:
+                pass
+        receipt["files_changed"] = kept_files
+        prev_omitted_list = list(receipt.get("omitted_unverified_new_test_files") or [])
+        receipt["omitted_unverified_new_test_files"] = list(dict.fromkeys([*prev_omitted_list, *dropped]))
+        if jid:
+            self.store.write_receipt(
+                jid,
+                receipt,
+                scrub=bool(receipt.get("scrub_receipt", False)),
+                workspace_root=str(self.workspace_root),
+            )
+        return dropped
+
     def mark_running_interrupted(self) -> list[str]:
-        """Called when the MCP server is shutting down: record unfinished jobs as interrupted instead of
-        leaving them 'running' forever, preserve any live worktree diff, and optionally salvage unapplied edits."""
+        """Called when the MCP server is shutting down: terminate active workers first, record unfinished jobs as
+        interrupted instead of leaving them 'running', preserve any live worktree diff, and salvage clean edits."""
         marked: list[str] = []
         with self._lock:
-            live = {jid for jid, fut in self._futures.items() if not fut.done()}
+            self._shutting_down = True
+            live_futs = {jid: fut for jid, fut in self._futures.items() if not fut.done()}
+            live = set(live_futs.keys())
+            owned_snapshot = set(self._owned_job_ids)
             cancelled_ids = set(self._cancelled)
+            live_hooks = [
+                self._cancel_hooks[jid]
+                for jid in live
+                if jid not in cancelled_ids and jid in self._cancel_hooks
+            ]
+            for jid, fut in live_futs.items():
+                if jid not in cancelled_ids:
+                    fut.cancel()
+        for cancel_fn in live_hooks:
+            try:
+                cancel_fn()
+            except Exception:
+                pass
+        for jid, fut in live_futs.items():
+            if jid not in cancelled_ids and not fut.done():
+                try:
+                    fut.result(timeout=1.5)
+                except Exception:
+                    pass
+        for r_existing in self.store.list_receipts(workspace_root=self.workspace_root):
+            r_id = str(r_existing.get("job_id") or "")
+            if (
+                r_id
+                and r_existing.get("status") == "running"
+                and (r_id in owned_snapshot or r_existing.get("owner_instance_id") == self._instance_id)
+            ):
+                live.add(r_id)
         for jid in live:
             try:
                 receipt = self.store.read_receipt(jid)
@@ -8098,6 +12100,9 @@ class JobManager:
                 continue
             if jid in cancelled_ids or receipt.get("cancelled") or receipt.get("status") == "cancelled":
                 # Keep the user's explicit cancel; never relabel it as a server interruption.
+                continue
+            if receipt.get("status") not in ("running", "interrupted"):
+                # _execute_job already finalized this receipt cleanly during the 1.5s drain window.
                 continue
             if not receipt.get("in_place") and not receipt.get("applied"):
                 wt_dir = Path(str(receipt.get("worktree_dir") or ""))
@@ -8130,13 +12135,13 @@ class JobManager:
                 marked.append(jid)
             except Exception:
                 continue
-        should_salvage = (
+        should_salvage = bool(owned_snapshot or marked) and (
             self._is_bounded_lead_session()
             or os.environ.get("CC_AGY_SALVAGE_ON_SHUTDOWN", "").strip().lower() in ("1", "true", "yes")
         )
         if should_salvage:
             try:
-                self.salvage_unapplied_worktree()
+                self.salvage_unapplied_worktree(owner_instance_id=self._instance_id)
             except Exception:
                 pass
         return marked
@@ -8146,6 +12151,7 @@ class JobManager:
         with self._lock:
             self._shutting_down = True
             hooks = list(self._cancel_hooks.values())
+            qa_threads = list(self._qa_bg_threads)
             for fut in self._futures.values():
                 if not fut.done():
                     fut.cancel()
@@ -8154,6 +12160,10 @@ class JobManager:
                 fn()
             except Exception:
                 pass
+        if wait:
+            for qt in qa_threads:
+                if qt.is_alive() and qt is not threading.current_thread():
+                    qt.join(timeout=15.0)
         self._executor.shutdown(wait=wait)
 
     @staticmethod
@@ -8164,6 +12174,14 @@ class JobManager:
         include_acceptance_details: bool = True,
     ) -> dict[str, Any]:
         """Return a token-bounded digest suitable for Claude Code's context window."""
+        is_running = receipt.get("status") == "running"
+        prompt_sources = [str(s) for s in (receipt.get("prompt_sources") or []) if s]
+        attempt_num = max(
+            1,
+            len(prompt_sources)
+            or len(receipt.get("prompts") or [])
+            or int(receipt.get("attempt") or 1),
+        )
         if not include_acceptance_details and not include_summary:
             raw_usage = receipt.get("usage") or {}
             raw_cost = receipt.get("cost") or {}
@@ -8188,15 +12206,21 @@ class JobManager:
                     "total_cost_cents": float(raw_cost.get("total_cost_cents") or 0.0),
                 },
             }
-            if receipt.get("acceptance_passed") is not None:
+            if attempt_num > 1:
+                slim["attempt"] = attempt_num
+            if prompt_sources and (attempt_num > 1 or any(s != "lead" for s in prompt_sources)):
+                slim["prompt_sources"] = prompt_sources
+            if not is_running and receipt.get("acceptance_passed") is not None:
                 slim["acceptance_passed"] = receipt.get("acceptance_passed")
             if (receipt.get("escalation") or {}).get("escalate_to_lead"):
                 slim["escalate_to_lead"] = True
             if receipt.get("reverted"):
                 slim["reverted"] = True
+            if receipt.get("partially_reverted"):
+                slim["partially_reverted"] = True
             if receipt.get("error"):
                 slim["error"] = receipt.get("error")
-            if receipt.get("stop_reason"):
+            if not is_running and receipt.get("stop_reason"):
                 slim["stop_reason"] = receipt.get("stop_reason")
             if receipt.get("escalated_from_model"):
                 slim["escalated_from_model"] = receipt.get("escalated_from_model")
@@ -8243,14 +12267,20 @@ class JobManager:
             "applied": bool(receipt.get("applied", False)),
             "in_place": bool(receipt.get("in_place", False)),
             "thinking_level": receipt.get("thinking_level"),
-            "stop_reason": receipt.get("stop_reason"),
+            "stop_reason": None if is_running else receipt.get("stop_reason"),
             "budget": receipt.get("budget"),
             "containment": receipt.get("containment", "none"),
             "containment_warning": receipt.get("containment_warning"),
-            "acceptance_passed": receipt.get("acceptance_passed"),
+            "acceptance_passed": None if is_running else receipt.get("acceptance_passed"),
             "error": receipt.get("error"),
         }
-        if receipt.get("files_changed") and receipt.get("status") != "running":
+        if attempt_num > 1 or (prompt_sources and any(s != "lead" for s in prompt_sources)):
+            digest["attempt"] = attempt_num
+            if prompt_sources:
+                digest["prompt_sources"] = prompt_sources
+        if receipt.get("cumulative_max_tool_calls"):
+            digest["cumulative_max_tool_calls"] = int(receipt["cumulative_max_tool_calls"])
+        if receipt.get("files_changed") and not is_running:
             digest["verification"] = classify_verification(
                 receipt.get("acceptance_results"), receipt.get("acceptance_passed")
             )
@@ -8258,20 +12288,38 @@ class JobManager:
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
         if receipt.get("escalated_from_model"):
             digest["escalated_from_model"] = receipt.get("escalated_from_model")
-        if receipt.get("vacuous_acceptance"):
+        if not is_running and receipt.get("vacuous_acceptance"):
             digest["vacuous_acceptance"] = True
+        if not is_running and receipt.get("test_only_diff"):
+            digest["test_only_diff"] = True
         if receipt.get("spec_conflict"):
             digest["spec_conflict"] = receipt.get("spec_conflict")
-        if receipt.get("budget_exhausted"):
+        if not is_running and receipt.get("budget_exhausted"):
             digest["budget_exhausted"] = True
-        if receipt.get("recovered_from_timeout"):
+        if not is_running and receipt.get("recovered_from_timeout"):
             digest["recovered_from_timeout"] = True
-        if receipt.get("missing_prompt_symbols"):
+        if not is_running and receipt.get("recovered_from_checkpoint"):
+            digest["recovered_from_checkpoint"] = True
+        if not is_running and receipt.get("missing_prompt_symbols"):
             digest["missing_prompt_symbols"] = list(receipt.get("missing_prompt_symbols") or [])
-        if receipt.get("contract_warnings"):
+        if not is_running and receipt.get("stub_mutation_warnings"):
+            digest["stub_mutation_warnings"] = list(receipt.get("stub_mutation_warnings") or [])
+        if not is_running and isinstance(receipt.get("qa_review"), dict):
+            digest["qa_review"] = dict(receipt["qa_review"])
+        if not is_running and receipt.get("contract_warnings"):
             digest["contract_warnings"] = list(receipt.get("contract_warnings") or [])
         if receipt.get("baseline_acceptance_warnings"):
             digest["baseline_acceptance_warnings"] = list(receipt.get("baseline_acceptance_warnings") or [])
+        if receipt.get("acceptance_remapped"):
+            digest["acceptance_remapped"] = list(receipt.get("acceptance_remapped") or [])
+        if receipt.get("excluded_runtime_artifacts"):
+            digest["excluded_runtime_artifacts"] = list(receipt.get("excluded_runtime_artifacts") or [])
+        if receipt.get("preserved_runtime_artifacts"):
+            digest["preserved_runtime_artifacts"] = list(receipt.get("preserved_runtime_artifacts") or [])
+        if receipt.get("omitted_untracked_out_of_scope"):
+            digest["omitted_untracked_out_of_scope"] = list(receipt.get("omitted_untracked_out_of_scope") or [])
+        if receipt.get("omitted_unverified_new_test_files"):
+            digest["omitted_unverified_new_test_files"] = list(receipt.get("omitted_unverified_new_test_files") or [])
         if receipt.get("applied"):
             digest["applied_files"] = list(receipt.get("applied_files") or receipt.get("files_changed") or [])
             prov = receipt.get("provenance") or {}
@@ -8279,13 +12327,18 @@ class JobManager:
                 digest["diff_sha256"] = prov.get("diff_sha256")
         if receipt.get("failed_attempts"):
             digest["failed_attempts"] = int(receipt.get("failed_attempts") or 0)
+        if receipt.get("escalate_to_lead") or (receipt.get("escalation") or {}).get("escalate_to_lead"):
+            digest["escalate_to_lead"] = True
         if receipt.get("escalation"):
             digest["escalation"] = receipt.get("escalation")
         if receipt.get("reverted"):
             digest["reverted"] = True
+        if receipt.get("partially_reverted"):
+            digest["partially_reverted"] = True
+        if receipt.get("reverted") or receipt.get("partially_reverted"):
             digest["reverted_files"] = receipt.get("reverted_files", [])
         if include_acceptance_details:
-            digest["acceptance_results"] = receipt.get("acceptance_results") or []
+            digest["acceptance_results"] = [] if is_running else (receipt.get("acceptance_results") or [])
         if (
             not receipt.get("applied")
             and receipt.get("files_changed")
@@ -8300,7 +12353,12 @@ class JobManager:
             digest["in_place_notes"] = receipt.get("in_place_notes", [])
             digest["undo_hint"] = receipt.get("undo_hint")
         if include_summary:
-            summary_text = str(receipt.get("summary") or "")
+            summary_text = "" if is_running else str(receipt.get("summary") or "")
+            if not is_running and not summary_text.strip():
+                for pa in reversed(list(receipt.get("prior_attempts") or [])):
+                    if isinstance(pa, dict) and str(pa.get("summary") or "").strip():
+                        summary_text = str(pa.get("summary") or "")
+                        break
             meta_tokens = estimate_tokens(json.dumps(digest, indent=2, sort_keys=True))
             max_summary_tokens = _env_int("CC_AGY_DIGEST_SUMMARY_TOKENS", 300)
             summary_budget = max(64, min(max_summary_tokens, MAX_TOOL_RESPONSE_TOKENS - meta_tokens - 250))
@@ -8308,6 +12366,6 @@ class JobManager:
                 summary_text, summary_budget
             )
             digest["summary"] = clipped_summary
-            digest["summary_truncated"] = bool(receipt.get("summary_truncated") or truncated)
+            digest["summary_truncated"] = False if is_running else bool(receipt.get("summary_truncated") or truncated)
             digest["summary_tokens_estimated"] = est_tokens
         return digest

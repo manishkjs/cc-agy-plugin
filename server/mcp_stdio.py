@@ -337,6 +337,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "with get_diff and approves the additional modified files (default: false)."
                     ),
                 },
+                "include_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional path/glob patterns for untracked out-of-scope files to explicitly include "
+                        "when allow_scope_violations=true."
+                    ),
+                },
+                "include_unverified_new_tests": {
+                    "type": "boolean",
+                    "description": (
+                        "Include newly created untracked test files even if acceptance_passed is not true "
+                        "(default: false)."
+                    ),
+                },
             },
             "required": ["job_id"],
         },
@@ -407,7 +422,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "delegate_revert",
         "description": (
             "Undo an applied job: restore every file it touched to its pre-apply state from the backups "
-            "recorded at apply time. Refuses if any of those files changed after the apply, unless skip_dirty."
+            "recorded at apply time. Refuses if any of those files changed after the apply, unless skip_dirty "
+            "(a partial revert: call again once the skipped files match the applied content to finish it)."
         ),
         "inputSchema": {
             "type": "object",
@@ -735,6 +751,7 @@ _CORE_OMIT_PROPERTIES: frozenset[str] = frozenset(
         "receipt_id",
         "dry_run",
         "skip_dirty",
+        "include_unverified_new_tests",
     }
 )
 
@@ -788,6 +805,7 @@ _CORE_CONCISE_PROP_DESCRIPTIONS: dict[tuple[str, str], str] = {
     ("delegate_apply", "job_id"): "Job ID.",
     ("delegate_apply", "cleanup_worktree"): "Remove worktree after apply.",
     ("delegate_apply", "allow_scope_violations"): "Approve out-of-scope edits.",
+    ("delegate_apply", "include_paths"): "Untracked out-of-scope paths to include.",
 }
 
 
@@ -894,6 +912,12 @@ def _optional_str(value: Any, field_name: str) -> str | None:
     return value
 
 
+def _require_str_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise InvalidParamsError(f"'{field_name}' must be a list of non-empty strings")
+    return list(value)
+
+
 def _parse_positive_float(value: Any, field_name: str, default: float) -> float:
     if value is None:
         return default
@@ -972,6 +996,8 @@ class MCPServer:
         self.store = store or (job_manager.store if job_manager else ReceiptStore())
         self.job_manager = job_manager or JobManager(store=self.store)
         self.ask_backend = ask_backend
+        if ask_backend is not None and getattr(self.job_manager, "ask_backend", None) is None:
+            self.job_manager.ask_backend = ask_backend
         self.batch_writer_factory = batch_writer_factory
         # Set by serve_stdio: writes a JSON-RPC notification (e.g. notifications/progress) to the client.
         self.notify: Any = None
@@ -1405,6 +1431,7 @@ class MCPServer:
                 spec_files=spec_f,
                 context_files=context_f,
                 checklist=checklist_items,
+                _skip_balanced_qa=will_run_qa,
             )
             if will_run_qa and qa_review_model:
                 digest = self._maybe_run_qa_review(
@@ -1473,12 +1500,20 @@ class MCPServer:
             try:
                 cleanup_b = parse_bool(args.get("cleanup_worktree"), True)
                 allow_scope_b = parse_bool(args.get("allow_scope_violations"), False)
+                inc_unverified_tests_b = parse_bool(args.get("include_unverified_new_tests"), False)
+                inc_paths = (
+                    _require_str_list(args.get("include_paths"), "include_paths")
+                    if "include_paths" in args and args.get("include_paths") is not None
+                    else None
+                )
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             return self.job_manager.delegate_apply(
                 job_id=job_id_str,
                 cleanup_worktree=cleanup_b,
                 allow_scope_violations=allow_scope_b,
+                include_paths=inc_paths,
+                include_unverified_new_tests=inc_unverified_tests_b,
             )
 
         if name == "delegate_continue":
@@ -1618,6 +1653,7 @@ class MCPServer:
                 preload_files=preload_b,
                 auto_apply=False,
                 checklist=dtg_checklist,
+                _skip_balanced_qa=bool(qa_review_model and qa_review_model.strip()),
             )
             if qa_review_model and qa_review_model.strip():
                 digest = self._maybe_run_qa_review(
@@ -1801,13 +1837,16 @@ class MCPServer:
                     "A QA diff audit identified the following issues against the task specification:\n"
                     f"{issues_block}\n\n"
                     f"{review_bundle['pointer_prompt']}\n\n"
-                    "Fix each issue above cleanly and verify tests pass."
+                    "Fix each issue above cleanly in production code without weakening test inputs or altering "
+                    "pre-existing test expectations (unless explicitly required by the specification), and verify tests pass."
                 )
             elif parsed_qa["passed"] is False:
                 followup = (
                     "A QA diff audit returned VERDICT: NEEDS_FIXES against the task specification.\n\n"
                     f"{review_bundle['pointer_prompt']}\n\n"
-                    "Verify every requirement and edge case in the task specification and ensure all tests pass."
+                    "Verify every requirement and edge case in the task specification, fix root causes in production "
+                    "code without weakening pre-existing test expectations (unless explicitly required by the "
+                    "specification), and ensure all tests pass."
                 )
             else:
                 followup = (
@@ -1895,7 +1934,9 @@ def serve_stdio(
             with write_lock:
                 _write_response(writer, resp, framed)
 
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="cc-agy-rpc") as rpc_pool:
+    is_live_process_stdin = in_stream is None
+    rpc_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cc-agy-rpc")
+    try:
         while True:
             first_line = reader.readline()
             if not first_line:
@@ -1992,15 +2033,35 @@ def serve_stdio(
             for msg in parsed_messages:
                 if isinstance(msg, dict) and msg.get("method") == "tools/call":
                     fut = rpc_pool.submit(_process_and_write, msg, use_content_length)
+                    # Keep only unfinished calls: a long session would otherwise hold every finished
+                    # future (and its result) until shutdown.
+                    in_flight_futures[:] = [f for f in in_flight_futures if not f.done()]
                     in_flight_futures.append(fut)
                 else:
                     _process_and_write(msg, use_content_length)
 
-        for fut in in_flight_futures:
+        if is_live_process_stdin:
+            # Host CLI closed stdin (e.g. session exit or cohort timeout): immediately interrupt
+            # and cancel active workers instead of blocking up to 240s in rpc_pool.shutdown(wait=True).
             try:
-                fut.result(timeout=60.0)
+                active_server.job_manager.mark_running_interrupted()
             except Exception:
                 pass
+            try:
+                active_server.job_manager.shutdown(wait=False)
+            except Exception:
+                pass
+            rpc_pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            for fut in in_flight_futures:
+                try:
+                    fut.result(timeout=60.0)
+                except Exception:
+                    pass
+            rpc_pool.shutdown(wait=True)
+    finally:
+        if is_live_process_stdin:
+            rpc_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _write_response(

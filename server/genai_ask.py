@@ -57,16 +57,21 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
     from google.oauth2.credentials import Credentials as OAuth2Credentials
 
     timeout_ms = int(request.get("timeout_ms") or 600_000)
+    req_tl = str(request.get("thinking_level") or "").strip().upper()
+    is_zero_thinking = req_tl in ("ZERO", "0", "OFF")
     vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
     if request.get("api_key"):
         http_opts = genai_types.HttpOptions(timeout=timeout_ms)
         client = genai.Client(api_key=request["api_key"], http_options=http_opts)
     elif vertex_base_url:
         gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+        gw_headers: dict[str, str] = {"Authorization": f"Bearer {gateway_tok}"}
+        if is_zero_thinking:
+            gw_headers["X-CC-AGY-Thinking-Budget"] = "0"
         gw_http_kwargs: dict[str, Any] = {
             "timeout": timeout_ms,
             "base_url": vertex_base_url,
-            "headers": {"Authorization": f"Bearer {gateway_tok}"},
+            "headers": gw_headers,
         }
         if vertex_base_url.startswith("http://") or "googleapis.com" not in vertex_base_url:
             gw_http_kwargs["client_args"] = {"follow_redirects": False}
@@ -96,9 +101,13 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
             cfg_kwargs["system_instruction"] = request["system_instruction"]
         if request.get("temperature") is not None:
             cfg_kwargs["temperature"] = float(request["temperature"])
-        if request.get("thinking_level"):
+        if is_zero_thinking:
             cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_level=str(request["thinking_level"])
+                thinking_budget=0
+            )
+        elif req_tl:
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=req_tl
             )
 
         config = genai_types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
@@ -137,6 +146,7 @@ def ask_gemini(
     system_instruction: str | None = None,
     temperature: float | None = None,
     thinking_level: str | None = None,
+    timeout_ms: int | None = None,
     project: str | None = None,
     location: str | None = None,
     api_key: str | None = None,
@@ -144,6 +154,7 @@ def ask_gemini(
     store: ReceiptStore | None = None,
     scrub_receipt: bool = False,
     backend: GenaiBackend | None = None,
+    record_receipt: bool = True,
 ) -> dict[str, Any]:
     """Run a single-shot Google AI Studio or Vertex AI Gemini query without spinning up Antigravity.
 
@@ -224,6 +235,8 @@ def ask_gemini(
         }
         if thinking_level:
             req_payload["thinking_level"] = thinking_level
+        if timeout_ms is not None and int(timeout_ms) > 0:
+            req_payload["timeout_ms"] = int(timeout_ms)
         result = active_backend(req_payload)
         if result.get("vertex_project"):
             resolved_project = str(result["vertex_project"])
@@ -282,13 +295,23 @@ def ask_gemini(
             "error": error_msg,
             "applied": False,
         }
-        saved_receipt = receipt_store.write_receipt(
-            job_id,
-            receipt_payload,
-            scrub=scrub_receipt,
-            workspace_root=str(ws_root),
-            api_key=resolved_key,
-        )
+        if record_receipt:
+            saved_receipt = receipt_store.write_receipt(
+                job_id,
+                receipt_payload,
+                scrub=scrub_receipt,
+                workspace_root=str(ws_root),
+                api_key=resolved_key,
+            )
+            computed_cost = saved_receipt["cost"]
+        else:
+            from server.regions import estimate_cost_usd
+
+            computed_cost = estimate_cost_usd(
+                chosen_model,
+                usage,
+                single_request=True,
+            )
 
     return {
         "job_id": job_id,
@@ -302,5 +325,5 @@ def ask_gemini(
         "response_truncated": was_truncated,
         "response_tokens_estimated": orig_tokens,
         "usage": usage,
-        "cost": saved_receipt["cost"],
+        "cost": computed_cost,
     }

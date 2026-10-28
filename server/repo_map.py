@@ -15,6 +15,7 @@ import re
 import subprocess
 
 from server.regions import estimate_tokens, truncate_to_token_budget
+from server.verify import run_git
 
 DEFAULT_REPO_MAP_MAX_TOKENS = 1200
 
@@ -48,18 +49,51 @@ _JAVA_KT_SIG_RE = re.compile(
 _MAX_CACHE_ENTRIES = 16
 _MEM_CACHE: dict[str, str] = {}
 
+_ENTRYPOINT_FILENAMES = frozenset({
+    "__main__.py", "cli.py", "main.py", "app.py",
+    "main.go", "root.go",
+    "index.ts", "index.tsx", "index.js", "main.ts", "cli.ts",
+    "main.rs", "lib.rs",
+})
+_API_LAYER_SEGMENTS = frozenset({
+    "api", "client", "queries", "query", "graphql", "rpc",
+    "routes", "router", "handler", "handlers", "cmd", "cli",
+})
+_LOW_PRIORITY_SEGMENTS = ("vendor", "third_party", "examples", "example", "benchmarks", "bench", "docs", "mocks", "mock")
+
+
+def _segment_has_api_layer_token(seg: str) -> bool:
+    stem = seg.split(".", 1)[0]
+    return any(tok in _API_LAYER_SEGMENTS for tok in re.split(r"[._-]+", stem) if tok)
+
+
+def _repo_map_source_priority(rel: str) -> tuple[int, int, str]:
+    """Order entrypoints and API/CLI dispatch layers ahead of deep leaf or generated modules."""
+    norm = rel.replace("\\", "/").strip("/")
+    low = norm.lower()
+    parts_low = low.split("/")
+    bname = parts_low[-1] if parts_low else low
+    depth = len(parts_low)
+    if any(seg in _LOW_PRIORITY_SEGMENTS for seg in parts_low[:-1]) or bname.endswith((".pb.go", "_pb2.py")):
+        return (3, depth, norm)
+    if bname in _ENTRYPOINT_FILENAMES:
+        return (0, depth, norm)
+    if any(_segment_has_api_layer_token(seg) for seg in parts_low):
+        return (1, depth, norm)
+    return (2, depth, norm)
+
 
 def _git_info(root: Path) -> tuple[str, list[str]]:
     """Return (head_sha or "nohead"/"nogit", sorted relative file paths)."""
     head_sha = "nogit"
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
+        head = run_git(
+            ["rev-parse", "--verify", "HEAD"],
             cwd=str(root), capture_output=True, text=True, timeout=5, check=False,
         )
         head_sha = head.stdout.strip() if head.returncode == 0 else "nohead"
-        ls = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        ls = run_git(
+            ["ls-files", "--cached", "--others", "--exclude-standard"],
             cwd=str(root), capture_output=True, text=True, timeout=10, check=False,
         )
         if ls.returncode == 0 and ls.stdout.strip():
@@ -324,14 +358,14 @@ def repo_map_cache_key(workspace_root: Path, *, _info: tuple[str, list[str]] | N
     """Key on repo path, HEAD SHA, discovered file list, and content digest of dirty/untracked files."""
     root = Path(workspace_root).resolve()
     head_sha, files = _info if _info is not None else _git_info(root)
-    h = hashlib.sha256(b"repo_map_v2\0")
+    h = hashlib.sha256(b"repo_map_v3\0")
     for part in (str(root), head_sha, "\n".join(files)):
         h.update(part.encode("utf-8"))
         h.update(b"\0")
     if head_sha != "nogit":
         try:
-            status = subprocess.run(
-                ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+            status = run_git(
+                ["status", "--porcelain", "-z", "--untracked-files=all"],
                 cwd=str(root), capture_output=True, text=True, timeout=10, check=False,
             )
             if status.returncode == 0:
@@ -413,8 +447,18 @@ def build_repo_map(
     if not files:
         return ""
 
-    test_files = [f for f in files if f.startswith(("tests/", "test/")) or "/test_" in f or f.endswith(("_test.py", ".test.ts", ".spec.ts"))]
-    src_files = [f for f in files if f not in test_files and Path(f).suffix.lower() in _SOURCE_EXTS]
+    test_files = [
+        f
+        for f in files
+        if f.startswith(("tests/", "test/"))
+        or "/__tests__/" in f"/{f}"
+        or "/test_" in f
+        or f.endswith(("_test.py", "_test.go", ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx", ".test.js", ".spec.js"))
+    ]
+    src_files = sorted(
+        (f for f in files if f not in test_files and Path(f).suffix.lower() in _SOURCE_EXTS),
+        key=_repo_map_source_priority,
+    )
     other_files = [f for f in files if f not in test_files and f not in src_files]
 
     lines: list[str] = [f"Repository map ({len(files)} tracked files, HEAD={head_sha[:12]}):"]
