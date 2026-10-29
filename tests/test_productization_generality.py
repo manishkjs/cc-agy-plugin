@@ -256,6 +256,15 @@ def test_cost_profiles_and_shipped_default_models(monkeypatch: pytest.MonkeyPatc
     }
     assert resolve_default_delegate_model(None, env=explicit_env) == "gemini-4-argon"
 
+    # Flash family environment overrides explicitly supersede hardcoded gemini-3.8-flash prompt requests
+    flash_next_env = {
+        "CC_AGY_DEFAULT_DELEGATE_MODEL": "gemini-flash-next",
+        "CC_AGY_DEFAULT_ASK_MODEL": "gemini-flash-next",
+    }
+    assert resolve_default_delegate_model("gemini-3.8-flash", env=flash_next_env) == "gemini-flash-next"
+    assert resolve_default_ask_model("gemini-3.8-flash", env=flash_next_env) == "gemini-flash-next"
+    assert resolve_default_delegate_model("gemini-4-argon", env=flash_next_env) == "gemini-4-argon"
+
     # sanitize_placeholder_env cleans CC_AGY_USERCFG_COST_PROFILE when unexpanded
     monkeypatch.setenv("CC_AGY_USERCFG_COST_PROFILE", "${user_config.cost_profile}")
     sanitize_placeholder_env()
