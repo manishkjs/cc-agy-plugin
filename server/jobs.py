@@ -31,6 +31,12 @@ from server.agy_runner import (
     run_antigravity_worker,
     verify_worker_run_record,
 )
+from server.model_routes import (
+    DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS,
+    DEFAULT_FLASH_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOTAL_TOKENS,
+)
 from server.repo_map import build_focused_file_outline, build_repo_map
 from server.receipts import (
     BudgetExceededError,
@@ -39,9 +45,17 @@ from server.receipts import (
     extract_diff_provenance,
     parse_diff_git_header,
     parse_unified_header_path,
+    receipt_owner_pid_alive as _receipt_owner_pid_alive,
     resolve_workspace_root,
     sha256_bytes,
     validate_job_id,
+)
+from server.verification_policy import (
+    classify_verification,
+    has_real_acceptance_pass,
+    is_non_smoke_passing_entry,
+    satisfies_auto_apply_verification,
+    satisfies_timeout_promotion,
 )
 from server.regions import (
     DEFAULT_DIFF_PAGE_TOKENS,
@@ -1356,12 +1370,8 @@ def _is_ignored_build_artifact(rel_path: str, root: Path | None = None) -> bool:
     return False
 
 
-DEFAULT_MAX_TOOL_CALLS = 100
-DEFAULT_FLASH_MAX_TOOL_CALLS = 55
-# Economy has no Argon escalation, so it gives Flash the full 100-call budget; balanced gives Flash
-# 55 calls before escalating to Argon/Carbon (with a 60-call escalation floor) so Flash finishes verified patches cleanly.
-DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS = 100
-DEFAULT_MAX_TOTAL_TOKENS = 5_000_000
+# DEFAULT_MAX_TOOL_CALLS, DEFAULT_FLASH_MAX_TOOL_CALLS, DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS,
+# and DEFAULT_MAX_TOTAL_TOKENS are imported from server.model_routes (single source of truth).
 DEFAULT_MAX_WAIT_SLICE_SECONDS = 240.0
 DEFAULT_ACCEPTANCE_TIMEOUT = 300.0
 DEFAULT_BOUNDED_ACCEPTANCE_TIMEOUT = 90.0
@@ -3139,14 +3149,7 @@ def evaluate_post_worker_baseline_failures(
         if isinstance(p, dict) and not p.get("passed") and not p.get("timed_out") and p.get("exit_code") not in (None, 0)
     }
     any_real_test_passed = any(
-        isinstance(x, dict)
-        and x.get("passed") is True
-        and not x.get("timed_out")
-        and not x.get("vacuous")
-        and not x.get("no_tests_collected")
-        and not x.get("runner_incompatible_skipped")
-        and not x.get("compile_smoke")
-        and not x.get("auto_import_smoke")
+        is_non_smoke_passing_entry(x)
         and (
             int((x.get("counts") or {}).get("passed") or 0) > 0
             or bool(_TEST_RUNNER_CMD_RE.search(str(x.get("command") or "")))
@@ -3345,12 +3348,9 @@ def _only_compiler_cli_config_failures(acc_results: list[dict[str, Any]]) -> boo
     if not acc_results:
         return False
     has_passing_test_runner = any(
-        isinstance(r, dict)
-        and r.get("passed") is True
+        is_non_smoke_passing_entry(r)
         and int(r.get("exit_code") if r.get("exit_code") is not None else 0) == 0
         and int((r.get("counts") or {}).get("passed") or 0) > 0
-        and not r.get("compile_smoke")
-        and not r.get("auto_import_smoke")
         for r in acc_results
     )
     if not has_passing_test_runner:
@@ -4098,30 +4098,6 @@ def detect_existing_test_stub_mutations(
                 f"rather than rewriting existing test assertions."
             )
     return warnings
-
-
-def _receipt_owner_pid_alive(receipt: dict[str, Any]) -> bool:
-    """Return True if `receipt['owner_instance_id']` encodes a live OS PID (or True if unknown)."""
-    owner = str(receipt.get("owner_instance_id") or "").strip()
-    if not owner or "-" not in owner:
-        return True
-    parts = owner.split("-")
-    pid_part = parts[1] if parts[0] == "inst" and len(parts) >= 3 else parts[0]
-    try:
-        pid = int(pid_part)
-    except ValueError:
-        return True
-    if pid <= 0:
-        return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
 
 
 import builtins as _py_builtins
@@ -5008,54 +4984,6 @@ def build_compile_smoke_commands(
         cmds.append(f"python3 -c {shlex.quote(json_script)} {_quoted(json_files)}")
 
     return cmds
-
-
-def has_real_acceptance_pass(acceptance_results: Any) -> bool:
-    """True when at least one explicit acceptance command passed (not auto-discovered, smoke, or skipped)."""
-    if not isinstance(acceptance_results, list) or not acceptance_results:
-        return False
-    return any(
-        isinstance(r, dict)
-        and r.get("passed") is True
-        and not r.get("auto_discovered_default")
-        and not r.get("auto_discovered_regression")
-        and not r.get("no_tests_collected")
-        and not r.get("runner_incompatible_skipped")
-        and not r.get("auto_import_smoke")
-        for r in acceptance_results
-    )
-
-
-def classify_verification(acceptance_results: Any, acceptance_passed: bool | None) -> str:
-    """Summarize how strongly a worker's change was verified.
-
-    Returns `failed`, `acceptance_tests` (an explicit acceptance command passed), `related_tests` (existing
-    tests the plugin discovered passed, but no explicit check covered the request), `smoke_only` (only
-    parse/compile/import checks ran), or `unverified` (nothing ran, or every check was skipped).
-    """
-    if acceptance_passed is False:
-        return "failed"
-    if has_real_acceptance_pass(acceptance_results):
-        return "acceptance_tests"
-    results = acceptance_results if isinstance(acceptance_results, list) else []
-    ran = [
-        r
-        for r in results
-        if isinstance(r, dict)
-        and r.get("passed") is True
-        and not r.get("no_tests_collected")
-        and not r.get("runner_incompatible_skipped")
-    ]
-    if any(
-        not r.get("compile_smoke")
-        and not r.get("auto_import_smoke")
-        and int(((r.get("counts") or {}) if isinstance(r.get("counts"), dict) else {}).get("passed") or 0) > 0
-        for r in ran
-    ):
-        return "related_tests"
-    if ran:
-        return "smoke_only"
-    return "unverified"
 
 
 def find_missing_prompt_symbols(
@@ -6877,21 +6805,20 @@ class JobManager:
             else:
                 status = "timeout"
                 error_msg = f"TimeoutError: {exc}"
-            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts, model=model)
-            if getattr(exc, "partial_containment", None):
-                worker_out["containment"] = getattr(exc, "partial_containment")
-            if getattr(exc, "partial_containment_warning", None):
-                worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
-            if getattr(exc, "partial_command_runs", None):
-                worker_out["command_runs"] = getattr(exc, "partial_command_runs")
-            if getattr(exc, "partial_agy_conversation_id", None):
-                active_agy_conv_id = str(getattr(exc, "partial_agy_conversation_id"))
-            if isinstance(getattr(exc, "partial_agy_conversation_usage", None), dict):
-                active_agy_conv_usage = {
-                    k: int(getattr(exc, "partial_agy_conversation_usage").get(k) or 0) for k in token_keys
-                }
-            if getattr(exc, "partial_agy_conversation_turns", None):
-                active_agy_conv_turns = int(getattr(exc, "partial_agy_conversation_turns"))
+            active_agy_conv_id, active_agy_conv_usage, active_agy_conv_turns = (
+                self._recover_partial_worker_exception_state(
+                    exc,
+                    usage=usage,
+                    tool_calls=tool_calls,
+                    thoughts=thoughts,
+                    worker_out=worker_out,
+                    token_keys=token_keys,
+                    active_agy_conv_id=active_agy_conv_id,
+                    active_agy_conv_usage=active_agy_conv_usage,
+                    active_agy_conv_turns=active_agy_conv_turns,
+                    model=model,
+                )
+            )
         except Exception as exc:
             with self._lock:
                 is_canc = job_id in self._cancelled
@@ -6901,21 +6828,20 @@ class JobManager:
             else:
                 status = "error"
                 error_msg = f"{type(exc).__name__}: {exc}"
-            self._merge_partial_exception_data(exc, usage, tool_calls, thoughts, model=model)
-            if getattr(exc, "partial_containment", None):
-                worker_out["containment"] = getattr(exc, "partial_containment")
-            if getattr(exc, "partial_containment_warning", None):
-                worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
-            if getattr(exc, "partial_command_runs", None):
-                worker_out["command_runs"] = getattr(exc, "partial_command_runs")
-            if getattr(exc, "partial_agy_conversation_id", None):
-                active_agy_conv_id = str(getattr(exc, "partial_agy_conversation_id"))
-            if isinstance(getattr(exc, "partial_agy_conversation_usage", None), dict):
-                active_agy_conv_usage = {
-                    k: int(getattr(exc, "partial_agy_conversation_usage").get(k) or 0) for k in token_keys
-                }
-            if getattr(exc, "partial_agy_conversation_turns", None):
-                active_agy_conv_turns = int(getattr(exc, "partial_agy_conversation_turns"))
+            active_agy_conv_id, active_agy_conv_usage, active_agy_conv_turns = (
+                self._recover_partial_worker_exception_state(
+                    exc,
+                    usage=usage,
+                    tool_calls=tool_calls,
+                    thoughts=thoughts,
+                    worker_out=worker_out,
+                    token_keys=token_keys,
+                    active_agy_conv_id=active_agy_conv_id,
+                    active_agy_conv_usage=active_agy_conv_usage,
+                    active_agy_conv_turns=active_agy_conv_turns,
+                    model=model,
+                )
+            )
         finally:
             self._unlink_checks_node_modules(worker_nm_links)
             try:
@@ -7406,22 +7332,9 @@ class JobManager:
                     error_msg = error_msg or "Cancelled by user via delegate_cancel."
 
             external_tamper = bool(not in_place and files_changed and not workspace_dir_accessed)
-            no_tests_re = re.compile(r"\bno tests ran\b|\bcollected 0 items\b|\bRan 0 tests\b", re.I)
-            real_acc_passed_on_job = (
-                bool(acceptance_results)
-                and not test_only_diff
-                and all(isinstance(r, dict) and r.get("passed") is True for r in acceptance_results)
-                and any(
-                    isinstance(r, dict)
-                    and r.get("passed") is True
-                    and not r.get("auto_discovered_default")
-                    and not r.get("auto_discovered_regression")
-                    and not r.get("no_tests_collected")
-                    and not r.get("runner_incompatible_skipped")
-                    and not r.get("auto_import_smoke")
-                    and not no_tests_re.search(str(r.get("output_tail") or ""))
-                    for r in acceptance_results
-                )
+            real_acc_passed_on_job = satisfies_timeout_promotion(
+                acceptance_results,
+                test_only_diff=test_only_diff,
             )
             recovered_from_timeout = False
             recovered_from_checkpoint = False
@@ -7807,6 +7720,37 @@ class JobManager:
         partial_th = getattr(exc, "partial_thoughts", None)
         if isinstance(partial_th, list):
             thoughts.extend(partial_th)
+
+    @classmethod
+    def _recover_partial_worker_exception_state(
+        cls,
+        exc: BaseException,
+        *,
+        usage: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        thoughts: list[str],
+        worker_out: dict[str, Any],
+        token_keys: tuple[str, ...] | list[str],
+        active_agy_conv_id: str | None,
+        active_agy_conv_usage: dict[str, int] | None,
+        active_agy_conv_turns: int | None,
+        model: str = "",
+    ) -> tuple[str | None, dict[str, int] | None, int | None]:
+        cls._merge_partial_exception_data(exc, usage, tool_calls, thoughts, model=model)
+        if getattr(exc, "partial_containment", None):
+            worker_out["containment"] = getattr(exc, "partial_containment")
+        if getattr(exc, "partial_containment_warning", None):
+            worker_out["containment_warning"] = getattr(exc, "partial_containment_warning")
+        if getattr(exc, "partial_command_runs", None):
+            worker_out["command_runs"] = getattr(exc, "partial_command_runs")
+        if getattr(exc, "partial_agy_conversation_id", None):
+            active_agy_conv_id = str(getattr(exc, "partial_agy_conversation_id"))
+        partial_conv_u = getattr(exc, "partial_agy_conversation_usage", None)
+        if isinstance(partial_conv_u, dict):
+            active_agy_conv_usage = {k: int(partial_conv_u.get(k) or 0) for k in token_keys}
+        if getattr(exc, "partial_agy_conversation_turns", None):
+            active_agy_conv_turns = int(getattr(exc, "partial_agy_conversation_turns"))
+        return active_agy_conv_id, active_agy_conv_usage, active_agy_conv_turns
 
     @staticmethod
     def _try_reuse_worker_acceptance(
@@ -9680,18 +9624,7 @@ class JobManager:
             acc_list_prev = receipt.get("acceptance_results")
             real_prev = (
                 receipt.get("acceptance_passed") is True
-                and isinstance(acc_list_prev, list)
-                and bool(acc_list_prev)
-                and any(
-                    isinstance(r, dict)
-                    and r.get("passed") is True
-                    and not r.get("auto_discovered_default")
-                    and not r.get("auto_discovered_regression")
-                    and not r.get("no_tests_collected")
-                    and not r.get("runner_incompatible_skipped")
-                    and not r.get("auto_import_smoke")
-                    for r in acc_list_prev
-                )
+                and has_real_acceptance_pass(acc_list_prev)
             )
             return {
                 "job_id": safe_id,
@@ -10119,18 +10052,7 @@ class JobManager:
 
         real_apply_pass = (
             receipt.get("acceptance_passed") is True
-            and isinstance(acc_list_apply, list)
-            and bool(acc_list_apply)
-            and any(
-                isinstance(r, dict)
-                and r.get("passed") is True
-                and not r.get("auto_discovered_default")
-                and not r.get("auto_discovered_regression")
-                and not r.get("no_tests_collected")
-                and not r.get("runner_incompatible_skipped")
-                and not r.get("auto_import_smoke")
-                for r in acc_list_apply
-            )
+            and has_real_acceptance_pass(acc_list_apply)
         )
         return {
             "job_id": safe_id,
@@ -10642,22 +10564,10 @@ class JobManager:
             if digest.get("acceptance_passed") is True:
                 try:
                     full_rec = self.store.read_receipt(job_id)
-                    acc_list = full_rec.get("acceptance_results")
-                    if isinstance(acc_list, list) and acc_list:
-                        real_acc_passed = any(
-                            isinstance(r, dict)
-                            and r.get("passed") is True
-                            and not r.get("compile_smoke")
-                            and (
-                                not r.get("auto_discovered_default")
-                                or int((r.get("counts") or {}).get("passed") or 0) > 0
-                            )
-                            and not r.get("auto_discovered_regression")
-                            and not r.get("no_tests_collected")
-                            and not r.get("runner_incompatible_skipped")
-                            and not r.get("auto_import_smoke")
-                            for r in acc_list
-                        )
+                    real_acc_passed = satisfies_auto_apply_verification(
+                        full_rec.get("acceptance_results"),
+                        True,
+                    )
                 except Exception:
                     real_acc_passed = False
             if real_acc_passed:
@@ -11999,13 +11909,7 @@ class JobManager:
                     dropped.append(ntf)
                     continue
                 already_passed = any(
-                    r.get("passed") is True
-                    and not r.get("timed_out")
-                    and not r.get("vacuous")
-                    and not r.get("no_tests_collected")
-                    and not r.get("runner_incompatible_skipped")
-                    and not r.get("compile_smoke")
-                    and not r.get("auto_import_smoke")
+                    is_non_smoke_passing_entry(r)
                     and not r.get("baseline_neutralized")
                     and (
                         int((r.get("counts") or {}).get("passed") or 0) > 0

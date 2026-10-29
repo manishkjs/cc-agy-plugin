@@ -32,6 +32,11 @@ import time
 from typing import Any, Callable
 
 from server.batch_plan import FileTask, is_protected_path
+from server.genai_client import (
+    build_genai_client as _build_genai_client,
+    close_genai_client,
+    extract_usage_metadata,
+)
 
 WRITER_LADDER: tuple[str, ...] = ("routed", "routed", "claude")
 TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
@@ -604,14 +609,7 @@ def make_genai_writer(
             except Exception as exc:  # noqa: BLE001 - classified below by status code / type
                 _raise_classified(exc)
                 raise
-            meta = getattr(resp, "usage_metadata", None)
-            usage = {
-                "prompt_token_count": int(getattr(meta, "prompt_token_count", 0) or 0),
-                "cached_content_token_count": int(getattr(meta, "cached_content_token_count", 0) or 0),
-                "candidates_token_count": int(getattr(meta, "candidates_token_count", 0) or 0),
-                "thoughts_token_count": int(getattr(meta, "thoughts_token_count", 0) or 0),
-                "total_token_count": int(getattr(meta, "total_token_count", 0) or 0),
-            }
+            usage = extract_usage_metadata(getattr(resp, "usage_metadata", None))
             finish = ""
             cands = getattr(resp, "candidates", None) or []
             if cands:
@@ -627,56 +625,9 @@ def make_genai_writer(
                 diagnostics="" if getattr(resp, "text", "") else f"finish_reason={finish}",
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
+            close_genai_client(client)
 
     return _write
-
-
-def _build_genai_client(auth: dict[str, Any], *, timeout_ms: int | None = None) -> Any:
-    """Construct a google-genai Client honoring API keys, Vertex ADC, and gateways."""
-    from google import genai
-    from google.genai import types as gt
-    from google.oauth2.credentials import Credentials as OAuth2Credentials
-    from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
-
-    if auth.get("api_key"):
-        http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
-        return genai.Client(api_key=auth["api_key"], **({"http_options": http_opts} if http_opts else {}))
-    base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
-    if base_url:
-        tok = resolve_vertex_base_url_token() or "custom-endpoint"
-        opt_kwargs: dict[str, Any] = {
-            "base_url": base_url,
-            "headers": {"Authorization": f"Bearer {tok}"},
-        }
-        if base_url.startswith("http://") or "googleapis.com" not in base_url:
-            opt_kwargs["client_args"] = {"follow_redirects": False}
-        if timeout_ms:
-            opt_kwargs["timeout"] = timeout_ms
-        client = genai.Client(
-            vertexai=True,
-            project=auth.get("project") or "custom-endpoint",
-            location=auth.get("location") or "global",
-            credentials=OAuth2Credentials(token=tok),
-            http_options=gt.HttpOptions(**opt_kwargs),
-        )
-        if (
-            base_url.startswith("http://") or "googleapis.com" not in base_url
-        ) and getattr(client, "_api_client", None) is not None:
-            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
-        return client
-    http_opts = gt.HttpOptions(timeout=timeout_ms) if timeout_ms else None
-    return genai.Client(
-        vertexai=True,
-        project=auth.get("project"),
-        location=auth.get("location"),
-        **({"http_options": http_opts} if http_opts else {}),
-    )
 
 
 def create_shared_cache(
@@ -685,6 +636,7 @@ def create_shared_cache(
     """Create a Gemini explicit context cache for text every task shares; None when not worth it or refused."""
     if not shared_text.strip() or auth.get("auth_mode") == "gemini_enterprise":
         return None
+    client: Any = None
     try:
         from google.genai import types as gt
 
@@ -701,16 +653,21 @@ def create_shared_cache(
         return str(getattr(cache, "name", "") or "") or None
     except Exception:  # noqa: BLE001 - too small for caching or not supported: fall back to inline prefix
         return None
+    finally:
+        close_genai_client(client)
 
 
 def delete_shared_cache(auth: dict[str, Any], name: str | None) -> None:
     if not name:
         return
+    client: Any = None
     try:
         client = _build_genai_client(auth)
         client.caches.delete(name=name)
     except Exception:  # noqa: BLE001 - the TTL expires it anyway
         pass
+    finally:
+        close_genai_client(client)
 
 
 def make_agent_writer(

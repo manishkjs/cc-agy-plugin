@@ -2875,7 +2875,12 @@ def test_v9_carbon_zero_thinking_budget_and_qa_retry_error_escalation(
     assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "ZERO"
+    monkeypatch.setenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "LOW")
+    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     monkeypatch.delenv("CC_AGY_ESCALATION_THINKING_LEVEL", raising=False)
+    assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
+    monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     assert resolve_thinking_level(None, model="my-model-v2-0", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "LOW"

@@ -160,22 +160,9 @@ def _inspect_receipt_apply_state(store: ReceiptStore, job_id: str | None) -> tup
         or rec.get("status") != "ok"
         or bool(rec.get("contract_warnings"))
     )
-    if rec.get("acceptance_passed") is not True:
-        return False, has_caveat
-    acc_list = rec.get("acceptance_results")
-    if not isinstance(acc_list, list) or not acc_list:
-        return False, has_caveat
-    explicit_pass = any(
-        isinstance(r, dict)
-        and r.get("passed") is True
-        and not r.get("auto_discovered_default")
-        and not r.get("auto_discovered_regression")
-        and not r.get("no_tests_collected")
-        and not r.get("runner_incompatible_skipped")
-        and not r.get("auto_import_smoke")
-        for r in acc_list
-    )
-    return explicit_pass, has_caveat
+    from server.verification_policy import satisfies_post_tool_auto_stop
+
+    return satisfies_post_tool_auto_stop(rec), has_caveat
 
 
 def evaluate_post_tool_use(

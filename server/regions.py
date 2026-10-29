@@ -35,6 +35,7 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
         "carbon-g",
         "carbon-g-zero",
         "bon-experiment-arm-226",
+        "gemini-flash-next",
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.5-flash-lite-preview",
@@ -119,6 +120,11 @@ MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
         "output": 2.50,
     },
     "gemini-3-flash-preview": {
+        "input": 0.50,
+        "cached_input": 0.05,
+        "output": 3.00,
+    },
+    "gemini-flash-next": {
         "input": 0.50,
         "cached_input": 0.05,
         "output": 3.00,

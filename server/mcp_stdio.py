@@ -30,12 +30,160 @@ from server.true_cost import true_total_report
 from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_plan
 from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
 from server.assist_tools import AssistRequestError, prepare_document, prepare_replication, prepare_tests
-from server.model_routes import resolve_batch_settings
+from server.model_routes import (
+    DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS,
+    DEFAULT_FLASH_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOTAL_TOKENS,
+    resolve_batch_settings,
+)
 from server.regions import resolve_auth_config
 from server.review_bundle import build_review_evidence_dir
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_MCP_VERSIONS = frozenset({"2024-11-05", "2025-03-26"})
+
+
+def _build_delegate_input_properties(
+    *,
+    include_wait: bool,
+    prompt_description: str,
+    auto_apply_description: str,
+    qa_review_description: str,
+) -> dict[str, Any]:
+    """Build the shared JSON Schema property map for `delegate_start` and `delegate_to_gemini`."""
+    props: dict[str, Any] = {
+        "prompt": {
+            "type": "string",
+            "description": prompt_description,
+        },
+        "spec_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional workspace-relative paths to specification or instruction files (e.g. ['PROMPT.md', 'docs/spec.md']) "
+                "whose contents are inlined verbatim into the worker's Turn-1 prompt so you do not have to re-type them."
+            ),
+        },
+        "context_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional workspace-relative paths to target/source files whose contents are inlined into the worker's "
+                "Turn-1 prompt so the worker can edit immediately without calling view_file."
+            ),
+        },
+        "checklist": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional list of concise behavioral requirement items for the worker to implement and verify.",
+        },
+        "model": {
+            "type": "string",
+            "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
+        },
+        "allowed_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional list of workspace-relative file paths or directory prefixes this worker may modify.",
+        },
+        "enabled_tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional allowlist of Antigravity worker tools.",
+        },
+        "disabled_tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional denylist of Antigravity worker tools.",
+        },
+        "enable_subagents": {
+            "type": "boolean",
+            "description": "Enable nested subagents inside the Antigravity worker (default: false).",
+        },
+        "plan": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Ordered plan steps for the worker (outcomes, not code). The worker reports each step DONE or BLOCKED.",
+        },
+        "acceptance": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Up to 5 targeted, read-only check commands (prefer focused test files such as "
+                "`pytest -q tests/test_target.py` rather than slow full-repo suites). The plugin runs "
+                "them after the worker finishes and returns pass/fail with output tails and diff_preview, "
+                "so you can call delegate_apply directly without re-running get_diff or Bash tests."
+            ),
+        },
+        "max_tool_calls": {
+            "type": "integer",
+            "description": (
+                f"Per-turn worker cap (default {DEFAULT_FLASH_MAX_TOOL_CALLS} on Flash in balanced, "
+                f"{DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS} in economy, {DEFAULT_MAX_TOOL_CALLS} on Argon/Pro, "
+                "env CC_AGY_MAX_TOOL_CALLS / CC_AGY_FLASH_MAX_TOOL_CALLS; 0 = no cap). "
+                "When hit, status becomes 'checkpoint' and you decide whether to continue."
+            ),
+        },
+        "max_total_tokens": {
+            "type": "integer",
+            "description": (
+                f"Per-turn worker token cap (default {DEFAULT_MAX_TOTAL_TOKENS:,}, "
+                "env CC_AGY_MAX_TOTAL_TOKENS; 0 = no cap)."
+            ),
+        },
+        "thinking_level": {
+            "type": "string",
+            "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
+            "description": "Worker reasoning depth (default HIGH, or CC_AGY_DELEGATE_THINKING_LEVEL). DEFAULT leaves it to the model.",
+        },
+        "in_place": {
+            "type": "boolean",
+            "description": (
+                "Edit the real working tree directly instead of an isolated copy (default: false). "
+                "Needs a clean tracked tree; one in_place job at a time; cannot be combined with "
+                "allowed_paths. The job counts as applied when it finishes; undo_hint shows how to revert."
+            ),
+        },
+        "scrub_receipt": {
+            "type": "boolean",
+            "description": "Redact paying project ID and host paths in the receipt (default: false).",
+        },
+        "api_key": {
+            "type": "string",
+            "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
+        },
+        "project": {
+            "type": "string",
+            "description": "Optional Google Cloud project ID for Vertex AI.",
+        },
+        "location": {
+            "type": "string",
+            "description": "Optional Vertex AI region override.",
+        },
+        "timeout_seconds": {
+            "type": "number",
+            "description": "Per-turn timeout in seconds (default: 1200).",
+        },
+    }
+    if include_wait:
+        props["wait"] = {
+            "type": "boolean",
+            "description": "If true, block until the worker finishes and return the digest.",
+        }
+    props["preload_files"] = {
+        "type": "boolean",
+        "description": "If true, list the top keyword-matched repository file paths (paths only, not contents) in the initial worker prompt so the worker opens the right files first (default: true).",
+    }
+    props["auto_apply"] = {
+        "type": "boolean",
+        "description": auto_apply_description,
+    }
+    props["qa_review_model"] = {
+        "type": "string",
+        "description": qa_review_description,
+    }
+    return props
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -103,133 +251,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": (
-                        "Concise, outcome-oriented task brief (keep under 200 tokens when passing spec_files/context_files, "
-                        "or under 500 words otherwise; state the behavioral requirements, edge cases, and target file paths "
-                        "directly without 'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines "
-                        "of implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
-                    ),
-                },
-                "spec_files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Optional workspace-relative paths to specification or instruction files (e.g. ['PROMPT.md', 'docs/spec.md']) "
-                        "whose contents are inlined verbatim into the worker's Turn-1 prompt so you do not have to re-type them."
-                    ),
-                },
-                "context_files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Optional workspace-relative paths to target/source files whose contents are inlined into the worker's "
-                        "Turn-1 prompt so the worker can edit immediately without calling view_file."
-                    ),
-                },
-                "checklist": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of concise behavioral requirement items for the worker to implement and verify.",
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
-                },
-                "allowed_paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of workspace-relative file paths or directory prefixes this worker may modify.",
-                },
-                "enabled_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional allowlist of Antigravity worker tools.",
-                },
-                "disabled_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional denylist of Antigravity worker tools.",
-                },
-                "enable_subagents": {
-                    "type": "boolean",
-                    "description": "Enable nested subagents inside the Antigravity worker (default: false).",
-                },
-                "plan": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Ordered plan steps for the worker (outcomes, not code). The worker reports each step DONE or BLOCKED.",
-                },
-                "acceptance": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Up to 5 targeted, read-only check commands (prefer focused test files such as "
-                        "`pytest -q tests/test_target.py` rather than slow full-repo suites). The plugin runs "
-                        "them after the worker finishes and returns pass/fail with output tails and diff_preview, "
-                        "so you can call delegate_apply directly without re-running get_diff or Bash tests."
-                    ),
-                },
-                "max_tool_calls": {
-                    "type": "integer",
-                    "description": "Per-turn worker cap (default 100, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
-                },
-                "max_total_tokens": {
-                    "type": "integer",
-                    "description": "Per-turn worker token cap (default 5,000,000, env CC_AGY_MAX_TOTAL_TOKENS; 0 = no cap).",
-                },
-                "thinking_level": {
-                    "type": "string",
-                    "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
-                    "description": "Worker reasoning depth (default HIGH, or CC_AGY_DELEGATE_THINKING_LEVEL). DEFAULT leaves it to the model.",
-                },
-                "in_place": {
-                    "type": "boolean",
-                    "description": (
-                        "Edit the real working tree directly instead of an isolated copy (default: false). "
-                        "Needs a clean tracked tree; one in_place job at a time; cannot be combined with "
-                        "allowed_paths. The job counts as applied when it finishes; undo_hint shows how to revert."
-                    ),
-                },
-                "scrub_receipt": {
-                    "type": "boolean",
-                    "description": "Redact paying project ID and host paths in the receipt (default: false).",
-                },
-                "api_key": {
-                    "type": "string",
-                    "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
-                },
-                "project": {
-                    "type": "string",
-                    "description": "Optional Google Cloud project ID for Vertex AI.",
-                },
-                "location": {
-                    "type": "string",
-                    "description": "Optional Vertex AI region override.",
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "description": "Per-turn timeout in seconds (default: 1200).",
-                },
-                "wait": {
-                    "type": "boolean",
-                    "description": "If true, block until the worker finishes and return the digest.",
-                },
-                "preload_files": {
-                    "type": "boolean",
-                    "description": "If true, list the top keyword-matched repository file paths (paths only, not contents) in the initial worker prompt so the worker opens the right files first (default: true).",
-                },
-                "auto_apply": {
-                    "type": "boolean",
-                    "description": "If true (default in strict orchestrator mode or when CC_AGY_AUTO_APPLY_ON_PASS=1) and wait=true, automatically apply the diff when status='ok', acceptance checks pass, and scope_violations=[].",
-                },
-                "qa_review_model": {
-                    "type": "string",
-                    "description": "Optional stronger Vertex Gemini model ID (or env CC_AGY_QA_REVIEW_MODEL) to run an automated QA diff audit when wait=true.",
-                },
-            },
+            "properties": _build_delegate_input_properties(
+                include_wait=True,
+                prompt_description=(
+                    "Concise, outcome-oriented task brief (keep under 200 tokens when passing spec_files/context_files, "
+                    "or under 500 words otherwise; state the behavioral requirements, edge cases, and target file paths "
+                    "directly without 'Wait:' self-debate or speculative monologues; avoid pasting >8 consecutive lines "
+                    "of implementation code; the worker receives a cached line-numbered Repository Map and Focused File Outline)."
+                ),
+                auto_apply_description=(
+                    "If true (default in strict orchestrator mode or when CC_AGY_AUTO_APPLY_ON_PASS=1) and wait=true, "
+                    "automatically apply the diff when status='ok', acceptance checks pass, and scope_violations=[]."
+                ),
+                qa_review_description=(
+                    "Optional stronger Vertex Gemini model ID (or env CC_AGY_QA_REVIEW_MODEL) to run an automated "
+                    "QA diff audit when wait=true."
+                ),
+            ),
             "required": ["prompt"],
         },
     },
@@ -483,103 +521,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Task specification for the Gemini worker.",
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
-                },
-                "allowed_paths": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of allowed relative paths.",
-                },
-                "enabled_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional allowlist of Antigravity worker tools.",
-                },
-                "disabled_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional denylist of Antigravity worker tools.",
-                },
-                "enable_subagents": {
-                    "type": "boolean",
-                    "description": "Enable nested subagents inside the Antigravity worker (default: false).",
-                },
-                "plan": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Ordered plan steps for the worker (outcomes, not code). The worker reports each step DONE or BLOCKED.",
-                },
-                "acceptance": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Up to 5 read-only check commands (e.g. focused pytest runs). The plugin runs them after the worker finishes and returns pass/fail with output tails, so you do not need to re-run them.",
-                },
-                "max_tool_calls": {
-                    "type": "integer",
-                    "description": "Per-turn worker cap (default 100, env CC_AGY_MAX_TOOL_CALLS; 0 = no cap). When hit, status becomes 'checkpoint' and you decide whether to continue.",
-                },
-                "max_total_tokens": {
-                    "type": "integer",
-                    "description": "Per-turn worker token cap (default 5,000,000, env CC_AGY_MAX_TOTAL_TOKENS; 0 = no cap).",
-                },
-                "thinking_level": {
-                    "type": "string",
-                    "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH", "DEFAULT"],
-                    "description": "Worker reasoning depth (default HIGH, or CC_AGY_DELEGATE_THINKING_LEVEL). DEFAULT leaves it to the model.",
-                },
-                "in_place": {
-                    "type": "boolean",
-                    "description": (
-                        "Edit the real working tree directly instead of an isolated copy (default: false). "
-                        "Needs a clean tracked tree; one in_place job at a time; cannot be combined with "
-                        "allowed_paths. The job counts as applied when it finishes; undo_hint shows how to revert."
-                    ),
-                },
-                "scrub_receipt": {
-                    "type": "boolean",
-                    "description": "Redact paying project ID and host paths in the receipt (default: false).",
-                },
-                "api_key": {
-                    "type": "string",
-                    "description": "Optional Google AI Studio Gemini API key. Overrides GEMINI_API_KEY environment variable and bypasses Vertex AI requirements.",
-                },
-                "project": {
-                    "type": "string",
-                    "description": "Optional Google Cloud project ID for Vertex AI.",
-                },
-                "location": {
-                    "type": "string",
-                    "description": "Optional Vertex AI region override.",
-                },
-                "auto_apply": {
-                    "type": "boolean",
-                    "description": "Automatically apply the worktree diff to the main workspace if status='ok' (default: true).",
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "description": "Timeout in seconds (default: 1200).",
-                },
-                "preload_files": {
-                    "type": "boolean",
-                    "description": "If true, list the top keyword-matched repository file paths (paths only, not contents) in the initial worker prompt so the worker opens the right files first (default: true).",
-                },
-                "qa_review_model": {
-                    "type": "string",
-                    "description": (
-                        "Optional 1-shot QA reviewer model (e.g. 'gemini-4-argon'). When set, audits the worker's "
-                        "git diff (capped at 25,000 tokens, HIGH thinking) against the task prompt after Turn 1 and, "
-                        "if concrete bugs are found, runs delegate_continue as a fresh worker session on the edited "
-                        "worktree before auto_apply. Experimental: not yet shown to raise solve rate."
-                    ),
-                },
-            },
+            "properties": _build_delegate_input_properties(
+                include_wait=False,
+                prompt_description="Task specification for the Gemini worker.",
+                auto_apply_description="Automatically apply the worktree diff to the main workspace if status='ok' (default: true).",
+                qa_review_description=(
+                    "Optional 1-shot QA reviewer model (e.g. 'gemini-4-argon'). When set, audits the worker's "
+                    "git diff (capped at 25,000 tokens, HIGH thinking) against the task prompt after Turn 1 and, "
+                    "if concrete bugs are found, runs delegate_continue as a fresh worker session on the edited "
+                    "worktree before auto_apply. Experimental: not yet shown to raise solve rate."
+                ),
+            ),
             "required": ["prompt"],
         },
     },
@@ -1367,95 +1319,7 @@ class MCPServer:
             )
 
         if name == "delegate_start":
-            prompt_str = _require_str(args.get("prompt"), "prompt")
-            enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
-            disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
-            spec_f = _validate_optional_str_list(args.get("spec_files"), "spec_files")
-            context_f = _validate_optional_str_list(args.get("context_files"), "context_files")
-            checklist_items = _validate_optional_str_list(args.get("checklist"), "checklist")
-            qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
-                os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
-            )
-            try:
-                allowed = validate_allowed_paths(args.get("allowed_paths"))
-                plan_steps = validate_plan(args.get("plan"))
-                acceptance_cmds = validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
-                enable_sub = parse_bool(args.get("enable_subagents"), False)
-                scrub_b = parse_bool(args.get("scrub_receipt"), False)
-                wait_b = parse_bool(args.get("wait"), False)
-                in_place_b = parse_bool(args.get("in_place"), False)
-                preload_b = parse_bool(args.get("preload_files"), True)
-                auto_apply_arg = (
-                    parse_bool(args.get("auto_apply"), False)
-                    if "auto_apply" in args and args.get("auto_apply") is not None
-                    else None
-                )
-            except ValueError as exc:
-                raise InvalidParamsError(str(exc)) from exc
-            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(
-                prompt_str, plan_steps, checklist_items
-            )
-            if "checklist" in repair_meta:
-                checklist_items = repair_meta["checklist"]
-            if in_place_b and auto_apply_arg is False:
-                raise InvalidParamsError(
-                    "in_place=True cannot be combined with auto_apply=False because in_place edits "
-                    "are applied directly to the working tree."
-                )
-            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
-            req_api_key = _optional_str(args.get("api_key"), "api_key")
-            req_project = _optional_str(args.get("project"), "project")
-            req_location = _optional_str(args.get("location"), "location")
-            will_run_qa = bool(wait_b and qa_review_model and qa_review_model.strip())
-            digest = self.job_manager.delegate_start(
-                prompt=prompt_str,
-                model=_optional_str(args.get("model"), "model"),
-                allowed_paths=allowed,
-                enabled_tools=enabled_t,
-                disabled_tools=disabled_t,
-                enable_subagents=enable_sub,
-                scrub_receipt=scrub_b,
-                timeout_seconds=timeout_sec,
-                wait=wait_b,
-                in_place=in_place_b,
-                api_key=req_api_key,
-                project=req_project,
-                location=req_location,
-                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-                plan=plan_steps,
-                acceptance=acceptance_cmds,
-                max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
-                max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
-                preload_files=preload_b,
-                auto_apply=False if will_run_qa else auto_apply_arg,
-                spec_files=spec_f,
-                context_files=context_f,
-                checklist=checklist_items,
-                _skip_balanced_qa=will_run_qa,
-            )
-            if will_run_qa and qa_review_model:
-                digest = self._maybe_run_qa_review(
-                    digest,
-                    prompt_str=prompt_str,
-                    qa_review_model=qa_review_model,
-                    in_place_b=in_place_b,
-                    timeout_sec=timeout_sec,
-                    req_api_key=req_api_key,
-                    req_project=req_project,
-                    req_location=req_location,
-                    scrub_b=scrub_b,
-                )
-                digest = self.job_manager._maybe_auto_apply_digest(
-                    str(digest["job_id"]),
-                    digest,
-                    auto_apply=auto_apply_arg,
-                    in_place=in_place_b,
-                )
-            if repair_meta.get("repaired") and isinstance(digest, dict):
-                digest["dictation_repaired"] = True
-                if repair_meta.get("snippet_paths"):
-                    digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
-            return digest
+            return self._execute_delegation_request(args, sync_convenience=False)
 
         if name == "delegate_status":
             limit_val = _parse_positive_int(args.get("limit"), "limit", 20)
@@ -1599,89 +1463,116 @@ class MCPServer:
             )
 
         if name == "delegate_to_gemini":
-            prompt_str = _require_str(args.get("prompt"), "prompt")
-            enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
-            disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
-            qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
-                os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
-            )
-            try:
-                allowed = validate_allowed_paths(args.get("allowed_paths"))
-                plan_steps = validate_plan(args.get("plan"))
-                acceptance_cmds = validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
-                enable_sub = parse_bool(args.get("enable_subagents"), False)
-                scrub_b = parse_bool(args.get("scrub_receipt"), False)
-                auto_apply = parse_bool(args.get("auto_apply"), True)
-                in_place_b = parse_bool(args.get("in_place"), False)
-                preload_b = parse_bool(args.get("preload_files"), True)
-                dtg_checklist = _validate_optional_str_list(args.get("checklist"), "checklist")
-            except ValueError as exc:
-                raise InvalidParamsError(str(exc)) from exc
-            prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(
-                prompt_str, plan_steps, dtg_checklist
-            )
-            if "checklist" in repair_meta:
-                dtg_checklist = repair_meta["checklist"]
-            if in_place_b and not auto_apply:
-                raise InvalidParamsError(
-                    "in_place=True cannot be combined with auto_apply=False because in_place edits "
-                    "are applied directly to the working tree."
+            return self._execute_delegation_request(args, sync_convenience=True)
+
+        raise InvalidParamsError(f"Unknown tool: {name!r}")
+
+    def _execute_delegation_request(
+        self,
+        args: dict[str, Any],
+        *,
+        sync_convenience: bool = False,
+    ) -> dict[str, Any]:
+        """Shared argument parser, dictation repair, QA audit, and auto-apply pipeline for `delegate_start` and `delegate_to_gemini`."""
+        prompt_str = _require_str(args.get("prompt"), "prompt")
+        enabled_t = _validate_optional_str_list(args.get("enabled_tools"), "enabled_tools")
+        disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
+        spec_f = _validate_optional_str_list(args.get("spec_files"), "spec_files")
+        context_f = _validate_optional_str_list(args.get("context_files"), "context_files")
+        checklist_items = _validate_optional_str_list(args.get("checklist"), "checklist")
+        qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
+            os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
+        )
+        try:
+            allowed = validate_allowed_paths(args.get("allowed_paths"))
+            plan_steps = validate_plan(args.get("plan"))
+            acceptance_cmds = validate_acceptance(args.get("acceptance"), self.job_manager.workspace_root)
+            enable_sub = parse_bool(args.get("enable_subagents"), False)
+            scrub_b = parse_bool(args.get("scrub_receipt"), False)
+            wait_b = True if sync_convenience else parse_bool(args.get("wait"), False)
+            in_place_b = parse_bool(args.get("in_place"), False)
+            preload_b = parse_bool(args.get("preload_files"), True)
+            if sync_convenience:
+                auto_apply_arg: bool | None = parse_bool(args.get("auto_apply"), True)
+            else:
+                auto_apply_arg = (
+                    parse_bool(args.get("auto_apply"), False)
+                    if "auto_apply" in args and args.get("auto_apply") is not None
+                    else None
                 )
-            timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
-            req_api_key = _optional_str(args.get("api_key"), "api_key")
-            req_project = _optional_str(args.get("project"), "project")
-            req_location = _optional_str(args.get("location"), "location")
-            digest = self.job_manager.delegate_start(
-                prompt=prompt_str,
-                model=_optional_str(args.get("model"), "model"),
-                allowed_paths=allowed,
-                enabled_tools=enabled_t,
-                disabled_tools=disabled_t,
-                enable_subagents=enable_sub,
-                scrub_receipt=scrub_b,
-                timeout_seconds=timeout_sec,
-                wait=True,
-                in_place=in_place_b,
-                api_key=req_api_key,
-                project=req_project,
-                location=req_location,
-                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-                plan=plan_steps,
-                acceptance=acceptance_cmds,
-                max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
-                max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
-                preload_files=preload_b,
-                auto_apply=False,
-                checklist=dtg_checklist,
-                _skip_balanced_qa=bool(qa_review_model and qa_review_model.strip()),
+        except ValueError as exc:
+            raise InvalidParamsError(str(exc)) from exc
+        prompt_str, plan_steps, repair_meta = self._maybe_repair_dictation(
+            prompt_str, plan_steps, checklist_items
+        )
+        if "checklist" in repair_meta:
+            checklist_items = repair_meta["checklist"]
+        if in_place_b and auto_apply_arg is False:
+            raise InvalidParamsError(
+                "in_place=True cannot be combined with auto_apply=False because in_place edits "
+                "are applied directly to the working tree."
             )
-            if qa_review_model and qa_review_model.strip():
-                digest = self._maybe_run_qa_review(
-                    digest,
-                    prompt_str=prompt_str,
-                    qa_review_model=qa_review_model,
-                    in_place_b=in_place_b,
-                    timeout_sec=timeout_sec,
-                    req_api_key=req_api_key,
-                    req_project=req_project,
-                    req_location=req_location,
-                    scrub_b=scrub_b,
-                )
+        timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 1200.0)
+        req_api_key = _optional_str(args.get("api_key"), "api_key")
+        req_project = _optional_str(args.get("project"), "project")
+        req_location = _optional_str(args.get("location"), "location")
+        will_run_qa = bool(wait_b and qa_review_model and qa_review_model.strip())
+        digest = self.job_manager.delegate_start(
+            prompt=prompt_str,
+            model=_optional_str(args.get("model"), "model"),
+            allowed_paths=allowed,
+            enabled_tools=enabled_t,
+            disabled_tools=disabled_t,
+            enable_subagents=enable_sub,
+            scrub_receipt=scrub_b,
+            timeout_seconds=timeout_sec,
+            wait=wait_b,
+            in_place=in_place_b,
+            api_key=req_api_key,
+            project=req_project,
+            location=req_location,
+            thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
+            plan=plan_steps,
+            acceptance=acceptance_cmds,
+            max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
+            max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
+            preload_files=preload_b,
+            auto_apply=False if will_run_qa else auto_apply_arg,
+            spec_files=spec_f,
+            context_files=context_f,
+            checklist=checklist_items,
+            _skip_balanced_qa=will_run_qa,
+        )
+        if will_run_qa and qa_review_model:
+            digest = self._maybe_run_qa_review(
+                digest,
+                prompt_str=prompt_str,
+                qa_review_model=qa_review_model,
+                in_place_b=in_place_b,
+                timeout_sec=timeout_sec,
+                req_api_key=req_api_key,
+                req_project=req_project,
+                req_location=req_location,
+                scrub_b=scrub_b,
+            )
             digest = self.job_manager._maybe_auto_apply_digest(
                 str(digest["job_id"]),
                 digest,
-                auto_apply=auto_apply,
+                auto_apply=auto_apply_arg,
                 in_place=in_place_b,
             )
-            if digest.get("status") not in ("ok", "checkpoint", "needs_input", "spec_conflict"):
-                digest["is_error"] = True
-            if repair_meta.get("repaired") and isinstance(digest, dict):
-                digest["dictation_repaired"] = True
-                if repair_meta.get("snippet_paths"):
-                    digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
-            return digest
-
-        raise InvalidParamsError(f"Unknown tool: {name!r}")
+        if sync_convenience and digest.get("status") not in (
+            "ok",
+            "checkpoint",
+            "needs_input",
+            "spec_conflict",
+        ):
+            digest["is_error"] = True
+        if repair_meta.get("repaired") and isinstance(digest, dict):
+            digest["dictation_repaired"] = True
+            if repair_meta.get("snippet_paths"):
+                digest["dictated_snippet_paths"] = repair_meta["snippet_paths"]
+        return digest
 
     def _maybe_repair_dictation(
         self,

@@ -8,12 +8,14 @@ You are the `gemini-delegator` orchestrator subagent for `cc-agy-plugin`.
 
 ## Route first
 
+<!-- SHARED:ROUTING_TABLE:BEGIN -->
 | Change | Route |
 |---|---|
-| 1 to 5 files (known cause) | Do it yourself. Delegation costs more than it saves at this size. |
+| 1 to 5 files with a known local fix | Edit directly on the Lead outside strict mode; delegate with `delegate_start` when repo exploration, test debugging, or strict mode is active. |
 | 6+ files with a clear per-file plan | Read at most 1 to 2 interface files, write `/tmp/<task>-plan.json`, and call `delegate_file_batch`. |
-| Read-only investigation, unknown file list, debugging a failing test suite | Delegate on Turn 1 or 2 with `delegate_start` (never read 10+ files yourself before delegating). |
-| Mid-chat: one new doc, tests from named cases, one edit repeated across files | `draft_document`, `write_tests_from_cases`, `replicate_edit`. |
+| Open-ended investigation, unknown files, or failing test suite | Delegate on Turn 1 or Turn 2 with `delegate_start` (or `ask_gemini` for a fast single-shot review without a worker copy). |
+| One new doc, tests from named cases, or one edit repeated across files | Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`. |
+<!-- SHARED:ROUTING_TABLE:END -->
 
 ## Operating Rules
 

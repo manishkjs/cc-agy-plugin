@@ -9,39 +9,21 @@ import time
 from typing import Any, Callable
 import uuid
 
+from server.genai_client import (
+    build_genai_client,
+    close_genai_client as _close_genai_client,
+    extract_usage_metadata,
+)
 from server.receipts import ReceiptStore, enforce_daily_budget, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
     resolve_auth_config,
     resolve_default_ask_model,
-    resolve_vertex_base_url,
-    resolve_vertex_base_url_token,
     sanitize_placeholder_env,
     truncate_to_token_budget,
 )
 
 GenaiBackend = Callable[[dict[str, Any]], dict[str, Any]]
-
-
-def _close_genai_client(client: Any) -> None:
-    """Close underlying httpx/requests sessions on a google-genai Client."""
-    if client is None:
-        return
-    api_client = getattr(client, "_api_client", None)
-    for fn_owner in (
-        getattr(api_client, "_authorized_session", None),
-        getattr(getattr(api_client, "_auth", None), "session", None),
-        client,
-        api_client,
-    ):
-        if fn_owner is None:
-            continue
-        close_fn = getattr(fn_owner, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
 
 
 def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
@@ -52,49 +34,16 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
 
         return run_agy_cli_ask(request)
 
-    from google import genai
     from google.genai import types as genai_types
-    from google.oauth2.credentials import Credentials as OAuth2Credentials
 
     timeout_ms = int(request.get("timeout_ms") or 600_000)
     req_tl = str(request.get("thinking_level") or "").strip().upper()
     is_zero_thinking = req_tl in ("ZERO", "0", "OFF")
-    vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
-    if request.get("api_key"):
-        http_opts = genai_types.HttpOptions(timeout=timeout_ms)
-        client = genai.Client(api_key=request["api_key"], http_options=http_opts)
-    elif vertex_base_url:
-        gateway_tok = resolve_vertex_base_url_token() or "custom-endpoint"
-        gw_headers: dict[str, str] = {"Authorization": f"Bearer {gateway_tok}"}
-        if is_zero_thinking:
-            gw_headers["X-CC-AGY-Thinking-Budget"] = "0"
-        gw_http_kwargs: dict[str, Any] = {
-            "timeout": timeout_ms,
-            "base_url": vertex_base_url,
-            "headers": gw_headers,
-        }
-        if vertex_base_url.startswith("http://") or "googleapis.com" not in vertex_base_url:
-            gw_http_kwargs["client_args"] = {"follow_redirects": False}
-        http_opts = genai_types.HttpOptions(**gw_http_kwargs)
-        client = genai.Client(
-            vertexai=True,
-            project=request.get("project") or "custom-endpoint",
-            location=request.get("location") or "global",
-            credentials=OAuth2Credentials(token=gateway_tok),
-            http_options=http_opts,
-        )
-        if (
-            vertex_base_url.startswith("http://") or "googleapis.com" not in vertex_base_url
-        ) and getattr(client, "_api_client", None) is not None:
-            client._api_client._use_google_auth_async = lambda: False  # type: ignore[method-assign]
-    else:
-        http_opts = genai_types.HttpOptions(timeout=timeout_ms)
-        client = genai.Client(
-            vertexai=True,
-            project=request.get("project"),
-            location=request.get("location"),
-            http_options=http_opts,
-        )
+    client = build_genai_client(
+        request,
+        timeout_ms=timeout_ms,
+        zero_thinking=is_zero_thinking,
+    )
     try:
         cfg_kwargs: dict[str, Any] = {}
         if request.get("system_instruction"):
@@ -116,23 +65,9 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
             contents=request["prompt"],
             config=config,
         )
-        usage_meta = getattr(response, "usage_metadata", None)
-        usage = {
-            "prompt_token_count": int(getattr(usage_meta, "prompt_token_count", 0) or 0),
-            "cached_content_token_count": int(
-                getattr(usage_meta, "cached_content_token_count", 0) or 0
-            ),
-            "candidates_token_count": int(
-                getattr(usage_meta, "candidates_token_count", 0) or 0
-            ),
-            "thoughts_token_count": int(
-                getattr(usage_meta, "thoughts_token_count", 0) or 0
-            ),
-            "total_token_count": int(getattr(usage_meta, "total_token_count", 0) or 0),
-        }
         return {
             "text": getattr(response, "text", "") or "",
-            "usage": usage,
+            "usage": extract_usage_metadata(getattr(response, "usage_metadata", None)),
         }
     finally:
         _close_genai_client(client)

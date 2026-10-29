@@ -11,13 +11,16 @@ If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor
 
 ## Pick the right tool first
 
-| Task shape | What to do |
+<!-- SHARED:ROUTING_TABLE:BEGIN -->
+| Change | Route |
 |---|---|
-| 1 to 5 files with a clear local fix | Edit directly on the host agent. Delegation adds overhead on tiny changes. |
-| 6+ files with a clear per-file plan | Read 1 to 2 interface files, write `/tmp/<task>-plan.json`, and call `delegate_file_batch(plan_path=...)`. |
-| Open-ended bug hunt, unknown files, failing test suite | Delegate on Turn 1 or Turn 2 with `delegate_start(prompt=..., checklist=[...], acceptance=[...], wait=true)`. |
-| Second-opinion diff or architecture review | Call `ask_gemini(prompt=..., context_files=[...])` (single-shot, no worker copy). |
-| Readiness or spend check | Call `doctor()` (zero token cost) or `cost_report()`. |
+| 1 to 5 files with a known local fix | Edit directly on the Lead outside strict mode; delegate with `delegate_start` when repo exploration, test debugging, or strict mode is active. |
+| 6+ files with a clear per-file plan | Read at most 1 to 2 interface files, write `/tmp/<task>-plan.json`, and call `delegate_file_batch`. |
+| Open-ended investigation, unknown files, or failing test suite | Delegate on Turn 1 or Turn 2 with `delegate_start` (or `ask_gemini` for a fast single-shot review without a worker copy). |
+| One new doc, tests from named cases, or one edit repeated across files | Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`. |
+<!-- SHARED:ROUTING_TABLE:END -->
+
+For zero-token readiness diagnostics or workspace spend checks, call `doctor()` or `cost_report()`.
 
 ## Cost and safety rules
 
@@ -25,6 +28,6 @@ If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor
 2. **State outcomes, not implementation lines.** Never paste more than 8 consecutive lines of code into `prompt` or `plan`. Pass concrete requirements in `checklist` and targeted test commands in `acceptance` (such as `["pytest -q tests/test_api.py"]`).
 3. **Check `verification` before applying.**
    - `verification="acceptance_tests"` with `scope_violations=[]`: explicit tests passed in the isolated copy. Call `delegate_apply(job_id=...)` directly without re-running the same tests.
-   - `verification` is `"smoke_only"`, `"related_tests"`, or `"unverified"` (common in repositories without tests): the plugin only ran syntax/compile smoke checks, so review `diff_preview` or `get_diff(job_id=...)` against every requirement yourself before `delegate_apply`.
+   - `verification` is `"smoke_only"` (syntax/compile checks only), `"related_tests"` (existing tests discovered by the plugin passed, with no explicit acceptance check), or `"unverified"` (nothing ran): review `diff_preview` or `get_diff(job_id=...)` against every requirement yourself before `delegate_apply`.
 4. **Stop when escalated or capped.** If a digest returns `escalation.escalate_to_lead=true` (two failed worker turns or a `429`/`503` quota limit) or `status="budget_exceeded"` (`CC_AGY_MAX_DAILY_CENTS`), stop delegating and finish the task directly on the host agent.
 5. **One-call undo.** `delegate_revert(job_id=...)` restores every file touched by an applied job.

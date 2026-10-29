@@ -19,17 +19,19 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
    - With `in_place=true`, edits your live working tree directly (requires a clean tracked tree, one `in_place` job at a time, and no `allowed_paths`), unwinds any worker commits or branch switches back to the baseline commit while keeping file edits on disk, and provides a shell-quoted `undo_hint`.
    - When `ctx-harness` (Straitjacket) is installed, replaces unbounded `RUN_COMMAND` with `run_command`, `ctx_get`, and `ctx_search` (capturing command outputs exceeding 400 lines or 6,000 tokens in a local evidence store).
    - Always pass outcome-oriented prompts (never paste more than 8 consecutive lines of implementation code into `prompt` or `plan`).
-   - Pass `plan` (up to 15 outcome steps), `acceptance` (up to 5 read-only check commands such as `["pytest -q"]`, `["go test ./..."]`, `["cargo test"]`, or `["npx vitest run"]`), `max_tool_calls` (default `40` on Flash in `balanced`, `100` in `economy` and on Argon/Carbon-G), `max_total_tokens` (default `5,000,000`), and `allowed_paths` when delegating scoped tasks.
+   - Pass `plan` (up to 15 outcome steps), `acceptance` (up to 5 read-only check commands such as `["pytest -q"]`, `["go test ./..."]`, `["cargo test"]`, or `["npx vitest run"]`), `max_tool_calls` (default `55` on Flash in `balanced`, `100` in `economy` and on Argon/Carbon-G), `max_total_tokens` (default `5,000,000`), and `allowed_paths` when delegating scoped tasks.
    - Every run writes an HMAC-SHA256 signed receipt in `$CC_AGY_DATA_DIR` / `$CLAUDE_PLUGIN_DATA` (or `~/.cache/cc-agy-plugin/<workspace-slug>/receipts/<job_id>.json`).
 
 ## Pick the route first
 
+<!-- SHARED:ROUTING_TABLE:BEGIN -->
 | Change | Route |
 |---|---|
-| 1 to 5 files (known cause) | Do it yourself. Delegation costs more than it saves at this size. |
+| 1 to 5 files with a known local fix | Edit directly on the Lead outside strict mode; delegate with `delegate_start` when repo exploration, test debugging, or strict mode is active. |
 | 6+ files with a clear per-file plan | Read at most 1 to 2 interface files, write `/tmp/<task>-plan.json`, and call `delegate_file_batch`. |
-| Read-only investigation, unknown file list, debugging a failing test suite | Delegate on Turn 1 or 2 with `delegate_start` (never read 10+ files yourself before delegating). |
-| Mid-chat: one new doc, tests from named cases, one edit repeated across files | `draft_document`, `write_tests_from_cases`, `replicate_edit`. |
+| Open-ended investigation, unknown files, or failing test suite | Delegate on Turn 1 or Turn 2 with `delegate_start` (or `ask_gemini` for a fast single-shot review without a worker copy). |
+| One new doc, tests from named cases, or one edit repeated across files | Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`. |
+<!-- SHARED:ROUTING_TABLE:END -->
 
 ### Lead Cost Discipline (Turn 1 to 2 Delegation Rule)
 

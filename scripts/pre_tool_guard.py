@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -19,8 +20,10 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 
+from server.receipts import receipt_owner_pid_alive  # noqa: E402
 from server.regions import is_strict_mode_enabled  # noqa: E402  (shared strict-mode check, re-exported)
 from server.regions import resolve_cost_profile  # noqa: E402
+from server.verification_policy import is_verified_applied_receipt  # noqa: E402
 
 
 def resolve_project_root(
@@ -1093,199 +1096,211 @@ def _is_readonly_git_diff_command(command: str) -> bool:
     return True
 
 
-def _session_has_multifile_delegate_job(data_root: Path) -> bool:
+_receipt_owner_pid_is_alive = receipt_owner_pid_alive
+_is_verified_applied_receipt = is_verified_applied_receipt
+
+
+@dataclass(frozen=True)
+class SessionReceiptSummary:
+    """Single-pass snapshot of current-session receipts for `PreToolUse` decisions."""
+
+    has_any_session_job_artifact: bool = False
+    has_session_json_files: bool = False
+    has_parsed_session_json_receipt: bool = False
+    has_live_running_any: bool = False
+    live_running_job_ids: tuple[str, ...] = ()
+    has_live_running_delegate: bool = False
+    has_terminal_session_receipt: bool = False
+    has_terminal_delegate: bool = False
+    has_multifile_applied_delegate: bool = False
+    has_terminal_any_job: bool = False
+    has_applied_any_job: bool = False
+    sticky_verified_applied: bool = False
+    escalated_delegate_receipts: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def has_lead_escalated_job(self) -> bool:
+        return bool(self.escalated_delegate_receipts) and not self.has_live_running_delegate
+
+
+def summarize_session_receipts(
+    data_root: Path,
+    ws_root: Path | None = None,
+) -> SessionReceiptSummary:
+    """Read current-session `receipts/job-*.json` files once and derive all hook state flags."""
+    try:
+        receipts_dir = data_root / "receipts"
+        if not receipts_dir.is_dir():
+            return SessionReceiptSummary()
+        marker = data_root / ".lead_session_started"
+        has_marker = marker.exists()
+        since = marker.stat().st_mtime if has_marker else 0.0
+        since_esc = (since - 1.0) if has_marker else 0.0
+        target_ws = str(Path(ws_root).resolve()) if ws_root is not None else None
+
+        has_any_artifact = False
+        has_session_json = False
+        has_parsed_session_json = False
+        has_live_any = False
+        live_running_ids: list[str] = []
+        has_live_delegate = False
+        has_terminal_delegate = False
+        has_multifile_delegate = False
+        terminal_recs: list[tuple[int, dict[str, Any]]] = []
+        escalated_recs: list[dict[str, Any]] = []
+        sig_store: Any = None
+
+        for p in sorted(receipts_dir.glob("job-*")):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            mtime = st.st_mtime
+            if mtime >= since:
+                has_any_artifact = True
+            name = p.name
+            if not name.endswith(".json") or name.endswith((".progress.jsonl", ".live.json")):
+                continue
+            if mtime >= since:
+                has_session_json = True
+            if mtime < since_esc and (target_ws is None or has_marker):
+                continue
+            try:
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+
+            kind = str(rec.get("kind") or "delegate")
+            status = str(rec.get("status") or "")
+            is_cancelled = status == "cancelled" or bool(rec.get("cancelled"))
+
+            if mtime >= since:
+                has_parsed_session_json = True
+                if status == "running" and receipt_owner_pid_alive(rec):
+                    has_live_any = True
+                    jid = str(rec.get("job_id") or "")
+                    if jid:
+                        live_running_ids.append(jid)
+                    if kind == "delegate":
+                        has_live_delegate = True
+                elif status != "running" and not is_cancelled:
+                    terminal_recs.append((st.st_mtime_ns, rec))
+                    if kind == "delegate":
+                        has_terminal_delegate = True
+                if kind == "delegate" and rec.get("applied"):
+                    applied_files = rec.get("applied_files") or []
+                    if isinstance(applied_files, list) and len(applied_files) >= 2:
+                        has_multifile_delegate = True
+
+            if (
+                kind == "delegate"
+                and status != "running"
+                and not is_cancelled
+                and not rec.get("external_worktree_tamper")
+            ):
+                if target_ws is not None and rec.get("workspace_root") not in (None, "/workspace", target_ws):
+                    continue
+                esc_info = rec.get("escalation")
+                claims_esc = rec.get("escalate_to_lead") is True or (
+                    isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True
+                )
+                if not claims_esc:
+                    continue
+                if target_ws is not None:
+                    rec_ts = float(
+                        rec.get("updated_at_epoch")
+                        or rec.get("finished_at_epoch")
+                        or rec.get("started_at_epoch")
+                        or 0.0
+                    )
+                    if rec_ts < since_esc:
+                        continue
+                elif mtime < since_esc:
+                    continue
+                if sig_store is None:
+                    from server.receipts import ReceiptStore
+
+                    sig_store = (
+                        ReceiptStore(data_root, workspace_root=ws_root)
+                        if ws_root is not None
+                        else ReceiptStore(data_root)
+                    )
+                if sig_store.verify_receipt_signature(rec):
+                    escalated_recs.append(rec)
+
+        has_terminal_any = any(bool(r.get("job_id")) for _mt, r in terminal_recs)
+        has_applied_any = any(
+            bool(r.get("job_id")) and bool(r.get("applied")) for _mt, r in terminal_recs
+        )
+        sticky_verified = False
+        if terminal_recs and not has_live_any:
+            ordered_recs = sorted(
+                terminal_recs,
+                key=lambda item: (float(item[1].get("started_at_epoch") or 0.0), item[0]),
+            )
+            for _mt, rec in ordered_recs:
+                if is_verified_applied_receipt(rec):
+                    sticky_verified = True
+                elif rec.get("reverted") or bool(rec.get("files_changed")):
+                    sticky_verified = False
+
+        return SessionReceiptSummary(
+            has_any_session_job_artifact=has_any_artifact,
+            has_session_json_files=has_session_json,
+            has_parsed_session_json_receipt=has_parsed_session_json,
+            has_live_running_any=has_live_any,
+            live_running_job_ids=tuple(live_running_ids),
+            has_live_running_delegate=has_live_delegate,
+            has_terminal_session_receipt=bool(terminal_recs),
+            has_terminal_delegate=has_terminal_delegate,
+            has_multifile_applied_delegate=has_multifile_delegate,
+            has_terminal_any_job=has_terminal_any,
+            has_applied_any_job=has_applied_any,
+            sticky_verified_applied=sticky_verified,
+            escalated_delegate_receipts=tuple(escalated_recs),
+        )
+    except Exception:
+        return SessionReceiptSummary()
+
+
+def _session_has_multifile_delegate_job(
+    data_root: Path,
+    summary: SessionReceiptSummary | None = None,
+) -> bool:
     """Return True when the current session has an applied delegate job touching >=2 files."""
-    try:
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime if marker.exists() else 0.0
-        receipts_dir = data_root / "receipts"
-        if not receipts_dir.is_dir():
-            return False
-        for p in receipts_dir.glob("job-*.json"):
-            if p.name.endswith(".progress.jsonl") or p.stat().st_mtime < since:
-                continue
-            try:
-                rec = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
-                continue
-            if not rec.get("applied"):
-                continue
-            applied_files = rec.get("applied_files") or []
-            if isinstance(applied_files, list) and len(applied_files) >= 2:
-                return True
-    except OSError:
-        pass
-    return False
+    active = summary if summary is not None else summarize_session_receipts(data_root)
+    return active.has_multifile_applied_delegate
 
 
-def _receipt_owner_pid_is_alive(rec: dict[str, Any]) -> bool:
-    """Return False when `owner_instance_id` (`<pid>-<hex>` or `inst-<pid>-<hex>`) points to a dead local PID."""
-    owner_id = str(rec.get("owner_instance_id") or "").strip()
-    if not owner_id or "-" not in owner_id:
-        return True
-    parts = owner_id.split("-")
-    pid_str = parts[1] if parts[0] == "inst" and len(parts) >= 3 else parts[0]
-    try:
-        pid = int(pid_str)
-    except ValueError:
-        return True
-    if pid <= 0:
-        return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-
-
-def _session_has_live_running_delegate_job(data_root: Path) -> bool:
+def _session_has_live_running_delegate_job(
+    data_root: Path,
+    summary: SessionReceiptSummary | None = None,
+) -> bool:
     """Return True when the current session has an active `running` delegate receipt owned by a live PID."""
-    try:
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime if marker.exists() else 0.0
-        receipts_dir = data_root / "receipts"
-        if not receipts_dir.is_dir():
-            return False
-        for p in receipts_dir.glob("job-*.json"):
-            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
-                continue
-            try:
-                rec = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
-                continue
-            if rec.get("status") == "running" and _receipt_owner_pid_is_alive(rec):
-                return True
-    except OSError:
-        pass
-    return False
+    active = summary if summary is not None else summarize_session_receipts(data_root)
+    return active.has_live_running_delegate
 
 
-def _session_has_terminal_delegate_job(data_root: Path) -> bool:
+def _session_has_terminal_delegate_job(
+    data_root: Path,
+    summary: SessionReceiptSummary | None = None,
+) -> bool:
     """Return True when the current session has at least one completed (non-running, non-cancelled) delegate job."""
-    try:
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime if marker.exists() else 0.0
-        receipts_dir = data_root / "receipts"
-        if not receipts_dir.is_dir():
-            return False
-        for p in receipts_dir.glob("job-*.json"):
-            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
-                continue
-            try:
-                rec = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
-                continue
-            if rec.get("status") not in ("running", "cancelled") and not rec.get("cancelled"):
-                return True
-    except OSError:
-        pass
-    return False
+    active = summary if summary is not None else summarize_session_receipts(data_root)
+    return active.has_terminal_delegate
 
 
-def _session_has_lead_escalated_job(data_root: Path, ws_root: Path | None = None) -> bool:
+def _session_has_lead_escalated_job(
+    data_root: Path,
+    ws_root: Path | None = None,
+    summary: SessionReceiptSummary | None = None,
+) -> bool:
     """Return True when any completed/stopped delegate receipt in the current session has `escalate_to_lead=True`
     and no worker job is actively running."""
-    if _session_has_live_running_delegate_job(data_root):
-        return False
-    try:
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime - 1.0 if marker.exists() else 0.0
-        if ws_root is not None:
-            from server.receipts import ReceiptStore
-
-            store = ReceiptStore(data_root, workspace_root=ws_root)
-            for r_esc in store.list_receipts(workspace_root=ws_root):
-                if r_esc.get("kind", "delegate") != "delegate":
-                    continue
-                if r_esc.get("status") in ("running", "cancelled") or r_esc.get("cancelled"):
-                    continue
-                if r_esc.get("external_worktree_tamper") or not store.verify_receipt_signature(r_esc):
-                    continue
-                rec_ts = float(
-                    r_esc.get("updated_at_epoch")
-                    or r_esc.get("finished_at_epoch")
-                    or r_esc.get("started_at_epoch")
-                    or 0.0
-                )
-                if rec_ts < since:
-                    continue
-                esc_info = r_esc.get("escalation")
-                if r_esc.get("escalate_to_lead") is True or (
-                    isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True
-                ):
-                    return True
-            return False
-        receipts_dir = data_root / "receipts"
-        if not receipts_dir.is_dir():
-            return False
-        fallback_store = ReceiptStore(data_root)
-        for p in receipts_dir.glob("job-*.json"):
-            if p.name.endswith((".progress.jsonl", ".live.json")) or p.stat().st_mtime < since:
-                continue
-            try:
-                rec = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(rec, dict) or rec.get("kind", "delegate") != "delegate":
-                continue
-            if (
-                rec.get("status") in ("running", "cancelled")
-                or rec.get("cancelled")
-                or rec.get("external_worktree_tamper")
-                or not fallback_store.verify_receipt_signature(rec)
-            ):
-                continue
-            esc_info = rec.get("escalation")
-            if rec.get("escalate_to_lead") is True or (
-                isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True
-            ):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _is_verified_applied_receipt(rec: dict[str, Any]) -> bool:
-    if (
-        rec.get("status") != "ok"
-        or rec.get("applied") is not True
-        or rec.get("reverted")
-        or rec.get("acceptance_passed") is not True
-        or rec.get("vacuous_acceptance")
-        or rec.get("test_only_diff")
-        or rec.get("scope_violations")
-        or rec.get("missing_prompt_symbols")
-        or rec.get("contract_warnings")
-        or rec.get("stub_mutation_warnings")
-    ):
-        return False
-    acc_list = rec.get("acceptance_results")
-    if not isinstance(acc_list, list) or not acc_list:
-        return False
-    return any(
-        isinstance(r, dict)
-        and r.get("passed") is True
-        and not r.get("compile_smoke")
-        and (
-            not r.get("auto_discovered_default")
-            or int((r.get("counts") or {}).get("passed") or 0) > 0
-        )
-        and not r.get("auto_discovered_regression")
-        and not r.get("no_tests_collected")
-        and not r.get("runner_incompatible_skipped")
-        and not r.get("auto_import_smoke")
-        for r in acc_list
-    )
+    active = summary if summary is not None else summarize_session_receipts(data_root, ws_root)
+    return active.has_lead_escalated_job
 
 
 _UNLIMITED_READ_VALUES = ("off", "none", "unlimited", "disabled")
@@ -1312,7 +1327,11 @@ def resolve_lead_read_limit(env: dict[str, str]) -> int | None:
     return None if value < 0 else value
 
 
-def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
+def _lead_review_read_bonus(
+    data_root: Path,
+    env: dict[str, str],
+    summary: SessionReceiptSummary | None = None,
+) -> int:
     """Extra strict-mode Lead reads granted once a worker job started in the current session exists.
 
     When a job auto-applied cleanly with passing acceptance checks and no missing symbols (and
@@ -1326,61 +1345,19 @@ def _lead_review_read_bonus(data_root: Path, env: dict[str, str]) -> int:
         bonus = 6
     if bonus <= 0:
         return 0
-    try:
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime if marker.exists() else 0.0
-        receipts_dir = data_root / "receipts"
-        if not receipts_dir.is_dir():
-            return 0
-        session_files = [
-            p for p in receipts_dir.glob("job-*")
-            if p.stat().st_mtime >= since
-        ]
-        if not session_files:
-            return 0
-        json_receipts = [
-            p for p in session_files
-            if p.name.endswith(".json") and not p.name.endswith((".progress.jsonl", ".live.json"))
-        ]
-        if json_receipts:
-            parsed_recs: list[tuple[int, dict[str, Any]]] = []
-            for jp in json_receipts:
-                try:
-                    rec_obj = json.loads(jp.read_text(encoding="utf-8"))
-                    if isinstance(rec_obj, dict):
-                        parsed_recs.append((jp.stat().st_mtime_ns, rec_obj))
-                except Exception:
-                    continue
-            if not parsed_recs:
-                return 0
-            if any(
-                r.get("status") == "running" and _receipt_owner_pid_is_alive(r)
-                for _mt, r in parsed_recs
-            ):
-                return 0
-            terminal_recs = [
-                (mt, r)
-                for mt, r in parsed_recs
-                if r.get("status") not in ("running", "cancelled") and not r.get("cancelled")
-            ]
-            if not terminal_recs:
-                return 0
-            if not raw_override:
-                ordered_recs = sorted(
-                    terminal_recs,
-                    key=lambda item: (float(item[1].get("started_at_epoch") or 0.0), item[0]),
-                )
-                sticky_verified_applied = False
-                for _mt, rec in ordered_recs:
-                    if _is_verified_applied_receipt(rec):
-                        sticky_verified_applied = True
-                    elif rec.get("reverted") or bool(rec.get("files_changed")):
-                        sticky_verified_applied = False
-                if sticky_verified_applied:
-                    return 0
-        return bonus
-    except OSError:
+    active = summary if summary is not None else summarize_session_receipts(data_root)
+    if not active.has_any_session_job_artifact:
         return 0
+    if active.has_session_json_files:
+        if (
+            not active.has_parsed_session_json_receipt
+            or active.has_live_running_any
+            or not active.has_terminal_session_receipt
+        ):
+            return 0
+        if not raw_override and active.sticky_verified_applied:
+            return 0
+    return bonus
 
 
 _CMD_HEAD_PREFIX_RE = (
@@ -1489,6 +1466,7 @@ def _check_strict_bash_test_runner_guard(
     ws_root: Path,
     out_dir: Path | str | None,
     env: dict[str, str],
+    summary: SessionReceiptSummary | None = None,
 ) -> str | None:
     """Prevent Lead host test-suite runs while a worker job is running or in Economy/zero-read mode."""
     if not _command_invokes_host_test_runner(command):
@@ -1500,45 +1478,25 @@ def _check_strict_bash_test_runner_guard(
             data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
         except Exception:
             data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
-        marker = data_root / ".lead_session_started"
-        since = marker.stat().st_mtime if marker.exists() else 0.0
-        receipts_dir = data_root / "receipts"
-        parsed: list[tuple[int, dict[str, Any]]] = []
-        if receipts_dir.is_dir():
-            for jp in receipts_dir.glob("job-*.json"):
-                if jp.name.endswith(".live.json") or jp.stat().st_mtime < since:
-                    continue
-                try:
-                    obj = json.loads(jp.read_text(encoding="utf-8"))
-                    if isinstance(obj, dict) and obj.get("job_id"):
-                        parsed.append((jp.stat().st_mtime_ns, obj))
-                except Exception:
-                    continue
-        for _mt, rec in parsed:
-            if rec.get("status") == "running" and _receipt_owner_pid_is_alive(rec):
-                jid = str(rec.get("job_id") or "")
-                return (
-                    f"Strict orchestrator mode: delegated worker job {jid!r} is still running in its isolated "
-                    f"worktree. Do NOT run test suites on the un-applied host workspace; call "
-                    f"delegate_result(job_id={jid!r}, wait=true) to wait for the worker."
-                )
+        active = summary if summary is not None else summarize_session_receipts(data_root, ws_root)
+        if active.live_running_job_ids:
+            jid = active.live_running_job_ids[0]
+            return (
+                f"Strict orchestrator mode: delegated worker job {jid!r} is still running in its isolated "
+                f"worktree. Do NOT run test suites on the un-applied host workspace; call "
+                f"delegate_result(job_id={jid!r}, wait=true) to wait for the worker."
+            )
         if resolve_cost_profile(env) != "economy" and resolve_lead_read_limit(env) != 0:
             return None
-        if _session_has_lead_escalated_job(data_root, ws_root):
+        if active.has_lead_escalated_job:
             return None
-        terminal = [
-            (mt, r)
-            for mt, r in parsed
-            if r.get("status") not in ("running", "cancelled") and not r.get("cancelled")
-        ]
-        any_applied = any(bool(r.get("applied")) for _mt, r in terminal)
-        if not terminal or not any_applied:
+        if not active.has_terminal_any_job or not active.has_applied_any_job:
             return (
                 "Economy strict mode: no worker diff has been applied to the host workspace yet (host is still "
                 "at clean HEAD, and running tests on the host can write untracked test artifacts that conflict "
                 "with delegate_apply). Delegate test execution and fixes via delegate_start or delegate_continue."
             )
-        if _lead_review_read_bonus(data_root, env) == 0:
+        if _lead_review_read_bonus(data_root, env, summary=active) == 0:
             return (
                 "Economy strict mode: worker changes were already verified by the acceptance test suite and "
                 "applied cleanly. Finish your response directly without re-running tests on the host."
@@ -3703,6 +3661,22 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
     if not is_strict_mode_enabled(source_env):
         return {}
 
+    _cached_data_root: Path | None = None
+    _cached_summary: SessionReceiptSummary | None = None
+
+    def _get_data_root_and_summary() -> tuple[Path, SessionReceiptSummary]:
+        nonlocal _cached_data_root, _cached_summary
+        if _cached_data_root is None:
+            try:
+                from server.receipts import ReceiptStore
+
+                _cached_data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
+            except Exception:
+                _cached_data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
+        if _cached_summary is None:
+            _cached_summary = summarize_session_receipts(_cached_data_root, ws_root)
+        return _cached_data_root, _cached_summary
+
     # 2a. Block Read / Grep / Glob on out_dir (.hmac_key / receipts) or PLUGIN_ROOT and enforce Lead read cap in strict mode
     if tool_name in ("Read", "Grep", "Glob"):
         if (
@@ -3763,13 +3737,10 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 }
         read_limit = resolve_lead_read_limit(source_env)
         if read_limit is not None:
-            try:
-                from server.receipts import ReceiptStore
-
-                data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
-            except Exception:
-                data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
-            if resolve_cost_profile(source_env) == "economy" and _session_has_live_running_delegate_job(data_root):
+            data_root, sess_summary = _get_data_root_and_summary()
+            if resolve_cost_profile(source_env) == "economy" and _session_has_live_running_delegate_job(
+                data_root, summary=sess_summary
+            ):
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -3780,13 +3751,13 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         ),
                     }
                 }
-            if _session_has_lead_escalated_job(data_root, ws_root):
+            if _session_has_lead_escalated_job(data_root, ws_root, summary=sess_summary):
                 return {}
             counter_path = data_root / ".lead_read_count"
             # Once a worker job from this session exists, the Lead gets extra reads to check the
             # result against the task. Without them a Lead that spent its planning reads has to
             # accept the worker's result unchecked.
-            read_limit += _lead_review_read_bonus(data_root, source_env)
+            read_limit += _lead_review_read_bonus(data_root, source_env, summary=sess_summary)
             try:
                 current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
             except Exception:
@@ -3795,7 +3766,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
             if (
                 tool_name == "Read"
                 and resolve_cost_profile(source_env) == "economy"
-                and not _session_has_terminal_delegate_job(data_root)
+                and not _session_has_terminal_delegate_job(data_root, summary=sess_summary)
             ):
                 raw_lim_chk = tool_input.get("limit")
                 try:
@@ -3913,19 +3884,16 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
             if classification == "workspace" and tool_name in ("Edit", "Write"):
                 try:
                     from server.jobs import _is_test_file_path, _matches_allowed_paths
-                    from server.receipts import ReceiptStore
 
-                    store_esc = ReceiptStore(out_dir or None, workspace_root=ws_root)
+                    esc_data_root, sess_summary = _get_data_root_and_summary()
                     rel_edit = res_edit.relative_to(ws_root).as_posix()
                     if (
                         rel_edit
                         and not rel_edit.startswith((".git/", ".cc-agy-data/", ".worktrees/"))
                         and not res_edit.is_symlink()
-                        and _session_has_lead_escalated_job(store_esc.data_dir, ws_root)
+                        and sess_summary.has_lead_escalated_job
                     ):
-                        marker_esc = store_esc.data_dir / ".lead_session_started"
-                        since_esc = marker_esc.stat().st_mtime - 1.0 if marker_esc.exists() else 0.0
-                        esc_cnt_path = store_esc.data_dir / ".lead_escalated_edit_count"
+                        esc_cnt_path = esc_data_root / ".lead_escalated_edit_count"
                         try:
                             cur_esc_edits = (
                                 int(esc_cnt_path.read_text(encoding="utf-8").strip())
@@ -3936,27 +3904,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                             cur_esc_edits = 0
                         if cur_esc_edits < 3:
                             authorized_esc = False
-                            for r_esc in store_esc.list_receipts(workspace_root=ws_root):
-                                if r_esc.get("kind", "delegate") != "delegate":
-                                    continue
-                                if r_esc.get("status") in ("running", "cancelled") or r_esc.get("cancelled"):
-                                    continue
-                                if r_esc.get("external_worktree_tamper") or not store_esc.verify_receipt_signature(r_esc):
-                                    continue
-                                rec_ts = float(
-                                    r_esc.get("updated_at_epoch")
-                                    or r_esc.get("finished_at_epoch")
-                                    or r_esc.get("started_at_epoch")
-                                    or 0.0
-                                )
-                                if rec_ts < since_esc:
-                                    continue
-                                esc_info = r_esc.get("escalation")
-                                if not (
-                                    r_esc.get("escalate_to_lead") is True
-                                    or (isinstance(esc_info, dict) and esc_info.get("escalate_to_lead") is True)
-                                ):
-                                    continue
+                            for r_esc in sess_summary.escalated_delegate_receipts:
                                 if r_esc.get("reverted"):
                                     continue
                                 r_allowed = list(r_esc.get("allowed_paths") or [])
@@ -3970,6 +3918,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                                     authorized_esc = True
                                     break
                             if authorized_esc:
+                                esc_data_root.mkdir(parents=True, exist_ok=True)
                                 esc_cnt_path.write_text(str(cur_esc_edits + 1), encoding="utf-8")
                                 return {}
                 except Exception:
@@ -4001,35 +3950,32 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                     "permissionDecisionReason": verdict["reason"],
                 }
             }
-        test_guard_reason = _check_strict_bash_test_runner_guard(
-            command, ws_root, out_dir, source_env
-        )
-        if test_guard_reason:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": test_guard_reason,
+        if _command_invokes_host_test_runner(command):
+            _bash_dr, bash_summary = _get_data_root_and_summary()
+            test_guard_reason = _check_strict_bash_test_runner_guard(
+                command, ws_root, out_dir, source_env, summary=bash_summary
+            )
+            if test_guard_reason:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": test_guard_reason,
+                    }
                 }
-            }
         bash_read_targets = detect_bash_workspace_read(
             command, ws_root, out_dir, cwd=cwd, env=source_env
         )
         if bash_read_targets:
             read_limit = resolve_lead_read_limit(source_env)
             if read_limit is not None:
-                try:
-                    from server.receipts import ReceiptStore
-
-                    data_root = ReceiptStore._resolve_data_dir(out_dir or None, ws_root)
-                except Exception:
-                    data_root = Path(out_dir) if out_dir else (ws_root / ".cc-agy-data")
-                if _session_has_lead_escalated_job(data_root, ws_root):
+                data_root, sess_summary = _get_data_root_and_summary()
+                if _session_has_lead_escalated_job(data_root, ws_root, summary=sess_summary):
                     return {}
                 if (
                     resolve_cost_profile(source_env) == "economy"
                     and read_limit > 0
-                    and not _session_has_terminal_delegate_job(data_root)
+                    and not _session_has_terminal_delegate_job(data_root, summary=sess_summary)
                 ):
                     return {
                         "hookSpecificOutput": {
@@ -4043,7 +3989,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                         }
                     }
                 counter_path = data_root / ".lead_read_count"
-                read_limit += _lead_review_read_bonus(data_root, source_env)
+                read_limit += _lead_review_read_bonus(data_root, source_env, summary=sess_summary)
                 try:
                     current_reads = int(counter_path.read_text(encoding="utf-8").strip()) if counter_path.exists() else 0
                 except Exception:
@@ -4095,7 +4041,7 @@ def evaluate_pre_tool_use(payload: dict[str, Any], env: dict[str, str] | None = 
                 allow_multifile_git_diff_spotcheck = (
                     _is_readonly_git_diff_command(command)
                     and not spotcheck_used_in_session
-                    and _session_has_multifile_delegate_job(data_root)
+                    and _session_has_multifile_delegate_job(data_root, summary=sess_summary)
                 )
                 if allow_multifile_git_diff_spotcheck:
                     try:

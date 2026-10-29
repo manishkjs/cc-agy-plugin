@@ -23,6 +23,28 @@ _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _BINARY_DIFF_RE = re.compile(r"^Binary files (.+?) and (.+?) differ$")
 
 
+def receipt_owner_pid_alive(receipt: Mapping[str, Any]) -> bool:
+    """Return False when `owner_instance_id` (`<pid>-<hex>` or `inst-<pid>-<hex>`) points to a dead local PID."""
+    owner = str(receipt.get("owner_instance_id") or "").strip()
+    if not owner or "-" not in owner:
+        return True
+    parts = owner.split("-")
+    pid_str = parts[1] if parts[0] == "inst" and len(parts) >= 3 else parts[0]
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
 def unquote_git_path(raw: str) -> str:
     """Unquote a git C-quoted path (e.g. '\"a/r\\303\\251sum\\303\\251.py\"') into a UTF-8 string."""
     s = raw.strip()

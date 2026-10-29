@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable, Mapping
 import urllib.parse
 
+from server.genai_client import extract_usage_metadata
 from server.regions import (
     env_flag,
     is_strict_mode_enabled,
@@ -229,17 +230,17 @@ def resolve_thinking_level(
     raw_env = (os.environ.get("CC_AGY_DELEGATE_THINKING_LEVEL") or "").strip()
     if raw_env.startswith("${"):
         raw_env = ""
-    forced_env = _normalize_thinking_token(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL"))
-    if not read_only and forced_env in THINKING_LEVELS:
-        return forced_env
     model_low = (model or "").strip().lower()
     clean_val = _normalize_thinking_token(value)
     esc_env = _normalize_thinking_token(os.environ.get("CC_AGY_ESCALATION_THINKING_LEVEL"))
-    if not read_only and esc_env and not esc_env.startswith("${") and "flash" not in model_low:
-        if clean_val in THINKING_LEVELS:
-            return clean_val
-        if esc_env in THINKING_LEVELS:
-            return esc_env
+    if not read_only and "flash" not in model_low:
+        if esc_env and not esc_env.startswith("${") and esc_env in THINKING_LEVELS:
+            return clean_val if clean_val in THINKING_LEVELS else esc_env
+        if model_low.endswith("-zero"):
+            return clean_val if clean_val in THINKING_LEVELS else "ZERO"
+    forced_env = _normalize_thinking_token(os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL"))
+    if not read_only and forced_env in THINKING_LEVELS:
+        return forced_env
     explicit_model_thinking = (
         "HIGH" if model_low.endswith("-high")
         else "MEDIUM" if model_low.endswith("-medium")
@@ -278,32 +279,6 @@ async def resolve_turn_usage(resp: Any) -> dict[str, int]:
     except Exception:
         return usage
     return extract_usage_metadata(raw)
-
-
-def extract_usage_metadata(raw: Any) -> dict[str, int]:
-    """Normalize one usage_metadata object (pydantic model, dict, or attribute bag) into token counters."""
-    usage = {
-        "prompt_token_count": 0,
-        "cached_content_token_count": 0,
-        "candidates_token_count": 0,
-        "thoughts_token_count": 0,
-        "total_token_count": 0,
-    }
-    if raw is None:
-        return usage
-    data = raw.model_dump() if hasattr(raw, "model_dump") else (dict(raw) if isinstance(raw, dict) else {})
-    if not data:
-        data = {k: getattr(raw, k, 0) for k in usage}
-    for k in usage:
-        try:
-            usage[k] = int(data.get(k) or 0)
-        except (TypeError, ValueError):
-            usage[k] = 0
-    if usage["total_token_count"] == 0:
-        usage["total_token_count"] = (
-            usage["prompt_token_count"] + usage["candidates_token_count"] + usage["thoughts_token_count"]
-        )
-    return usage
 
 
 def extract_usage_from_session(agent: Any, resp: Any = None) -> dict[str, int]:

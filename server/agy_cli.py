@@ -1008,6 +1008,47 @@ def _sum_step_usages(step_usages: Mapping[int, dict[str, int]]) -> dict[str, int
     return acc
 
 
+def _start_stdin_writer(proc: subprocess.Popen[bytes], prompt_text: str) -> threading.Thread:
+    """Spawn a daemon thread that writes `prompt_text` (UTF-8) to `proc.stdin` and closes the pipe."""
+
+    def _write_stdin() -> None:
+        if proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(prompt_text.encode("utf-8"))
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_write_stdin, daemon=True)
+    thread.start()
+    return thread
+
+
+def _start_pipe_chunk_drainer(stream: Any, chunks: list[bytes]) -> threading.Thread:
+    """Spawn a daemon thread that drains binary chunks from `stream` into `chunks` until EOF."""
+
+    def _drain() -> None:
+        assert stream is not None
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    thread = threading.Thread(target=_drain, daemon=True)
+    thread.start()
+    return thread
+
+
 def _compute_conversation_turn_delta(
     *,
     turn_usage: Mapping[str, int],
@@ -1149,37 +1190,10 @@ def _run_stream_json_turn(
         finally:
             line_q.put(None)
 
-    def _drain_stderr() -> None:
-        assert proc.stderr is not None
-        try:
-            while True:
-                chunk = proc.stderr.read(8192)
-                if not chunk:
-                    break
-                stderr_chunks.append(chunk)
-        except (OSError, ValueError):
-            pass
-
-    def _write_stdin() -> None:
-        if proc.stdin is None:
-            return
-        try:
-            proc.stdin.write(prompt_text.encode("utf-8"))
-            proc.stdin.flush()
-        except (OSError, ValueError):
-            pass
-        finally:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
     t_out = threading.Thread(target=_drain_stdout_lines, daemon=True)
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_in = threading.Thread(target=_write_stdin, daemon=True)
     t_out.start()
-    t_err.start()
-    t_in.start()
+    t_err = _start_pipe_chunk_drainer(proc.stderr, stderr_chunks)
+    t_in = _start_stdin_writer(proc, prompt_text)
 
     resolved_conv_id = conversation_id or ""
     step_tool_calls: list[dict[str, Any]] = []
@@ -1819,48 +1833,9 @@ def _run_json_envelope_once(
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
 
-    def _write_stdin() -> None:
-        if proc.stdin is None:
-            return
-        try:
-            proc.stdin.write(prompt_text.encode("utf-8"))
-            proc.stdin.flush()
-        except (OSError, ValueError):
-            pass
-        finally:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
-    def _drain_stdout() -> None:
-        assert proc.stdout is not None
-        try:
-            while True:
-                chunk = proc.stdout.read(8192)
-                if not chunk:
-                    break
-                stdout_chunks.append(chunk)
-        except (OSError, ValueError):
-            pass
-
-    def _drain_stderr() -> None:
-        assert proc.stderr is not None
-        try:
-            while True:
-                chunk = proc.stderr.read(8192)
-                if not chunk:
-                    break
-                stderr_chunks.append(chunk)
-        except (OSError, ValueError):
-            pass
-
-    t_in = threading.Thread(target=_write_stdin, daemon=True)
-    t_out = threading.Thread(target=_drain_stdout, daemon=True)
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_in.start()
-    t_out.start()
-    t_err.start()
+    t_in = _start_stdin_writer(proc, prompt_text)
+    t_out = _start_pipe_chunk_drainer(proc.stdout, stdout_chunks)
+    t_err = _start_pipe_chunk_drainer(proc.stderr, stderr_chunks)
 
     try:
         proc.wait(timeout=timeout_sec)

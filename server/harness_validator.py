@@ -355,4 +355,11 @@ def validate_plugin_tree(root: Path) -> list[str]:
     hooks_json = plugin_root / "hooks" / "hooks.json"
     errors.extend(validate_hooks_config(hooks_json, plugin_root=plugin_root))
 
+    # 5. Shared routing table and worker budget constant sync across README, skills, and subagent docs
+    sync_script = plugin_root / "scripts" / "sync_docs.py"
+    if sync_script.is_file():
+        from scripts.sync_docs import sync_routing_blocks
+
+        errors.extend(sync_routing_blocks(plugin_root, write=False))
+
     return errors

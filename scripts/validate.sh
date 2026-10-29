@@ -23,7 +23,10 @@ for rel in \
   plugins/cc-agy-plugin/skills/vertex/SKILL.md \
   skills/vertex/SKILL.md \
   scripts/install_agy_cli.sh \
-  server/agy_cli.py; do
+  scripts/sync_docs.py \
+  server/agy_cli.py \
+  server/genai_client.py \
+  server/verification_policy.py; do
   require_file "$root/$rel"
 done
 
@@ -61,13 +64,19 @@ for prompt in codex_plugin["interface"].get("defaultPrompt", []):
 readme = (root / "README.md").read_text(encoding="utf-8")
 assert f"badge/version-{ver}-" in readme, f"README version badge out of sync with {ver}"
 assert f"| **Version** | {ver}," in readme, f"README status version out of sync with {ver}"
-m_badge_tests = re.search(r"badge/tests-(\d+)%20passing", readme)
-m_table_tests = re.search(r"\|\s*\*\*Quality\*\*\s*\|\s*(\d+)\s+automated tests", readme)
-assert m_badge_tests and m_table_tests, "README test count missing in badge or status table"
-assert m_badge_tests.group(1) == m_table_tests.group(1), (
-    f"README test badge ({m_badge_tests.group(1)}) != status table ({m_table_tests.group(1)})"
+assert not re.search(r"badge/tests-\d+%20passing", readme), "Avoid hardcoded test counts in README badge"
+assert not re.search(r"\b\d+\s+automated(?:\s+unit,)?\s+tests\b", readme, re.I), (
+    "Avoid hardcoded test counts in README prose"
 )
+
+sys.path.insert(0, str(root))
+from server.harness_validator import validate_plugin_tree
+
+tree_errors = validate_plugin_tree(root)
+assert not tree_errors, "validate_plugin_tree failed:\n" + "\n".join(tree_errors)
 PY
+
+python3 "$root/scripts/sync_docs.py" --check --root "$root"
 
 tmp_home="$(mktemp -d "${TMPDIR:-/tmp}/cc-agy-validate.XXXXXX")"
 trap 'rm -rf "$tmp_home"' EXIT

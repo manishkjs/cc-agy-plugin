@@ -1,16 +1,8 @@
-"""Which model does which job, in one place.
+"""Canonical routing table, worker budget defaults, and batch writer settings.
 
-Decision table the plugin documents for the Lead:
-
-=============================================  ==========================================
-Change                                          Route
-=============================================  ==========================================
-1-5 files                                       Lead edits directly (no delegation)
-6+ files with a clear per-file plan             ``delegate_file_batch`` (single-shot writers)
-Read-only investigation, test-suite debugging   ``delegate_start`` (full agent, bounded shell)
-Doc, tests from cases, one edit repeated        ``draft_document`` / ``write_tests_from_cases``
-                                                / ``replicate_edit``
-=============================================  ==========================================
+See :data:`ROUTING_DECISION_ROWS` and :func:`render_routing_markdown_table` for the
+single source of truth synchronized across ``README.md``, skills, and subagent docs
+via ``scripts/sync_docs.py``.
 """
 from __future__ import annotations
 
@@ -18,6 +10,45 @@ from dataclasses import dataclass
 import math
 import os
 from typing import Any
+
+DEFAULT_MAX_TOOL_CALLS = 100
+DEFAULT_FLASH_MAX_TOOL_CALLS = 55
+DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS = 100
+DEFAULT_MAX_TOTAL_TOKENS = 5_000_000
+
+ROUTING_TABLE_BEGIN = "<!-- SHARED:ROUTING_TABLE:BEGIN -->"
+ROUTING_TABLE_END = "<!-- SHARED:ROUTING_TABLE:END -->"
+
+ROUTING_DECISION_ROWS: tuple[tuple[str, str], ...] = (
+    (
+        "1 to 5 files with a known local fix",
+        "Edit directly on the Lead outside strict mode; delegate with `delegate_start` when repo exploration, test debugging, or strict mode is active.",
+    ),
+    (
+        "6+ files with a clear per-file plan",
+        "Read at most 1 to 2 interface files, write `/tmp/<task>-plan.json`, and call `delegate_file_batch`.",
+    ),
+    (
+        "Open-ended investigation, unknown files, or failing test suite",
+        "Delegate on Turn 1 or Turn 2 with `delegate_start` (or `ask_gemini` for a fast single-shot review without a worker copy).",
+    ),
+    (
+        "One new doc, tests from named cases, or one edit repeated across files",
+        "Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`.",
+    ),
+)
+
+
+def render_routing_markdown_table() -> str:
+    """Render the canonical Markdown routing decision table shared across docs and skills."""
+    lines = [
+        "| Change | Route |",
+        "|---|---|",
+    ]
+    for change, route in ROUTING_DECISION_ROWS:
+        lines.append(f"| {change} | {route} |")
+    return "\n".join(lines)
+
 
 WRITER_KINDS = ("genai", "agent")
 DEFAULT_BATCH_WRITER = "genai"
