@@ -398,9 +398,6 @@ def resolve_default_delegate_model(
     env: Any = None,
 ) -> str:
     """Resolve the worker model from explicit argument, environment/userConfig override, or cost_profile."""
-    req_clean = (requested_model or "").strip()
-    if req_clean and not req_clean.startswith("${"):
-        return req_clean
     source = env if env is not None else os.environ
     override = first_valid_env(
         source,
@@ -409,6 +406,11 @@ def resolve_default_delegate_model(
         "CC_AGY_USERCFG_DEFAULT_DELEGATE_MODEL",
         default="",
     )
+    req_clean = (requested_model or "").strip()
+    if req_clean and not req_clean.startswith("${"):
+        if override and req_clean == "gemini-3.8-flash" and "flash" in override.lower():
+            return override
+        return req_clean
     if override:
         return override
     profile = resolve_cost_profile(source)
@@ -423,9 +425,6 @@ def resolve_default_ask_model(
     env: Any = None,
 ) -> str:
     """Resolve the single-shot ask_gemini model from explicit argument, env/userConfig override, or cost_profile."""
-    req_clean = (requested_model or "").strip()
-    if req_clean and not req_clean.startswith("${"):
-        return req_clean
     source = env if env is not None else os.environ
     override = first_valid_env(
         source,
@@ -434,6 +433,11 @@ def resolve_default_ask_model(
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL",
         default="",
     )
+    req_clean = (requested_model or "").strip()
+    if req_clean and not req_clean.startswith("${"):
+        if override and req_clean == "gemini-3.8-flash" and "flash" in override.lower():
+            return override
+        return req_clean
     if override:
         return override
     profile = resolve_cost_profile(source)
