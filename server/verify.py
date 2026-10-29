@@ -7,20 +7,24 @@ so it stays addressable when the tail is not enough.
 """
 from __future__ import annotations
 
+import atexit
 from collections import deque
 from collections.abc import Collection, Mapping, Sequence
+import codecs
 from dataclasses import dataclass, field
-import filecmp
 import hashlib
 import os
 import posixpath
 import re
+import selectors
 import shutil
+import sys
 import tempfile
 import threading
 from typing import Any, Callable
 from pathlib import Path, PurePosixPath
 import signal
+import stat
 import subprocess
 import time
 import uuid
@@ -418,6 +422,8 @@ class WorkspaceSnapshot:
     head_sha: str | None = None
     head_ref: str | None = None
     index_tree: str | None = None
+    index_raw_sha: str | None = None
+    index_was_absent: bool = False
     git_dirs: dict[str, Path] = field(default_factory=dict)
     git_dir_modes: dict[str, int | None] = field(default_factory=dict)
     git_meta: dict[str, tuple[str, str | None, int | None]] = field(default_factory=dict)
@@ -427,9 +433,17 @@ class WorkspaceSnapshot:
     git_state: frozenset[str] = frozenset()
     index_digest: str | None = None
     index_backup: str | None = None
+    index_bytes: bytes | None = None
+    index_ns: tuple[int, int] | None = None
     dirty: frozenset[str] = frozenset()
     backup_dir: Path | None = None
     budget: int = _SNAPSHOT_MAX_BYTES
+    keep_backups: bool = False
+    inline_bytes: dict[str, bytes] = field(default_factory=dict)
+    inline_budget: int = 32 << 20
+    backup_hashes: dict[str, str] = field(default_factory=dict)
+    backup_fds: dict[str, Any] = field(default_factory=dict)
+    clean_tracked: dict[str, tuple[int, int, int, int, int, int, str | None]] | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -507,22 +521,123 @@ def _symlink_target_digest(link_path: Path) -> str | None:
     return None if walk_err else h.hexdigest()
 
 
-def _capture(snap: WorkspaceSnapshot, path: Path) -> tuple[str, str | None, int | None] | None:
-    if path.is_symlink():
+def _files_equal_bytes(a: Path, b: Path | str) -> bool:
+    """Compare two regular files byte-for-byte without consulting ``filecmp._cache``."""
+    pb = Path(b)
+    try:
+        sa = a.lstat()
+        sb = pb.lstat()
+        if not stat.S_ISREG(sa.st_mode) or not stat.S_ISREG(sb.st_mode) or sa.st_size != sb.st_size:
+            return False
+        with open(a, "rb") as fa, open(pb, "rb") as fb:
+            while True:
+                ca = fa.read(65_536)
+                cb = fb.read(65_536)
+                if ca != cb:
+                    return False
+                if not ca:
+                    return True
+    except OSError:
+        return False
+
+
+def _copy_to_unlinked_tmp_and_sha256(src: Path) -> tuple[Any, str]:
+    """Copy ``src`` into an unlinked O_CLOEXEC ``TemporaryFile`` while computing its SHA-256."""
+    digest = hashlib.sha256()
+    tmp_fh = tempfile.TemporaryFile()
+    try:
+        with open(src, "rb") as f_in:
+            while True:
+                chunk = f_in.read(262_144)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                tmp_fh.write(chunk)
+        tmp_fh.flush()
+        return tmp_fh, digest.hexdigest()
+    except BaseException:
+        tmp_fh.close()
+        raise
+
+
+def _close_backup_fds(fds: Mapping[str, Any]) -> None:
+    for fh in list(fds.values()):
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _capture(
+    snap: WorkspaceSnapshot,
+    path: Path,
+    *,
+    backup_cache: dict[str, tuple[str, int, int, int, int, int, int, bytes | None, str | None, Any]] | None = None,
+    cache_key: str | None = None,
+    session_fds: dict[str, Any] | None = None,
+) -> tuple[str, str | None, int | None] | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ("absent", None, None)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
         return ("symlink", os.readlink(path), None)
-    if path.is_file():
-        st = path.stat()
+    if stat.S_ISREG(st.st_mode):
+        mode = st.st_mode & 0o7777
         if st.st_size > snap.budget or len(snap.entries) >= _SNAPSHOT_MAX_FILES:
             # Past the backup budget: record size and mtime only (detected, reported, not restorable).
-            return ("stat", f"{st.st_size}:{st.st_mtime_ns}", st.st_mode & 0o7777)
+            return ("stat", f"{st.st_size}:{st.st_mtime_ns}", mode)
+        if backup_cache is not None and cache_key is not None:
+            cached = backup_cache.get(cache_key)
+            if cached is not None:
+                saved_str, c_dev, c_ino, c_size, c_mtime_ns, c_ctime_ns, _c_mode, c_bytes, c_sha, c_fh = cached
+                if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns) == (
+                    c_dev, c_ino, c_size, c_mtime_ns, c_ctime_ns
+                ):
+                    if c_bytes is not None and snap.inline_budget >= len(c_bytes):
+                        if path.read_bytes() == c_bytes:
+                            snap.budget -= st.st_size
+                            snap.inline_budget -= len(c_bytes)
+                            snap.inline_bytes[saved_str] = c_bytes
+                            return ("file", saved_str, mode)
+                    elif c_sha is not None and c_fh is not None and not getattr(c_fh, "closed", True):
+                        if _sha256_file(path) == c_sha:
+                            snap.budget -= st.st_size
+                            snap.backup_hashes[saved_str] = c_sha
+                            snap.backup_fds[saved_str] = c_fh
+                            return ("file", saved_str, mode)
         snap.budget -= st.st_size
-        if snap.backup_dir is None:
-            snap.backup_dir = Path(tempfile.mkdtemp(prefix="cc-agy-check-snap-"))
-        saved = snap.backup_dir / f"{len(snap.entries) + len(snap.git_meta):06d}"
-        shutil.copyfile(path, saved)
-        return ("file", str(saved), st.st_mode & 0o7777)
-    if not path.exists():
-        return ("absent", None, None)
+        slot = f"mem:{uuid.uuid4().hex[:12]}" if backup_cache is not None else f"mem:{len(snap.entries) + len(snap.git_meta):06d}"
+        raw_inline: bytes | None = None
+        sha_hex: str | None = None
+        unlinked_fh: Any = None
+        if st.st_size <= 262_144 and snap.inline_budget >= st.st_size:
+            raw_inline = path.read_bytes()
+            snap.inline_budget -= len(raw_inline)
+            snap.inline_bytes[slot] = raw_inline
+        else:
+            unlinked_fh, sha_hex = _copy_to_unlinked_tmp_and_sha256(path)
+            snap.backup_hashes[slot] = sha_hex
+            snap.backup_fds[slot] = unlinked_fh
+            if session_fds is not None:
+                session_fds[slot] = unlinked_fh
+        if backup_cache is not None and cache_key is not None:
+            old = backup_cache.get(cache_key)
+            if old is not None and old[9] is not None and old[9] is not unlinked_fh:
+                try:
+                    old[9].close()
+                except OSError:
+                    pass
+                if session_fds is not None:
+                    session_fds.pop(old[0], None)
+            backup_cache[cache_key] = (
+                slot, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, mode, raw_inline, sha_hex, unlinked_fh
+            )
+        return ("file", slot, mode)
+    if stat.S_ISDIR(st.st_mode):
+        return ("dir", None, st.st_mode & 0o7777)
     return None
 
 
@@ -558,9 +673,95 @@ def _git_dirs(root: Path) -> dict[str, Path]:
     return layout[1] if layout is not None else {}
 
 
-def _index_digest(root: Path) -> str | None:
-    res = _git(root, "ls-files", "--stage", "-z")
+def _index_digest(root: Path, *, index_file: str | None = None) -> str | None:
+    overrides = {"GIT_INDEX_FILE": index_file} if index_file is not None else None
+    res = run_git(["-c", "core.quotePath=false", "ls-files", "--stage", "-z"], root,
+                  env_overrides=overrides, capture_output=True, check=False)
     return hashlib.sha256(res.stdout).hexdigest() if res.returncode == 0 else None
+
+
+def _write_tree_for_index(root: Path, *, index_file: str | None = None) -> str | None:
+    overrides = {"GIT_INDEX_FILE": index_file} if index_file is not None else None
+    res = run_git(["write-tree"], root, env_overrides=overrides, capture_output=True, check=False)
+    return res.stdout.decode("utf-8", "surrogateescape").strip() if res.returncode == 0 else None
+
+
+def _read_head_ref(own_dir: Path | None, root: Path, status_branch_head: str | None = None) -> str | None:
+    """Return ``symbolic-ref -q HEAD`` without spawning git on normal files-backend checkouts."""
+    if own_dir is not None:
+        head_file = own_dir / "HEAD"
+        try:
+            if not head_file.is_symlink() and head_file.is_file():
+                raw = head_file.read_text(encoding="utf-8", errors="surrogateescape").strip()
+                if raw.startswith("ref:"):
+                    ref = raw[4:].strip()
+                    if ref and ref != "refs/heads/.invalid":
+                        return ref
+                else:
+                    return None
+        except OSError:
+            pass
+    if status_branch_head == "(detached)":
+        return None
+    return _git_text(root, "symbolic-ref", "-q", "HEAD") or None
+
+
+def _git_status_porcelain(
+    root: Path,
+    own_dir: Path | None,
+    *,
+    include_untracked: bool = False,
+) -> tuple[str | None, str | None, list[str], list[str]] | None:
+    """Query HEAD sha/ref, dirty tracked paths, and (optionally) untracked paths in one git call."""
+    untracked_arg = "--untracked-files=all" if include_untracked else "--untracked-files=no"
+    res = run_git(
+        ["--no-optional-locks", "-c", "core.quotePath=false", "status",
+         "--porcelain=v2", "--branch", "--no-renames", "-z", untracked_arg],
+        root,
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        return None
+    tokens = res.stdout.decode("utf-8", "surrogateescape").split("\0")
+    head_sha: str | None = None
+    branch_head: str | None = None
+    dirty: list[str] = []
+    untracked: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        idx += 1
+        if not tok:
+            continue
+        if tok.startswith("# branch.oid "):
+            oid = tok[len("# branch.oid "):].strip()
+            head_sha = None if (not oid or oid == "(initial)") else oid
+        elif tok.startswith("# branch.head "):
+            branch_head = tok[len("# branch.head "):].strip()
+        elif tok.startswith("1 "):
+            parts = tok.split(" ", 8)
+            if len(parts) == 9 and parts[8]:
+                dirty.append(parts[8])
+        elif tok.startswith("2 "):
+            parts = tok.split(" ", 9)
+            if len(parts) == 10 and parts[9]:
+                dirty.append(parts[9])
+            if idx < len(tokens):
+                orig_p = tokens[idx]
+                idx += 1
+                if orig_p:
+                    dirty.append(orig_p)
+        elif tok.startswith("u "):
+            parts = tok.split(" ", 10)
+            if len(parts) == 11 and parts[10]:
+                dirty.append(parts[10])
+        elif tok.startswith("? "):
+            rel_u = tok[2:]
+            if rel_u:
+                untracked.append(rel_u)
+    head_ref = _read_head_ref(own_dir, root, branch_head)
+    return head_ref, head_sha, dirty, untracked
 
 
 def _hook_names(git_dir: Path | None) -> frozenset[str]:
@@ -570,10 +771,10 @@ def _hook_names(git_dir: Path | None) -> frozenset[str]:
     return frozenset(p.name for p in hooks.iterdir() if not p.name.endswith(".sample"))
 
 
-def untracked_baseline(cwd: Path) -> frozenset[str] | None:
+def untracked_baseline(cwd: Path, *, _root: Path | None = None) -> frozenset[str] | None:
     """Untracked, non-ignored files of the checkout containing ``cwd``, relative to its root; taken
     once when a run starts, so files earlier commands of the same run create count as run artifacts."""
-    root = checkout_root(cwd)
+    root = _root if _root is not None else checkout_root(cwd)
     if root is None:
         return None
     paths = _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z")
@@ -657,6 +858,7 @@ def remove_new_untracked(
     quarantine_dir: Path | None = None,
     report: dict[str, Any] | None = None,
     preserve_paths: Collection[Path] = (),
+    _root: Path | None = None,
 ) -> list[str]:
     """Remove untracked, non-ignored files that appeared since ``baseline`` (relative to the checkout
     root), so they never land in the job's diff; return the removed paths.
@@ -669,7 +871,7 @@ def remove_new_untracked(
     where it is rather than deleted. ``report`` receives ``quarantine_dir``, ``moved`` and
     ``left_in_place``.
     """
-    root = checkout_root(cwd)
+    root = _root if _root is not None else checkout_root(cwd)
     if root is None or baseline is None:
         return []
     try:
@@ -732,6 +934,168 @@ def remove_new_untracked(
     return removed
 
 
+def _capture_git_subdir_state(sub: Path) -> tuple[bool, int | None, str | None, str | None]:
+    try:
+        if sub.is_symlink():
+            return (True, None, os.readlink(sub), _symlink_target_digest(sub))
+        if sub.is_dir():
+            return (False, sub.lstat().st_mode & 0o7777, None, None)
+    except OSError:
+        pass
+    return (False, None, None, None)
+
+
+def _build_workspace_snapshot(
+    root: Path,
+    cwd_prefix: str,
+    git_dirs: dict[str, Path],
+    head_ref: str | None,
+    head_sha: str | None,
+    dirty: Collection[str],
+    untracked: Collection[str],
+    *,
+    extra_paths: Collection[str] = (),
+    backup_dir: Path | None = None,
+    backup_cache: dict[str, tuple[str, int, int, int, int, int, int, bytes | None, str | None, Any]] | None = None,
+    session_fds: dict[str, Any] | None = None,
+    keep_backups: bool = False,
+) -> WorkspaceSnapshot:
+    base = head_sha or _EMPTY_TREE
+    snap = WorkspaceSnapshot(
+        root=root,
+        cwd_prefix=cwd_prefix,
+        base=base,
+        entries={},
+        git_dirs=git_dirs,
+        dirty=frozenset(dirty),
+        head_sha=head_sha,
+        head_ref=head_ref,
+        backup_dir=backup_dir,
+        keep_backups=keep_backups,
+    )
+    for rel in dict.fromkeys([*dirty, *sorted(untracked), *sorted(extra_paths)]):
+        if not rel or rel == "." or rel.startswith(_PLUGIN_SCRATCH_PREFIXES):
+            continue
+        try:
+            entry = _capture(snap, root / rel, backup_cache=backup_cache, cache_key=f"wt:{rel}", session_fds=session_fds)
+        except OSError:
+            continue
+        if entry is not None:
+            snap.entries[rel] = entry
+    own_dir = snap.git_dirs.get(".git")
+    if own_dir is not None:
+        snap.git_state = frozenset(n for n in _GIT_STATE_PATHS if (own_dir / n).exists() or (own_dir / n).is_symlink())
+        idx_file = own_dir / "index"
+        try:
+            if idx_file.is_symlink():
+                snap.index_tree = _git_text(root, "write-tree")
+            elif idx_file.is_file():
+                idx_st = idx_file.stat()
+                snap.index_ns = (idx_st.st_atime_ns, idx_st.st_mtime_ns)
+                cached_idx = backup_cache.get("git-index") if backup_cache is not None else None
+                if (
+                    cached_idx is not None
+                    and (idx_st.st_dev, idx_st.st_ino, idx_st.st_size, idx_st.st_mtime_ns, idx_st.st_ctime_ns)
+                    == cached_idx[1:6]
+                    and (
+                        (cached_idx[7] is not None and idx_file.read_bytes() == cached_idx[7])
+                        or (
+                            cached_idx[7] is None
+                            and cached_idx[8] is not None
+                            and cached_idx[9] is not None
+                            and not getattr(cached_idx[9], "closed", True)
+                            and _sha256_file(idx_file) == cached_idx[8]
+                        )
+                    )
+                ):
+                    snap.index_bytes = cached_idx[7]
+                    snap.index_raw_sha = cached_idx[8]
+                    if cached_idx[9] is not None:
+                        snap.backup_fds["git-index"] = cached_idx[9]
+                elif idx_st.st_size <= (8 << 20):
+                    raw_idx = idx_file.read_bytes()
+                    idx_sha = hashlib.sha256(raw_idx).hexdigest()
+                    snap.index_bytes = raw_idx
+                    snap.index_raw_sha = idx_sha
+                    if backup_cache is not None:
+                        old_idx = backup_cache.get("git-index")
+                        if old_idx is not None and old_idx[9] is not None:
+                            try:
+                                old_idx[9].close()
+                            except OSError:
+                                pass
+                            if session_fds is not None:
+                                session_fds.pop("git-index", None)
+                        backup_cache["git-index"] = (
+                            "git-index",
+                            idx_st.st_dev,
+                            idx_st.st_ino,
+                            idx_st.st_size,
+                            idx_st.st_mtime_ns,
+                            idx_st.st_ctime_ns,
+                            0o600,
+                            raw_idx,
+                            idx_sha,
+                            None,
+                        )
+                else:
+                    idx_fh, idx_sha = _copy_to_unlinked_tmp_and_sha256(idx_file)
+                    snap.index_raw_sha = idx_sha
+                    snap.backup_fds["git-index"] = idx_fh
+                    if session_fds is not None:
+                        old_fh = session_fds.pop("git-index", None)
+                        if old_fh is not None and old_fh is not idx_fh:
+                            try:
+                                old_fh.close()
+                            except OSError:
+                                pass
+                        session_fds["git-index"] = idx_fh
+                    if backup_cache is not None:
+                        backup_cache["git-index"] = (
+                            "git-index",
+                            idx_st.st_dev,
+                            idx_st.st_ino,
+                            idx_st.st_size,
+                            idx_st.st_mtime_ns,
+                            idx_st.st_ctime_ns,
+                            0o600,
+                            None,
+                            idx_sha,
+                            idx_fh,
+                        )
+            elif not idx_file.exists():
+                snap.index_was_absent = True
+        except OSError:
+            snap.index_tree = _git_text(root, "write-tree")
+    for label, git_dir in snap.git_dirs.items():
+        snap.git_dir_modes[label] = (
+            (git_dir.lstat().st_mode & 0o7777) if (git_dir.is_dir() and not git_dir.is_symlink()) else None
+        )
+        snap.hooks_dir_state[label] = _capture_git_subdir_state(git_dir / "hooks")
+        snap.info_dir_state[label] = _capture_git_subdir_state(git_dir / "info")
+        hooks = _hook_names(git_dir)
+        snap.hooks[label] = hooks
+        meta_names = [
+            n for n in _GIT_META_FILES
+            if not (n.startswith("info/") and snap.info_dir_state[label][0])
+        ]
+        for name in (*meta_names, *(f"hooks/{h}" for h in sorted(hooks))):
+            meta_key = f"{label}/{name}"
+            try:
+                entry = _capture(
+                    snap,
+                    git_dir / name,
+                    backup_cache=backup_cache,
+                    cache_key=f"meta:{meta_key}",
+                    session_fds=session_fds,
+                )
+            except OSError:
+                continue
+            if entry is not None:
+                snap.git_meta[meta_key] = entry
+    return snap
+
+
 def snapshot_workspace(cwd: Path, untracked: Collection[str] | None = None) -> WorkspaceSnapshot | None:
     """Back up the change set before a check; None when ``cwd`` is not inside a git checkout.
 
@@ -747,85 +1111,56 @@ def snapshot_workspace(cwd: Path, untracked: Collection[str] | None = None) -> W
         prefix = Path(cwd).resolve().relative_to(root.resolve()).as_posix()
     except (OSError, ValueError):
         prefix = ""
-    # Pin the commit by sha: a check may move HEAD (commit, reset, checkout) before we compare.
-    head_sha = _git_text(root, "rev-parse", "-q", "--verify", "HEAD^{commit}") or None
-    head_ref = _git_text(root, "symbolic-ref", "-q", "HEAD") or None
-    base = head_sha or _EMPTY_TREE
-    dirty = _git_paths(root, "diff", "--name-only", "--no-renames", "-z", base)
-    if dirty is None:
+    own_dir = git_dirs.get(".git")
+    status_info = _git_status_porcelain(root, own_dir, include_untracked=(untracked is None))
+    if status_info is None:
         return None
-    if untracked is None:
-        untracked = _git_paths(root, "ls-files", "--others", "--exclude-standard", "-z") or []
-    snap = WorkspaceSnapshot(
-        root=root, cwd_prefix="" if prefix == "." else prefix, base=base, entries={},
-        index_tree=_git_text(root, "write-tree"), git_dirs=git_dirs, dirty=frozenset(dirty),
-        head_sha=head_sha, head_ref=head_ref,
+    head_ref, head_sha, dirty, status_untracked = status_info
+    eff_untracked = status_untracked if untracked is None else untracked
+    return _build_workspace_snapshot(
+        root,
+        "" if prefix == "." else prefix,
+        git_dirs,
+        head_ref,
+        head_sha,
+        dirty,
+        eff_untracked,
     )
-    for rel in dict.fromkeys([*dirty, *sorted(untracked)]):
-        if rel.startswith(_PLUGIN_SCRATCH_PREFIXES):
-            continue
-        try:
-            entry = _capture(snap, root / rel)
-        except OSError:
-            continue
-        if entry is not None:
-            snap.entries[rel] = entry
-    own_dir = snap.git_dirs.get(".git")
-    if own_dir is not None:
-        snap.git_state = frozenset(n for n in _GIT_STATE_PATHS if (own_dir / n).exists() or (own_dir / n).is_symlink())
-        if snap.index_tree is None and (own_dir / "index").is_file():
-            # Unmerged entries make write-tree fail: compare the staged listing and keep the raw index.
-            snap.index_digest = _index_digest(root)
-            if snap.backup_dir is None:
-                snap.backup_dir = Path(tempfile.mkdtemp(prefix="cc-agy-check-snap-"))
-            snap.index_backup = str(snap.backup_dir / "git-index")
-            shutil.copyfile(own_dir / "index", snap.index_backup)
-    def _capture_git_subdir_state(sub: Path) -> tuple[bool, int | None, str | None, str | None]:
-        try:
-            if sub.is_symlink():
-                return (True, None, os.readlink(sub), _symlink_target_digest(sub))
-            if sub.is_dir():
-                return (False, sub.lstat().st_mode & 0o7777, None, None)
-        except OSError:
-            pass
-        return (False, None, None, None)
-
-    for label, git_dir in snap.git_dirs.items():
-        snap.git_dir_modes[label] = (
-            (git_dir.lstat().st_mode & 0o7777) if (git_dir.is_dir() and not git_dir.is_symlink()) else None
-        )
-        snap.hooks_dir_state[label] = _capture_git_subdir_state(git_dir / "hooks")
-        snap.info_dir_state[label] = _capture_git_subdir_state(git_dir / "info")
-        hooks = _hook_names(git_dir)
-        snap.hooks[label] = hooks
-        meta_names = [
-            n for n in _GIT_META_FILES
-            if not (n.startswith("info/") and snap.info_dir_state[label][0])
-        ]
-        for name in (*meta_names, *(f"hooks/{h}" for h in sorted(hooks))):
-            try:
-                entry = _capture(snap, git_dir / name)
-            except OSError:
-                continue
-            if entry is not None:
-                snap.git_meta[f"{label}/{name}"] = entry
-    return snap
 
 
-def _entry_matches(path: Path, kind: str, payload: str | None, mode: int | None) -> bool:
+def _entry_matches(
+    path: Path,
+    kind: str,
+    payload: str | None,
+    mode: int | None,
+    *,
+    inline_bytes: bytes | None = None,
+    expected_sha: str | None = None,
+) -> bool:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return kind == "absent"
+    except OSError:
+        return False
     try:
         if kind == "absent":
-            return not path.exists() and not path.is_symlink()
-        if kind == "symlink":
-            return path.is_symlink() and os.readlink(path) == payload
-        if path.is_symlink() or not path.is_file() or payload is None:
             return False
-        if mode is not None and (path.stat().st_mode & 0o7777) != mode:
+        if kind == "dir":
+            return stat.S_ISDIR(st.st_mode)
+        if kind == "symlink":
+            return stat.S_ISLNK(st.st_mode) and os.readlink(path) == payload
+        if not stat.S_ISREG(st.st_mode) or payload is None:
+            return False
+        if mode is not None and (st.st_mode & 0o7777) != mode:
             return False
         if kind == "stat":
-            st = path.stat()
             return f"{st.st_size}:{st.st_mtime_ns}" == payload
-        return filecmp.cmp(path, payload, shallow=False)
+        if inline_bytes is not None:
+            return st.st_size == len(inline_bytes) and path.read_bytes() == inline_bytes
+        if expected_sha is not None:
+            return _sha256_file(path) == expected_sha
+        return _files_equal_bytes(path, payload)
     except OSError:
         return False
 
@@ -911,6 +1246,31 @@ def _prepare_parent_within(top: Path, target_parent: Path, *, create: bool, unli
     return True
 
 
+def _read_verified_backup_fd(backup_fh: Any, expected_sha: str | None) -> Path | None:
+    """Materialize an unlinked backup ``TemporaryFile`` into a fresh temporary file after verifying SHA-256."""
+    if backup_fh is None or getattr(backup_fh, "closed", True):
+        return None
+    fd_out, tmp_str = tempfile.mkstemp(prefix="cc-agy-restore-")
+    tmp_path = Path(tmp_str)
+    digest = hashlib.sha256()
+    try:
+        backup_fh.seek(0)
+        with os.fdopen(fd_out, "wb") as f_out:
+            while True:
+                chunk = backup_fh.read(262_144)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                f_out.write(chunk)
+        if expected_sha is not None and digest.hexdigest() != expected_sha:
+            tmp_path.unlink(missing_ok=True)
+            return None
+        return tmp_path
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        return None
+
+
 def _restore_entry(
     path: Path,
     kind: str,
@@ -919,31 +1279,53 @@ def _restore_entry(
     *,
     top: Path | None = None,
     unlink_planted_links: bool = False,
+    inline_bytes: bytes | None = None,
+    expected_sha: str | None = None,
+    backup_fh: Any = None,
 ) -> None:
-    need_parent = kind in ("symlink", "file") and payload is not None
-    if top is not None:
-        if not _prepare_parent_within(top, path.parent, create=need_parent, unlink_planted_links=unlink_planted_links):
-            return
-    if path.is_symlink():
-        path.unlink(missing_ok=True)
-    elif path.is_file():
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        path.unlink(missing_ok=True)
-    elif path.is_dir():
-        _rmtree_writable(path)
-    elif path.exists():
-        path.unlink(missing_ok=True)
-    if kind == "symlink" and payload is not None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(payload, path)
-    elif kind == "file" and payload is not None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(payload, path)
-        if mode is not None:
-            os.chmod(path, mode)
+    staged_tmp: Path | None = None
+    try:
+        if kind == "file" and inline_bytes is None:
+            if backup_fh is not None:
+                staged_tmp = _read_verified_backup_fd(backup_fh, expected_sha)
+                if staged_tmp is None:
+                    return
+            elif payload is None or not Path(payload).is_file() or Path(payload).is_symlink():
+                return
+            elif expected_sha is not None and _sha256_file(Path(payload)) != expected_sha:
+                return
+        need_parent = kind in ("symlink", "file") and (payload is not None or inline_bytes is not None or staged_tmp is not None)
+        if top is not None:
+            if not _prepare_parent_within(top, path.parent, create=need_parent, unlink_planted_links=unlink_planted_links):
+                return
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+        elif path.is_file():
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            _rmtree_writable(path)
+        elif path.exists():
+            path.unlink(missing_ok=True)
+        if kind == "symlink" and payload is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(payload, path)
+        elif kind == "file" and (inline_bytes is not None or staged_tmp is not None or payload is not None):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if inline_bytes is not None:
+                path.write_bytes(inline_bytes)
+            elif staged_tmp is not None:
+                shutil.copyfile(staged_tmp, path)
+            elif payload is not None:
+                shutil.copyfile(payload, path)
+            if mode is not None:
+                os.chmod(path, mode)
+    finally:
+        if staged_tmp is not None:
+            staged_tmp.unlink(missing_ok=True)
 
 
 _RUN_ARTIFACT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis",
@@ -980,6 +1362,74 @@ def _join_prefix(prefix: str, rel: str) -> str:
     return posixpath.normpath(f"{prefix}/{rel}" if prefix else rel)
 
 
+def _head_matches_fast(snapshot: WorkspaceSnapshot) -> bool:
+    own_dir = snapshot.git_dirs.get(".git")
+    if own_dir is None:
+        return False
+    common_dir = snapshot.git_dirs.get(".git-common") or own_dir
+    head_file = own_dir / "HEAD"
+    try:
+        if head_file.is_symlink() or not head_file.is_file():
+            return False
+        raw = head_file.read_text(encoding="utf-8", errors="surrogateescape").strip()
+        if raw.startswith("ref:"):
+            ref = raw[4:].strip()
+            if ref != snapshot.head_ref or not ref.startswith("refs/") or ".." in ref:
+                return False
+            ref_file = common_dir / ref
+            if ref_file.is_symlink():
+                return False
+            if ref_file.is_file():
+                oid = ref_file.read_text(encoding="utf-8", errors="surrogateescape").strip()
+                return bool(snapshot.head_sha and oid == snapshot.head_sha)
+            if not ref_file.exists() and snapshot.head_sha is None:
+                return not (common_dir / "packed-refs").exists()
+            return False
+        return snapshot.head_ref is None and snapshot.head_sha is not None and raw == snapshot.head_sha
+    except OSError:
+        return False
+
+
+def _clean_tracked_intact(
+    root: Path,
+    clean_tracked: dict[str, tuple[int, int, int, int, int, int, str | None]],
+) -> bool:
+    checked_dirs: set[str] = set()
+    for rel, (c_dev, c_ino, c_mode, c_size, c_mtime_ns, c_ctime_ns, c_extra) in clean_tracked.items():
+        try:
+            slash = rel.find("/")
+            while slash != -1:
+                d_rel = rel[:slash]
+                if d_rel not in checked_dirs:
+                    st_d = os.lstat(root / d_rel)
+                    if not stat.S_ISDIR(st_d.st_mode):
+                        return False
+                    checked_dirs.add(d_rel)
+                slash = rel.find("/", slash + 1)
+            p = root / rel
+            st = os.lstat(p)
+            if c_dev == -1:
+                if not stat.S_ISLNK(st.st_mode) or (st.st_mode & 0o7777) != c_mode or os.readlink(p) != c_extra:
+                    return False
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                return False
+            if (st.st_dev, st.st_ino, st.st_mode & 0o7777, st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (
+                c_dev,
+                c_ino,
+                c_mode,
+                c_size,
+                c_mtime_ns,
+                c_ctime_ns,
+            ):
+                return False
+            if c_extra is not None and _sha256_file(p) != c_extra:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def check_side_effects(
     snapshot: WorkspaceSnapshot | None,
     *,
@@ -987,22 +1437,7 @@ def check_side_effects(
     restore: bool = True,
     change_set: Collection[str] = (),
 ) -> tuple[list[str], list[str]]:
-    """Compare the checkout with ``snapshot`` after one check; return ``(changed, untrusted)``.
-
-    ``changed`` lists every path (relative to the checkout root) the check modified, deleted, replaced
-    or staged, plus ``.git/...`` entries for rewritten git metadata; unless ``restore`` is False all of
-    it is put back (index first, then files). ``allowed`` paths (relative to the check's cwd, e.g. the
-    task file a formatter rewrites) are skipped while they stay plain paths; turning one into a symlink
-    is always a side effect. ``untrusted`` is the subset that makes the check's verdict meaningless,
-    because then the check did not test the bytes that will ship: changes to tracked files the change
-    set already modified, to git metadata, HEAD or the index, and (when restoring, i.e. in an isolated
-    job copy) to any other file except generated artifacts (lockfiles, snapshots, coverage). In
-    report-only mode (``restore=False``: a check running in the user's own tree, where a person may be
-    editing too) only tracked change-set files, paths in ``change_set`` (relative to cwd, e.g. files
-    the worker created), git metadata, HEAD and the index count. Planted git config and hooks are put
-    back even in report-only mode; HEAD is compared by sha and restored only in an isolated job copy.
-    The snapshot's backups are always removed.
-    """
+    """Compare the checkout with ``snapshot`` after one check; return ``(changed, untrusted)``."""
     if snapshot is None:
         return [], []
     try:
@@ -1024,15 +1459,8 @@ def check_side_effects(
 
         # 1. Git metadata first, before any git command reads a config or hook the check planted.
         _check_git_metadata(snapshot, flag)
-        # 2. HEAD, then in-progress operations, then the index.
-        head_ref_now = _git_text(root, "symbolic-ref", "-q", "HEAD") or None
-        head_sha_now = _git_text(root, "rev-parse", "-q", "--verify", "HEAD^{commit}") or None
-        if (head_ref_now, head_sha_now) != (snapshot.head_ref, snapshot.head_sha):
-            # A commit, reset or checkout made by a check rewrites history with the user's identity.
-            flag(".git/HEAD")
-            if restore:
-                _restore_head(root, snapshot)
         own_dir = snapshot.git_dirs.get(".git")
+
         if own_dir is not None:
             for name in _GIT_STATE_PATHS:
                 path = own_dir / name
@@ -1045,46 +1473,182 @@ def check_side_effects(
                         _rmtree_writable(path) if path.is_dir() and not path.is_symlink() else path.unlink()
                     except OSError:
                         pass
-        if snapshot.index_tree:
-            if _git_text(root, "write-tree") != snapshot.index_tree:
-                # A check that stages or unstages files changes what a later commit or diff would ship.
-                flag(".git/index")
+
+        idx_file = (own_dir / "index") if own_dir is not None else None
+        index_untouched = False
+        if idx_file is not None and not idx_file.is_symlink():
+            try:
+                if snapshot.index_was_absent and not idx_file.exists():
+                    index_untouched = True
+                elif snapshot.index_raw_sha is not None and idx_file.is_file():
+                    index_untouched = _sha256_file(idx_file) == snapshot.index_raw_sha
+            except OSError:
+                index_untouched = False
+
+        # 2. Fast-path clean checkouts without spawning git when HEAD, index, metadata, and clean tracked
+        # files are all unchanged; otherwise run git status / rediff to inspect and restore.
+        if (
+            not allowed_set
+            and not changed
+            and index_untouched
+            and snapshot.clean_tracked is not None
+            and _head_matches_fast(snapshot)
+            and _clean_tracked_intact(root, snapshot.clean_tracked)
+        ):
+            now_dirty = list(snapshot.dirty)
+        else:
+            status_info = _git_status_porcelain(root, own_dir, include_untracked=False)
+            need_rediff = status_info is None
+            if status_info is not None:
+                head_ref_now, head_sha_now, status_dirty, _ = status_info
+            else:
+                head_ref_now = _git_text(root, "symbolic-ref", "-q", "HEAD") or None
+                head_sha_now = _git_text(root, "rev-parse", "-q", "--verify", "HEAD^{commit}") or None
+                status_dirty = []
+            if (head_ref_now, head_sha_now) != (snapshot.head_ref, snapshot.head_sha):
+                # A commit, reset or checkout made by a check rewrites history with the user's identity.
+                flag(".git/HEAD")
                 if restore:
-                    _git(root, "read-tree", snapshot.index_tree)
-        elif snapshot.index_digest is not None and _index_digest(root) != snapshot.index_digest:
-            flag(".git/index")
-            if restore and snapshot.index_backup and own_dir is not None:
+                    _restore_head(root, snapshot)
+                    need_rediff = True
+
+            if not index_untouched:
+                if restore and own_dir is not None:
+                    (own_dir / "index.lock").unlink(missing_ok=True)
+                idx_was_symlink = idx_file is not None and idx_file.is_symlink()
+                if idx_was_symlink:
+                    flag(".git/index")
+                    if restore and idx_file is not None:
+                        idx_file.unlink(missing_ok=True)
+                orig_tree: str | None = None
+                tmp_idx_path: Path | None = None
                 try:
-                    shutil.copyfile(snapshot.index_backup, own_dir / "index")
-                except OSError:
-                    pass
-        # 3. Files. Compared after HEAD and the index are back, so a path that was only unstaged is not
-        # reported. If git cannot list changes any more, the git state itself was tampered with: say
-        # so, and still restore every backed-up file.
-        now_dirty = _git_paths(root, "diff", "--name-only", "--no-renames", "-z", snapshot.base)
-        if now_dirty is None:
-            flag(".git")
-            now_dirty = []
+                    eff_idx_backup: str | None = None
+                    idx_fh = snapshot.backup_fds.get("git-index")
+                    if snapshot.index_bytes is not None:
+                        fd_i, raw_tmp_idx = tempfile.mkstemp(prefix="cc-agy-idx-")
+                        try:
+                            os.write(fd_i, snapshot.index_bytes)
+                        finally:
+                            os.close(fd_i)
+                        tmp_idx_path = Path(raw_tmp_idx)
+                        eff_idx_backup = raw_tmp_idx
+                    elif idx_fh is not None:
+                        tmp_idx_path = _read_verified_backup_fd(idx_fh, snapshot.index_raw_sha)
+                        if tmp_idx_path is not None:
+                            eff_idx_backup = str(tmp_idx_path)
+                    elif snapshot.index_backup and Path(snapshot.index_backup).is_file() and not Path(snapshot.index_backup).is_symlink():
+                        if snapshot.index_raw_sha is None or _sha256_file(Path(snapshot.index_backup)) == snapshot.index_raw_sha:
+                            eff_idx_backup = snapshot.index_backup
+
+                    if snapshot.index_was_absent:
+                        orig_tree = _EMPTY_TREE
+                    elif eff_idx_backup:
+                        orig_tree = _write_tree_for_index(root, index_file=eff_idx_backup)
+                    elif snapshot.index_tree:
+                        orig_tree = snapshot.index_tree
+                    now_tree = _write_tree_for_index(root) if not idx_was_symlink else None
+                    if orig_tree is not None:
+                        if not idx_was_symlink and now_tree != orig_tree:
+                            flag(".git/index")
+                    else:
+                        orig_dig = snapshot.index_digest or (
+                            _index_digest(root, index_file=eff_idx_backup) if eff_idx_backup else None
+                        )
+                        if not idx_was_symlink and orig_dig is not None and _index_digest(root) != orig_dig:
+                            flag(".git/index")
+                    if restore and own_dir is not None and idx_file is not None:
+                        need_rediff = True
+                        try:
+                            if snapshot.index_was_absent:
+                                idx_file.unlink(missing_ok=True)
+                            elif snapshot.index_bytes is not None:
+                                idx_file.write_bytes(snapshot.index_bytes)
+                                if snapshot.index_ns is not None:
+                                    os.utime(idx_file, ns=snapshot.index_ns)
+                            elif eff_idx_backup:
+                                bak_idx = Path(eff_idx_backup)
+                                bak_st = bak_idx.stat()
+                                shutil.copyfile(bak_idx, idx_file)
+                                os.utime(
+                                    idx_file,
+                                    ns=snapshot.index_ns or (bak_st.st_atime_ns, bak_st.st_mtime_ns),
+                                )
+                            elif snapshot.index_tree:
+                                _git(root, "read-tree", snapshot.index_tree)
+                        except OSError:
+                            pass
+                finally:
+                    if tmp_idx_path is not None:
+                        tmp_idx_path.unlink(missing_ok=True)
+
+            # 3. Files. Compared after HEAD and the index are back, so a path that was only unstaged is not
+            # reported. If git cannot list changes any more, the git state itself was tampered with: say
+            # so, and still restore every backed-up file.
+            if need_rediff:
+                now_dirty_opt = _git_paths(root, "diff", "--name-only", "--no-renames", "-z", snapshot.base)
+                if now_dirty_opt is None:
+                    flag(".git")
+                    now_dirty = []
+                else:
+                    now_dirty = now_dirty_opt
+            else:
+                now_dirty = status_dirty
         from_base: list[str] = []
-        for rel in sorted(set(now_dirty) | set(snapshot.entries)):
+        extra_planted: list[str] = []
+        if snapshot.clean_tracked is not None:
+            checked_parent_links: dict[str, bool] = {}
+            for c_rel in snapshot.clean_tracked:
+                p_dir = posixpath.dirname(c_rel)
+                if not p_dir:
+                    continue
+                is_linked = checked_parent_links.get(p_dir)
+                if is_linked is None:
+                    is_linked = _symlink_in_path(root, p_dir)
+                    checked_parent_links[p_dir] = is_linked
+                if is_linked:
+                    extra_planted.append(c_rel)
+        for rel in sorted(set(now_dirty) | set(snapshot.entries) | set(extra_planted)):
             if rel.startswith(_PLUGIN_SCRATCH_PREFIXES):
                 continue
-            if rel in allowed_set and not _symlink_in_path(root, rel) and not (root / rel).is_dir():
-                continue
+            if rel in allowed_set and not _symlink_in_path(root, rel):
+                try:
+                    st_al = os.lstat(root / rel)
+                except OSError:
+                    st_al = None
+                if st_al is not None and stat.S_ISREG(st_al.st_mode) and (st_al.st_mode & 0o600) == 0o600:
+                    continue
             path = root / rel
             entry = snapshot.entries.get(rel)
             if entry is None:
                 from_base.append(rel)
                 continue
             kind, payload, mode = entry
-            if _entry_matches(path, kind, payload, mode):
+            parent_rel = posixpath.dirname(rel)
+            parent_has_symlink = bool(parent_rel and _symlink_in_path(root, parent_rel))
+            inlined = snapshot.inline_bytes.get(payload) if (kind == "file" and payload is not None) else None
+            exp_sha = snapshot.backup_hashes.get(payload) if (kind == "file" and payload is not None) else None
+            if not parent_has_symlink and _entry_matches(
+                path, kind, payload, mode, inline_bytes=inlined, expected_sha=exp_sha
+            ):
                 continue
             changed.append(rel)
             if counts_against(rel):
                 untrusted.append(rel)
-            if restore and kind != "stat":
+            if restore and kind not in ("stat", "dir"):
+                bak_fh = snapshot.backup_fds.get(payload) if (kind == "file" and payload is not None) else None
                 try:
-                    _restore_entry(path, kind, payload, mode, top=root, unlink_planted_links=True)
+                    _restore_entry(
+                        path,
+                        kind,
+                        payload,
+                        mode,
+                        top=root,
+                        unlink_planted_links=True,
+                        inline_bytes=inlined,
+                        expected_sha=exp_sha,
+                        backup_fh=bak_fh,
+                    )
                 except OSError:
                     pass
         for start in range(0, len(from_base), 200):
@@ -1098,11 +1662,18 @@ def check_side_effects(
                 if in_base:
                     for rel_base in in_base:
                         _prepare_parent_within(root, (root / rel_base).parent, create=True, unlink_planted_links=True)
+                        base_target = root / rel_base
+                        if base_target.is_symlink():
+                            base_target.unlink(missing_ok=True)
+                        elif base_target.is_dir():
+                            _rmtree_writable(base_target)
                     _git(root, "checkout", snapshot.base, "--", *in_base)
         return sorted(set(changed)), sorted(set(untrusted))
     finally:
-        if snapshot.backup_dir is not None:
-            shutil.rmtree(snapshot.backup_dir, ignore_errors=True)
+        if not snapshot.keep_backups:
+            _close_backup_fds(snapshot.backup_fds)
+            if snapshot.backup_dir is not None:
+                _rmtree_writable(snapshot.backup_dir)
 
 
 def _check_git_metadata(snapshot: WorkspaceSnapshot, flag: Callable[[str], None]) -> None:
@@ -1199,12 +1770,25 @@ def _check_git_metadata(snapshot: WorkspaceSnapshot, flag: Callable[[str], None]
         if git_dir.is_symlink():
             continue
         meta_path = git_dir / name
-        if _entry_matches(meta_path, kind, payload, mode):
+        meta_inlined = snapshot.inline_bytes.get(payload) if (kind == "file" and payload is not None) else None
+        meta_sha = snapshot.backup_hashes.get(payload) if (kind == "file" and payload is not None) else None
+        if _entry_matches(meta_path, kind, payload, mode, inline_bytes=meta_inlined, expected_sha=meta_sha):
             continue
         flag(key)
         if kind != "stat":
+            meta_fh = snapshot.backup_fds.get(payload) if (kind == "file" and payload is not None) else None
             try:
-                _restore_entry(meta_path, kind, payload, mode, top=git_dir, unlink_planted_links=False)
+                _restore_entry(
+                    meta_path,
+                    kind,
+                    payload,
+                    mode,
+                    top=git_dir,
+                    unlink_planted_links=False,
+                    inline_bytes=meta_inlined,
+                    expected_sha=meta_sha,
+                    backup_fh=meta_fh,
+                )
             except OSError:
                 pass
     for label, git_dir in snapshot.git_dirs.items():
@@ -1331,16 +1915,981 @@ def _kill_group(pid: int) -> None:
         pass
 
 
-def _drain(stream: Any, log_handle: Any, tail: deque[str]) -> None:
-    """Copy a process's output to the log file while keeping only a bounded tail in memory."""
-    kept = 0
-    for chunk in iter(lambda: stream.read(8192), ""):
-        if log_handle is not None:
+_PROC_TICKS_LOCK = threading.Lock()
+_PROC_START_TICKS_CACHE: dict[tuple[int, int, int], int] = {}
+
+
+def _proc_start_ticks(pid: int, st_ino: int, st_ctime_ns: int) -> int | None:
+    """Return Linux ``/proc/<pid>/stat`` monotonic boot start ticks (field 22), cached per procfs inode."""
+    key = (pid, st_ino, st_ctime_ns)
+    with _PROC_TICKS_LOCK:
+        cached = _PROC_START_TICKS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read(4_096)
+        rp = data.rfind(b")")
+        if rp < 0:
+            return None
+        val = int(data[rp + 2:].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+    with _PROC_TICKS_LOCK:
+        if len(_PROC_START_TICKS_CACHE) > 8_192:
+            _PROC_START_TICKS_CACHE.clear()
+        _PROC_START_TICKS_CACHE[key] = val
+    return val
+
+
+def _environ_has_entry(env_bytes: bytes, entry: bytes) -> bool:
+    idx = env_bytes.find(entry)
+    while idx >= 0:
+        end = idx + len(entry)
+        if (idx == 0 or env_bytes[idx - 1] == 0) and (end == len(env_bytes) or env_bytes[end] == 0):
+            return True
+        idx = env_bytes.find(entry, idx + 1)
+    return False
+
+
+def _kill_check_descendants(
+    pipe_dev: int,
+    pipe_ino: int,
+    run_id: str,
+    *,
+    min_start_ticks: int | None = None,
+) -> None:
+    """Kill detached ``setsid`` descendants on Linux via either the per-check env marker or open stdout pipe."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return
+    my_pid = os.getpid()
+    my_pgid = os.getpgrp()
+    my_uid = os.getuid()
+    pipe_link = f"pipe:[{pipe_ino}]"
+    cookie_entry = f"_AGY_CHECK_RUN_ID={run_id}".encode("ascii") if run_id else b""
+    for _pass in range(2):
+        killed_any = False
+        try:
+            entries = os.listdir(proc_root)
+        except OSError:
+            return
+        for name in entries:
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == my_pid:
+                continue
+            p_dir = proc_root / name
+            try:
+                pst = os.lstat(p_dir)
+            except OSError:
+                continue
+            if pst.st_uid != my_uid:
+                continue
+            if min_start_ticks is not None:
+                st_ticks = _proc_start_ticks(pid, pst.st_ino, pst.st_ctime_ns)
+                if st_ticks is not None and st_ticks < min_start_ticks:
+                    continue
+            matched = False
+            if cookie_entry:
+                try:
+                    with open(p_dir / "environ", "rb") as efh:
+                        matched = _environ_has_entry(efh.read(2_097_152), cookie_entry)
+                except OSError:
+                    pass
+            if not matched:
+                fd_dir = p_dir / "fd"
+                try:
+                    fd_names = os.listdir(fd_dir)
+                except OSError:
+                    fd_names = []
+                for fd_name in fd_names:
+                    fd_path = fd_dir / fd_name
+                    try:
+                        if os.readlink(fd_path) == pipe_link:
+                            st = os.stat(fd_path)
+                            if st.st_dev == pipe_dev and st.st_ino == pipe_ino:
+                                matched = True
+                                break
+                    except OSError:
+                        continue
+            if matched:
+                killed_any = True
+                try:
+                    pgid = os.getpgid(pid)
+                    if pgid > 1 and pgid != my_pgid:
+                        os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        if not killed_any:
+            break
+
+
+def _append_bounded_chunk(
+    chunk: str,
+    *,
+    log_handle: Any,
+    tail: deque[str],
+    kept_ref: list[int],
+    max_chars: int,
+    io_lock: threading.Lock,
+    io_closed: list[bool],
+) -> None:
+    if not chunk:
+        return
+    with io_lock:
+        if io_closed[0]:
+            return
+        if log_handle is not None and not getattr(log_handle, "closed", False):
             log_handle.write(chunk)
         tail.append(chunk)
-        kept += len(chunk)
-        while kept - len(tail[0]) > TAIL_CHARS and len(tail) > 1:
-            kept -= len(tail.popleft())
+        kept_ref[0] += len(chunk)
+        while kept_ref[0] - len(tail[0]) > max_chars and len(tail) > 1:
+            kept_ref[0] -= len(tail.popleft())
+        if len(tail) == 1 and len(tail[0]) > max_chars * 2:
+            only = tail.popleft()
+            trimmed = only[-max_chars:]
+            tail.append(trimmed)
+            kept_ref[0] = len(trimmed)
+
+
+def _drain(stream: Any, log_handle: Any, tail: deque[str], max_chars: int = TAIL_CHARS) -> None:
+    """Copy a process's output to the log file while keeping only a bounded tail in memory."""
+    kept_ref = [0]
+    io_lock = threading.Lock()
+    io_closed = [False]
+    for chunk in iter(lambda: stream.read(8192), ""):
+        _append_bounded_chunk(
+            chunk,
+            log_handle=log_handle,
+            tail=tail,
+            kept_ref=kept_ref,
+            max_chars=max_chars,
+            io_lock=io_lock,
+            io_closed=io_closed,
+        )
+
+
+_SUBREAPER_C_SOURCE = r"""
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
+#endif
+
+static volatile sig_atomic_t got_term = 0;
+static int sig_pipe[2] = {-1, -1};
+
+static void on_sig(int sig) {
+    int saved_errno = errno;
+    if (sig == SIGTERM || sig == SIGINT) {
+        got_term = 1;
+    }
+    if (sig_pipe[1] >= 0) {
+        char b = 1;
+        ssize_t unused = write(sig_pipe[1], &b, 1);
+        (void)unused;
+    }
+    errno = saved_errno;
+}
+
+static void kill_direct_children(pid_t my_pid, pid_t my_pgrp) {
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    struct dirent *de;
+    char path[128];
+    char buf[4096];
+    pid_t pids[4096];
+    pid_t pgrps[4096];
+    size_t count = 0;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (!isdigit((unsigned char)name[0])) continue;
+        char *endp = NULL;
+        long pid_l = strtol(name, &endp, 10);
+        if (!endp || *endp != '\0' || pid_l <= 1 || (pid_t)pid_l == my_pid) continue;
+        snprintf(path, sizeof(path), "/proc/%ld/stat", pid_l);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        char *rp = strrchr(buf, ')');
+        if (!rp || rp[1] != ' ') continue;
+        char state = '\0';
+        int ppid = -1, pgrp = -1;
+        if (sscanf(rp + 2, "%c %d %d", &state, &ppid, &pgrp) != 3) continue;
+        if ((pid_t)ppid == my_pid && count < 4096) {
+            pids[count] = (pid_t)pid_l;
+            pgrps[count] = (pid_t)pgrp;
+            count++;
+        }
+    }
+    closedir(d);
+    for (size_t i = 0; i < count; i++) {
+        if (pgrps[i] > 1 && pgrps[i] != my_pgrp) kill(-pgrps[i], SIGSTOP);
+        kill(pids[i], SIGSTOP);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (pgrps[i] > 1 && pgrps[i] != my_pgrp) kill(-pgrps[i], SIGKILL);
+        kill(pids[i], SIGKILL);
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--probe-subreaper") == 0) {
+        return prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0 ? 0 : 1;
+    }
+    if (argc < 2) return 2;
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) return 125;
+    if (pipe2(sig_pipe, O_NONBLOCK | O_CLOEXEC) != 0) return 125;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sig;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGCHLD, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    pid_t my_pid = getpid();
+    pid_t my_pgrp = getpgrp();
+
+    pid_t child = fork();
+    if (child < 0) return 126;
+    if (child == 0) {
+        setpgid(0, 0);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        execvp(argv[1], &argv[1]);
+        _exit(127);
+    }
+    (void)setpgid(child, child);
+
+    int dn = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (dn >= 0) {
+        if (dn != STDOUT_FILENO) (void)dup2(dn, STDOUT_FILENO);
+        if (dn != STDERR_FILENO) (void)dup2(dn, STDERR_FILENO);
+        if (dn > STDERR_FILENO) close(dn);
+    }
+
+    int main_status = 0;
+    int have_main = 0;
+    while (!have_main && !got_term) {
+        char drain[64];
+        while (read(sig_pipe[0], drain, sizeof(drain)) > 0) {}
+        int no_children = 0;
+        for (;;) {
+            int st = 0;
+            pid_t w = waitpid(-1, &st, WNOHANG);
+            if (w > 0) {
+                if (w == child) {
+                    main_status = st;
+                    have_main = 1;
+                }
+                continue;
+            }
+            if (w < 0 && errno == ECHILD) {
+                no_children = 1;
+            }
+            break;
+        }
+        if (have_main || got_term || no_children) break;
+        struct pollfd pfd;
+        pfd.fd = sig_pipe[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        (void)poll(&pfd, 1, 100);
+    }
+
+    kill(-child, SIGSTOP);
+    kill(child, SIGSTOP);
+    kill(-child, SIGKILL);
+    kill(child, SIGKILL);
+
+    for (int iter = 0; iter < 2000; iter++) {
+        int reaped_all = 0;
+        for (;;) {
+            int st = 0;
+            pid_t w = waitpid(-1, &st, WNOHANG);
+            if (w > 0) {
+                if (w == child && !have_main) {
+                    main_status = st;
+                    have_main = 1;
+                }
+                continue;
+            }
+            if (w < 0 && errno == ECHILD) {
+                reaped_all = 1;
+            }
+            break;
+        }
+        if (reaped_all) break;
+        kill_direct_children(my_pid, my_pgrp);
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+
+    if (got_term && !have_main) return 128 + SIGTERM;
+    if (WIFEXITED(main_status)) return WEXITSTATUS(main_status);
+    if (WIFSIGNALED(main_status)) return 128 + WTERMSIG(main_status);
+    return 1;
+}
+"""
+
+_PY_SUBREAPER_SCRIPT = r"""
+import ctypes, errno, os, select, signal, sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+if len(sys.argv) == 2 and sys.argv[1] == "--probe-subreaper":
+    sys.exit(0 if libc.prctl(36, 1, 0, 0, 0) == 0 else 1)
+if len(sys.argv) < 2 or libc.prctl(36, 1, 0, 0, 0) != 0:
+    sys.exit(125)
+
+r_fd, w_fd = os.pipe()
+os.set_blocking(r_fd, False)
+os.set_blocking(w_fd, False)
+signal.set_wakeup_fd(w_fd, warn_on_full_buffer=False)
+got_term = False
+
+def _on_sig(sig, _frame):
+    global got_term
+    if sig in (signal.SIGTERM, signal.SIGINT):
+        got_term = True
+
+signal.signal(signal.SIGCHLD, _on_sig)
+signal.signal(signal.SIGTERM, _on_sig)
+signal.signal(signal.SIGINT, _on_sig)
+
+my_pid = os.getpid()
+my_pgrp = os.getpgrp()
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    signal.set_wakeup_fd(-1)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except OSError:
+        os._exit(127)
+try:
+    os.setpgid(child, child)
+except OSError:
+    pass
+try:
+    dn = os.open("/dev/null", os.O_WRONLY)
+    os.dup2(dn, 1)
+    os.dup2(dn, 2)
+    if dn > 2:
+        os.close(dn)
+except OSError:
+    pass
+
+main_status = 0
+have_main = False
+while not have_main and not got_term:
+    try:
+        while os.read(r_fd, 64):
+            pass
+    except BlockingIOError:
+        pass
+    no_children = False
+    while True:
+        try:
+            w, st = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            no_children = True
+            break
+        except InterruptedError:
+            continue
+        if w == 0:
+            break
+        if w == child:
+            main_status = st
+            have_main = True
+    if have_main or got_term or no_children:
+        break
+    try:
+        select.select([r_fd], [], [], 0.05)
+    except InterruptedError:
+        pass
+
+def _kill_direct():
+    targets = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid <= 1 or pid == my_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                data = fh.read(4096)
+            rp = data.rfind(b")")
+            if rp < 0:
+                continue
+            fields = data[rp + 2:].split()
+            if int(fields[1]) == my_pid:
+                targets.append((pid, int(fields[2])))
+        except (OSError, IndexError, ValueError):
+            continue
+    for pid, pgrp in targets:
+        for sig in (signal.SIGSTOP,):
+            if pgrp > 1 and pgrp != my_pgrp:
+                try:
+                    os.killpg(pgrp, sig)
+                except OSError:
+                    pass
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+    for pid, pgrp in targets:
+        if pgrp > 1 and pgrp != my_pgrp:
+            try:
+                os.killpg(pgrp, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+for sig in (signal.SIGSTOP, signal.SIGKILL):
+    try:
+        os.killpg(child, sig)
+    except OSError:
+        pass
+    try:
+        os.kill(child, sig)
+    except OSError:
+        pass
+
+for _ in range(2000):
+    reaped_all = False
+    while True:
+        try:
+            w, st = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            reaped_all = True
+            break
+        except InterruptedError:
+            continue
+        if w == 0:
+            break
+        if w == child and not have_main:
+            main_status = st
+            have_main = True
+    if reaped_all:
+        break
+    _kill_direct()
+    select.select([], [], [], 0.001)
+
+if got_term and not have_main:
+    sys.exit(128 + signal.SIGTERM)
+if os.WIFEXITED(main_status):
+    sys.exit(os.WEXITSTATUS(main_status))
+if os.WIFSIGNALED(main_status):
+    sys.exit(128 + os.WTERMSIG(main_status))
+sys.exit(1)
+"""
+
+_SUBREAPER_LOCK = threading.Lock()
+_SUBREAPER_BIN_INFO: tuple[str, int, int, int, int, int, str] | None = None
+_SUBREAPER_C_DISABLED: bool = False
+_PY_SUBREAPER_AVAILABLE: bool | None = None
+_FORCE_PYTHON_SUBREAPER: bool = False
+
+
+def _popen_sync_rc(argv: Sequence[str], *, timeout: float = 10.0) -> int | None:
+    try:
+        p = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            return p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            return None
+    except OSError:
+        return None
+
+
+def _ensure_c_subreaper_bin() -> str | None:
+    global _SUBREAPER_BIN_INFO, _SUBREAPER_C_DISABLED
+    if _FORCE_PYTHON_SUBREAPER or sys.platform != "linux":
+        return None
+    with _SUBREAPER_LOCK:
+        if _SUBREAPER_BIN_INFO is not None:
+            bpath, bdev, bino, bsize, bmtime, bctime, bsha = _SUBREAPER_BIN_INFO
+            try:
+                st = os.lstat(bpath)
+                if (
+                    stat.S_ISREG(st.st_mode)
+                    and (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                    == (bdev, bino, bsize, bmtime, bctime)
+                    and _sha256_file(Path(bpath)) == bsha
+                ):
+                    return bpath
+            except OSError:
+                pass
+            _SUBREAPER_BIN_INFO = None
+        if _SUBREAPER_C_DISABLED:
+            return None
+        compiler: str | None = None
+        for cand in ("cc", "gcc", "clang"):
+            found = shutil.which(cand)
+            if found:
+                compiler = found
+                break
+        if compiler is None:
+            _SUBREAPER_C_DISABLED = True
+            return None
+        sr_dir = Path(tempfile.mkdtemp(prefix="cc-agy-subreaper-"))
+        atexit.register(_rmtree_writable, sr_dir)
+        src_file = sr_dir / "subreaper.c"
+        bin_file = sr_dir / "subreaper"
+        try:
+            src_file.write_text(_SUBREAPER_C_SOURCE, encoding="utf-8")
+            rc = _popen_sync_rc([compiler, "-O2", str(src_file), "-o", str(bin_file)], timeout=15.0)
+            src_file.unlink(missing_ok=True)
+            if rc != 0 or not bin_file.is_file():
+                _rmtree_writable(sr_dir)
+                _SUBREAPER_C_DISABLED = True
+                return None
+            os.chmod(bin_file, 0o500)
+            os.chmod(sr_dir, 0o500)
+            if _popen_sync_rc([str(bin_file), "--probe-subreaper"], timeout=3.0) != 0:
+                _rmtree_writable(sr_dir)
+                _SUBREAPER_C_DISABLED = True
+                return None
+            st = os.lstat(bin_file)
+            bsha = _sha256_file(bin_file)
+            _SUBREAPER_BIN_INFO = (
+                str(bin_file),
+                st.st_dev,
+                st.st_ino,
+                st.st_size,
+                st.st_mtime_ns,
+                st.st_ctime_ns,
+                bsha,
+            )
+            return str(bin_file)
+        except OSError:
+            _rmtree_writable(sr_dir)
+            _SUBREAPER_C_DISABLED = True
+            return None
+
+
+def _python_subreaper_ok() -> bool:
+    global _PY_SUBREAPER_AVAILABLE
+    if sys.platform != "linux":
+        return False
+    with _SUBREAPER_LOCK:
+        if _PY_SUBREAPER_AVAILABLE is None:
+            _PY_SUBREAPER_AVAILABLE = (
+                _popen_sync_rc([sys.executable, "-I", "-S", "-c", _PY_SUBREAPER_SCRIPT, "--probe-subreaper"], timeout=5.0)
+                == 0
+            )
+        return _PY_SUBREAPER_AVAILABLE
+
+
+def _build_check_launch_argv(cmd: str, proc_env: Mapping[str, str]) -> tuple[list[str], bool]:
+    bash_bin = shutil.which("bash", path=proc_env.get("PATH")) or shutil.which("bash") or "/bin/bash"
+    c_bin = _ensure_c_subreaper_bin()
+    if c_bin is not None:
+        return [c_bin, bash_bin, "-c", cmd], True
+    if _python_subreaper_ok():
+        return [sys.executable, "-I", "-S", "-c", _PY_SUBREAPER_SCRIPT, bash_bin, "-c", cmd], True
+    return [bash_bin, "-c", cmd], False
+
+
+def execute_check_process(
+    cmd: str,
+    cwd: Path,
+    env: Mapping[str, str],
+    *,
+    timeout: float,
+    log_handle: Any = None,
+    max_tail_chars: int = TAIL_CHARS,
+) -> tuple[int | None, bool, str, float]:
+    """Run ``bash -c cmd`` under a dedicated session + Linux ``PR_SET_CHILD_SUBREAPER`` supervisor,
+    stream output into a bounded tail, and kill every descendant process (even clean-env ``setsid``
+    daemons with redirected stdio) before returning."""
+    started = time.time()
+    tail: deque[str] = deque()
+    kept_ref = [0]
+    io_lock = threading.Lock()
+    io_closed = [False]
+    proc_exited = threading.Event()
+    run_id = uuid.uuid4().hex
+    proc_env = dict(env)
+    proc_env["_AGY_CHECK_RUN_ID"] = run_id
+    launch_argv, has_subreaper = _build_check_launch_argv(cmd, proc_env)
+    proc = subprocess.Popen(
+        launch_argv,
+        cwd=str(cwd),
+        env=proc_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=False,
+        start_new_session=True,
+    )
+    min_start_ticks: int | None = None
+    if not has_subreaper:
+        try:
+            proc_st = os.lstat(f"/proc/{proc.pid}")
+            min_start_ticks = _proc_start_ticks(proc.pid, proc_st.st_ino, proc_st.st_ctime_ns)
+        except OSError:
+            min_start_ticks = None
+    assert proc.stdout is not None
+    raw_fd = proc.stdout.fileno()
+    pipe_st = os.fstat(raw_fd)
+    pipe_dev, pipe_ino = pipe_st.st_dev, pipe_st.st_ino
+    os.set_blocking(raw_fd, False)
+
+    def _drain_fd() -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        sel = selectors.DefaultSelector()
+        eof = False
+        leaked_writer = False
+        try:
+            sel.register(raw_fd, selectors.EVENT_READ)
+            while not eof:
+                exited = proc_exited.is_set()
+                if not exited:
+                    sel.select(timeout=0.05)
+                    exited = proc_exited.is_set()
+                drained_post_exit = 0
+                while True:
+                    try:
+                        data = os.read(raw_fd, 65_536)
+                    except BlockingIOError:
+                        if exited:
+                            leaked_writer = True
+                        break
+                    except OSError:
+                        eof = True
+                        break
+                    if not data:
+                        eof = True
+                        break
+                    text_part = decoder.decode(data, final=False)
+                    _append_bounded_chunk(
+                        text_part,
+                        log_handle=log_handle,
+                        tail=tail,
+                        kept_ref=kept_ref,
+                        max_chars=max_tail_chars,
+                        io_lock=io_lock,
+                        io_closed=io_closed,
+                    )
+                    if exited:
+                        drained_post_exit += len(data)
+                        if drained_post_exit >= 524_288:
+                            leaked_writer = True
+                            break
+                if exited:
+                    break
+            if leaked_writer:
+                _kill_check_descendants(pipe_dev, pipe_ino, run_id, min_start_ticks=None)
+            rem_text = decoder.decode(b"", final=True)
+            if rem_text:
+                _append_bounded_chunk(
+                    rem_text,
+                    log_handle=log_handle,
+                    tail=tail,
+                    kept_ref=kept_ref,
+                    max_chars=max_tail_chars,
+                    io_lock=io_lock,
+                    io_closed=io_closed,
+                )
+        finally:
+            try:
+                sel.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=_drain_fd, daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        try:
+            proc.wait(timeout=max(0.1, float(timeout)))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    finally:
+        subreaper_cleaned = False
+        if has_subreaper:
+            if proc.poll() is not None:
+                subreaper_cleaned = True
+            else:
+                try:
+                    os.kill(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3.0)
+                    subreaper_cleaned = True
+                except subprocess.TimeoutExpired:
+                    subreaper_cleaned = False
+        if not subreaper_cleaned:
+            _kill_group(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc.pid)
+                proc.wait()
+            _kill_check_descendants(pipe_dev, pipe_ino, run_id, min_start_ticks=min_start_ticks)
+        proc_exited.set()
+    reader.join(timeout=2.0)
+    with io_lock:
+        io_closed[0] = True
+        tail_str = "".join(tail)
+    if not reader.is_alive():
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    duration = time.time() - started
+    return (None if timed_out else proc.returncode), timed_out, tail_str, duration
+
+
+class _SnapshotSession:
+    """Reusable workspace snapshot session across sequential check commands in ``cwd``."""
+
+    def __init__(self, cwd: Path, *, extra_paths: Collection[str] = ()) -> None:
+        self.cwd = cwd
+        self.root: Path | None = None
+        self.cwd_prefix: str = ""
+        self.git_dirs: dict[str, Path] = {}
+        self.baseline: frozenset[str] | None = None
+        self.backup_dir: Path | None = None
+        self.backup_cache: dict[str, tuple[str, int, int, int, int, int, int, bytes | None, str | None, Any]] = {}
+        self.backup_fds: dict[str, Any] = {}
+        self._extra_root_paths: tuple[str, ...] = ()
+        self._initial_status: tuple[str | None, str | None, list[str], list[str]] | None = None
+        self._clean_tracked: dict[str, tuple[int, int, int, int, int, int, str | None]] | None = None
+        self._excluded_dirty: set[str] = set()
+        self._current_snap: WorkspaceSnapshot | None = None
+        self._can_reuse_prev: bool = False
+
+        layout = _repo_layout(cwd)
+        if layout is None:
+            return
+        root, git_dirs = layout
+        self.root = root
+        self.git_dirs = git_dirs
+        try:
+            prefix = Path(cwd).resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            prefix = ""
+        self.cwd_prefix = "" if prefix == "." else prefix
+        extra_norm: list[str] = []
+        for raw_p in extra_paths:
+            if not raw_p:
+                continue
+            for cand in (_join_prefix(self.cwd_prefix, raw_p), posixpath.normpath(raw_p)):
+                if cand and cand != "." and not cand.startswith("..") and cand not in extra_norm:
+                    extra_norm.append(cand)
+        self._extra_root_paths = tuple(extra_norm)
+        status_info = _git_status_porcelain(root, git_dirs.get(".git"), include_untracked=True)
+        if status_info is not None:
+            self._initial_status = status_info
+            self.baseline = frozenset(status_info[3])
+            self._excluded_dirty = set(status_info[2])
+            self._clean_tracked = self._load_clean_tracked(root, self._excluded_dirty)
+        else:
+            self.baseline = untracked_baseline(cwd, _root=root)
+
+    @staticmethod
+    def _record_clean_entry(
+        root: Path,
+        rel: str,
+        now_ns: int,
+    ) -> tuple[int, int, int, int, int, int, str | None] | None:
+        parent_rel = posixpath.dirname(rel)
+        if parent_rel and _symlink_in_path(root, parent_rel):
+            return None
+        p = root / rel
+        st = os.lstat(p)
+        if stat.S_ISDIR(st.st_mode):
+            return None  # gitlink / submodule: use git status per command
+        if stat.S_ISLNK(st.st_mode):
+            return (-1, 0, st.st_mode & 0o7777, 0, 0, 0, os.readlink(p))
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        extra_sha: str | None = None
+        if now_ns - st.st_ctime_ns <= 1_000_000_000:
+            if st.st_size > (4 << 20):
+                return None
+            extra_sha = _sha256_file(p)
+        return (st.st_dev, st.st_ino, st.st_mode & 0o7777, st.st_size, st.st_mtime_ns, st.st_ctime_ns, extra_sha)
+
+    @classmethod
+    def _load_clean_tracked(
+        cls,
+        root: Path,
+        dirty_set: set[str],
+    ) -> dict[str, tuple[int, int, int, int, int, int, str | None]] | None:
+        if _local_git_configs_may_define_filters(root):
+            return None
+        tracked = _git_paths(root, "ls-files", "-z")
+        if tracked is None or len(tracked) > 5_000:
+            return None
+        now_ns = time.time_ns()
+        clean: dict[str, tuple[int, int, int, int, int, int, str | None]] = {}
+        for rel in tracked:
+            if rel in dirty_set:
+                continue
+            try:
+                rec = cls._record_clean_entry(root, rel, now_ns)
+            except OSError:
+                return None
+            if rec is None:
+                return None
+            clean[rel] = rec
+        return clean
+
+    def _ensure_backup_dir(self) -> Path:
+        if self.backup_dir is None or not self.backup_dir.is_dir():
+            self.backup_dir = Path(tempfile.mkdtemp(prefix="cc-agy-check-snap-"))
+        return self.backup_dir
+
+    def before_command(self) -> WorkspaceSnapshot | None:
+        if self.root is None:
+            return None
+        if self._initial_status is not None:
+            head_ref, head_sha, dirty, _ = self._initial_status
+            self._initial_status = None
+            snap = _build_workspace_snapshot(
+                self.root,
+                self.cwd_prefix,
+                self.git_dirs,
+                head_ref,
+                head_sha,
+                dirty,
+                self.baseline or (),
+                extra_paths=self._extra_root_paths,
+                backup_cache=self.backup_cache,
+                session_fds=self.backup_fds,
+                keep_backups=True,
+            )
+            snap.clean_tracked = self._clean_tracked
+            self._current_snap = snap
+            self._can_reuse_prev = False
+            return snap
+        if self._can_reuse_prev and self._current_snap is not None:
+            self._can_reuse_prev = False
+            return self._current_snap
+        status_info = _git_status_porcelain(self.root, self.git_dirs.get(".git"), include_untracked=False)
+        if status_info is None:
+            self._clean_tracked = None
+            self._current_snap = None
+            self._can_reuse_prev = False
+            return None
+        head_ref, head_sha, dirty, _ = status_info
+        new_dirty_set = set(dirty)
+        if self._clean_tracked is not None:
+            if self._excluded_dirty - new_dirty_set:
+                # A previously dirty file became clean wrt HEAD (e.g. restore_tracked=False); invalidate
+                # _clean_tracked so it never lacks a clean tracked file.
+                self._clean_tracked = None
+            else:
+                for d_rel in new_dirty_set - self._excluded_dirty:
+                    self._clean_tracked.pop(d_rel, None)
+                self._excluded_dirty = new_dirty_set
+        snap = _build_workspace_snapshot(
+            self.root,
+            self.cwd_prefix,
+            self.git_dirs,
+            head_ref,
+            head_sha,
+            dirty,
+            self.baseline or (),
+            extra_paths=self._extra_root_paths,
+            backup_cache=self.backup_cache,
+            session_fds=self.backup_fds,
+            keep_backups=True,
+        )
+        snap.clean_tracked = self._clean_tracked
+        self._current_snap = snap
+        self._can_reuse_prev = False
+        return snap
+
+    def after_command(
+        self,
+        snap: WorkspaceSnapshot | None,
+        *,
+        allowed: Collection[str] = (),
+        restore: bool = True,
+        change_set: Collection[str] = (),
+    ) -> tuple[list[str], list[str]]:
+        changed, untrusted = check_side_effects(snap, allowed=allowed, restore=restore, change_set=change_set)
+        if not restore or allowed:
+            self._clean_tracked = None
+        elif changed and self._clean_tracked is not None and self.root is not None:
+            now_ns = time.time_ns()
+            for c_rel in changed:
+                if c_rel.startswith(".git"):
+                    self._clean_tracked = None
+                    break
+                if c_rel in self._clean_tracked:
+                    try:
+                        rec = self._record_clean_entry(self.root, c_rel, now_ns)
+                    except OSError:
+                        rec = None
+                    if rec is None:
+                        self._clean_tracked = None
+                        break
+                    self._clean_tracked[c_rel] = rec
+                elif c_rel not in self._excluded_dirty:
+                    self._clean_tracked = None
+                    break
+        self._can_reuse_prev = bool(snap is not None and restore and not allowed and not changed)
+        return changed, untrusted
+
+    def close(self) -> None:
+        _close_backup_fds(self.backup_fds)
+        self.backup_fds.clear()
+        if self.backup_dir is not None:
+            _rmtree_writable(self.backup_dir)
+            self.backup_dir = None
+        self.backup_cache.clear()
+        self._current_snap = None
 
 
 def _non_git_files(
@@ -1416,42 +2965,65 @@ def _untracked(cwd: Path) -> set[str]:
     }
 
 
-def run_commands(
-    commands: list[str] | tuple[str, ...],
+def execute_command_suite(
+    commands: Sequence[str],
     cwd: Path,
     *,
     timeout: float = 300.0,
+    total_wall_budget: float | None = None,
     stop_on_failure: bool = True,
+    stop_on_timeout: bool = True,
     log_dir: Path | None = None,
     clean_new_files: bool = True,
     allowed_mutations: Collection[str] = (),
     restore_tracked: bool = True,
-) -> list[CommandResult]:
-    """Run commands in order inside cwd; stop at the first failure unless stop_on_failure is False.
-
-    Output streams to a log file (when log_dir is set) and only a bounded tail is held in memory.
-    Untracked files the commands create (caches, reports) are removed afterwards. Before each command
-    the change set is snapshotted; files the command modifies or deletes are restored (except
-    ``allowed_mutations``) and listed on its result, and a command that changed anything other than a
-    generated artifact fails, because it did not test the files that will ship. A behavioral test
-    command that exits 0 but runs no test (zero collected, or every test skipped) also fails and is
-    marked ``vacuous``.
-    """
+    change_set: Collection[str] = (),
+    quarantine_dir: Path | None = None,
+    max_tail_chars: int = TAIL_CHARS,
+    check_all_vacuous: bool = False,
+    diagnostic_hook: Callable[[str, int | None, bool, str, float, Mapping[str, str]], dict[str, Any] | None] | None = None,
+) -> tuple[list[tuple[CommandResult, dict[str, Any]]], dict[str, Any]]:
+    """Shared execution engine for batch checks (``run_commands``) and delegation checks (``run_acceptance``)."""
     from server.jobs import _parse_test_counts
 
-    results: list[CommandResult] = []
+    items: list[tuple[CommandResult, dict[str, Any]]] = []
+    cleanup_summary: dict[str, Any] = {"created": [], "quarantine": {}}
     env = scrubbed_env(cwd)
     removed_env = sorted(secret_env_names())[:30]
     before: set[str] | None = None
     before_unreadable_dirs: set[str] = set()
     before_dirs: set[str] = set()
     own_logs: set[Path] = set()
-    baseline = untracked_baseline(cwd)
+    suite_started_mono = time.monotonic()
+    session = _SnapshotSession(cwd, extra_paths=(*allowed_mutations, *change_set))
+    baseline = session.baseline
     if clean_new_files and baseline is None:
         before = _non_git_files(cwd, unreadable_dirs_out=before_unreadable_dirs, dirs_out=before_dirs)
     try:
         for cmd in commands:
-            started = time.time()
+            eff_timeout = float(timeout)
+            if total_wall_budget is not None:
+                rem_wall = float(total_wall_budget) - max(0.0, time.monotonic() - suite_started_mono)
+                if rem_wall < 1.0:
+                    skipped_res = CommandResult(
+                        command=cmd,
+                        passed=False,
+                        exit_code=None,
+                        timed_out=True,
+                        duration_seconds=0.0,
+                        tail="Skipped: acceptance wall budget exhausted before session deadline.",
+                    )
+                    items.append((
+                        skipped_res,
+                        {
+                            "counts": {"passed": 0, "failed": 0, "errors": 0},
+                            "raw_tail": skipped_res.tail,
+                            "wall_exhausted_skipped": True,
+                        },
+                    ))
+                    break
+                eff_timeout = min(eff_timeout, max(1.0, rem_wall))
+
             log_path = ""
             log_handle = None
             if log_dir is not None:
@@ -1462,39 +3034,49 @@ def run_commands(
                 key_log = _canonical_non_symlink_key(log_file)
                 if key_log is not None:
                     own_logs.add(key_log)
-            tail: deque[str] = deque()
-            snapshot = snapshot_workspace(cwd, baseline)
+
+            snapshot = session.before_command()
             changed: list[str] = []
             untrusted: list[str] = []
+            diag_extra: dict[str, Any] = {}
+            cmd_started = time.time()
             try:
-                proc = subprocess.Popen(
-                    ["bash", "-c", cmd], cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", start_new_session=True,
+                rc, timed_out, out, _ = execute_check_process(
+                    cmd,
+                    cwd,
+                    env,
+                    timeout=eff_timeout,
+                    log_handle=log_handle,
+                    max_tail_chars=max_tail_chars,
                 )
-                reader = threading.Thread(target=_drain, args=(proc.stdout, log_handle, tail), daemon=True)
-                reader.start()
-                timed_out = False
-                try:
-                    proc.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    _kill_group(proc.pid)
-                    proc.wait()
-                _kill_group(proc.pid)
-                reader.join(timeout=10)
-                if proc.stdout is not None and not reader.is_alive():
-                    proc.stdout.close()
+                if diagnostic_hook is not None and not timed_out:
+                    rem_diag = eff_timeout
+                    if total_wall_budget is not None:
+                        rem_diag = min(
+                            float(timeout),
+                            max(1.0, float(total_wall_budget) - max(0.0, time.monotonic() - suite_started_mono)),
+                        )
+                    hook_res = diagnostic_hook(cmd, rc, timed_out, out, rem_diag, env)
+                    if hook_res:
+                        diag_extra.update(hook_res)
             finally:
                 if log_handle is not None:
                     log_handle.close()
-                changed, untrusted = check_side_effects(snapshot, allowed=allowed_mutations, restore=restore_tracked)
-            out = "".join(tail)
+                changed, untrusted = session.after_command(
+                    snapshot,
+                    allowed=allowed_mutations,
+                    restore=restore_tracked,
+                    change_set=change_set,
+                )
+            total_dur = time.time() - cmd_started
+            counts = _parse_test_counts(out)
             vacuous = (
                 not timed_out
-                and is_behavioral_check(cmd)
-                and vacuous_test_run(out, proc.returncode, timed_out, _parse_test_counts(out))
+                and (check_all_vacuous or is_behavioral_check(cmd))
+                and vacuous_test_run(out, rc, timed_out, counts)
             )
-            tail_text = out[-TAIL_CHARS:]
+            display_out = str(diag_extra.get("combined_output") or out)
+            tail_text = display_out[-max_tail_chars:]
             if vacuous:
                 tail_text += (
                     "\n[cc-agy] The command exited cleanly but ran no test (0 collected or every test skipped); "
@@ -1502,13 +3084,14 @@ def run_commands(
                 )
             if untrusted:
                 tail_text += side_effect_note(untrusted, restored=restore_tracked)
-            passed = (not timed_out) and proc.returncode == 0 and not vacuous and not untrusted
+            force_failed = bool(diag_extra.get("force_failed"))
+            passed = (not timed_out) and rc == 0 and not vacuous and not untrusted and not force_failed
             result = CommandResult(
                 command=cmd,
                 passed=passed,
-                exit_code=None if timed_out else proc.returncode,
+                exit_code=None if timed_out else rc,
                 timed_out=timed_out,
-                duration_seconds=round(time.time() - started, 2),
+                duration_seconds=round(total_dur, 2),
                 tail=tail_text,
                 log_path=log_path,
                 vacuous=vacuous,
@@ -1516,14 +3099,34 @@ def run_commands(
                 untrusted_side_effects=untrusted[:50],
                 credential_env_removed=[] if passed else removed_env,
             )
-            results.append(result)
+            meta = {
+                "counts": counts,
+                "raw_tail": display_out[-max_tail_chars:],
+                **diag_extra,
+            }
+            items.append((result, meta))
             if stop_on_failure and not result.passed:
                 break
+            if stop_on_timeout and timed_out:
+                break
     finally:
+        session.close()
         if clean_new_files:
             if baseline is not None:
-                remove_new_untracked(cwd, baseline, whole_checkout=restore_tracked, preserve_paths=own_logs)
+                q_report: dict[str, Any] = {}
+                created = remove_new_untracked(
+                    cwd,
+                    baseline,
+                    whole_checkout=restore_tracked,
+                    quarantine_dir=quarantine_dir,
+                    report=q_report,
+                    preserve_paths=own_logs,
+                    _root=session.root,
+                )
+                cleanup_summary["created"] = created
+                cleanup_summary["quarantine"] = q_report
             elif before is not None:
+                created_ng: list[str] = []
                 if restore_tracked and not cwd.is_symlink() and cwd.is_dir():
                     try:
                         cmode = cwd.lstat().st_mode & 0o7777
@@ -1543,15 +3146,49 @@ def run_commands(
                         target = cwd / rel
                         if own_logs and _canonical_non_symlink_key(target) in own_logs:
                             continue
+                        if not (target.is_file() or target.is_symlink()):
+                            continue
                         if restore_tracked or target.is_symlink() or _is_run_artifact(rel):
-                            _unlink_forcefully(cwd, target)
+                            if _unlink_forcefully(cwd, target):
+                                created_ng.append(rel)
                     if restore_tracked:
                         for drel in sorted(after_dirs - before_dirs, reverse=True):
                             try:
                                 os.rmdir(cwd / drel)
                             except OSError:
                                 pass
-    return results
+                cleanup_summary["created"] = created_ng
+    return items, cleanup_summary
+
+
+def run_commands(
+    commands: list[str] | tuple[str, ...],
+    cwd: Path,
+    *,
+    timeout: float = 300.0,
+    stop_on_failure: bool = True,
+    log_dir: Path | None = None,
+    clean_new_files: bool = True,
+    allowed_mutations: Collection[str] = (),
+    restore_tracked: bool = True,
+    change_set: Collection[str] = (),
+) -> list[CommandResult]:
+    """Run commands in order inside cwd; stop at the first failure unless stop_on_failure is False."""
+    items, _ = execute_command_suite(
+        commands,
+        cwd,
+        timeout=timeout,
+        stop_on_failure=stop_on_failure,
+        stop_on_timeout=stop_on_failure,
+        log_dir=log_dir,
+        clean_new_files=clean_new_files,
+        allowed_mutations=allowed_mutations,
+        restore_tracked=restore_tracked,
+        change_set=change_set,
+        max_tail_chars=TAIL_CHARS,
+        check_all_vacuous=False,
+    )
+    return [res for res, _ in items]
 
 
 _ERROR_LINE_RE = re.compile(

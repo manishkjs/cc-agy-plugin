@@ -12,6 +12,7 @@ import gc
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1905,3 +1906,684 @@ class Round11LogDirSymlinkAndNonGitTests(unittest.TestCase):
             )
             self.assertFalse((ng2 / "stray.txt").exists())
             self.assertFalse((ng2 / "locked" / "in.txt").exists())
+
+
+class AstraFollowupCommit1f4ca2bTests(unittest.TestCase):
+    """Regression coverage for the three reproduced blockers and snapshot overhead on commit 1f4ca2b."""
+
+    def test_missing_pytest_target_keeps_explicit_acceptance_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = _repo(tmp)
+            (root / "test_existing.py").write_text(
+                "from pkg.core import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+                encoding="utf-8",
+            )
+            _git(root, "add", "test_existing.py")
+            _git(root, "commit", "-qm", "add test_existing")
+
+            cmd = f"{PY} -m pytest -q test_existing.py test_missing_required.py"
+            direct = run_acceptance([cmd], root)
+            self.assertEqual(len(direct), 1)
+            self.assertFalse(direct[0]["passed"])
+            self.assertEqual(direct[0]["exit_code"], 4)
+            self.assertEqual(direct[0].get("filtered_missing_paths"), ["test_missing_required.py"])
+            self.assertIn("1 passed", direct[0].get("output_tail", ""))
+
+            def worker(req):
+                wt = Path(req["workspace_dir"])
+                (wt / "pkg" / "core.py").write_text("def add(a, b):\n    return int(a) + int(b)\n", encoding="utf-8")
+                return {"text": "updated add"}
+
+            jm = JobManager(workspace_root=root, store=store, worker_backend=worker)
+            try:
+                res = jm.delegate_start(
+                    "Update add in pkg/core.py.",
+                    model="gemini-3.8-flash",
+                    project="p",
+                    acceptance=[cmd],
+                    auto_apply=True,
+                    wait=True,
+                )
+                self.assertIs(res.get("acceptance_passed"), False)
+                self.assertEqual(res.get("verification"), "failed")
+                self.assertFalse(res.get("applied"))
+                self.assertEqual(res["acceptance_results"][0]["exit_code"], 4)
+                self.assertFalse(res["acceptance_results"][0]["passed"])
+
+                # Basename-collision variant: missing path shares basename with an existing tracked test.
+                cmd_collision = f"{PY} -m pytest -q test_existing.py subdir/test_existing.py"
+                res2 = jm.delegate_start(
+                    "Update add in pkg/core.py.",
+                    model="gemini-3.8-flash",
+                    project="p",
+                    acceptance=[cmd_collision],
+                    auto_apply=True,
+                    wait=True,
+                )
+                self.assertIs(res2.get("acceptance_passed"), False)
+                self.assertEqual(res2.get("verification"), "failed")
+                self.assertFalse(res2.get("applied"))
+
+                # Single nonexistent target sharing basename with existing test must also fail explicit acceptance.
+                cmd_single_remap = f"{PY} -m pytest -q nonexistent_pkg/test_existing.py"
+                res3 = jm.delegate_start(
+                    "Update add in pkg/core.py.",
+                    model="gemini-3.8-flash",
+                    project="p",
+                    acceptance=[cmd_single_remap],
+                    auto_apply=True,
+                    wait=True,
+                )
+                self.assertIs(res3.get("acceptance_passed"), False)
+                self.assertEqual(res3.get("verification"), "failed")
+                self.assertFalse(res3.get("applied"))
+                acc3 = res3["acceptance_results"][0]
+                self.assertEqual(acc3["exit_code"], 4)
+                self.assertFalse(acc3["passed"])
+                self.assertEqual(acc3.get("filtered_missing_paths"), ["nonexistent_pkg/test_existing.py"])
+                self.assertIn("1 passed", acc3.get("output_tail", ""))
+            finally:
+                jm.shutdown()
+
+    def test_formatter_permission_does_not_exempt_subsequent_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            stub_bin = base / "stub_bin"
+            stub_bin.mkdir()
+            black_stub = stub_bin / "black"
+            black_stub.write_text(
+                f"#!{PY}\nimport pathlib, sys\n"
+                "p = pathlib.Path(sys.argv[-1])\n"
+                "text = p.read_text(encoding='utf-8')\n"
+                "if 'DELETE_ME' in text:\n"
+                "    p.unlink()\n"
+                "else:\n"
+                "    p.write_text(text.replace('=2', ' = 2'), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            black_stub.chmod(0o755)
+            patched_path = f"{stub_bin}:{os.environ.get('PATH', '')}"
+
+            with unittest.mock.patch.dict(os.environ, {"PATH": patched_path}):
+                # 1. A test rewriting the target file (VALUE = 2 -> VALUE = 999) must fail even with formatter enabled.
+                root1, store1 = _repo(str(base / "r1"))
+                (root1 / "tests_x").mkdir()
+                (root1 / "tests_x" / "__init__.py").write_text("", encoding="utf-8")
+                (root1 / "tests_x" / "test_tamper.py").write_text(
+                    "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_tamper(self):\n"
+                    "        import pkg.val as m\n        self.assertEqual(m.VALUE, 2)\n"
+                    "        open('pkg/val.py', 'w').write('VALUE = 999\\n')\n",
+                    encoding="utf-8",
+                )
+                _git(root1, "add", "-A")
+                _git(root1, "commit", "-qm", "add tamper test")
+                srv1, jm1 = _server(root1, store1, _writer_factory({"pkg/val.py": ["VALUE=2\n"]}))
+                try:
+                    out1 = _call(srv1, "delegate_file_batch", {
+                        "formatter": "black {path}",
+                        "tasks": [
+                            _task("t1", "pkg/val.py", checks=[f"{PY} -m unittest -q tests_x.test_tamper"])
+                        ],
+                        "project": "p",
+                        "claude_writer": False,
+                    })
+                    self.assertNotEqual(out1["status"], "ok")
+                    self.assertEqual(out1["tasks"][0]["state"], "failed")
+                    self.assertIn("pkg/val.py", out1["check_side_effects"]["t1"])
+                    diff1 = store1.diff_path(out1["job_id"]).read_text(encoding="utf-8")
+                    self.assertNotIn("999", diff1)
+                finally:
+                    jm1.shutdown()
+
+                # 2. A legitimate formatter normalizing whitespace followed by a read-only test passes cleanly.
+                root2, store2 = _repo(str(base / "r2"))
+                (root2 / "tests_x").mkdir()
+                (root2 / "tests_x" / "__init__.py").write_text("", encoding="utf-8")
+                (root2 / "tests_x" / "test_clean.py").write_text(
+                    "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_clean(self):\n"
+                    "        import pkg.clean_val as m\n        self.assertEqual(m.VALUE, 2)\n",
+                    encoding="utf-8",
+                )
+                _git(root2, "add", "-A")
+                _git(root2, "commit", "-qm", "add clean test")
+                srv2, jm2 = _server(root2, store2, _writer_factory({"pkg/clean_val.py": ["VALUE=2\n"]}))
+                try:
+                    out2 = _call(srv2, "delegate_file_batch", {
+                        "formatter": "black {path}",
+                        "tasks": [
+                            _task("t2", "pkg/clean_val.py", checks=[f"{PY} -m unittest -q tests_x.test_clean"])
+                        ],
+                        "project": "p",
+                        "claude_writer": False,
+                    })
+                    self.assertEqual(out2["status"], "ok")
+                    self.assertEqual(out2["tasks"][0]["state"], "landed")
+                    wt2 = Path(store2.read_receipt(out2["job_id"])["worktree_dir"])
+                    self.assertEqual((wt2 / "pkg" / "clean_val.py").read_text(encoding="utf-8"), "VALUE = 2\n")
+                finally:
+                    jm2.shutdown()
+
+                # 3. A broken formatter that deletes the target file must fail verification.
+                root3, store3 = _repo(str(base / "r3"))
+                srv3, jm3 = _server(root3, store3, _writer_factory({"pkg/core.py": ["# DELETE_ME\n"]}))
+                try:
+                    out3 = _call(srv3, "delegate_file_batch", {
+                        "formatter": "black {path}",
+                        "tasks": [_task("t3", "pkg/core.py", action="modify", checks=[])],
+                        "project": "p",
+                        "claude_writer": False,
+                    })
+                    self.assertNotEqual(out3["status"], "ok")
+                    self.assertEqual(out3["tasks"][0]["state"], "failed")
+                finally:
+                    jm3.shutdown()
+
+    def test_acceptance_terminates_background_children_and_bounds_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            orig = (root / "pkg" / "core.py").read_text(encoding="utf-8")
+            spawn_cmd = (
+                f"{PY} -c \"import subprocess, sys; "
+                f"subprocess.Popen([sys.executable, '-c', "
+                f"'import time, pathlib; time.sleep(0.45); pathlib.Path(\\\"pkg/core.py\\\").write_text(\\\"PWNED\\\\n\\\")'], "
+                f"stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                f"print('1 passed in 0.01s')\""
+            )
+            res = run_acceptance([spawn_cmd], root)
+            self.assertTrue(res[0]["passed"])
+            time.sleep(0.65)
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), orig)
+
+            # Baseline probe helper must also kill background children upon normal completion.
+            import server.jobs as _jobs_mod
+            from server.verify import scrubbed_env
+            rc_p, to_p, _ = _jobs_mod._run_bounded_probe_cmd(
+                spawn_cmd, cwd=root, exec_env=scrubbed_env(root), timeout_s=5.0
+            )
+            self.assertEqual(rc_p, 0)
+            self.assertFalse(to_p)
+            time.sleep(0.65)
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), orig)
+
+            # Bounded streaming on noisy acceptance output (2 MB stdout without holding full output).
+            noisy_cmd = (
+                f"{PY} -c \"import sys; sys.stdout.write('x' * (2 * 1024 * 1024) + '\\n2 passed in 0.02s\\n')\""
+            )
+            noisy_res = run_acceptance([noisy_cmd], root)
+            self.assertTrue(noisy_res[0]["passed"])
+            self.assertEqual(noisy_res[0]["counts"]["passed"], 2)
+            self.assertLessEqual(len(noisy_res[0]["output_tail"]), 25_000)
+
+    def test_repeated_noop_checks_batch_git_queries_and_keep_per_command_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            for idx in range(100):
+                p = root / "pkg" / f"f_{idx:03d}.py"
+                p.write_text(f"V = {idx}\n", encoding="utf-8")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-qm", "100 tracked files")
+            for idx in range(100):
+                (root / "pkg" / f"f_{idx:03d}.py").write_text(f"V = {idx + 1000}\n", encoding="utf-8")
+
+            # Warm global filter cache once so we measure steady-state check overhead.
+            run_commands(["true"], root)
+
+            real_subproc_run = subprocess.run
+            calls = {"n": 0}
+
+            def counting_run(*args, **kwargs):
+                calls["n"] += 1
+                return real_subproc_run(*args, **kwargs)
+
+            with unittest.mock.patch("subprocess.run", side_effect=counting_run):
+                res = run_commands(["true"] * 10, root)
+            self.assertEqual(len(res), 10)
+            self.assertTrue(all(r.passed for r in res))
+            self.assertLessEqual(calls["n"], 6, f"Expected <=6 subprocess.run calls, got {calls['n']}")
+
+            calls["n"] = 0
+            with unittest.mock.patch("subprocess.run", side_effect=counting_run):
+                acc = run_acceptance(["true"] * 10, root)
+            self.assertEqual(len(acc), 10)
+            self.assertTrue(all(r["passed"] for r in acc))
+            self.assertLessEqual(calls["n"], 6, f"Expected <=6 subprocess.run calls in run_acceptance, got {calls['n']}")
+
+            # Per-command isolation must still catch and restore BOTH dirty-file and clean-tracked-file mutations!
+            orig_core = (root / "pkg" / "core.py").read_text(encoding="utf-8")
+            cmds = ["true"] * 3 + ["echo mutated > pkg/f_042.py", "true", "echo bad > pkg/core.py"] + ["true"] * 4
+            isolated = run_commands(cmds, root, stop_on_failure=False)
+            self.assertEqual([r.passed for r in isolated], [True, True, True, False, True, False, True, True, True, True])
+            self.assertEqual(isolated[3].untrusted_side_effects, ["pkg/f_042.py"])
+            self.assertEqual(isolated[5].untrusted_side_effects, ["pkg/core.py"])
+            self.assertEqual((root / "pkg" / "f_042.py").read_text(encoding="utf-8"), "V = 1042\n")
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), orig_core)
+
+
+class CritiqueRound1FollowupTests(unittest.TestCase):
+    """Regression coverage for all 8 Round 1 critique findings from Pro Next and Argon."""
+
+    def test_remapped_missing_target_stays_failed_across_auto_escalation_and_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = _repo(tmp)
+            (root / "test_existing.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            _git(root, "add", "test_existing.py")
+            _git(root, "commit", "-qm", "add test_existing")
+
+            calls = {"n": 0}
+
+            def worker_esc(req):
+                calls["n"] += 1
+                wt = Path(req["workspace_dir"])
+                (wt / "pkg" / "core.py").write_text(
+                    f"def add(a, b):\n    return int(a) + int(b)  # call {calls['n']}\n",
+                    encoding="utf-8",
+                )
+                return {"text": f"done call {calls['n']}"}
+
+            with unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE": "1",
+                    "CC_AGY_ESCALATE_MODEL_ON_FAILURE": "1",
+                },
+            ):
+                jm = JobManager(workspace_root=root, store=store, worker_backend=worker_esc)
+                try:
+                    cmd = f"{PY} -m pytest -q nonexistent_pkg/test_existing.py"
+                    res = jm.delegate_start(
+                        "Update add in pkg/core.py.",
+                        model="gemini-3.8-flash",
+                        project="p",
+                        acceptance=[cmd],
+                        auto_apply=True,
+                        wait=True,
+                    )
+                    self.assertGreaterEqual(calls["n"], 2)
+                    self.assertIs(res.get("acceptance_passed"), False)
+                    self.assertEqual(res.get("verification"), "failed")
+                    self.assertFalse(res.get("applied"))
+                    self.assertFalse((root / "nonexistent_pkg" / "test_existing.py").exists())
+
+                    cont = jm.delegate_continue(
+                        res["job_id"],
+                        "Keep working on add.",
+                        auto_apply=True,
+                        wait=True,
+                    )
+                    self.assertIs(cont.get("acceptance_passed"), False)
+                    self.assertEqual(cont.get("verification"), "failed")
+                    self.assertFalse(cont.get("applied"))
+                finally:
+                    jm.shutdown()
+
+    def test_worker_acceptance_reuse_rejects_deleted_directory_or_removed_test_files(self) -> None:
+        from server.agy_runner import sign_worker_run_record
+        from server.receipts import sha256_bytes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            core_new = b"def add(a, b):\n    return int(a) + int(b)\n"
+            (root / "pkg" / "core.py").write_bytes(core_new)
+            acc_cmd = f"{PY} -m pytest -q tests_new"
+            rec = {
+                "ts": time.time() + 0.5,
+                "command": acc_cmd,
+                "working_directory": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "duration_seconds": 0.1,
+                "output_tail": "1 passed in 0.01s\n",
+                "file_hashes": {
+                    "pkg/core.py": sha256_bytes(core_new),
+                    "tests_new/test_req.py": sha256_bytes(b"def test_req(): assert True\n"),
+                },
+                "present_files": ["pkg/__init__.py", "pkg/core.py", "tests_new/test_req.py"],
+            }
+            rec["hmac"] = sign_worker_run_record(rec)
+            reused = JobManager._try_reuse_worker_acceptance(
+                root,
+                files_changed=["pkg/core.py"],
+                acceptance_cmds=[acc_cmd],
+                worker_runs=[rec],
+            )
+            self.assertIsNone(reused)
+
+            # Even if file_hashes matches current_hashes, missing target directory or missing present_files rejects reuse
+            # across subdirectory targets (tests_new), root targets (.), and bare whole-repo discovery (pytest -q).
+            (root / "tests_new").mkdir()
+            for candidate_cmd in (acc_cmd, f"{PY} -m pytest -q .", f"{PY} -m pytest -q"):
+                rec2 = {
+                    "ts": time.time() + 0.5,
+                    "command": candidate_cmd,
+                    "working_directory": "",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "duration_seconds": 0.1,
+                    "output_tail": "1 passed in 0.01s\n",
+                    "file_hashes": {"pkg/core.py": sha256_bytes(core_new)},
+                    "present_files": ["pkg/__init__.py", "pkg/core.py", "tests_new/test_req.py"],
+                }
+                rec2["hmac"] = sign_worker_run_record(rec2)
+                self.assertIsNone(
+                    JobManager._try_reuse_worker_acceptance(
+                        root,
+                        files_changed=["pkg/core.py"],
+                        acceptance_cmds=[candidate_cmd],
+                        worker_runs=[rec2],
+                    )
+                )
+
+    def test_clean_tracked_invalidation_for_large_files_and_restore_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
+            root1, _ = _repo(tmp1)
+            big_clean = root1 / "pkg" / "big.bin"
+            big_payload = b"A" * (5 * 1024 * 1024)
+            big_clean.write_bytes(big_payload)
+            _git(root1, "add", "-A")
+            _git(root1, "commit", "-qm", "add 5MB file")
+            time.sleep(1.05)
+
+            res = run_commands(
+                ["echo Tamper1 > pkg/big.bin", "echo Tamper2 > pkg/big.bin"],
+                root1,
+                stop_on_failure=False,
+            )
+            self.assertFalse(res[0].passed)
+            self.assertFalse(res[1].passed)
+            self.assertIn("pkg/big.bin", res[1].untrusted_side_effects)
+            self.assertEqual(big_clean.stat().st_size, len(big_payload))
+
+            root2, _ = _repo(tmp2)
+            # _repo already commits pkg/data.txt with "original\n"; start dirty, rewrite back to HEAD, then tamper.
+            (root2 / "pkg" / "data.txt").write_text("dirty_start\n", encoding="utf-8")
+            res_rf = run_acceptance(
+                ["printf 'original\\n' > pkg/data.txt", "printf 'PWNED\\n' > pkg/data.txt"],
+                root2,
+                restore_tracked=False,
+                change_set=["pkg/data.txt"],
+            )
+            self.assertFalse(res_rf[0]["passed"])
+            self.assertFalse(res_rf[1]["passed"])
+            self.assertEqual(res_rf[1].get("tracked_side_effects"), ["pkg/data.txt"])
+
+    def test_large_dirty_file_mtime_preserving_tamper_detected_without_filecmp_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            dirty_big = root / "pkg" / "core.py"
+            orig_bytes = b"#" * 70_000 + b"\nVALUE = 1\n"
+            dirty_big.write_bytes(orig_bytes)
+            tamper_cmd = (
+                f"{PY} -c \"import os, pathlib; p = pathlib.Path('pkg/core.py'); st = p.stat(); "
+                f"p.write_bytes(b'#' * 70000 + b'\\nVALUE = 9\\n'); "
+                f"os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))\""
+            )
+            res = run_commands(["true", tamper_cmd], root, stop_on_failure=False)
+            self.assertTrue(res[0].passed)
+            self.assertFalse(res[1].passed)
+            self.assertEqual(res[1].untrusted_side_effects, ["pkg/core.py"])
+            self.assertEqual(dirty_big.read_bytes(), orig_bytes)
+
+    def test_setsid_grandchild_holding_stdout_does_not_stall_or_leak_late_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            orig_core = (root / "pkg" / "core.py").read_text(encoding="utf-8")
+
+            # Case 1: setsid grandchild keeps stdout open, sleeps 2.5s, prints 999, and tries to mutate pkg/core.py.
+            gc_hold = Path(tmp) / "gc_hold.py"
+            gc_hold.write_text(
+                "import pathlib, time\n"
+                "time.sleep(2.5)\n"
+                "print(999, flush=True)\n"
+                "pathlib.Path('pkg/core.py').write_text('LATE_HOLD\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            parent_hold = Path(tmp) / "parent_hold.py"
+            parent_hold.write_text(
+                "import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, {str(gc_hold)!r}], start_new_session=True)\n"
+                "print('1 passed in 0.01s', flush=True)\n",
+                encoding="utf-8",
+            )
+            t0 = time.monotonic()
+            res = run_commands([f"{PY} {shlex.quote(str(parent_hold))}"], root, timeout=0.5, log_dir=Path(tmp) / "logs")
+            dt = time.monotonic() - t0
+            self.assertTrue(res[0].passed)
+            self.assertLess(dt, 1.5)
+            self.assertNotIn("999", res[0].tail)
+            self.assertNotIn("SyntaxError", res[0].tail)
+
+            # Case 2: setsid grandchild redirects stdout/stderr to DEVNULL and sleeps 0.25s before mutating pkg/core.py.
+            gc_devnull = Path(tmp) / "gc_devnull.py"
+            gc_devnull.write_text(
+                "import pathlib, time\n"
+                "time.sleep(0.25)\n"
+                "pathlib.Path('pkg/core.py').write_text('LATE_DEVNULL\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            parent_devnull = Path(tmp) / "parent_devnull.py"
+            parent_devnull.write_text(
+                "import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, {str(gc_devnull)!r}], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "print('1 passed in 0.01s', flush=True)\n",
+                encoding="utf-8",
+            )
+            res_dn = run_commands([f"{PY} {shlex.quote(str(parent_devnull))}"], root, timeout=1.0)
+            self.assertTrue(res_dn[0].passed)
+
+            # Case 3: setsid grandchild closes fds 1 and 2 right after spawn, then sleeps 0.25s before mutating pkg/core.py.
+            gc_close = Path(tmp) / "gc_close.py"
+            gc_close.write_text(
+                "import os, pathlib, time\n"
+                "time.sleep(0.02)\n"
+                "os.close(1)\n"
+                "os.close(2)\n"
+                "time.sleep(0.25)\n"
+                "pathlib.Path('pkg/core.py').write_text('LATE_CLOSE\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            parent_close = Path(tmp) / "parent_close.py"
+            parent_close.write_text(
+                "import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, {str(gc_close)!r}], start_new_session=True)\n"
+                "print('1 passed in 0.01s', flush=True)\n",
+                encoding="utf-8",
+            )
+            acc_res = run_acceptance([f"{PY} {shlex.quote(str(parent_close))}"], root, timeout=1.0)
+            self.assertTrue(acc_res[0]["passed"])
+
+            time.sleep(0.45)
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), orig_core)
+
+    def test_planted_parent_directory_symlink_detected_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
+            r1, _ = _repo(tmp1)
+            orig1 = (r1 / "pkg" / "core.py").read_text(encoding="utf-8")
+            res1 = run_commands(["mv pkg .hidden_pkg && ln -s .hidden_pkg pkg"], r1)
+            self.assertFalse(res1[0].passed)
+            self.assertFalse((r1 / "pkg").is_symlink())
+            self.assertTrue((r1 / "pkg" / "core.py").is_file())
+            self.assertEqual((r1 / "pkg" / "core.py").read_text(encoding="utf-8"), orig1)
+
+            r2, _ = _repo(tmp2)
+            (r2 / "pkg" / "core.py").write_text("VALUE = 2\n", encoding="utf-8")
+            res2 = run_commands(["mv pkg .hidden_pkg && ln -s .hidden_pkg pkg"], r2)
+            self.assertFalse(res2[0].passed)
+            self.assertFalse((r2 / "pkg").is_symlink())
+            self.assertTrue((r2 / "pkg" / "core.py").is_file())
+            self.assertEqual((r2 / "pkg" / "core.py").read_text(encoding="utf-8"), "VALUE = 2\n")
+
+    def test_readonly_formatter_mode_change_restored_without_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = _repo(tmp)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            fake_black = bin_dir / "black"
+            fake_black.write_text(
+                f"#!{PY}\nimport os, sys\nos.chmod(sys.argv[-1], 0o444)\n",
+                encoding="utf-8",
+            )
+            fake_black.chmod(0o755)
+            patched_path = f"{bin_dir}:{os.environ.get('PATH', '')}"
+            with unittest.mock.patch.dict(os.environ, {"PATH": patched_path}):
+                srv, jm = _server(
+                    root,
+                    store,
+                    _writer_factory({"pkg/core.py": ["def add(a, b):\n    return a + b + 999\n"]}),
+                )
+                try:
+                    out = _call(srv, "delegate_file_batch", {
+                        "formatter": "black {path}",
+                        "tasks": [
+                            _task("t1", "pkg/core.py", action="modify", checks=[f"{PY} -c 'import sys; sys.exit(1)'"])
+                        ],
+                        "project": "p",
+                        "claude_writer": False,
+                    })
+                    self.assertNotEqual(out["status"], "ok")
+                    rec = store.read_receipt(out["job_id"])
+                    self.assertEqual(rec["tasks"][0]["state"], "failed")
+                    self.assertNotIn("PermissionError", rec["tasks"][0].get("detail", ""))
+                    diff_text = store.diff_path(out["job_id"]).read_text(encoding="utf-8")
+                    self.assertNotIn("999", diff_text)
+                finally:
+                    jm.shutdown()
+
+    def test_global_git_lfs_filter_does_not_disable_clean_tracked_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            fake_home = Path(tmp) / "fake_home"
+            fake_home.mkdir()
+            (fake_home / ".gitconfig").write_text(
+                '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n',
+                encoding="utf-8",
+            )
+            real_subproc_run = subprocess.run
+            calls = {"n": 0}
+
+            def counting_run(*args, **kwargs):
+                calls["n"] += 1
+                return real_subproc_run(*args, **kwargs)
+
+            with unittest.mock.patch.dict(os.environ, {"HOME": str(fake_home)}):
+                run_commands(["true"], root)
+                calls["n"] = 0
+                with unittest.mock.patch("subprocess.run", side_effect=counting_run):
+                    res = run_commands(["true"] * 10, root)
+                self.assertTrue(all(r.passed for r in res))
+                self.assertLessEqual(calls["n"], 6, f"Expected <=6 subprocess.run calls with global lfs, got {calls['n']}")
+
+    def test_restoring_git_index_preserves_mtime_for_same_tick_racy_git_edits(self) -> None:
+        for _ in range(10):
+            with tempfile.TemporaryDirectory() as tmp:
+                root, _ = _repo(tmp)
+                (root / "pkg" / "core.py").write_text("def add(a, b):\n    return b + a\n", encoding="utf-8")
+                cmd = "git add -A && git -c user.email=t@e -c user.name=T commit -qm 'made by a test'"
+                res = run_commands([cmd], root)[-1]
+                self.assertFalse(res.passed)
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertEqual(status, "M pkg/core.py")
+
+    def test_clean_env_setsid_devnull_descendants_killed_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            expected = "def add(a, b):\n    return a + b\n# edit\n"
+            (root / "pkg" / "core.py").write_text(expected, encoding="utf-8")
+
+            # 1. Python fixture spawning a clean-env, new-session, DEVNULL background writer (Opus P3).
+            spawner = Path(tmp) / "spawn_clean_daemon.py"
+            spawner.write_text(
+                "import subprocess, sys\n"
+                "subprocess.Popen(\n"
+                "    [sys.executable, '-c', \"import time; time.sleep(0.25); open('pkg/core.py', 'a').write('LATE_PY\\\\n')\"],\n"
+                "    env={'PATH': '/usr/bin:/bin'},\n"
+                "    start_new_session=True,\n"
+                "    stdin=subprocess.DEVNULL,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n"
+                "print('1 passed in 0.01s', flush=True)\n",
+                encoding="utf-8",
+            )
+            acc = run_acceptance([f"{PY} {shlex.quote(str(spawner))}"], root, timeout=5.0)
+            self.assertTrue(acc[0]["passed"])
+            rc_res = run_commands([f"{PY} {shlex.quote(str(spawner))}"], root, timeout=5.0)
+            self.assertTrue(rc_res[0].passed)
+
+            # 2. Shell env -i + setsid + DEVNULL background writer (Opus P3b).
+            shell_cmd = (
+                "env -i PATH=/usr/bin:/bin setsid sh -c "
+                "'sleep 0.25; printf \"LATE_SH\\n\" >> pkg/core.py' </dev/null >/dev/null 2>&1 & "
+                "echo '1 passed in 0.01s'"
+            )
+            acc_sh = run_acceptance([shell_cmd], root, timeout=5.0)
+            self.assertTrue(acc_sh[0]["passed"])
+
+            # 3. 3-hop nested setsid + empty env + DEVNULL daemon fork chain.
+            hop3 = Path(tmp) / "hop3.py"
+            hop3.write_text(
+                "import pathlib, time\n"
+                "time.sleep(0.25)\n"
+                "with open('pkg/core.py', 'a', encoding='utf-8') as fh:\n"
+                "    fh.write('LATE_HOP3\\n')\n",
+                encoding="utf-8",
+            )
+            hop2 = Path(tmp) / "hop2.py"
+            hop2.write_text(
+                "import subprocess, sys\n"
+                f"subprocess.Popen([sys.executable, {str(hop3)!r}], env={{}}, start_new_session=True, "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
+                encoding="utf-8",
+            )
+            hop1 = Path(tmp) / "hop1.py"
+            hop1.write_text(
+                "import subprocess, sys\n"
+                f"p = subprocess.Popen([sys.executable, {str(hop2)!r}], env={{}}, start_new_session=True, "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "p.wait(timeout=3)\n"
+                "print('1 passed in 0.01s', flush=True)\n",
+                encoding="utf-8",
+            )
+            res_hop = run_commands([f"{PY} {shlex.quote(str(hop1))}"], root, timeout=5.0)
+            self.assertTrue(res_hop[0].passed)
+
+            # 4. Python -I -S ctypes fallback subreaper (both clean exit and timeout).
+            with unittest.mock.patch.object(verify_mod, "_FORCE_PYTHON_SUBREAPER", True):
+                res_py_fb = run_commands([f"{PY} {shlex.quote(str(spawner))}"], root, timeout=5.0)
+                self.assertTrue(res_py_fb[0].passed)
+                hang_cmd = (
+                    "env -i PATH=/usr/bin:/bin setsid sh -c "
+                    "'sleep 0.35; printf \"LATE_TO\\n\" >> pkg/core.py' </dev/null >/dev/null 2>&1 & "
+                    "sleep 10"
+                )
+                res_py_to = run_commands([hang_cmd], root, timeout=0.2)
+                self.assertTrue(res_py_to[0].timed_out)
+
+            time.sleep(0.55)
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), expected)
+
+    def test_tampered_snapshot_backup_does_not_poison_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _repo(tmp)
+            small_orig = "dirty small original\n"
+            large_orig = ("LARGE_DIRTY_LINE_0123456789ABCDEF\n" * 10_000)  # ~340 KB (> 256 KB inline threshold)
+            (root / "pkg" / "data.txt").write_text(small_orig, encoding="utf-8")
+            (root / "pkg" / "core.py").write_text(large_orig, encoding="utf-8")
+
+            tamper_snaps = (
+                f"{PY} -c \"import glob, os, pathlib; "
+                "files = [pathlib.Path(p) for p in glob.glob('/tmp/cc-agy-check-snap-*/*') if os.path.isfile(p)]; "
+                "[os.chmod(p, 0o600) or p.write_text('TAMPER\\\\n', encoding='utf-8') for p in files]\""
+            )
+            corrupt_wt = "printf 'HACK_SMALL\\n' > pkg/data.txt && printf 'HACK_LARGE\\n' > pkg/core.py"
+            res = run_commands([tamper_snaps, corrupt_wt], root, stop_on_failure=False)
+            self.assertTrue(res[0].passed)
+            self.assertFalse(res[1].passed)
+            self.assertEqual((root / "pkg" / "data.txt").read_text(encoding="utf-8"), small_orig)
+            self.assertEqual((root / "pkg" / "core.py").read_text(encoding="utf-8"), large_orig)

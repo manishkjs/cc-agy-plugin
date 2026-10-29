@@ -2376,19 +2376,17 @@ def run_acceptance(
     restore_tracked: bool = True,
     change_set: list[str] | tuple[str, ...] = (),
     quarantine_dir: Path | None = None,
+    diagnostic_remaps: dict[str, tuple[str, list[str]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run acceptance checks with a hard timeout (whole process group is killed), then delete any new
-    untracked files the checks themselves created (e.g. caches or TLS key logs), so they never land in
-    the diff or block later turns.
+    """Run acceptance checks via ``verify.execute_command_suite`` so both delegation and batch paths
+    share identical credential scrubbing, bounded output streaming, unconditional process-group
+    termination, per-command workspace snapshots, and untracked artifact cleanup.
 
-    Checks run with the same credential-free environment as batch checks (``verify.scrubbed_env``).
-    The change set is snapshotted before every command: files a command modifies or deletes are
-    restored and listed under ``side_effects_restored`` (with ``restore_tracked=False``, for in-place
-    jobs whose checks run in the user's own tree, they are only listed under ``tracked_side_effects``),
-    and a command that changed anything other than a generated artifact (lockfile, snapshot, coverage)
-    fails with ``untrusted_side_effects``, because it did not test the files that will ship.
+    If an explicit pytest acceptance command exits with code 4 because one or more requested targets
+    are missing, any reduced or remapped command runs for diagnostic output only; ``passed`` remains
+    ``False`` and ``exit_code`` stays ``4`` so a missing required test never becomes a passing result.
     """
-    from server.verify import _is_run_artifact, _non_git_files, remove_new_untracked, scrubbed_env, untracked_baseline
+    from server.verify import execute_check_process, execute_command_suite
 
     default_timeout = (
         DEFAULT_BOUNDED_ACCEPTANCE_TIMEOUT
@@ -2399,200 +2397,152 @@ def run_acceptance(
         else DEFAULT_ACCEPTANCE_TIMEOUT
     )
     limit = float(timeout or _env_int("CC_AGY_ACCEPTANCE_TIMEOUT", int(default_timeout)))
-    acc_started_mono = time.monotonic()
-    run_baseline = untracked_baseline(cwd)
-    non_git_unreadable_dirs: set[str] = set()
-    non_git_before_dirs: set[str] = set()
-    non_git_before = (
-        _non_git_files(cwd, unreadable_dirs_out=non_git_unreadable_dirs, dirs_out=non_git_before_dirs)
-        if run_baseline is None
-        else None
-    )
-    exec_env = scrubbed_env(cwd)
-    exec_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-    results: list[dict[str, Any]] = []
-    _run_acceptance_commands(cmds, cwd, exec_env, limit, acc_started_mono, total_wall_budget, results,
-                             restore_tracked=restore_tracked, change_set=change_set)
-    if run_baseline is not None:
-        # Anchored at the checkout root: a check run from a subdirectory can create files beside it.
-        cleanup: dict[str, Any] = {}
-        created = remove_new_untracked(cwd, run_baseline, whole_checkout=restore_tracked,
-                                       quarantine_dir=quarantine_dir, report=cleanup)
-        if cleanup.get("moved") and results:
-            results[-1]["quarantined_files"] = {"dir": cleanup["quarantine_dir"], "files": cleanup["moved"][:20]}
-        if cleanup.get("left_in_place") and results:
-            results[-1]["untracked_left_in_place"] = cleanup["left_in_place"][:20]
-    else:
-        from server.verify import _unlink_forcefully
 
-        created = []
-        if non_git_before is not None:
-            if restore_tracked and not cwd.is_symlink() and cwd.is_dir():
-                try:
-                    cmode = cwd.lstat().st_mode & 0o7777
-                    if (cmode & 0o700) != 0o700:
-                        os.chmod(cwd, cmode | 0o700)
-                except OSError:
-                    pass
-            non_git_after_dirs: set[str] = set()
-            non_git_after = _non_git_files(
+    def _missing_target_diagnostics(
+        cmd: str,
+        rc: int | None,
+        _timed_out: bool,
+        out: str,
+        rem_timeout: float,
+        exec_env: Any,
+    ) -> dict[str, Any] | None:
+        if rc != 4:
+            return None
+        filtered_cmd, filtered_missing = _strip_missing_pytest_file_targets(cmd, out or "", cwd)
+        if not filtered_cmd and diagnostic_remaps:
+            remap_pair = diagnostic_remaps.get(cmd.strip())
+            if remap_pair:
+                filtered_cmd, filtered_missing = remap_pair[0], list(remap_pair[1])
+        if not filtered_cmd:
+            diag_details: list[dict[str, str]] = []
+            remapped_list, did_diag_remap = remap_nonexistent_pytest_acceptance_cmds(
+                [cmd],
                 cwd,
-                make_dirs_readable=restore_tracked,
-                skip_unreadable_dirs=non_git_unreadable_dirs,
-                dirs_out=non_git_after_dirs,
+                [{"command": cmd, "exit_code": 4, "passed": False, "error_tail": out or ""}],
+                remap_details=diag_details,
             )
-            if non_git_after is not None:
-                for rel in sorted(non_git_after - non_git_before):
-                    p = cwd / rel
-                    if not (p.is_file() or p.is_symlink()):
-                        continue
-                    if restore_tracked or p.is_symlink() or _is_run_artifact(rel):
-                        if _unlink_forcefully(cwd, p):
-                            created.append(rel)
-                if restore_tracked:
-                    for drel in sorted(non_git_after_dirs - non_git_before_dirs, reverse=True):
-                        try:
-                            os.rmdir(cwd / drel)
-                        except OSError:
-                            pass
+            if did_diag_remap and remapped_list and remapped_list[0].strip() != cmd.strip():
+                filtered_cmd = remapped_list[0]
+                filtered_missing = list(
+                    dict.fromkeys(
+                        str(d.get("missing_target") or "").strip()
+                        for d in diag_details
+                        if isinstance(d, dict) and d.get("missing_target")
+                    )
+                )
+        if not filtered_cmd or not filtered_missing:
+            return None
+        diag_rc, diag_to, diag_out, _ = execute_check_process(
+            filtered_cmd,
+            cwd,
+            exec_env,
+            timeout=max(1.0, rem_timeout),
+            max_tail_chars=20_000,
+        )
+        diag_header = (
+            f"\n[cc-agy diagnostic: requested target(s) {filtered_missing} not found; "
+            f"diagnostic run of {filtered_cmd}]\n"
+        )
+        combined = f"{(out or '').rstrip()}{diag_header}{diag_out or ''}"
+        return {
+            "force_failed": True,
+            "effective_command": filtered_cmd,
+            "filtered_missing_paths": filtered_missing,
+            "diagnostic_exit_code": diag_rc,
+            "diagnostic_timed_out": diag_to,
+            "diagnostic_counts": _parse_test_counts(diag_out or ""),
+            "combined_output": combined,
+        }
+
+    suite_items, cleanup_summary = execute_command_suite(
+        cmds,
+        cwd,
+        timeout=limit,
+        total_wall_budget=total_wall_budget,
+        stop_on_failure=False,
+        stop_on_timeout=True,
+        clean_new_files=True,
+        restore_tracked=restore_tracked,
+        change_set=change_set,
+        quarantine_dir=quarantine_dir,
+        max_tail_chars=20_000,
+        check_all_vacuous=True,
+        diagnostic_hook=_missing_target_diagnostics,
+    )
+    results: list[dict[str, Any]] = []
+    for cmd_res, meta in suite_items:
+        if meta.get("wall_exhausted_skipped"):
+            results.append(
+                {
+                    "command": cmd_res.command,
+                    "exit_code": None,
+                    "timed_out": True,
+                    "passed": False,
+                    "duration_seconds": 0.0,
+                    "counts": {"passed": 0, "failed": 0, "errors": 0},
+                    "output_tail": cmd_res.tail,
+                }
+            )
+            continue
+        raw_tail = str(meta.get("raw_tail") or "")
+        tail, _, _ = truncate_to_token_budget(raw_tail[-20_000:], ACCEPTANCE_OUTPUT_TOKENS)
+        if cmd_res.untrusted_side_effects:
+            from server.verify import side_effect_note
+
+            tail = (tail or "") + side_effect_note(cmd_res.untrusted_side_effects, restored=restore_tracked)
+        filtered_cmd = meta.get("effective_command")
+        filtered_missing_paths = meta.get("filtered_missing_paths")
+        entry: dict[str, Any] = {
+            "command": cmd_res.command,
+            "exit_code": cmd_res.exit_code,
+            "timed_out": cmd_res.timed_out,
+            "passed": cmd_res.passed,
+            "duration_seconds": round(cmd_res.duration_seconds, 1),
+            "counts": dict(meta.get("counts") or {"passed": 0, "failed": 0, "errors": 0}),
+            "output_tail": tail,
+            **({"vacuous": True} if cmd_res.vacuous else {}),
+            **(
+                {
+                    "side_effects_restored" if restore_tracked else "tracked_side_effects": list(
+                        cmd_res.side_effects_restored[:50]
+                    )
+                }
+                if cmd_res.side_effects_restored
+                else {}
+            ),
+            **(
+                {"untrusted_side_effects": list(cmd_res.untrusted_side_effects[:50])}
+                if cmd_res.untrusted_side_effects
+                else {}
+            ),
+            **(
+                {"credential_env_removed": list(cmd_res.credential_env_removed)}
+                if cmd_res.credential_env_removed
+                else {}
+            ),
+            **(
+                {
+                    "effective_command": filtered_cmd,
+                    "filtered_missing_paths": list(filtered_missing_paths),
+                    **({"diagnostic_counts": dict(meta["diagnostic_counts"])} if "diagnostic_counts" in meta else {}),
+                    **({"diagnostic_exit_code": meta["diagnostic_exit_code"]} if "diagnostic_exit_code" in meta else {}),
+                    **({"diagnostic_timed_out": True} if meta.get("diagnostic_timed_out") else {}),
+                }
+                if filtered_cmd and filtered_missing_paths
+                else {}
+            ),
+        }
+        results.append(entry)
+
+    q_report = cleanup_summary.get("quarantine") or {}
+    if q_report.get("moved") and results:
+        results[-1]["quarantined_files"] = {"dir": q_report["quarantine_dir"], "files": q_report["moved"][:20]}
+    if q_report.get("left_in_place") and results:
+        results[-1]["untracked_left_in_place"] = q_report["left_in_place"][:20]
+    created = cleanup_summary.get("created") or []
     if created and results:
         results[-1]["cleaned_artifacts"] = created[:20]
     return results
-
-
-def _run_acceptance_commands(
-    cmds: list[str],
-    cwd: Path,
-    exec_env: dict[str, str],
-    limit: float,
-    acc_started_mono: float,
-    total_wall_budget: float | None,
-    results: list[dict[str, Any]],
-    *,
-    restore_tracked: bool = True,
-    change_set: list[str] | tuple[str, ...] = (),
-) -> None:
-    """Run each acceptance command in order, appending one result dict per command to ``results``."""
-    from server.verify import (
-        check_side_effects,
-        secret_env_names,
-        side_effect_note,
-        snapshot_workspace,
-        untracked_baseline,
-        vacuous_test_run,
-    )
-
-    baseline = untracked_baseline(cwd)
-    removed_env = sorted(secret_env_names())[:30]
-    for cmd in cmds:
-        eff_limit = limit
-        if total_wall_budget is not None:
-            rem_wall = float(total_wall_budget) - max(0.0, time.monotonic() - acc_started_mono)
-            if rem_wall < 1.0:
-                results.append(
-                    {
-                        "command": cmd,
-                        "exit_code": None,
-                        "timed_out": True,
-                        "passed": False,
-                        "duration_seconds": 0.0,
-                        "counts": {"passed": 0, "failed": 0, "errors": 0},
-                        "output_tail": "Skipped: acceptance wall budget exhausted before session deadline.",
-                    }
-                )
-                break
-            eff_limit = min(eff_limit, max(1.0, rem_wall))
-        snapshot = snapshot_workspace(cwd, baseline)
-        try:
-            started = time.time()
-            proc = subprocess.Popen(
-                ["bash", "-c", cmd],
-                cwd=str(cwd),
-                env=exec_env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                start_new_session=True,
-            )
-            timed_out = False
-            try:
-                out, _ = proc.communicate(timeout=eff_limit)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                out, _ = proc.communicate()
-            filtered_cmd: str | None = None
-            filtered_missing_paths: list[str] = []
-            if not timed_out and proc.returncode == 4:
-                filtered_cmd, filtered_missing_paths = _strip_missing_pytest_file_targets(cmd, out or "", cwd)
-                if filtered_cmd:
-                    eff_limit2 = limit
-                    if total_wall_budget is not None:
-                        rem_wall2 = float(total_wall_budget) - max(0.0, time.monotonic() - acc_started_mono)
-                        eff_limit2 = min(eff_limit2, max(1.0, rem_wall2))
-                    proc = subprocess.Popen(
-                        ["bash", "-c", filtered_cmd],
-                        cwd=str(cwd),
-                        env=exec_env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        start_new_session=True,
-                    )
-                    try:
-                        out, _ = proc.communicate(timeout=eff_limit2)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                        out, _ = proc.communicate()
-        except BaseException:
-            check_side_effects(snapshot, restore=restore_tracked, change_set=change_set)
-            raise
-        changed, untrusted = check_side_effects(snapshot, restore=restore_tracked, change_set=change_set)
-        tail, _, _ = truncate_to_token_budget((out or "")[-20000:], ACCEPTANCE_OUTPUT_TOKENS)
-        if untrusted:
-            tail = (tail or "") + side_effect_note(untrusted, restored=restore_tracked)
-        counts = _parse_test_counts(out or "")
-        vacuous_zero_tests = vacuous_test_run(out or "", proc.returncode, timed_out, counts)
-        cmd_passed = (not timed_out) and proc.returncode == 0 and not vacuous_zero_tests and not untrusted
-        results.append(
-            {
-                "command": cmd,
-                "exit_code": None if timed_out else proc.returncode,
-                "timed_out": timed_out,
-                "passed": cmd_passed,
-                "duration_seconds": round(time.time() - started, 1),
-                "counts": counts,
-                "output_tail": tail,
-                **({"vacuous": True} if vacuous_zero_tests else {}),
-                **({"side_effects_restored" if restore_tracked else "tracked_side_effects": changed[:50]}
-                   if changed else {}),
-                **({"untrusted_side_effects": untrusted[:50]} if untrusted else {}),
-                **({"credential_env_removed": removed_env} if (removed_env and not cmd_passed) else {}),
-                **(
-                    {
-                        "effective_command": filtered_cmd,
-                        "filtered_missing_paths": filtered_missing_paths,
-                    }
-                    if filtered_cmd and filtered_missing_paths
-                    else {}
-                ),
-            }
-        )
-        if timed_out:
-            break
 
 
 _PROBE_SKIP_TOP_DIRS = frozenset({
@@ -2882,28 +2832,16 @@ def _run_bounded_probe_cmd(
     exec_env: dict[str, str],
     timeout_s: float,
 ) -> tuple[int | None, bool, str]:
-    proc = subprocess.Popen(
-        ["bash", "-c", cmd],
-        cwd=str(cwd),
-        env=exec_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        start_new_session=True,
+    from server.verify import execute_check_process
+
+    rc, timed_out, out, _ = execute_check_process(
+        cmd,
+        cwd,
+        exec_env,
+        timeout=max(0.1, float(timeout_s)),
+        max_tail_chars=20_000,
     )
-    timed_out = False
-    try:
-        out, _ = proc.communicate(timeout=max(0.1, timeout_s))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        out, _ = proc.communicate()
-    return (None if timed_out else proc.returncode), timed_out, (out or "")
+    return rc, timed_out, (out or "")
 
 
 _LINTER_OR_STATIC_CHECK_CMD_RE = re.compile(
@@ -3129,7 +3067,22 @@ def remap_nonexistent_pytest_acceptance_cmds(
                     continue
             if tracked is None:
                 tracked = _list_tracked_repo_files(cwd)
-            matches = [tf for tf in tracked if Path(tf).name == target_bname and (cwd / tf).is_file()]
+            try:
+                cur_toks = shlex.split(new_cmd)
+            except ValueError:
+                cur_toks = new_cmd.split()
+            existing_cmd_targets = {
+                tok.split("::", 1)[0].replace("\\", "/").strip("/")
+                for tok in cur_toks
+                if not tok.startswith("-") and tok.split("::", 1)[0].endswith(".py")
+            }
+            matches = [
+                tf
+                for tf in tracked
+                if Path(tf).name == target_bname
+                and (cwd / tf).is_file()
+                and tf not in existing_cmd_targets
+            ]
             chosen_tf: str | None = None
             if len(matches) == 1:
                 chosen_tf = matches[0]
@@ -7060,12 +7013,8 @@ class JobManager:
                             effective_acceptance.append(ccmd)
                             compile_smoke_cmds.add(ccmd)
                 auto_default_acceptance = bool(effective_acceptance)
-            if effective_acceptance and runnable_acc_status and is_mutating_job and not files_changed:
-                # Never run acceptance commands on an unmodified worktree for a mutating coding job:
-                # pre-existing baseline tests passing with zero edits is vacuous (e.g. an early tool-budget checkpoint).
-                vacuous_acceptance = True
-                effective_acceptance = []
             active_acceptance_remapped = list(acceptance_remapped or [])
+            diagnostic_remaps: dict[str, tuple[str, list[str]]] = {}
             if effective_acceptance and active_acceptance_remapped:
                 restored_cmds: list[str] = []
                 still_remapped: list[dict[str, str]] = []
@@ -7074,18 +7023,65 @@ class JobManager:
                     for item in active_acceptance_remapped
                     if isinstance(item, dict) and item.get("remapped_command")
                 }
+                remap_by_orig: dict[str, list[dict[str, str]]] = {}
+                for item in active_acceptance_remapped:
+                    if isinstance(item, dict) and item.get("original_command") and item.get("remapped_command"):
+                        orig_k = str(item.get("original_command") or "").strip()
+                        remap_by_orig.setdefault(orig_k, []).append(item)
                 for ecmd in effective_acceptance:
-                    rm_entry = remap_by_new.get(ecmd.strip())
-                    orig_missing = str((rm_entry or {}).get("missing_target") or "").strip()
-                    orig_cmd_str = str((rm_entry or {}).get("original_command") or "").strip()
-                    if rm_entry and orig_missing and orig_cmd_str and (target_acc_cwd / orig_missing).exists():
-                        restored_cmds.append(orig_cmd_str)
+                    cur_cmd = ecmd.strip()
+                    chain: list[dict[str, str]] = []
+                    seen_cmds: set[str] = set()
+                    while cur_cmd in remap_by_new and cur_cmd not in seen_cmds:
+                        seen_cmds.add(cur_cmd)
+                        entry_rm = remap_by_new[cur_cmd]
+                        chain.append(entry_rm)
+                        prev_c = str(entry_rm.get("original_command") or "").strip()
+                        if not prev_c:
+                            break
+                        cur_cmd = prev_c
+                    if chain:
+                        chain.reverse()
+                        orig_cmd_str = str(chain[0].get("original_command") or "").strip() or ecmd
+                        diag_cmd_str = ecmd
+                    elif cur_cmd in remap_by_orig:
+                        # Forward walk when acceptance already preserves the original explicit command.
+                        fwd_cmd = cur_cmd
+                        while fwd_cmd in remap_by_orig and fwd_cmd not in seen_cmds:
+                            seen_cmds.add(fwd_cmd)
+                            entry_rm = remap_by_orig[fwd_cmd][-1]
+                            chain.append(entry_rm)
+                            nxt_c = str(entry_rm.get("remapped_command") or "").strip()
+                            if not nxt_c:
+                                break
+                            fwd_cmd = nxt_c
+                        orig_cmd_str = ecmd
+                        diag_cmd_str = str(chain[-1].get("remapped_command") or "").strip() if chain else ecmd
                     else:
                         restored_cmds.append(ecmd)
-                        if rm_entry:
-                            still_remapped.append(rm_entry)
+                        continue
+                    missing_still: list[str] = []
+                    for entry_rm in chain:
+                        orig_missing = str(entry_rm.get("missing_target") or "").strip()
+                        if orig_missing and not (target_acc_cwd / orig_missing).exists():
+                            if orig_missing not in missing_still:
+                                missing_still.append(orig_missing)
+                    if missing_still:
+                        # Keep the full chain intact whenever any target in it remains missing so
+                        # multi-step remaps never break lookup keys across continuation turns.
+                        still_remapped.extend(chain)
+                    restored_cmds.append(orig_cmd_str)
+                    if missing_still and orig_cmd_str.strip() != diag_cmd_str.strip():
+                        diagnostic_remaps[orig_cmd_str.strip()] = (diag_cmd_str, missing_still)
                 effective_acceptance = restored_cmds
+                if not auto_default_acceptance:
+                    acceptance = list(restored_cmds)
                 active_acceptance_remapped = still_remapped
+            if effective_acceptance and runnable_acc_status and is_mutating_job and not files_changed:
+                # Never run acceptance commands on an unmodified worktree for a mutating coding job:
+                # pre-existing baseline tests passing with zero edits is vacuous (e.g. an early tool-budget checkpoint).
+                vacuous_acceptance = True
+                effective_acceptance = []
             has_timed_out_baseline_cmd = False
             if effective_acceptance and runnable_acc_status and files_changed and baseline_acceptance_probe:
                 timed_out_baseline_cmds = {
@@ -7155,6 +7151,7 @@ class JobManager:
                             restore_tracked=not in_place,
                             change_set=list(files_changed or []),
                             quarantine_dir=(self.store.data_dir / "quarantine" / job_id) if in_place else None,
+                            diagnostic_remaps=diagnostic_remaps or None,
                         )
                     norm_prompt_for_missing = "\n".join(str(p) for p in (recorded_prompts or []) if p).replace("\\", "/")
                     for r_item in acceptance_results:
@@ -7857,8 +7854,52 @@ class JobManager:
                     max_mtime = max(max_mtime, parent_dir.stat().st_mtime)
             except OSError:
                 return None
+        from server.verify import is_behavioral_check, vacuous_test_run
+
+        _PYTEST_OPTS_WITH_VALUE = frozenset({
+            "-k", "-m", "-c", "-o", "-p", "-W", "-r", "-n",
+            "--rootdir", "--confcutdir", "--basetemp", "--maxfail",
+            "--tb", "--import-mode", "--cov", "--cov-report",
+            "--cov-config", "--junitxml", "--log-level", "--capture",
+            "--durations", "--durations-min", "--deselect", "--ignore",
+            "--ignore-glob", "--override-ini",
+        })
         reused: list[dict[str, Any]] = []
         for acc_cmd in acceptance_cmds:
+            if "pytest" in acc_cmd or "py.test" in acc_cmd:
+                try:
+                    acc_toks = shlex.split(acc_cmd)
+                except ValueError:
+                    acc_toks = acc_cmd.split()
+                runner_idx: int | None = None
+                for idx_t, tok in enumerate(acc_toks):
+                    if Path(tok).name in ("pytest", "py.test"):
+                        runner_idx = idx_t
+                        break
+                if runner_idx is not None:
+                    skip_val = False
+                    end_opts = False
+                    for tok in acc_toks[runner_idx + 1:]:
+                        if skip_val:
+                            skip_val = False
+                            continue
+                        if not end_opts and tok == "--":
+                            end_opts = True
+                            continue
+                        if not end_opts and tok.startswith("-"):
+                            if tok in _PYTEST_OPTS_WITH_VALUE:
+                                skip_val = True
+                            continue
+                        base_tok = tok.split("::", 1)[0].strip()
+                        if not base_tok or not (target_cwd / base_tok).exists():
+                            return None
+                else:
+                    for tok in acc_toks:
+                        if tok.startswith("-"):
+                            continue
+                        base_tok = tok.split("::", 1)[0].strip()
+                        if base_tok.endswith(".py") and not (target_cwd / base_tok).exists():
+                            return None
             norm_acc = " ".join(acc_cmd.strip().split())
             matched_rec: dict[str, Any] | None = None
             for rec in reversed(records):
@@ -7870,9 +7911,9 @@ class JobManager:
                 rec_wd = str(rec.get("working_directory") or "").strip()
                 if rec_wd not in ("", "."):
                     continue
+                present_at_run = rec.get("present_files")
                 if missing_rels:
                     deleted_at_run = rec.get("deleted_files")
-                    present_at_run = rec.get("present_files")
                     if isinstance(deleted_at_run, list):
                         if any(m not in deleted_at_run for m in missing_rels):
                             continue
@@ -7881,12 +7922,22 @@ class JobManager:
                             continue
                     else:
                         continue
+                if isinstance(present_at_run, list):
+                    if any(
+                        not isinstance(pf, str)
+                        or not pf
+                        or Path(pf).is_absolute()
+                        or ".." in Path(pf).parts
+                        or not (target_cwd / pf).exists()
+                        for pf in present_at_run
+                    ):
+                        continue
                 rec_hashes = rec.get("file_hashes")
                 if not isinstance(rec_hashes, dict):
                     continue
-                if any(rec_hashes.get(rel) != sha_val for rel, sha_val in current_hashes.items()):
+                if set(rec_hashes.keys()) != set(current_hashes.keys()):
                     continue
-                if isinstance(rec.get("deleted_files"), list) and set(rec_hashes.keys()) != set(current_hashes.keys()):
+                if any(rec_hashes.get(rel) != sha_val for rel, sha_val in current_hashes.items()):
                     continue
                 if any(rel in rec_hashes for rel in missing_rels):
                     continue
@@ -7898,6 +7949,8 @@ class JobManager:
                 return None
             out_tail = str(matched_rec.get("output_tail") or "")
             counts = _parse_test_counts(out_tail)
+            if is_behavioral_check(acc_cmd) and vacuous_test_run(out_tail, 0, False, counts):
+                return None
             reused.append(
                 {
                     "command": acc_cmd,
@@ -8203,14 +8256,24 @@ class JobManager:
                     remap_details=acceptance_remapped,
                 )
                 if did_remap:
-                    acceptance_cmds = remapped_cmds
-                    baseline_probe = probe_baseline_acceptance(
-                        acceptance_cmds,
-                        wt_dir,
-                        per_cmd_timeout=per_probe_limit,
-                        total_timeout=total_probe_limit,
-                        reset_tracked=True,
-                    )
+                    # Keep acceptance_cmds equal to the caller's explicit commands so missing targets never
+                    # silently satisfy acceptance; probe distinct remapped targets for diagnostic context only.
+                    diag_only_cmds = [
+                        rcmd for rcmd, ocmd in zip(remapped_cmds, acceptance_cmds) if rcmd.strip() != ocmd.strip()
+                    ]
+                    if diag_only_cmds:
+                        diag_probes = probe_baseline_acceptance(
+                            diag_only_cmds,
+                            wt_dir,
+                            per_cmd_timeout=per_probe_limit,
+                            total_timeout=total_probe_limit,
+                            reset_tracked=True,
+                        )
+                        for dp in diag_probes:
+                            if isinstance(dp, dict) and not dp.get("passed"):
+                                dp_copy = dict(dp)
+                                dp_copy["diagnostic_only"] = True
+                                baseline_probe.append(dp_copy)
             finally:
                 self._unlink_checks_node_modules(probe_nm_link)
 
@@ -8576,7 +8639,7 @@ class JobManager:
                         "test expectations)." + flash_summary_note + fail_detail
                     ),
                     allowed_paths=receipt.get("allowed_paths"),
-                    acceptance=receipt.get("acceptance"),
+                    acceptance=None,
                     timeout_seconds=worker_timeout,
                     wait=True,
                     scrub_receipt=bool(receipt.get("scrub_receipt", False)),
@@ -8651,7 +8714,7 @@ class JobManager:
                     job_id=job_id,
                     follow_up_prompt=lead_in + fail_detail,
                     allowed_paths=receipt.get("allowed_paths"),
-                    acceptance=receipt.get("acceptance"),
+                    acceptance=None,
                     timeout_seconds=worker_timeout,
                     wait=True,
                     scrub_receipt=bool(receipt.get("scrub_receipt", False)),
@@ -8927,15 +8990,17 @@ class JobManager:
             if receipt.get("vertex_project") and receipt.get("vertex_project") != "[REDACTED]"
             else None
         )
+        explicit_qa_env = (os.environ.get("CC_AGY_QA_THINKING_LEVEL") or "").strip().upper()
         raw_qa_thinking = (
-            os.environ.get("CC_AGY_QA_THINKING_LEVEL")
-            or os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL")
-            or ""
-        ).strip().upper()
+            explicit_qa_env
+            or (os.environ.get("CC_AGY_FORCE_WORKER_THINKING_LEVEL") or "").strip().upper()
+        )
         if raw_qa_thinking in ("0", "OFF"):
             raw_qa_thinking = "ZERO"
         qa_model_low = str(qa_model).strip().lower()
-        if raw_qa_thinking in ("ZERO", "MINIMAL", "LOW", "MEDIUM", "HIGH"):
+        if qa_model_low.endswith("-zero") and not explicit_qa_env:
+            qa_thinking = "ZERO"
+        elif raw_qa_thinking in ("ZERO", "MINIMAL", "LOW", "MEDIUM", "HIGH"):
             qa_thinking = raw_qa_thinking
         elif qa_model_low.endswith("-zero"):
             qa_thinking = "ZERO"
@@ -9148,7 +9213,7 @@ class JobManager:
                                 job_id=job_id,
                                 follow_up_prompt=_build_qa_followup(p_qa),
                                 allowed_paths=receipt.get("allowed_paths"),
-                                acceptance=receipt.get("acceptance"),
+                                acceptance=None,
                                 timeout_seconds=wt_to,
                                 wait=False,
                                 scrub_receipt=bool(receipt.get("scrub_receipt", False)),
@@ -9238,7 +9303,7 @@ class JobManager:
                 job_id=job_id,
                 follow_up_prompt=followup,
                 allowed_paths=receipt.get("allowed_paths"),
-                acceptance=receipt.get("acceptance"),
+                acceptance=None,
                 timeout_seconds=worker_timeout,
                 wait=True,
                 scrub_receipt=bool(receipt.get("scrub_receipt", False)),
@@ -11130,7 +11195,10 @@ class JobManager:
         )
         prior_acceptance_remapped = (
             list(receipt.get("acceptance_remapped"))
-            if acceptance is None and isinstance(receipt.get("acceptance_remapped"), list)
+            if (
+                (acceptance is None or list(acceptance) == list(receipt.get("acceptance") or []))
+                and isinstance(receipt.get("acceptance_remapped"), list)
+            )
             else []
         )
         with self._lock:
@@ -11881,7 +11949,7 @@ class JobManager:
             for ntf in new_test_files:
                 bname = Path(ntf).name
                 timed_out_in_acc = any(
-                    r.get("timed_out") is True
+                    (r.get("timed_out") is True or r.get("diagnostic_timed_out") is True)
                     and (
                         ntf in str(r.get("effective_command") or r.get("command") or "")
                         or bname in str(r.get("effective_command") or r.get("command") or "")
@@ -11904,8 +11972,13 @@ class JobManager:
                         failed_in_acc = True
                         break
                     eff_c = str(r.get("effective_command") or r.get("command") or "")
+                    eff_rc = (
+                        r.get("diagnostic_exit_code")
+                        if r.get("diagnostic_exit_code") is not None
+                        else r.get("exit_code")
+                    )
                     if (
-                        int(r.get("exit_code") or 0) not in (0, 4)
+                        int(eff_rc or 0) not in (0, 4)
                         and (ntf in eff_c or bname in eff_c)
                     ):
                         try:

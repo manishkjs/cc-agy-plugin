@@ -35,7 +35,7 @@ from server.model_routes import BatchSettings
 from server.receipts import enforce_daily_budget
 from server.repo_map import build_repo_map
 from server.task_graph import DONE_STATES, run_task_graph
-from server.verify import failure_tail, has_behavioral_check, run_commands
+from server.verify import _prepare_parent_within, _rmtree_writable, failure_tail, has_behavioral_check, run_commands
 from server.writers import (
     AppliedAnswer,
     WRITER_SYSTEM_PROMPT,
@@ -521,15 +521,25 @@ class FileBatchRunner:
 
     def _make_verify(self, task, wt, plan, settings, log_dir, apply_lock, content_gate=None, side_effects=None):
         def restore(answer: AppliedAnswer, target: Path) -> None:
-            # Never write through a link a check may have planted: drop the link itself first.
-            link = symlink_component(wt, task.path)
-            if link is not None:
-                (wt / link).unlink(missing_ok=True)
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target)  # a broken formatter or check replaced the file with a directory
-            if answer.previous_bytes is None:
+            # Never write through a link a check may have planted, and always clear read-only modes
+            # left by a broken formatter or check before unlinking or restoring previous_bytes.
+            _prepare_parent_within(
+                wt,
+                target.parent,
+                create=(answer.previous_bytes is not None),
+                unlink_planted_links=True,
+            )
+            if target.is_symlink():
                 target.unlink(missing_ok=True)
-            else:
+            elif target.is_dir():
+                _rmtree_writable(target)  # a broken formatter or check replaced the file with a directory
+            elif target.exists():
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
+                target.unlink(missing_ok=True)
+            if answer.previous_bytes is not None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(answer.previous_bytes)
 
@@ -546,17 +556,35 @@ class FileBatchRunner:
                     if problem:
                         restore(answer, target)
                         return False, problem
-                cmds: list[str] = []
+                results: list[CommandResult] = []
                 if plan.formatter:
-                    cmds.append(plan.formatter.replace("{path}", shlex.quote(task.path)))
-                cmds.extend(task.checks)
+                    fmt_cmd = plan.formatter.replace("{path}", shlex.quote(task.path))
+                    results.extend(
+                        run_commands(
+                            [fmt_cmd],
+                            wt,
+                            timeout=settings.check_timeout,
+                            log_dir=log_dir,
+                            allowed_mutations=(task.path,),
+                            change_set=(task.path,),
+                        )
+                    )
+                check_cmds: list[str] = list(task.checks)
                 if task.repro_test:
-                    cmds.append(task.repro_test)
-                # Only the plan's formatter may rewrite the target; any other file a check touches is
-                # restored by run_commands so test side effects never reach the job's diff.
-                allowed = (task.path,) if plan.formatter else ()
-                results = run_commands(cmds, wt, timeout=settings.check_timeout, log_dir=log_dir,
-                                       allowed_mutations=allowed) if cmds else []
+                    check_cmds.append(task.repro_test)
+                # Only the formatter step above may rewrite task.path; every subsequent check runs with
+                # allowed_mutations=() so a test rewriting task.path is flagged and restored.
+                if check_cmds and all(r.passed for r in results):
+                    results.extend(
+                        run_commands(
+                            check_cmds,
+                            wt,
+                            timeout=settings.check_timeout,
+                            log_dir=log_dir,
+                            allowed_mutations=(),
+                            change_set=(task.path,),
+                        )
+                    )
                 restored = sorted({p for r in results for p in r.side_effects_restored})
                 if restored and side_effects is not None:
                     seen = side_effects.setdefault(task.task_id, [])
