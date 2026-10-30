@@ -2525,6 +2525,8 @@ def test_r7_r2_qa_review_wall_time_counted_in_wait_slice_and_marks_resolved(
     monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
     monkeypatch.setenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", "2.0")
+    # This test pins the first-round QA timing; the post-escalation audit has its own test below.
+    monkeypatch.setenv("CC_AGY_POST_ESCALATION_QA", "0")
 
     seen: list[str] = []
     qa_calls: list[str] = []
@@ -2568,6 +2570,125 @@ def test_r7_r2_qa_review_wall_time_counted_in_wait_slice_and_marks_resolved(
         rec = store.read_receipt(d0["job_id"])
         assert rec is not None
         assert rec["qa_review"]["resolved_by_escalation"] is True
+    finally:
+        jm.shutdown()
+
+
+def test_post_escalation_qa_audits_escalated_diff_once_and_fixes_on_same_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """After a QA-driven escalation, the escalated model's final diff gets exactly one more audit;
+    NEEDS_FIXES triggers one repair turn on the escalated model, then no third audit."""
+    repo = tmp_path / "repo_post_esc_qa"
+    _init_repo(repo)
+    (repo / "app.py").write_text("def f() -> int:\n    return 0\n", encoding="utf-8")
+    (repo / "test_app.py").write_text("from app import f\ndef test_f():\n    assert f() >= 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+    monkeypatch.setenv("CC_AGY_POST_ESCALATION_QA", "1")
+    monkeypatch.delenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", raising=False)
+
+    seen: list[str] = []
+    qa_calls: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text(f"def f() -> int:\n    return {len(seen)}\n", encoding="utf-8")
+        return {"text": f"turn {len(seen)}", "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110}}
+
+    def ask_qa(req: dict[str, object]) -> dict[str, object]:
+        qa_calls.append(str(req["model"]))
+        return {"text": "VERDICT: NEEDS_FIXES\n- ISSUE: app.py:2: f() must return 3", "usage": {"prompt_token_count": 200, "candidates_token_count": 20, "total_token_count": 220}}
+
+    store = ReceiptStore(tmp_path / "data_post_esc_qa", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker, ask_backend=ask_qa)
+    try:
+        fin = jm.delegate_start(
+            "Make f() return 3",
+            model="gemini-flash-next",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        for _ in range(6):
+            if fin.get("status") != "running":
+                break
+            fin = jm.delegate_result(fin["job_id"], wait=True, timeout=10.0)
+        assert fin["status"] == "ok"
+        assert seen == ["gemini-flash-next", "gemini-4-argon", "gemini-4-argon"]
+        assert qa_calls == ["gemini-4-argon", "gemini-4-argon"]
+        rec = store.read_receipt(fin["job_id"])
+        assert rec["qa_review"]["post_escalation"] is True
+    finally:
+        jm.shutdown()
+
+
+def test_autonomous_solo_flash_checkpoint_retry_and_self_qa(tmp_path: Path, monkeypatch) -> None:
+    """In autonomous solo mode (CC_AGY_AUTONOMOUS_SOLO=1), Flash retries on a tool-call checkpoint
+    and runs a self-QA audit (and fix turn) on the same Flash model before applying."""
+    repo = tmp_path / "repo_solo_flash"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), check=True)
+    (repo / "app.py").write_text("def f() -> int:\n    return 0\n", encoding="utf-8")
+    (repo / "test_app.py").write_text("from app import f\ndef test_f():\n    assert f() >= 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+    monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "economy")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "0")
+    monkeypatch.setenv("CC_AGY_AUTONOMOUS_SOLO", "1")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+    monkeypatch.delenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", raising=False)
+
+    seen: list[str] = []
+    qa_calls: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        seen.append(str(req["model"]))
+        wt = Path(str(req["workspace_dir"]))
+        if len(seen) == 1:
+            (wt / "app.py").write_text("def f() -> int:\n    return 1\n", encoding="utf-8")
+            return {
+                "text": "hit cap",
+                "stop_reason": "MAX_TOOL_CALLS_EXCEEDED",
+                "tool_calls": [{"name": "view_file", "args": {}}] * 100,
+                "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110},
+            }
+        (wt / "app.py").write_text(f"def f() -> int:\n    return {len(seen)}\n", encoding="utf-8")
+        return {"text": f"turn {len(seen)}", "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110}}
+
+    def ask_qa(req: dict[str, object]) -> dict[str, object]:
+        qa_calls.append(str(req["model"]))
+        return {"text": "VERDICT: NEEDS_FIXES\n- ISSUE: app.py:2: f() must return 3", "usage": {"prompt_token_count": 150, "candidates_token_count": 15, "total_token_count": 165}}
+
+    store = ReceiptStore(tmp_path / "data_solo_flash", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker, ask_backend=ask_qa)
+    try:
+        fin = jm.delegate_start(
+            "Make f() return 3",
+            model="gemini-flash-next",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+            auto_apply=True,
+        )
+        assert fin["status"] == "ok"
+        assert fin["applied"] is True
+        assert seen == ["gemini-flash-next", "gemini-flash-next", "gemini-flash-next"]
+        assert qa_calls == ["gemini-flash-next"]
+        assert "return 3" in (repo / "app.py").read_text(encoding="utf-8")
     finally:
         jm.shutdown()
 

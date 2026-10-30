@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""One-command setup of cc-agy-plugin for Claude Code and Codex.
+"""One-command setup of cc-agy-plugin for Claude Code, Codex, and Antigravity.
 
 Usage (from a clone of this repository):
 
     python3 -m server.install --host claude --auth gemini-enterprise
     python3 -m server.install --host codex  --auth gemini-enterprise
+    python3 -m server.install --host agy    --auth gemini-enterprise
     python3 -m server.install --host all --profile quality
 
 Automatically sets up a PEP 668-safe per-user Python virtualenv (`~/.local/share/cc-agy-plugin/venv`)
 when system Python does not already have `google-antigravity` and `google-genai`, and forwards
-non-secret configuration to Codex (`~/.codex/config.toml`) and Claude Code (`--config` / `userConfig`).
+non-secret configuration to Codex (`~/.codex/config.toml`), Claude Code (`--config` / `userConfig`),
+and Antigravity (`~/.gemini/config/mcp_config.json` and `~/.gemini/config/plugins/cc-agy-plugin/`).
 API keys and OAuth tokens are never written into config files on disk.
 """
 
@@ -482,6 +484,179 @@ def install_claude(
     return result
 
 
+class AgyConfigError(RuntimeError):
+    """Raised when ~/.gemini/config/mcp_config.json cannot be updated without risking existing settings."""
+
+
+def build_agy_server_entry(
+    *,
+    python_bin: str | None = None,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Build the stdio MCP server entry for Antigravity's `~/.gemini/config/mcp_config.json`."""
+    py = python_bin or resolve_python_bin()
+    norm_auth = _normalize_auth_choice(auth_mode)
+    env: dict[str, str] = {"CC_AGY_COST_PROFILE": profile}
+    if norm_auth == "gemini_enterprise":
+        env["CC_AGY_AUTH_MODE"] = "gemini_enterprise"
+    elif norm_auth in ("api_key", "vertex", "gateway"):
+        env["CC_AGY_AUTH_MODE"] = norm_auth
+    if project:
+        env["GOOGLE_CLOUD_PROJECT"] = project
+    if location and norm_auth != "gemini_enterprise":
+        env["GOOGLE_CLOUD_LOCATION"] = location
+    if base_url:
+        env["CC_AGY_VERTEX_BASE_URL"] = base_url
+    if agy_cli_path:
+        env["CC_AGY_CLI_BIN"] = agy_cli_path
+    if max_daily_cents is not None and max_daily_cents > 0:
+        env["CC_AGY_MAX_DAILY_CENTS"] = f"{max_daily_cents:g}"
+    if strict:
+        env["CC_AGY_STRICT_MODE"] = "true"
+    return {
+        "command": py,
+        "args": [str(SERVER_ENTRY)],
+        "env": env,
+    }
+
+
+def upsert_agy_mcp_config(
+    config_text: str,
+    entry: dict[str, Any],
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+) -> str:
+    """Upsert `mcpServers[name]` inside an Antigravity `mcp_config.json` document without touching other keys."""
+    stripped = config_text.strip()
+    if not stripped:
+        parsed: dict[str, Any] = {}
+    else:
+        try:
+            loaded = json.loads(stripped)
+        except Exception as exc:
+            raise AgyConfigError(f"existing mcp_config.json is not valid JSON ({exc}); fix it first") from exc
+        if not isinstance(loaded, dict):
+            raise AgyConfigError("existing mcp_config.json top-level value must be a JSON object")
+        parsed = dict(loaded)
+    servers = parsed.get("mcpServers")
+    if servers is None:
+        servers_map: dict[str, Any] = {}
+    elif isinstance(servers, dict):
+        servers_map = dict(servers)
+    else:
+        raise AgyConfigError("existing mcp_config.json 'mcpServers' field must be a JSON object")
+    servers_map[name] = entry
+    parsed["mcpServers"] = servers_map
+    return json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+
+
+def install_agy(
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    strict: bool = False,
+    dry_run: bool = False,
+    agy_config_dir: Path | None = None,
+    python_bin: str | None = None,
+) -> dict[str, Any]:
+    """Register cc-agy-plugin in Antigravity's documented `~/.gemini/config/` MCP, plugin, and skill directories."""
+    cfg_dir = agy_config_dir or Path(
+        os.environ.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")
+    ).expanduser()
+    mcp_cfg_path = cfg_dir / "mcp_config.json"
+    skill_dst = cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"
+    plugin_dir = cfg_dir / "plugins" / PLUGIN_NAME
+    plugin_json_path = plugin_dir / "plugin.json"
+    plugin_mcp_path = plugin_dir / "mcp_config.json"
+    plugin_skill_path = plugin_dir / "skills" / "vertex" / "SKILL.md"
+
+    entry = build_agy_server_entry(
+        python_bin=python_bin,
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        agy_cli_path=agy_cli_path,
+        max_daily_cents=max_daily_cents,
+        strict=strict,
+    )
+    env_flags = [f"--env {k}={v}" for k, v in entry["env"].items()]
+    cli_cmd = f"agy mcp add {' '.join(env_flags)} {name} {entry['command']} {SERVER_ENTRY}"
+
+    existing = mcp_cfg_path.read_text(encoding="utf-8") if mcp_cfg_path.is_file() else ""
+    result: dict[str, Any] = {
+        "host": "agy",
+        "config_path": str(mcp_cfg_path),
+        "skill_path": str(skill_dst),
+        "plugin_dir": str(plugin_dir),
+        "server_name": name,
+        "entry": entry,
+        "cli_command": cli_cmd,
+    }
+    try:
+        updated = upsert_agy_mcp_config(existing, entry, name=name)
+    except AgyConfigError as exc:
+        result["status"] = "refused"
+        result["error"] = str(exc)
+        return result
+    if dry_run:
+        result["status"] = "dry_run"
+        return result
+
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_mode = (mcp_cfg_path.stat().st_mode & 0o777) if mcp_cfg_path.is_file() else 0o600
+    if existing and existing != updated:
+        backup = mcp_cfg_path.with_name(f"mcp_config.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        _write_private(backup, existing, 0o600)
+        result["backup_path"] = str(backup)
+    if existing != updated:
+        _write_private(mcp_cfg_path, updated, cfg_mode)
+
+    skill_text = CODEX_SKILL_SOURCE.read_text(encoding="utf-8") if CODEX_SKILL_SOURCE.is_file() else ""
+    if skill_text:
+        skill_dst.parent.mkdir(parents=True, exist_ok=True)
+        if not skill_dst.is_file() or skill_dst.read_text(encoding="utf-8") != skill_text:
+            skill_dst.write_text(skill_text, encoding="utf-8")
+
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    plugin_manifest = {
+        "name": PLUGIN_NAME,
+        "displayName": PLUGIN_NAME,
+        "version": "0.3.0",
+        "description": (
+            "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
+            "in isolated git worktrees with signed cost receipts."
+        ),
+    }
+    plugin_json_text = json.dumps(plugin_manifest, indent=2, ensure_ascii=False) + "\n"
+    if not plugin_json_path.is_file() or plugin_json_path.read_text(encoding="utf-8") != plugin_json_text:
+        plugin_json_path.write_text(plugin_json_text, encoding="utf-8")
+    plugin_mcp_text = json.dumps({"mcpServers": {name: entry}}, indent=2, ensure_ascii=False) + "\n"
+    if not plugin_mcp_path.is_file() or plugin_mcp_path.read_text(encoding="utf-8") != plugin_mcp_text:
+        _write_private(plugin_mcp_path, plugin_mcp_text, 0o600)
+    if skill_text:
+        plugin_skill_path.parent.mkdir(parents=True, exist_ok=True)
+        if not plugin_skill_path.is_file() or plugin_skill_path.read_text(encoding="utf-8") != skill_text:
+            plugin_skill_path.write_text(skill_text, encoding="utf-8")
+
+    result["status"] = "installed" if existing != updated else "unchanged"
+    return result
+
+
 def preflight(
     env: dict[str, str] | None = None,
     *,
@@ -594,8 +769,23 @@ def run_interactive_wizard(
     source = env if env is not None else os.environ
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
-    host_raw = str(input_fn("1. Coding tool [1=Both, 2=Codex, 3=Claude Code] (1): ") or "").strip().lower()
-    host_map = {"": "all", "1": "all", "all": "all", "both": "all", "2": "codex", "codex": "codex", "3": "claude", "claude": "claude"}
+    host_raw = str(
+        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity] (1): ") or ""
+    ).strip().lower()
+    host_map = {
+        "": "all",
+        "1": "all",
+        "all": "all",
+        "both": "all",
+        "2": "codex",
+        "codex": "codex",
+        "3": "claude",
+        "claude": "claude",
+        "4": "agy",
+        "agy": "agy",
+        "antigravity": "agy",
+        "jetski": "agy",
+    }
     host = host_map.get(host_raw, "all")
 
     from server.regions import _should_auto_detect_agy_cli
@@ -687,8 +877,15 @@ def main(argv: list[str] | None = None) -> int:
             print("\nSetup cancelled.")
             return 1
 
-    parser = argparse.ArgumentParser(prog="cc-agy-install", description="Set up cc-agy-plugin for Codex and/or Claude Code.")
-    parser.add_argument("--host", choices=("codex", "claude", "all"), default="all")
+    parser = argparse.ArgumentParser(
+        prog="cc-agy-install",
+        description="Set up cc-agy-plugin for Claude Code, Codex, and/or Antigravity.",
+    )
+    parser.add_argument(
+        "--host",
+        choices=("codex", "claude", "agy", "antigravity", "jetski", "all"),
+        default="all",
+    )
     parser.add_argument(
         "--auth",
         choices=AUTH_CHOICES,
@@ -792,6 +989,21 @@ def main(argv: list[str] | None = None) -> int:
                 strict=args.strict,
             )
         )
+    if args.host in ("agy", "antigravity", "jetski", "all"):
+        report["hosts"].append(
+            install_agy(
+                name=args.name,
+                profile=args.profile,
+                auth_mode=args.auth,
+                project=args.project,
+                location=args.location,
+                base_url=args.base_url,
+                agy_cli_path=args.agy_cli_path,
+                max_daily_cents=args.max_daily_cents,
+                strict=args.strict,
+                dry_run=args.dry_run,
+            )
+        )
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -813,6 +1025,15 @@ def main(argv: list[str] | None = None) -> int:
             if host["status"] == "dry_run":
                 print(host["block"])
             print('  Next: run `codex` in your repository and ask: "Run doctor to verify my Gemini setup."')
+        elif host["host"] == "agy":
+            print(f"\nAntigravity: {host['status']} -> {host['config_path']} [mcpServers.{host['server_name']}]")
+            if host.get("error"):
+                print(f"  ! {host['error']}")
+            if host.get("backup_path"):
+                print(f"  backup: {host['backup_path']}")
+            print(f"  plugin bundle: {host['plugin_dir']}")
+            print(f"  or via CLI: $ {host['cli_command']}")
+            print('  Next: start `agy` in your repository and ask: "Run doctor to verify my Gemini setup."')
         else:
             print(f"\nClaude Code: {host['status']}")
             for cmd in host["commands"]:

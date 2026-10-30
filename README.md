@@ -2,7 +2,7 @@
 
 # cc-agy-plugin
 
-**Keep Claude Code or Codex as your lead architect while fast, low-cost Gemini workers write and test the code in an isolated git copy.**
+**Keep Claude Code, Codex, or Antigravity as your lead architect while fast, low-cost Gemini workers write and test the code in an isolated git copy.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
@@ -16,7 +16,7 @@
 
 ## Why use it
 
-You already work inside **Claude Code** or **Codex**. Installing `cc-agy-plugin` connects your coding agent to **Gemini Flash** (`gemini-flash-next`) and **Gemini 4 Argon** without changing how you type prompts or review diffs. Based on how you connect, the plugin automatically uses the standalone **Antigravity CLI (`agy`)** for included **Gemini Enterprise** seats or the **Google Antigravity Python SDK** for **AI Studio** and **Vertex AI**.
+You already work inside **Claude Code**, **Codex**, or **Antigravity** (`agy` CLI / Antigravity IDE). Installing `cc-agy-plugin` connects your coding agent to **Gemini Flash** (`gemini-flash-next`) and **Gemini 4 Argon** without changing how you type prompts or review diffs. Based on how you connect, the plugin automatically uses the standalone **Antigravity CLI (`agy`)** for included **Gemini Enterprise** seats or the **Google Antigravity Python SDK** for **AI Studio** and **Vertex AI**.
 
 Your main agent stays in charge of planning and code review. When files need to be written, refactored, or debugged, it hands a short brief to a Gemini worker inside a separate git copy of your repo. The plugin checks that your code compiles and passes tests, merges only verified changes back into your workspace, and writes a signed cost receipt with a one-call undo.
 
@@ -54,14 +54,17 @@ Setup takes about a minute in a normal terminal shell. The installer automatical
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
 ```
 
-### 2. Install for Claude Code or Codex (pick your connection)
+### 2. Install for Claude Code, Codex, or Antigravity (pick your connection)
 
 Run one of the commands below in a normal terminal shell (or run `python3 -m server.install` with no flags for a 4-question interactive wizard):
 
 **Option A: Gemini Enterprise work subscription (uses your included monthly seat)**
 ```bash
-# Install for Claude Code (or pass --host codex) and download ~/.local/share/cc-agy-plugin/bin/agy:
+# Install for Claude Code, Codex, or Antigravity (--host claude | codex | agy | all)
+# and download ~/.local/share/cc-agy-plugin/bin/agy:
 python3 -m server.install --host claude --auth gemini-enterprise
+# Or install directly into Antigravity CLI / IDE (~/.gemini/config/):
+python3 -m server.install --host agy --auth gemini-enterprise
 
 # Sign in once in a terminal with your work Google account (then type /exit or Ctrl+C):
 ~/.local/share/cc-agy-plugin/bin/agy
@@ -70,18 +73,18 @@ python3 -m server.install --host claude --auth gemini-enterprise
 **Option B: Google AI Studio API key (fastest personal setup, pay-as-you-go)**
 ```bash
 export GEMINI_API_KEY="your-key"
-python3 -m server.install --host claude   # or --host codex
+python3 -m server.install --host claude   # or --host codex, --host agy, or --host all
 ```
 
 **Option C: Google Cloud Vertex AI project (pay-as-you-go)**
 ```bash
 gcloud auth application-default login
 export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-python3 -m server.install --host claude   # or --host codex
+python3 -m server.install --host claude   # or --host codex, --host agy, or --host all
 ```
 
 > [!TIP]
-> **One install, automatic backend routing:** Gemini Enterprise seats run through the standalone `agy` CLI, while AI Studio keys, Vertex AI projects, and gateways run through the Python SDK. See [Options](#options), [Authentication precedence](#authentication-precedence), and the [Configuration reference](#configuration-reference) for flags and fallback rules.
+> **One install, automatic backend routing:** Gemini Enterprise seats run through the standalone `agy` CLI, while AI Studio keys, Vertex AI projects, and gateways run through the Python SDK. Passing `--host agy` (or `--host all`) registers the `agy` MCP server in `~/.gemini/config/mcp_config.json`, installs the routing skill in `~/.gemini/config/skills/cc-agy-plugin/SKILL.md`, and writes a native Antigravity plugin bundle in `~/.gemini/config/plugins/cc-agy-plugin/`. See [Options](#options), [Authentication precedence](#authentication-precedence), and the [Configuration reference](#configuration-reference) for flags and fallback rules.
 
 If `claude` is already open in another terminal tab, run `/reload-plugins` inside that session (or restart with `claude --continue`), or prefix shell commands inside Claude Code with `!`.
 
@@ -89,6 +92,7 @@ If `claude` is already open in another terminal tab, run `/reload-plugins` insid
 
 - **In Claude Code:** type `/cc-agy-plugin:doctor`
 - **In Codex:** start `codex` in your project and ask: `"Run doctor to verify my Gemini setup."`
+- **In Antigravity (`agy` CLI or IDE):** start `agy` in your project (or run `agy mcp list` to confirm `agy` is registered) and ask: `"Run doctor to verify my Gemini setup."`
 
 ## How to use it
 
@@ -96,7 +100,7 @@ If `claude` is already open in another terminal tab, run `/reload-plugins` insid
   <img src="assets/overview.svg" alt="The Lead agent sends a brief to cc-agy-plugin, which runs a Gemini worker in an isolated copy, tests the result, and returns a signed, costed diff" width="100%">
 </p>
 
-Once installed, open your project in Claude Code or Codex and work normally. Both hosts load the plugin's routing skill automatically, so you do not need to memorize internal MCP tool names.
+Once installed, open your project in Claude Code, Codex, or Antigravity and work normally. All three hosts load the plugin's routing skill automatically, so you do not need to memorize internal MCP tool names.
 
 ### Plain-English prompts you can type right away
 
@@ -146,7 +150,7 @@ See [Authentication precedence](#authentication-precedence) for exact credential
 
 ### Installer flags and runtime configuration
 
-Pass `--host codex|claude|all`, `--auth`, `--profile`, `--project`, `--location`, `--base-url`, `--max-daily-cents`, or `--strict` to `python3 -m server.install` (or run `claude --plugin-dir /path/to/cc-agy-plugin` for a single session). All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference).
+Pass `--host codex|claude|agy|all`, `--auth`, `--profile`, `--project`, `--location`, `--base-url`, `--max-daily-cents`, or `--strict` to `python3 -m server.install` (or run `claude --plugin-dir /path/to/cc-agy-plugin` for a single session). All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference).
 
 ## Benchmark results
 
@@ -156,16 +160,26 @@ Paired cross-language benchmark across 26 real repository tasks (10 Python DeepS
 |:--|:--:|:--:|:--:|:--:|:--:|:--|
 | Claude Code · Opus 5.5 (solo) | 22 / 26 | 806 / 891 | 87.6¢ | baseline | 4m 12s | Baseline · All-Opus in Claude Code (TypeScript generics 6 / 6 at 71¢) |
 | Claude Code + plugin · Opus + Flash (`economy`) | 15 / 26 | 797 / 891 | 60.6¢ (22¢ + 39¢) | -31% | 5m 37s | Narrative 1 · Stay in CC, cut spend 31% (5 / 6 TS, 7 / 10 Go, 797 / 891 tests) |
-| Antigravity · Flash -> Carbon Low | 16 / 26 | 814 / 891 | 76.1¢ ($0 Claude) | -13% | 8m 18s | Narrative 2 · Pure AGY 2-tier (814 / 891 tests vs 806 Opus, 7 / 10 Go, 5 / 5 Aider -76%) |
+| Antigravity · Flash -> Carbon Low | 18 / 26 | 810 / 891 | 74.9¢ ($0 Claude) | -14% | 7m 15s | Narrative 2 · Pure AGY 2-tier (18 / 26, 810 / 891 tests vs 806 Opus, 7 / 10 Py & Go, -14%) |
 | Antigravity · Carbon Zero-Think (solo) | 20 / 26 | 846 / 891 | 93.9¢ ($0 Claude) | +7% | 7m 31s | Narrative 3 · Pure AGY Carbon 0-Think (94.9% tests vs 90.5% Opus; 9 / 10 Python, 7 / 10 Go) |
 | Claude Code + plugin · Flash 3.8 -> Argon (`balanced`) | 21 / 26 | 855 / 891 | 81.1¢ (21¢ + 61¢) | -7% | 7m 45s | Highest CC + plugin pass rate (10 / 10 Python at -14% cost; Go -15%) |
 | Claude Code + plugin · Opus + Argon (`quality`) | 20 / 26 | 865 / 891 | 80.0¢ (22¢ + 58¢) | -9% | 5m 37s | Highest holdout test pass rate (97.1% overall; 99.8% on Python) |
-| Antigravity · Flash (solo) | 7 / 26 | 173 / 891 | 27.9¢ ($0 Claude) | -68% | 4m 05s | Pure AGY Flash solo (5 / 10 Go at 16.4¢, 2 / 6 TS, 0 / 10 Python) |
+| Antigravity · Flash (solo) | 18 / 26 | 841 / 891 | 47.2¢ ($0 Claude) | -46% | 6m 39s | Pure AGY Flash + plugin harness (18 / 26, 841 / 891 tests, 9 / 10 Python -53%, 6 / 10 Go -52%) |
 
 - Narrative 1 (Stay in Claude Code with `cc-agy-plugin`): Pairing Opus 5.5 with Gemini Flash (`economy`) cuts average spend by 31% (60.6¢ vs 87.6¢) and passes 797 / 891 holdout tests (89.5%, or 797 / 844 = 94.4% of executed assertions) while solving 15 / 26: 5 / 6 on TypeScript (98 / 103 tests = 95.1% at 66.2¢ = -7%, solving `koota` 90 / 90 alongside all 3 / 3 `vuejs/core` tasks and `darkreader-7241`), 7 / 10 on Go to match Opus solo (152 / 182 tests at 20.6¢ = -33%), and a 37% Python cost cut to 97.2¢ (solving 3 / 10 strict tasks while passing 547 / 559 = 97.9% of executed Python assertions, with 4 single-assertion near-misses on `igel` 23 / 24, `aiomonitor` 6 / 7, `mobly` 82 / 83, and `httpx` 121 / 122). Adding Argon step-up (`balanced` `v9`) reaches 21 / 26 solved (855 / 891 holdout tests, 96.0%) with a 10 / 10 (100%) sweep on Python (606 / 606 holdout tests at 133¢ vs 154¢ Opus solo, -14% total and -22% per solve).
-- Narrative 2 (Move to Antigravity · 2-tier `Flash -> Carbon Low`): Removing Claude Code eliminates the ~21¢ Opus Lead overhead (`$0.00` Claude tokens). Starting on Gemini Flash (`LOW` thinking) and escalating in-place on the same worktree to `gemini-4-carbon-low` only when local checks fail solves 16 / 26 tasks while passing 814 / 891 hidden holdout tests (91.4% vs Opus solo's 806 / 891 = 90.5%, +8 tests) at 76.1¢ avg (-13% vs Opus solo): 7 / 10 on Go to match Opus solo (157 / 182 tests, 46.7¢) with 5 / 5 Aider Go solved on Flash alone at 3.8¢ (-76% vs Opus's 15.5¢), 4 / 6 on TypeScript (97 / 103 tests = 94.2%, including all 3 / 3 `vuejs/core` tasks) at 63.0¢ (-12% vs Opus's 71.2¢), and 5 / 10 on Python (560 / 606 tests = 92.4%) at 113.2¢ (-26% vs Opus's 154.1¢). Running `Antigravity · Flash (solo)` without escalation solves 7 / 26 at 27.9¢ (-68% vs Opus solo): 5 / 10 Go, 2 / 6 TypeScript, and 0 / 10 Python.
+- Narrative 2 (Move to Antigravity · Autonomous `Flash (solo)` & 2-tier `Flash -> Carbon Low`): Removing Claude Code eliminates the ~21¢ Opus Lead overhead (`$0.00` Claude tokens). Giving `Antigravity · Flash (solo)` the full plugin harness (`CC_AGY_AUTONOMOUS_SOLO=1`: upfront repo map, Straitjacket read containment, a 75% tool-budget wrap-up reserve to run tests before hitting the tool cap, same-model checkpoint continuation, and warning-gated self-QA) lifts it from 7 / 26 (`v10`) to 18 / 26 solved (69.2%) and 841 / 891 hidden holdout tests (94.4% vs Opus solo's 806 / 891 = 90.5%, +35 tests) at 47.2¢ avg (-46% vs Opus solo, 68.2¢/solve): matching Opus solo on Python at 9 / 10 (588 / 606 tests = 97.0% vs Opus's 546 / 606) at 71.8¢ (-53%), solving 6 / 10 on Go (157 / 182 tests, 5 / 5 Aider Go at 2.5¢) at 14.8¢ (-52%), and solving 3 / 6 on TypeScript (96 / 103 tests = 93.2%, including `koota` 90 / 90) at 60.4¢ (-15%). Escalating in-place on the same worktree to `gemini-4-carbon-low` when local checks fail (`Antigravity · Flash -> Carbon Low` `v12`) also solves 18 / 26 tasks (810 / 891 holdout tests = 90.9%, or 810 / 847 = 95.6% executed assertions) at 74.9¢ avg (-14% vs Opus solo): 7 / 10 on Python (557 / 606 tests at 118.7¢ = -23%, rescuing `igel` 24 / 24), 7 / 10 on Go to match Opus solo (157 / 182 tests at 32.6¢, 5 / 5 Aider Go at 3.1¢ = -80%), and 4 / 6 on TypeScript (96 / 103 tests at 72.5¢).
 - Narrative 3 (Move to Antigravity · Single-model `Carbon Zero-Think Solo`): Running standalone Gemini Carbon with explicit `thinkingBudget: 0` in Antigravity (`$0.00` Claude tokens) solves 20 / 26 (76.9%) and passes 846 / 891 hidden holdout tests (94.9% vs Opus solo's 806 / 891 = 90.5%, +40 tests) at 93.9¢, matching Opus solo on both Python (9 / 10, 588 / 606 tests vs Opus's 546 / 606) and Go (7 / 10, 157 / 182 tests) while solving 4 / 6 on TypeScript (101 / 103 tests = 98.1%).
 - Worktree isolation without a cheaper model: Holding Gemini 4 Argon fixed as both Lead and Worker across 16 DeepSWE tasks still cut model turns by 25% (580 to 433) and cost by 24% (3,084¢ to 2,352¢, solving 11 / 16 vs 10 / 16 standalone) purely from keeping failed edits and test tracebacks inside a disposable worktree. Interactive per-run receipts across all 750+ graded runs are in [`docs/brownfield_gemini_benchmark.html`](docs/brownfield_gemini_benchmark.html).
+
+### Using `cc-agy-plugin` inside Antigravity: before vs. after
+
+Installing `cc-agy-plugin` directly into Antigravity (`python3 -m server.install --host agy`) delivers three measured cost and reliability gains without paying any Claude Code lead overhead (`$0.00` Claude tokens):
+
+| Antigravity scenario | Without `cc-agy-plugin` | With `cc-agy-plugin` | Measured gain |
+|:--|:--|:--|:--|
+| **1. `gemini-flash-next` across 26 tasks (`v10` raw vs. `v12` plugin harness)** | `7 / 26` solved (`26.9%`), `173 / 891` holdout tests (`19.4%`), `0 / 10` on Python, `103.5¢` per solved task | **`18 / 26` solved (`69.2%`)**, **`841 / 891` holdout tests (`94.4%`)**, **`9 / 10` on Python**, `47.2¢` avg (`68.2¢` per solve) | **+11 tasks (+157% solves), +668 tests, -34% cost per solve** (`-50%` avg cost vs. standalone Carbon Zero-Think's `93.9¢`, and **`-61%` on Python** at `71.8¢` vs. `186.1¢`) |
+| **2. 2-tier `Flash -> Carbon Low` (`v12`) vs. standalone `Carbon Zero-Think` (`v9`, 26 tasks)** | `93.9¢` avg / task (`186.1¢` on Python, `45.7¢` on Go, `7 / 10` Go solves) | **`74.9¢` avg / task** (`118.7¢` on Python, **`32.6¢` on Go**, `7 / 10` Go solves, `5 / 5` Aider Go at `3.1¢`), `18 / 26` solved (`810 / 891` tests = `90.9%`) | **-20% average cost across 26 tasks** (`-36%` on Python, **`-29%` on Go**, and `-80%` on Aider Go) by keeping first-pass edits on Flash and stepping up to Carbon Low only when checks fail |
+| **3. `Antigravity · Argon` Lead delegating to isolated worker vs. standalone `Argon` (16 Python DeepSWE tasks)** | `10 / 16` solved (`62.5%`), `580` total turns, `3,084¢` total (`192.8¢` / task, `308.4¢` / solve) | **`11–12 / 16` solved (`68.8%–75.0%`)**, `433` total turns, **`2,352¢` total (`147.0¢` / task**, `196.0¢–213.8¢` / solve) | **-24% total cost, -30% to -36% cost per solve, -25% turns, and +1 to +2 extra tasks solved** purely from isolated git worktree delegation and Straitjacket log containment |
 
 > [!NOTE]
 > Each setup ran once per task (`n=1`) in the 26-task cross-language suite, so 1-to-3 task solve differences sit within normal single-run variance, and every run is wire-reconciled against proxy token logs (`0` post-exit orphan calls).
@@ -348,7 +362,7 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 
 | Setting (`install` flag / `userConfig` / env var) | Default | What it controls |
 |---|---|---|
-| `--host codex\|claude\|all` | `all` | Target host(s) for `python3 -m server.install` (or pass `claude --plugin-dir /path/to/cc-agy-plugin` / `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main`). |
+| `--host codex\|claude\|agy\|all` | `all` | Target host(s) for `python3 -m server.install` (`agy` / `antigravity` / `jetski` installs into `~/.gemini/config/`; or pass `claude --plugin-dir /path/to/cc-agy-plugin` / `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main`). |
 | `--auth` / `userConfig.auth_mode` / `CC_AGY_AUTH_MODE` | `auto` | Connection mode (`gemini_enterprise`, `agy_cli`, `api_key`, `vertex`, `gateway`, or `auto`; alias `CC_AGY_GEMINI_ENTERPRISE=true`). |
 | `--agy-cli-path`, `--install-agy-cli` / `userConfig.agy_cli_path` / `CC_AGY_CLI_BIN`, `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | External `agy` binary and OAuth config directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
 | `userConfig.gemini_api_key` / `GEMINI_API_KEY` (`GOOGLE_API_KEY`) | unset | Google AI Studio API key (redacted from child shells and receipts). |
@@ -396,7 +410,7 @@ cc-agy-plugin/
 │   ├── main.py               # MCP stdio entry point + managed venv re-exec
 │   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
 │   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
-│   ├── install.py            # Interactive 4-step wizard + Codex/Claude installer (cc-agy-install)
+│   ├── install.py            # Interactive 4-step wizard + Codex/Claude/Antigravity installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
 │   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / gateway), routing, pricing, daily cap
 │   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing

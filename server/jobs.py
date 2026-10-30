@@ -5380,17 +5380,27 @@ class JobManager:
             session_elapsed > 0.55 * session_deadline or remaining_worker < 180.0
         ):
             return None
+        autonomous_solo = env_flag("CC_AGY_AUTONOMOUS_SOLO") is True
         status = str(receipt.get("status") or "")
+        if autonomous_solo and status == "checkpoint":
+            if (
+                receipt.get("acceptance_passed") is False
+                or receipt.get("vacuous_acceptance")
+                or not receipt.get("files_changed")
+            ):
+                return "tool_call_checkpoint"
         if status != "ok":
             return None
         if not receipt.get("files_changed"):
+            if autonomous_solo and receipt.get("vacuous_acceptance"):
+                return "vacuous_acceptance"
             return None
         tool_calls_used = int(
             receipt.get("tool_call_count") or len(receipt.get("tool_calls") or [])
         )
         max_tool_calls = int((receipt.get("budget") or {}).get("max_tool_calls") or 100)
         call_cap = min(60, max(1, int(0.6 * max_tool_calls)))
-        if tool_calls_used >= call_cap:
+        if not autonomous_solo and tool_calls_used >= call_cap:
             return None
         acc_results = [
             r for r in (receipt.get("acceptance_results") or []) if isinstance(r, dict)
@@ -7265,9 +7275,14 @@ class JobManager:
             diff_path = self.store.diff_path(job_id)
             diff_path.write_text(diff_text, encoding="utf-8")
 
+            lead_only_prompts = [
+                p
+                for idx, p in enumerate(recorded_prompts or [])
+                if idx == 0 or (prompt_sources and idx < len(prompt_sources) and prompt_sources[idx] == "lead")
+            ]
             missing_prompt_symbols = (
                 find_missing_prompt_symbols(
-                    "\n".join(recorded_prompts) if recorded_prompts else "",
+                    "\n".join(lead_only_prompts),
                     diff_text,
                     worktree_root=self.workspace_root if in_place else wt_dir,
                     files_changed=files_changed,
@@ -8820,31 +8835,42 @@ class JobManager:
         qa_flag = env_flag("CC_AGY_BALANCED_QA_REVIEW")
         if qa_flag is False:
             return None
-        if resolve_cost_profile() != "balanced":
+        autonomous_solo = env_flag("CC_AGY_AUTONOMOUS_SOLO") is True
+        if resolve_cost_profile() != "balanced" and not autonomous_solo:
             return None
         if self.worker_backend is not None and qa_flag is not True:
             return None
+        # One extra audit round on the escalated model's final diff: escalated turns otherwise ship
+        # without any review even when the stronger model leaves a requirement half-done.
+        prior_qa = receipt.get("qa_review") if isinstance(receipt.get("qa_review"), dict) else None
+        post_escalation_round = bool(
+            receipt.get("escalated_from_model")
+            and not (prior_qa or {}).get("post_escalation")
+            and env_flag("CC_AGY_POST_ESCALATION_QA") is True
+        )
         if (
             in_place
             or is_cancelled_now
             or receipt.get("applied")
             or receipt.get("skip_balanced_qa")
-            or receipt.get("qa_review")
-            or receipt.get("escalated_from_model")
+            or (receipt.get("qa_review") and not post_escalation_round)
+            or (receipt.get("escalated_from_model") and not post_escalation_round)
             or receipt.get("status") != "ok"
             or receipt.get("acceptance_passed") is not True
             or not receipt.get("files_changed")
         ):
             return None
         cur_model = str(receipt.get("model") or "")
-        if "flash" not in cur_model.lower():
+        if "flash" not in cur_model.lower() and not post_escalation_round:
             return None
-        qa_model = self._resolve_escalation_target_model(cur_model)
+        qa_model = self._resolve_escalation_target_model(cur_model) or (
+            cur_model if (post_escalation_round or autonomous_solo) else None
+        )
         if not qa_model:
             return None
         qa_started_mono = time.monotonic()
         esc_deadline, _esc_elapsed, rem_budget = self._session_deadline_budget()
-        if esc_deadline is not None and rem_budget < 90.0:
+        if esc_deadline is not None and rem_budget < (180.0 if post_escalation_round else 90.0):
             return None
         diff_path = self.store.diff_path(job_id)
         diff_text = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
@@ -8890,6 +8916,15 @@ class JobManager:
                 "Worker hit MAX_TOOL_CALLS_EXCEEDED right as acceptance tests passed; verify that every "
                 "requirement, edge case, and caller in the Original User Specification is completely implemented."
             )
+        changed_rel = [str(p) for p in (receipt.get("files_changed") or []) if p]
+        if changed_rel and not any(_is_test_file_path(p) for p in changed_rel):
+            warn_items.append(
+                "The diff changes production code but adds or updates no test file, so the passing suite may "
+                "never exercise the requested behavior. Name the existing test that covers each requirement, "
+                "or report the uncovered requirement as an ISSUE."
+            )
+        if autonomous_solo and not warn_items:
+            return None
         if warn_items:
             spec_sections.append("### Automated Diff Warnings\n" + "\n".join(f"- {w}" for w in warn_items))
         full_spec_text = "\n\n".join(spec_sections).strip()
@@ -9125,6 +9160,7 @@ class JobManager:
                             "passed": p_qa["passed"],
                             "issues": p_qa["issues"],
                             "resumed": bool(do_esc),
+                            **({"post_escalation": True} if post_escalation_round else {}),
                             "review_dir": review_bundle["review_dir"],
                             "pointer_prompt_tokens": review_bundle["pointer_prompt_tokens"],
                             "usage": q_usage or None,
@@ -9219,6 +9255,7 @@ class JobManager:
             "passed": parsed_qa["passed"],
             "issues": parsed_qa["issues"],
             "resumed": bool(will_escalate),
+            **({"post_escalation": True} if post_escalation_round else {}),
             "review_dir": review_bundle["review_dir"],
             "pointer_prompt_tokens": review_bundle["pointer_prompt_tokens"],
             "usage": qa_usage or None,
@@ -10968,7 +11005,7 @@ class JobManager:
             len(receipt.get("tool_calls") or []),
         )
         prior_tokens_used = int((receipt.get("usage") or {}).get("total_token_count") or 0)
-        if not force_retry and _prompt_source not in ("lead", "plugin_retry") and (
+        if not force_retry and _prompt_source not in ("lead", "plugin_retry", "plugin_qa_review") and (
             (
                 effective_max_tokens is not None
                 and prior_tokens_used >= effective_max_tokens
@@ -11008,12 +11045,12 @@ class JobManager:
             # own continue. Other continuations and escalations to another model keep the cumulative
             # remainder.
             fresh_slice = escalated_from is None and (
-                _prompt_source == "plugin_retry"
+                _prompt_source in ("plugin_retry", "plugin_qa_review")
                 or (bool(prior_sources) and prior_sources[-1] == "plugin_retry")
                 or receipt.get("status") == "checkpoint"
                 or receipt.get("stop_reason") == "MAX_TOOL_CALLS_EXCEEDED"
             )
-            if escalated_from is not None and not explicit_calls:
+            if (escalated_from is not None or _prompt_source == "plugin_qa_review") and not explicit_calls:
                 # Guarantee Argon at least 60 tool calls even after a 75-call Flash checkpoint
                 # (100 - 75 = 25 would starve Argon on multi-file tasks), while still bounding it.
                 phase_budget_calls = max(min(60, budget_calls), rem_calls)
@@ -11412,6 +11449,23 @@ class JobManager:
                     self._wait_sliced_auto_apply[safe_id] = auto_apply
                 return self._digest_with_progress(updated)
             digest = self._digest_with_progress(updated)
+            if updated.get("escalated_from_model") or (
+                _prompt_source == "plugin_retry" and env_flag("CC_AGY_AUTONOMOUS_SOLO") is True
+            ):
+                # Escalated or autonomous-solo retry turns get one audit of their final diff before auto-apply.
+                post_esc_digest = self._maybe_run_balanced_pre_apply_qa(
+                    safe_id,
+                    updated,
+                    auto_apply=auto_apply,
+                    in_place=in_place,
+                    is_cancelled_now=bool(updated.get("cancelled")),
+                    wait_elapsed=max(0.0, float(_wait_elapsed) + max(0.0, time.monotonic() - cont_started_mono)),
+                    timeout_seconds=timeout_seconds,
+                    wait_budget=_wait_budget,
+                )
+                if post_esc_digest is not None:
+                    return post_esc_digest
+                digest = self._digest_with_progress(self.store.read_receipt(safe_id))
             return self._maybe_auto_apply_digest(
                 safe_id,
                 digest,

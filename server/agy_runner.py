@@ -596,6 +596,7 @@ def build_straitjacket_tools(
     isolated_worktree: bool = False,
     live_state_path: str | Path | None = None,
     save_dir: str | Path | None = None,
+    max_tool_calls: int | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -979,7 +980,9 @@ def build_straitjacket_tools(
         calls = _straitjacket_state["calls"]
         _persist_live_tool_count(calls)
         elapsed = max(0.0, time.monotonic() - _session_started_mono)
-        if calls < 8 and elapsed < session_timeout * 0.35:
+        tool_cap = int(max_tool_calls or 0)
+        near_tool_cap = bool(tool_cap > 0 and calls >= max(12, int(tool_cap * 0.75)))
+        if calls < 8 and elapsed < session_timeout * 0.35 and not near_tool_cap:
             return raw_output
         now_m = time.monotonic()
         if not _straitjacket_state["has_edits"] and (now_m - _straitjacket_state["last_git_check"] >= 4.0):
@@ -997,17 +1000,19 @@ def build_straitjacket_tools(
                     _straitjacket_state["has_edits"] = True
             except Exception:
                 pass
-        if not _straitjacket_state["has_edits"] and (calls >= 8 or elapsed >= session_timeout * 0.35):
+        if not _straitjacket_state["has_edits"] and (calls >= 8 or elapsed >= session_timeout * 0.35 or near_tool_cap):
             return (
                 f"{raw_output}\n"
-                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed, {calls} Straitjacket calls, "
+                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed, {calls}"
+                f"{f'/{tool_cap}' if tool_cap > 0 else ''} Straitjacket calls, "
                 "0 files modified in worktree: stop searching/reading and write your implementation with "
                 "edit_file / create_file NOW so your edits are saved on disk before timeout.]"
             )
-        if _straitjacket_state["has_edits"] and elapsed >= session_timeout * 0.75:
+        if _straitjacket_state["has_edits"] and (elapsed >= session_timeout * 0.75 or near_tool_cap):
+            cap_str = f", {calls}/{tool_cap} tool calls used" if tool_cap > 0 else ""
             return (
                 f"{raw_output}\n"
-                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed: finish your current edit, "
+                f"[Turn budget: {int(elapsed)}s/{int(session_timeout)}s elapsed{cap_str}: finish your current edit, "
                 "run the targeted acceptance test, and conclude your turn before timeout.]"
             )
         return raw_output
@@ -2244,6 +2249,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 isolated_worktree=bool(request.get("isolated_worktree")),
                 live_state_path=live_state_file,
                 save_dir=save_dir,
+                max_tool_calls=int(request["max_tool_calls"]) if request.get("max_tool_calls") else None,
             )
             for sj_fn in sj_tools:
                 if getattr(sj_fn, "__name__", "") == "run_command" and isinstance(getattr(sj_fn, "command_runs", None), list):

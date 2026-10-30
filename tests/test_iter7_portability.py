@@ -14,11 +14,15 @@ import pytest
 from scripts.session_start import REVIEW_AFTER_APPLY_GUIDANCE, REVIEW_BEFORE_APPLY_GUIDANCE
 from server.doctor import run_doctor
 from server.install import (
+    AgyConfigError,
     CodexConfigError,
+    build_agy_server_entry,
     build_codex_server_block,
+    install_agy,
     install_codex,
     preflight,
     run_interactive_wizard,
+    upsert_agy_mcp_config,
     upsert_codex_server_block,
 )
 from server.jobs import (
@@ -519,6 +523,101 @@ def test_interactive_wizard_builds_expected_cli_flags() -> None:
         env={"GEMINI_API_KEY": "present"},
     )
     assert built_default == ["--host", "all", "--profile", "balanced"]
+
+    agy_answers = iter(["4", "4", "2", "300"])
+    built_agy = run_interactive_wizard(
+        input_fn=lambda _p: next(agy_answers),
+        output_fn=printed.append,
+        env={},
+    )
+    assert built_agy == [
+        "--host",
+        "agy",
+        "--profile",
+        "economy",
+        "--auth",
+        "gemini-enterprise",
+        "--max-daily-cents",
+        "300",
+    ]
+
+
+def test_agy_install_registers_mcp_plugin_and_skill_without_leaking_secrets(tmp_path: Path) -> None:
+    entry = build_agy_server_entry(
+        python_bin="/venv/bin/python",
+        profile="economy",
+        auth_mode="gemini_enterprise",
+        agy_cli_path="/opt/bin/agy",
+        project="my-proj",
+        location="us-central1",
+        base_url="https://gw.example.internal",
+        max_daily_cents=450.0,
+        strict=True,
+    )
+    assert entry["command"] == "/venv/bin/python"
+    assert entry["env"]["CC_AGY_COST_PROFILE"] == "economy"
+    assert entry["env"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise"
+    assert entry["env"]["CC_AGY_CLI_BIN"] == "/opt/bin/agy"
+    assert entry["env"]["GOOGLE_CLOUD_PROJECT"] == "my-proj"
+    assert entry["env"]["CC_AGY_VERTEX_BASE_URL"] == "https://gw.example.internal"
+    assert entry["env"]["CC_AGY_MAX_DAILY_CENTS"] == "450"
+    assert entry["env"]["CC_AGY_STRICT_MODE"] == "true"
+    assert "GEMINI_API_KEY" not in entry["env"]
+    assert "ANTIGRAVITY_OAUTH_TOKEN" not in entry["env"]
+
+    with pytest.raises(AgyConfigError):
+        upsert_agy_mcp_config("{not valid json", entry)
+    with pytest.raises(AgyConfigError):
+        upsert_agy_mcp_config('{"mcpServers": []}', entry)
+
+    existing = json.dumps({"mcpServers": {"other": {"command": "echo", "args": ["ok"]}}})
+    merged = json.loads(upsert_agy_mcp_config(existing, entry, name="agy"))
+    assert merged["mcpServers"]["other"]["command"] == "echo"
+    assert merged["mcpServers"]["agy"]["command"] == "/venv/bin/python"
+
+    agy_cfg_dir = tmp_path / "gemini_config"
+    agy_cfg_dir.mkdir()
+    mcp_path = agy_cfg_dir / "mcp_config.json"
+    mcp_path.write_text(existing, encoding="utf-8")
+    mcp_path.chmod(0o600)
+
+    first = install_agy(
+        name="agy",
+        profile="balanced",
+        auth_mode="gemini_enterprise",
+        agy_cli_path="/opt/bin/agy",
+        project=None,
+        location=None,
+        base_url="https://gw.example.internal",
+        max_daily_cents=500.0,
+        strict=False,
+        dry_run=False,
+        agy_config_dir=agy_cfg_dir,
+        python_bin="/venv/bin/python",
+    )
+    assert first["status"] == "installed"
+    assert (Path(first["backup_path"]).stat().st_mode & 0o777) == 0o600
+    assert (mcp_path.stat().st_mode & 0o777) == 0o600
+    assert (agy_cfg_dir / "skills" / "cc-agy-plugin" / "SKILL.md").is_file()
+    assert (agy_cfg_dir / "plugins" / "cc-agy-plugin" / "plugin.json").is_file()
+    assert (agy_cfg_dir / "plugins" / "cc-agy-plugin" / "mcp_config.json").is_file()
+    assert (agy_cfg_dir / "plugins" / "cc-agy-plugin" / "skills" / "vertex" / "SKILL.md").is_file()
+
+    second = install_agy(
+        name="agy",
+        profile="balanced",
+        auth_mode="gemini_enterprise",
+        agy_cli_path="/opt/bin/agy",
+        project=None,
+        location=None,
+        base_url="https://gw.example.internal",
+        max_daily_cents=500.0,
+        strict=False,
+        dry_run=False,
+        agy_config_dir=agy_cfg_dir,
+        python_bin="/venv/bin/python",
+    )
+    assert second["status"] == "unchanged"
 
 
 def test_gateway_env_and_writer_client_resolution(monkeypatch: pytest.MonkeyPatch) -> None:

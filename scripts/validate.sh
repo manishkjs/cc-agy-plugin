@@ -123,13 +123,23 @@ printf 'oauth-token-placeholder-value\n' > "$ent_home/agy-cfg/antigravity-oauth-
 ent_json="$(
   cd "$root"
   CODEX_HOME="$ent_home" \
+  AGY_CONFIG_DIR="$ent_home/gemini-config" \
   CC_AGY_CLI_BIN="$ent_home/bin/agy" \
   CC_AGY_CLI_CONFIG_DIR="$ent_home/agy-cfg" \
   ANTIGRAVITY_OAUTH_TOKEN="tok-not-written" \
     python3 -m server.install --host codex --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
 )"
 
-python3 - "$ent_json" "$ent_home/config.toml" <<'PY'
+agy_host_json="$(
+  cd "$root"
+  AGY_CONFIG_DIR="$ent_home/gemini-config" \
+  CC_AGY_CLI_BIN="$ent_home/bin/agy" \
+  CC_AGY_CLI_CONFIG_DIR="$ent_home/agy-cfg" \
+  ANTIGRAVITY_OAUTH_TOKEN="tok-not-written" \
+    python3 -m server.install --host agy --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
+)"
+
+python3 - "$ent_json" "$ent_home/config.toml" "$agy_host_json" "$ent_home/gemini-config/mcp_config.json" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -140,6 +150,14 @@ assert report["preflight"]["ready"] is True, report["preflight"]
 cfg_text = Path(sys.argv[2]).read_text(encoding="utf-8")
 assert 'CC_AGY_AUTH_MODE = "gemini_enterprise"' in cfg_text, cfg_text
 assert "tok-not-written" not in cfg_text, "Enterprise OAuth token leaked into config.toml!"
+
+agy_report = json.loads(sys.argv[3])
+agy_host = next(h for h in agy_report["hosts"] if h["host"] == "agy")
+assert agy_host["status"] == "installed", agy_host
+agy_mcp_text = Path(sys.argv[4]).read_text(encoding="utf-8")
+agy_mcp = json.loads(agy_mcp_text)
+assert agy_mcp["mcpServers"]["agy"]["env"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise", agy_mcp
+assert "tok-not-written" not in agy_mcp_text, "Enterprise OAuth token leaked into mcp_config.json!"
 PY
 
 printf 'Validation passed.\n'
