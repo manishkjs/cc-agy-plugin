@@ -901,7 +901,7 @@ def run_interactive_wizard(
         output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
     prof_raw = str(
-        input_fn("3. Model preset [1=balanced (Flash then Argon), 2=economy (Flash only), 3=quality (Argon first)] (1): ")
+        input_fn("3. Model preset [1=balanced (Flash then Carbon), 2=economy (Flash only), 3=quality (Argon first)] (1): ")
         or ""
     ).strip().lower()
     prof_map = {

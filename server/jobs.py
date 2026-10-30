@@ -58,6 +58,7 @@ from server.verification_policy import (
     satisfies_timeout_promotion,
 )
 from server.regions import (
+    DEFAULT_ESCALATION_MODEL,
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
     estimate_tokens,
@@ -5301,7 +5302,7 @@ class JobManager:
         return self.worker_backend is None
 
     def _resolve_escalation_target_model(self, current_model: str) -> str | None:
-        """Return the escalated worker model (e.g. 'gemini-4-argon') when escalating from Flash, or None."""
+        """Return the escalated worker model (default `DEFAULT_ESCALATION_MODEL`, Carbon zero-thinking) when escalating from Flash, or None."""
         if "flash" not in (current_model or "").lower():
             return None
         raw_esc = os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip()
@@ -5309,14 +5310,14 @@ class JobManager:
             return None
         if raw_esc:
             target = (
-                "gemini-4-argon"
+                DEFAULT_ESCALATION_MODEL
                 if raw_esc.lower() in ("1", "true", "yes", "on")
                 else raw_esc
             )
         elif resolve_cost_profile() == "economy":
             return None
         elif self._is_bounded_lead_session() or self.worker_backend is None:
-            target = "gemini-4-argon"
+            target = DEFAULT_ESCALATION_MODEL
         else:
             return None
         return target if target != current_model else None

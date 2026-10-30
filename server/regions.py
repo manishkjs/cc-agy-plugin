@@ -48,6 +48,9 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
 
 # Default Flash worker model (cost_profile economy/balanced and single-shot asks).
 DEFAULT_FLASH_MODEL = "gemini-flash-next"
+# Step-up model when a Flash turn fails its checks (balanced profile). Carbon with zero thinking
+# solved every task Flash solved plus 2 more in the 26-task suite; override with CC_AGY_ESCALATE_MODEL_ON_FAILURE.
+DEFAULT_ESCALATION_MODEL = "gemini-4-carbon-zero"
 
 # Standard Vertex regional locations supported by GA Gemini models.
 VALID_VERTEX_REGIONS: frozenset[str] = frozenset(

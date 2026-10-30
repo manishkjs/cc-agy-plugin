@@ -367,7 +367,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
     assert d2["model"] == "gemini-flash-next"
     assert "escalated_from_model" not in d2
 
-    # Task 3: post-apply bugfix on billing.py (overlapping file + fix intent) -> escalates to gemini-4-argon!
+    # Task 3: post-apply bugfix on billing.py (overlapping file + fix intent) -> escalates to DEFAULT_ESCALATION_MODEL (Carbon zero)!
     d3 = jm.delegate_start(
         "Fix regression in billing.py edge case",
         allowed_paths=["billing.py"],
@@ -375,7 +375,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
         project="p",
         wait=True,
     )
-    assert d3["model"] == "gemini-4-argon"
+    assert d3["model"] == "gemini-4-carbon-zero"
     assert d3.get("escalated_from_model") == "gemini-flash-next"
 
     # Economy profile disables auto-escalation even on overlapping follow-up
