@@ -2827,7 +2827,7 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
         self.assertEqual(resolve_thinking_level(None, model="gemini-3.8-flash", read_only=True), "HIGH")
         self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=False), "LOW")
         self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=True), "HIGH")
-        self.assertEqual(resolve_batch_settings({"model": "mechanical"}).model, "gemini-3.8-flash")
+        self.assertEqual(resolve_batch_settings({"model": "mechanical"}).model, "gemini-flash-next")
         self.assertEqual(resolve_batch_settings({"read_budget": 6}).writer, "agent")
         self.assertFalse(is_behavioral_check("python3 -m py_compile pkg/a.py"))
         self.assertTrue(is_behavioral_check("python3 -m pytest -q tests/test_a.py"))

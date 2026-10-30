@@ -10,11 +10,11 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
 1. **Single-Shot Review Tier (`ask_gemini`)**:
    - Calls Gemini directly via `google-genai` (or `agy --output-format json --mode plan` on Gemini Enterprise seats) without loading an agent workspace copy.
    - Use for architecture reviews, root-cause hypotheses, and second opinions on diffs or specific `context_files`.
-   - Default model: `gemini-3.8-flash` (`gemini-4-argon` when `cost_profile="quality"`, or override via `model=...` / `CC_AGY_DEFAULT_ASK_MODEL`).
+   - Default model: `gemini-flash-next` (`gemini-4-argon` when `cost_profile="quality"`, or override via `model=...` / `CC_AGY_DEFAULT_ASK_MODEL`).
 
 2. **Agentic Worker Tier (`delegate_start`, `delegate_result`, `get_diff`, `delegate_apply`, `delegate_revert`, `delegate_continue`, `delegate_cancel`, `delegate_to_gemini`, `cost_report`, `doctor`)**:
    - Routes automatically to the standalone Antigravity CLI (`agy --output-format stream-json`) on Gemini Enterprise subscriptions, or spawns `google.antigravity.Agent` (`GeminiAPIEndpoint` in API-key mode, `VertexEndpoint` in Vertex AI and AI Gateway modes).
-   - Default model: `gemini-3.8-flash` under the default `balanced` cost profile, escalating automatically to `gemini-4-argon` on retries, failed checks, or overlapping follow-up fixes (`cost_profile="quality"` starts directly on `gemini-4-argon`; `cost_profile="economy"` stays on `gemini-3.8-flash`).
+   - Default model: `gemini-flash-next` under the default `balanced` cost profile, escalating automatically to `gemini-4-argon` on retries, failed checks, or overlapping follow-up fixes (`cost_profile="quality"` starts directly on `gemini-4-argon`; `cost_profile="economy"` stays on `gemini-flash-next`).
    - By default (`in_place=false`), runs inside a standalone git repository copy under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) initialized with `git init -b main`. When `CC_AGY_SPARSE_WORKTREE=1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>` is set on large monorepos, passing `allowed_paths` materializes a scoped sparse copy (including 2-hop local imports) so worktree setup stays fast without marking omitted files as deleted. Failed or timed-out runs leave your working tree untouched. Note: this provides git-level checkout isolation, not an OS container sandbox; worker commands execute with your user account's OS authority.
    - With `in_place=true`, edits your live working tree directly (requires a clean tracked tree, one `in_place` job at a time, and no `allowed_paths`), unwinds any worker commits or branch switches back to the baseline commit while keeping file edits on disk, and provides a shell-quoted `undo_hint`.
    - When `ctx-harness` (Straitjacket) is installed, replaces unbounded `RUN_COMMAND` with `run_command`, `ctx_get`, and `ctx_search` (capturing command outputs exceeding 400 lines or 6,000 tokens in a local evidence store).
@@ -61,7 +61,7 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
 2. **Run it:** `delegate_file_batch(plan_path="/tmp/<task>-plan.json")`. Pass `read_budget=6` on brownfield repos where writers need up to 6 read-only lookups, or `model="gemini-4-argon"` for harder file specs. A bad plan comes back as `status: "invalid_plan"` with every problem and its JSON path; fix them all in one edit.
 3. **Read the digest:** each task is `landed`, `unchanged` (already done in a previous run), `failed` (with a short `check_tail`) or `held` (a dependency failed). Re-sending the same plan resumes the job and skips finished tasks at no cost.
 4. **Land it:** If `acceptance_passed=true` and `review_required`/`syntax_only_tasks` are empty, call `delegate_apply(job_id=...)` directly; otherwise spot-check with `get_diff(job_id=..., file_filter="...")` before `delegate_apply(job_id=...)`. Fix a failed task yourself, or adjust its intent and re-send.
-5. **Cost:** writers default to `gemini-3.8-flash` with LOW thinking; the third attempt goes to Claude (`claude -p`, no tools). Run `doctor` for a zero-cost offline readiness check or `probe_writers` once per session to verify live writer auth before a batch.
+5. **Cost:** writers default to `gemini-flash-next` with LOW thinking; the third attempt goes to Claude (`claude -p`, no tools). Run `doctor` for a zero-cost offline readiness check or `probe_writers` once per session to verify live writer auth before a batch.
 
 ## Agent worker workflow (`delegate_start`)
 
@@ -75,7 +75,7 @@ Use the `vertex` MCP server tools to split work between two execution tiers usin
 4. **Verify and apply**:
    - For isolated jobs (`in_place=false`), call `delegate_apply(job_id=...)` once satisfied. Because the plugin already executed your `acceptance` commands and returned `acceptance_passed`, you do not need to re-run the same test commands unless doing final integration checks.
 5. **Existing-repo Flash pipeline (`preload_files` + optional `qa_review_model`)**:
-   - On existing repositories, pass `model="gemini-3.8-flash"` and `preload_files=True` to `delegate_to_gemini`, and give it `acceptance` tests that catch misses: Flash is much cheaper per attempt than Opus but solves fewer hard tasks on its own.
+   - On existing repositories, pass `model="gemini-flash-next"` and `preload_files=True` to `delegate_to_gemini`, and give it `acceptance` tests that catch misses: Flash is much cheaper per attempt than Opus but solves fewer hard tasks on its own.
    - `preload_files=True` lists the top keyword-matched file paths (paths only, not contents) in Turn 1. Full file contents in Turn 1 get re-read on every later turn, which inflates cost.
    - `qa_review_model="gemini-4-argon"` is experimental: a single-shot HIGH-thinking diff audit (diff capped at 25,000 tokens) that runs `delegate_continue` as a fresh worker session on the edited worktree if it finds defects. It is not yet shown to raise solve rate.
    - Do not ask Gemini to write spec tests before implementation (they are often wrong), and do not hand a Flash draft to Opus to finish (you pay for the work twice).

@@ -8704,7 +8704,7 @@ class JobManager:
         """Merge a 1-shot QA review's usage and metadata onto `job-*.json` without creating a separate receipt."""
         safe_id = validate_job_id(job_id)
         receipt = self.store.read_receipt(safe_id)
-        prior_model = str(receipt.get("model") or "gemini-3.8-flash")
+        prior_model = str(receipt.get("model") or "gemini-flash-next")
         u = dict(receipt.get("usage") or {})
         pq = int((qa_usage or {}).get("prompt_token_count") or 0)
         cq = int((qa_usage or {}).get("cached_content_token_count") or 0)
@@ -10856,7 +10856,7 @@ class JobManager:
             if raw_fp and raw_fp not in prior_inspected_files and len(prior_inspected_files) < 8:
                 prior_inspected_files.append(raw_fp)
 
-        prior_model = str(receipt.get("model") or "gemini-3.8-flash")
+        prior_model = str(receipt.get("model") or "gemini-flash-next")
         model = prior_model
         escalated_from: str | None = None
         target_esc_model = self._resolve_escalation_target_model(model)

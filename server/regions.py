@@ -46,6 +46,9 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
     }
 )
 
+# Default Flash worker model (cost_profile economy/balanced and single-shot asks).
+DEFAULT_FLASH_MODEL = "gemini-flash-next"
+
 # Standard Vertex regional locations supported by GA Gemini models.
 VALID_VERTEX_REGIONS: frozenset[str] = frozenset(
     {
@@ -416,7 +419,7 @@ def resolve_default_delegate_model(
     profile = resolve_cost_profile(source)
     if profile == "quality":
         return "gemini-4-argon"
-    return "gemini-3.8-flash"
+    return DEFAULT_FLASH_MODEL
 
 
 def resolve_default_ask_model(
@@ -443,7 +446,7 @@ def resolve_default_ask_model(
     profile = resolve_cost_profile(source)
     if profile == "quality":
         return "gemini-4-argon"
-    return "gemini-3.8-flash"
+    return DEFAULT_FLASH_MODEL
 
 
 def is_strict_mode_enabled(env: Any = None) -> bool:

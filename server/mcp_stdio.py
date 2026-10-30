@@ -80,7 +80,7 @@ def _build_delegate_input_properties(
         },
         "model": {
             "type": "string",
-            "description": "Vertex Gemini model ID (default: gemini-3.8-flash, or gemini-4-argon when cost_profile='quality').",
+            "description": "Vertex Gemini model ID (default: gemini-flash-next, or gemini-4-argon when cost_profile='quality').",
         },
         "allowed_paths": {
             "type": "array",
@@ -202,7 +202,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-3.8-flash; respects cost_profile).",
+                    "description": "Vertex Gemini model ID (default: gemini-flash-next; respects cost_profile).",
                 },
                 "context_files": {
                     "type": "array",
@@ -546,7 +546,7 @@ _AUTH_PROPS: dict[str, Any] = {
 _WRITER_PROPS: dict[str, Any] = {
     "writer": {"type": "string", "enum": ["genai", "agent"],
                "description": "Low-cost writer: 'genai' (one generate_content call, default) or 'agent' (Antigravity, writer-only or bounded reader)."},
-    "model": {"type": "string", "description": "Writer model (default gemini-3.8-flash, 'gemini-4-argon', or CC_AGY_BATCH_MODEL)."},
+    "model": {"type": "string", "description": "Writer model (default gemini-flash-next, 'gemini-4-argon', or CC_AGY_BATCH_MODEL)."},
     "thinking_level": {"type": "string", "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH"], "description": "Writer thinking (default LOW)."},
     "read_budget": {"type": "integer", "description": "Bounded read-only lookups per task on the agent writer (default 0 = blind writer, max 12; e.g. 6 on messy brownfield repos)."},
     "claude_writer": {"type": "boolean", "description": "Use Claude (claude -p, no tools) as the third attempt (default true)."},

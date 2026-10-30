@@ -474,7 +474,7 @@ def test_fix5_checklist_and_semicolon_dictation_guarded_while_1line_api_hints_pa
         assert out["status"] == "spec_conflict"
         assert "is_error" not in out
         assert "urllib3.util.parse_url" in out["spec_conflict"]
-        assert seen_models == ["gemini-3.8-flash"]
+        assert seen_models == ["gemini-flash-next"]
     finally:
         jm.shutdown()
 

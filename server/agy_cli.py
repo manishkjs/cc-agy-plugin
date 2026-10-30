@@ -1526,7 +1526,7 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
     cfg_key = str(agy_cli_config_dir(env))
 
     workspace_dir = str(request["workspace_dir"])
-    requested_model = str(request.get("model") or "gemini-3.8-flash")
+    requested_model = str(request.get("model") or "gemini-flash-next")
     thinking_level = request.get("thinking_level")
     effort = map_thinking_level_to_effort(thinking_level, requested_model)
     active_model, active_effort, reroute_note = _resolve_cached_model_for_cli(
@@ -1922,7 +1922,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
     env = request.get("env") if isinstance(request.get("env"), Mapping) else None
     agy_bin = _resolve_or_bootstrap_agy_bin(env)
 
-    requested_model = str(request.get("model") or "gemini-3.8-flash")
+    requested_model = str(request.get("model") or "gemini-flash-next")
     effort = map_thinking_level_to_effort(request.get("thinking_level"), requested_model)
     active_model, active_effort, reroute_note = _resolve_cached_model_for_cli(
         agy_bin, requested_model, effort, env=env

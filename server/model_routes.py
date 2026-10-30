@@ -52,8 +52,8 @@ def render_routing_markdown_table() -> str:
 
 WRITER_KINDS = ("genai", "agent")
 DEFAULT_BATCH_WRITER = "genai"
-DEFAULT_BATCH_MODEL = "gemini-3.8-flash"
-MECHANICAL_BATCH_MODEL = "gemini-3.8-flash"
+DEFAULT_BATCH_MODEL = "gemini-flash-next"
+MECHANICAL_BATCH_MODEL = "gemini-flash-next"
 DEFAULT_BATCH_THINKING = "LOW"
 DEFAULT_CLAUDE_WRITER_MODEL = "opus"
 DEFAULT_MAX_PARALLEL = 4
