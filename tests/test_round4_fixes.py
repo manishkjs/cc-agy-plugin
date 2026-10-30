@@ -2693,6 +2693,55 @@ def test_autonomous_solo_flash_checkpoint_retry_and_self_qa(tmp_path: Path, monk
         jm.shutdown()
 
 
+@pytest.mark.parametrize("escalate_to, expect_qa", [("gemini-4-carbon-zero", ["gemini-4-carbon-zero"]), ("0", [])])
+def test_autonomous_solo_cross_model_review_runs_even_without_warnings(
+    tmp_path: Path, monkeypatch, escalate_to: str, expect_qa: list[str]
+) -> None:
+    """A clean Flash pass that adds its own test file raises no diff warnings. A different reviewer model
+    (Carbon) must still audit it once; same-model self-QA stays warning-gated and is skipped."""
+    repo = tmp_path / f"repo_xqa_{escalate_to.replace('-', '_')}"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), check=True)
+    (repo / "app.py").write_text("def f() -> int:\n    return 0\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "init app"], cwd=str(repo), check=True)
+
+    monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", escalate_to)
+    monkeypatch.setenv("CC_AGY_AUTONOMOUS_SOLO", "1")
+    monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
+    monkeypatch.delenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", raising=False)
+
+    qa_calls: list[str] = []
+
+    def worker(req: dict[str, object]) -> dict[str, object]:
+        wt = Path(str(req["workspace_dir"]))
+        (wt / "app.py").write_text("def f() -> int:\n    return 3\n", encoding="utf-8")
+        (wt / "test_app.py").write_text("from app import f\ndef test_f():\n    assert f() == 3\n", encoding="utf-8")
+        return {"text": "done", "usage": {"prompt_token_count": 100, "candidates_token_count": 10, "total_token_count": 110}}
+
+    def ask_qa(req: dict[str, object]) -> dict[str, object]:
+        qa_calls.append(str(req["model"]))
+        return {"text": "VERDICT: PASS", "usage": {"prompt_token_count": 50, "candidates_token_count": 5, "total_token_count": 55}}
+
+    store = ReceiptStore(tmp_path / f"data_xqa_{escalate_to.replace('-', '_')}", workspace_root=repo)
+    jm = JobManager(workspace_root=repo, store=store, worker_backend=worker, ask_backend=ask_qa)
+    try:
+        fin = jm.delegate_start(
+            "Make f() return 3",
+            model="gemini-flash-next",
+            project="p",
+            acceptance=["python3 -m pytest -q test_app.py"],
+            wait=True,
+        )
+        assert fin["status"] == "ok"
+        assert qa_calls == expect_qa
+    finally:
+        jm.shutdown()
+
+
 def test_r7_r2_expectation_warnings_count_functions_ignore_pure_adds_exempt_spec_and_allow_argon_apply(
     tmp_path: Path, monkeypatch
 ) -> None:

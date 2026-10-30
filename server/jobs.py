@@ -8932,7 +8932,10 @@ class JobManager:
                 "never exercise the requested behavior. Name the existing test that covers each requirement, "
                 "or report the uncovered requirement as an ISSUE."
             )
-        if autonomous_solo and not warn_items:
+        # Same-model self-QA only runs on warnings. A different (stronger) reviewer always gets one look:
+        # Flash often writes its own passing test file, which clears every warning while the change is
+        # still wrong, so a warning-gated cross-model review never fires on exactly those diffs.
+        if autonomous_solo and not warn_items and qa_model == cur_model:
             return None
         if warn_items:
             spec_sections.append("### Automated Diff Warnings\n" + "\n".join(f"- {w}" for w in warn_items))
