@@ -2034,6 +2034,220 @@ else:
             assert res2[0]["passed"] is True, res2
 
 
+class TestUserControlGuarantees:
+    """Verify explicit user-control guardrails across auth, project lists, doctor, installer, and manual apply."""
+
+    def test_blocked_and_allowed_projects_enforced_across_vertex_adc_and_agy_cli(self, tmp_path: Path):
+        from server.agy_cli import build_agy_subprocess_env
+
+        # 1. Ambient GCP project vars are scrubbed from agy CLI subprocesses
+        scrubbed = build_agy_subprocess_env(
+            {
+                "GOOGLE_CLOUD_PROJECT": "ambient-personal-proj",
+                "GCLOUD_PROJECT": "ambient-personal-proj",
+                "VERTEX_PROJECT": "ambient-personal-proj",
+                "CLOUD_ML_PROJECT_ID": "ambient-personal-proj",
+                "GOOGLE_CLOUD_QUOTA_PROJECT": "ambient-personal-proj",
+                "PATH": "/usr/bin:/bin",
+            }
+        )
+        for key in (
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "VERTEX_PROJECT",
+            "CLOUD_ML_PROJECT_ID",
+            "GOOGLE_CLOUD_QUOTA_PROJECT",
+        ):
+            assert key not in scrubbed
+
+        # 2. Vertex project matching CC_AGY_BLOCKED_PROJECTS is rejected at 0 tokens
+        with pytest.raises(ValueError, match="Blocked GCP project 'personal-billing-proj'"):
+            resolve_auth_config(
+                env={
+                    "GOOGLE_CLOUD_PROJECT": "personal-billing-proj",
+                    "CC_AGY_BLOCKED_PROJECTS": "personal-billing-proj, other-blocked",
+                }
+            )
+
+        # 3. ADC quota_project_id matching CC_AGY_BLOCKED_PROJECTS is rejected even if --project differs
+        adc_file = tmp_path / "adc.json"
+        adc_file.write_text(json.dumps({"quota_project_id": "secret-personal-quota"}), encoding="utf-8")
+        with pytest.raises(ValueError, match="adc.quota_project_id"):
+            resolve_auth_config(
+                requested_project="team-vertex-proj",
+                env={
+                    "GOOGLE_APPLICATION_CREDENTIALS": str(adc_file),
+                    "CC_AGY_BLOCKED_PROJECTS": "secret-personal-quota",
+                },
+            )
+
+        # 4. agy CLI onboarding.json cloudaicompanionProject is exposed and checked against blocklist & allowlist
+        ext_bin = _make_mock_external_agy(tmp_path / "bin" / "agy")
+        cfg_dir = tmp_path / "agy_cfg"
+        (cfg_dir / "cache").mkdir(parents=True)
+        (cfg_dir / "antigravity-oauth-token").write_text("oauth-token-123456789", encoding="utf-8")
+        (cfg_dir / "cache" / "onboarding.json").write_text(
+            json.dumps(
+                {
+                    "enterpriseOnboardingComplete": True,
+                    "cloudaicompanionProject": "companion-seat-proj",
+                    "tierId": "enterprise-plus",
+                }
+            ),
+            encoding="utf-8",
+        )
+        info = inspect_agy_cli_offline({"CC_AGY_CLI_BIN": str(ext_bin), "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir)})
+        assert info["companion_project"] == "companion-seat-proj"
+        assert info["tier_id"] == "enterprise-plus"
+
+        with pytest.raises(ValueError, match="agy_cli.cloudaicompanionProject"):
+            resolve_auth_config(
+                env={
+                    "CC_AGY_AUTH_MODE": "gemini_enterprise",
+                    "CC_AGY_CLI_BIN": str(ext_bin),
+                    "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
+                    "CC_AGY_BLOCKED_PROJECTS": "companion-seat-proj",
+                }
+            )
+
+        with pytest.raises(ValueError, match="CC_AGY_ALLOWED_PROJECTS"):
+            resolve_auth_config(
+                env={
+                    "CC_AGY_AUTH_MODE": "gemini_enterprise",
+                    "CC_AGY_CLI_BIN": str(ext_bin),
+                    "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
+                    "CC_AGY_ALLOWED_PROJECTS": "approved-corp-proj",
+                }
+            )
+
+        ok_ent = resolve_auth_config(
+            env={
+                "CC_AGY_AUTH_MODE": "gemini_enterprise",
+                "CC_AGY_CLI_BIN": str(ext_bin),
+                "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
+                "CC_AGY_ALLOWED_PROJECTS": "companion-seat-proj",
+            }
+        )
+        assert ok_ent["auth_mode"] == "gemini_enterprise"
+
+    def test_no_auto_apply_enforces_manual_review_across_sync_tool_strict_mode_in_place_and_salvage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from server.install import build_agy_server_entry, build_claude_user_config, build_codex_server_block
+        from server.mcp_stdio import MCPServer
+
+        # Installer flags propagate across Codex, Claude Code userConfig, and Antigravity mcp_config
+        codex_toml = build_codex_server_block(
+            python_bin="/usr/bin/python3",
+            allowed_projects="corp-safe",
+            blocked_projects="personal-proj",
+            no_auto_apply=True,
+        )
+        assert 'CC_AGY_ALLOWED_PROJECTS = "corp-safe"' in codex_toml
+        assert 'CC_AGY_BLOCKED_PROJECTS = "personal-proj"' in codex_toml
+        assert 'CC_AGY_AUTO_APPLY_ON_PASS = "0"' in codex_toml
+
+        claude_cfg = build_claude_user_config(
+            allowed_projects="corp-safe",
+            blocked_projects="personal-proj",
+            no_auto_apply=True,
+        )
+        assert claude_cfg["allowed_projects"] == "corp-safe"
+        assert claude_cfg["blocked_projects"] == "personal-proj"
+        assert claude_cfg["auto_apply_on_pass"] is False
+
+        agy_entry = build_agy_server_entry(
+            python_bin="/usr/bin/python3",
+            allowed_projects="corp-safe",
+            blocked_projects="personal-proj",
+            no_auto_apply=True,
+        )
+        assert agy_entry["env"]["CC_AGY_AUTO_APPLY_ON_PASS"] == "0"
+
+        # Runtime enforcement: even in strict mode or via delegate_to_gemini(auto_apply=True),
+        # CC_AGY_AUTO_APPLY_ON_PASS=0 leaves the host repo untouched until explicit delegate_apply!
+        repo = _init_git_repo(tmp_path / "manual_repo")
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / "test_app.py").write_text("import app\ndef test_x():\n    assert app.x == 99\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-studio-key-xyz")
+        monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
+        monkeypatch.setenv("CC_AGY_TOOL_PROFILE", "full")
+        monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "0")
+
+        store = ReceiptStore(tmp_path / "store", workspace_root=repo)
+
+        def edit_worker(req: dict[str, Any]) -> dict[str, Any]:
+            wt = Path(str(req["workspace_dir"]))
+            (wt / "app.py").write_text("x = 99\n", encoding="utf-8")
+            return {"text": "updated x"}
+
+        jm = JobManager(workspace_root=repo, store=store, worker_backend=edit_worker)
+        srv = MCPServer(job_manager=jm, store=store)
+        try:
+            # 1) in_place=True is rejected when manual review is enforced
+            with pytest.raises(ValueError, match="in_place=True is disabled by user policy"):
+                jm.delegate_start("Change x", in_place=True, wait=True)
+
+            # 2) delegate_to_gemini (sync convenience) and explicit auto_apply=True do NOT auto-apply
+            resp = srv.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "delegate_to_gemini",
+                        "arguments": {"prompt": "Set x = 99", "auto_apply": True, "acceptance": ["pytest -q"]},
+                    },
+                }
+            )
+            assert isinstance(resp, dict), resp
+            assert "result" in resp, resp
+            digest = json.loads(resp["result"]["content"][0]["text"])
+            assert digest["status"] == "ok"
+            assert not digest.get("applied")
+            assert (repo / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+            # 3) Shutdown / mark_running_interrupted does NOT salvage unapplied diffs when manual review is enforced
+            jm.mark_running_interrupted()
+            assert (repo / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+            # 4) Explicit delegate_apply lands the reviewed diff cleanly, and delegate_revert undoes it
+            applied = jm.delegate_apply(digest["job_id"])
+            assert applied["applied"] is True
+            assert (repo / "app.py").read_text(encoding="utf-8") == "x = 99\n"
+
+            reverted = jm.delegate_revert(digest["job_id"])
+            assert "app.py" in reverted["reverted_files"]
+            assert (repo / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+            # 5) doctor exposes full user_controls summary and warns on unpinned ambient Vertex
+            doc_manual = run_doctor(
+                workspace_root=repo,
+                env={
+                    "GOOGLE_CLOUD_PROJECT": "ambient-vertex-proj",
+                    "CC_AGY_AUTO_APPLY_ON_PASS": "0",
+                    "CC_AGY_ALLOWED_PROJECTS": "ambient-vertex-proj",
+                    "CC_AGY_BLOCKED_PROJECTS": "personal-proj",
+                },
+                store=store,
+            )
+            assert doc_manual["healthy"] is True
+            uc = doc_manual["user_controls"]
+            assert uc["auth_mode_pinned"] is False
+            assert uc["manual_apply_enforced"] is True
+            assert uc["auto_apply_on_pass"] is False
+            assert uc["in_place_allowed"] is False
+            assert uc["allowed_projects"] == ["ambient-vertex-proj"]
+            assert uc["blocked_projects"] == ["personal-proj"]
+            assert any("Auth mode is 'auto' and selected pay-as-you-go Vertex AI" in w for w in doc_manual["warnings"])
+        finally:
+            jm.shutdown(wait=True)
+
+
+
 
 
 

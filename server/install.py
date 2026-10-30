@@ -70,6 +70,10 @@ CODEX_FORWARDED_ENV_VARS = (
     "GOOGLE_VERTEX_BASE_URL",
     "CC_AGY_VERTEX_BASE_URL_TOKEN",
     "CC_AGY_MAX_DAILY_CENTS",
+    "CC_AGY_ALLOWED_PROJECTS",
+    "CC_AGY_BLOCKED_PROJECTS",
+    "CC_AGY_AUTO_APPLY_ON_PASS",
+    "CC_AGY_ALLOW_IN_PLACE",
 )
 # Worker jobs run for minutes; Codex's default MCP tool timeout is far shorter.
 CODEX_TOOL_TIMEOUT_SEC = 1800
@@ -119,6 +123,9 @@ def build_codex_server_block(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
     py = python_bin or resolve_python_bin()
@@ -139,6 +146,12 @@ def build_codex_server_block(
     if max_daily_cents is not None and max_daily_cents > 0:
         formatted = f"{max_daily_cents:g}"
         env["CC_AGY_MAX_DAILY_CENTS"] = formatted
+    if allowed_projects and allowed_projects.strip():
+        env["CC_AGY_ALLOWED_PROJECTS"] = allowed_projects.strip()
+    if blocked_projects and blocked_projects.strip():
+        env["CC_AGY_BLOCKED_PROJECTS"] = blocked_projects.strip()
+    if no_auto_apply:
+        env["CC_AGY_AUTO_APPLY_ON_PASS"] = "0"
     forwarded = [v for v in CODEX_FORWARDED_ENV_VARS if v not in env]
     lines = [
         f"[mcp_servers.{name}]",
@@ -253,6 +266,9 @@ def install_codex(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     dry_run: bool,
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
@@ -267,6 +283,9 @@ def install_codex(
         base_url=base_url,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
     )
     existing = cfg.read_text(encoding="utf-8") if cfg.is_file() else ""
     skill_dst = home / "skills" / PLUGIN_NAME / "SKILL.md"
@@ -329,6 +348,9 @@ def build_claude_user_config(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
     """Build non-secret Claude Code `userConfig` key/value pairs matching `.claude-plugin/plugin.json`."""
@@ -348,6 +370,12 @@ def build_claude_user_config(
         cfg["agy_cli_path"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
         cfg["max_daily_cents"] = f"{max_daily_cents:g}"
+    if allowed_projects and allowed_projects.strip():
+        cfg["allowed_projects"] = allowed_projects.strip()
+    if blocked_projects and blocked_projects.strip():
+        cfg["blocked_projects"] = blocked_projects.strip()
+    if no_auto_apply:
+        cfg["auto_apply_on_pass"] = False
     if strict:
         cfg["strict_delegation_mode"] = True
     return cfg
@@ -362,6 +390,9 @@ def claude_install_commands(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     strict: bool = False,
 ) -> list[list[str]]:
     cfg = build_claude_user_config(
@@ -372,6 +403,9 @@ def claude_install_commands(
         base_url=base_url,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
         strict=strict,
     )
     install_cmd = ["claude", "plugin", "install", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"]
@@ -394,6 +428,9 @@ def install_claude(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
     user_cfg = build_claude_user_config(
@@ -404,6 +441,9 @@ def install_claude(
         base_url=base_url,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
         strict=strict,
     )
     cmds = claude_install_commands(
@@ -414,6 +454,9 @@ def install_claude(
         base_url=base_url,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
         strict=strict,
     )
     result: dict[str, Any] = {
@@ -498,6 +541,9 @@ def build_agy_server_entry(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
     """Build the stdio MCP server entry for Antigravity's `~/.gemini/config/mcp_config.json`."""
@@ -518,6 +564,12 @@ def build_agy_server_entry(
         env["CC_AGY_CLI_BIN"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
         env["CC_AGY_MAX_DAILY_CENTS"] = f"{max_daily_cents:g}"
+    if allowed_projects and allowed_projects.strip():
+        env["CC_AGY_ALLOWED_PROJECTS"] = allowed_projects.strip()
+    if blocked_projects and blocked_projects.strip():
+        env["CC_AGY_BLOCKED_PROJECTS"] = blocked_projects.strip()
+    if no_auto_apply:
+        env["CC_AGY_AUTO_APPLY_ON_PASS"] = "0"
     if strict:
         env["CC_AGY_STRICT_MODE"] = "true"
     return {
@@ -567,6 +619,9 @@ def install_agy(
     base_url: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
     strict: bool = False,
     dry_run: bool = False,
     agy_config_dir: Path | None = None,
@@ -592,6 +647,9 @@ def install_agy(
         base_url=base_url,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
         strict=strict,
     )
     env_flags = [f"--env {k}={v}" for k, v in entry["env"].items()]
@@ -753,6 +811,8 @@ def preflight(
             "agy_bin": agy_cli_status.get("agy_bin"),
             "auth_configured": bool(agy_cli_status.get("auth_configured")),
             "credential_source": agy_cli_status.get("credential_source"),
+            "companion_project": agy_cli_status.get("companion_project"),
+            "tier_id": agy_cli_status.get("tier_id"),
         }
     return out
 
@@ -902,6 +962,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Download and verify the standalone Antigravity CLI (`agy`) into ~/.local/share/cc-agy-plugin/bin.")
     parser.add_argument("--max-daily-cents", type=float, default=None,
                         help="Optional daily spend limit in US cents (for example 500 for $5.00/day).")
+    parser.add_argument("--allowed-projects", default=None,
+                        help="Optional comma-separated allowlist of GCP project IDs (sets CC_AGY_ALLOWED_PROJECTS).")
+    parser.add_argument("--blocked-projects", default=None,
+                        help="Optional comma-separated blocklist of GCP project IDs (sets CC_AGY_BLOCKED_PROJECTS).")
+    parser.add_argument("--no-auto-apply", action="store_true",
+                        help="Require manual diff review (`get_diff` then `delegate_apply`) before any worker change touches your repo.")
     parser.add_argument("--strict", action="store_true",
                         help="Enable strict orchestrator mode in Claude Code userConfig.")
     parser.add_argument("--no-bootstrap", action="store_true",
@@ -972,6 +1038,9 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
+                allowed_projects=args.allowed_projects,
+                blocked_projects=args.blocked_projects,
+                no_auto_apply=args.no_auto_apply,
                 dry_run=args.dry_run,
             )
         )
@@ -986,6 +1055,9 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
+                allowed_projects=args.allowed_projects,
+                blocked_projects=args.blocked_projects,
+                no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
             )
         )
@@ -1000,6 +1072,9 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
+                allowed_projects=args.allowed_projects,
+                blocked_projects=args.blocked_projects,
+                no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
                 dry_run=args.dry_run,
             )

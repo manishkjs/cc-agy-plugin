@@ -1493,7 +1493,10 @@ class MCPServer:
             in_place_b = parse_bool(args.get("in_place"), False)
             preload_b = parse_bool(args.get("preload_files"), True)
             if sync_convenience:
-                auto_apply_arg: bool | None = parse_bool(args.get("auto_apply"), True)
+                from server.regions import resolve_auto_apply_override
+
+                default_sync_apply = resolve_auto_apply_override() is not False
+                auto_apply_arg: bool | None = parse_bool(args.get("auto_apply"), default_sync_apply)
             else:
                 auto_apply_arg = (
                     parse_bool(args.get("auto_apply"), False)

@@ -99,13 +99,10 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 
 def _auto_apply_on_pass(env: dict[str, str]) -> bool:
-    """Mirror JobManager._should_auto_apply(None): explicit env wins, otherwise strict mode turns it on."""
-    raw = str(env.get("CC_AGY_AUTO_APPLY_ON_PASS") or "").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    if raw in _TRUTHY:
-        return True
-    return is_strict_mode_enabled(env)
+    """Mirror JobManager._should_auto_apply(None): explicit env/userConfig wins, otherwise strict mode turns it on."""
+    from server.regions import resolve_auto_apply_on_pass
+
+    return resolve_auto_apply_on_pass(env)
 
 
 ZERO_READ_GUIDANCE = (

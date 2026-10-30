@@ -8172,6 +8172,14 @@ class JobManager:
         started_at = round(time.time(), 3)
         pre_untracked: dict[str, str | None] = {}
         if in_place:
+            from server.regions import is_in_place_allowed
+
+            if not is_in_place_allowed():
+                raise ValueError(
+                    "in_place=True is disabled by user policy (CC_AGY_AUTO_APPLY_ON_PASS=0 / --no-auto-apply or "
+                    "CC_AGY_ALLOW_IN_PLACE=0). Run in an isolated git worktree (`in_place=False`) and review the "
+                    "diff before calling `delegate_apply`."
+                )
             self._acquire_in_place_slot(job_id)
             try:
                 baseline_sha, pre_untracked = self._check_in_place_ready()
@@ -10470,14 +10478,14 @@ class JobManager:
                 "reverted_files": reverted, "skipped_dirty": dirty}
 
     def _should_auto_apply(self, auto_apply: bool | None) -> bool:
+        from server.regions import resolve_auto_apply_on_pass, resolve_auto_apply_override
+
+        user_override = resolve_auto_apply_override()
+        if user_override is False:
+            return False
         if auto_apply is not None:
             return bool(auto_apply)
-        raw_auto = os.environ.get("CC_AGY_AUTO_APPLY_ON_PASS", "").strip().lower()
-        if raw_auto in ("0", "false", "no", "off"):
-            return False
-        if raw_auto in ("1", "true", "yes", "on"):
-            return True
-        return is_strict_mode_enabled()
+        return resolve_auto_apply_on_pass()
 
     def _maybe_auto_apply_digest(
         self,
@@ -12166,9 +12174,16 @@ class JobManager:
                 marked.append(jid)
             except Exception:
                 continue
-        should_salvage = bool(owned_snapshot or marked) and (
-            self._is_bounded_lead_session()
-            or os.environ.get("CC_AGY_SALVAGE_ON_SHUTDOWN", "").strip().lower() in ("1", "true", "yes")
+        from server.regions import resolve_auto_apply_override
+
+        raw_salvage = os.environ.get("CC_AGY_SALVAGE_ON_SHUTDOWN", "").strip().lower()
+        salvage_disabled = raw_salvage in ("0", "false", "no", "off") or (
+            resolve_auto_apply_override() is False and raw_salvage not in ("1", "true", "yes", "on")
+        )
+        should_salvage = (
+            not salvage_disabled
+            and bool(owned_snapshot or marked)
+            and (self._is_bounded_lead_session() or raw_salvage in ("1", "true", "yes", "on"))
         )
         if should_salvage:
             try:

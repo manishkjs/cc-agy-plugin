@@ -47,6 +47,11 @@ _SCRUBBED_SUBPROCESS_ENV_KEYS = frozenset(
         "GOOGLE_GENAI_USE_VERTEXAI",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_VERTEX_BASE_URL",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "VERTEX_PROJECT",
+        "CLOUD_ML_PROJECT_ID",
+        "GOOGLE_CLOUD_QUOTA_PROJECT",
         "CLOUDSDK_AUTH_ACCESS_TOKEN",
         "GITHUB_TOKEN",
         "GH_TOKEN",
@@ -293,6 +298,31 @@ def resolve_agy_cli_binary(
     return None, skipped_internal
 
 
+def _read_onboarding_metadata(config_dir: Path) -> tuple[bool, str | None, str | None]:
+    """Read non-secret onboarding flags, `cloudaicompanionProject`, and `tierId` from `cache/onboarding.json`."""
+    onboarding_file = config_dir / "cache" / "onboarding.json"
+    try:
+        if onboarding_file.is_file() and onboarding_file.stat().st_size > 2:
+            data = json.loads(onboarding_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                raw_proj = data.get("cloudaicompanionProject")
+                comp_proj = str(raw_proj).strip() if isinstance(raw_proj, str) and str(raw_proj).strip() else None
+                raw_tier = data.get("tierId")
+                tier_id = str(raw_tier).strip() if isinstance(raw_tier, str) and str(raw_tier).strip() else None
+                complete = any(
+                    bool(data.get(flag_key))
+                    for flag_key in (
+                        "onboardingComplete",
+                        "enterpriseOnboardingComplete",
+                        "consumerOnboardingComplete",
+                    )
+                ) or bool(tier_id or comp_proj)
+                return complete, comp_proj, tier_id
+    except (OSError, ValueError):
+        pass
+    return False, None, None
+
+
 def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bool, str | None]:
     env_tok = _clean_env_str(source, "ANTIGRAVITY_OAUTH_TOKEN")
     if len(env_tok) >= 8:
@@ -307,22 +337,10 @@ def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bo
     except OSError:
         pass
 
-    onboarding_file = config_dir / "cache" / "onboarding.json"
-    try:
-        if onboarding_file.is_file() and onboarding_file.stat().st_size > 2:
-            data = json.loads(onboarding_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for flag_key in (
-                    "onboardingComplete",
-                    "enterpriseOnboardingComplete",
-                    "consumerOnboardingComplete",
-                ):
-                    if bool(data.get(flag_key)):
-                        return True, f"onboarding_cache:{onboarding_file}"
-                if data.get("tierId") or data.get("cloudaicompanionProject"):
-                    return True, f"onboarding_cache:{onboarding_file}"
-    except (OSError, ValueError):
-        pass
+    onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
+    if onboarding_ok:
+        onboarding_file = config_dir / "cache" / "onboarding.json"
+        return True, f"onboarding_cache:{onboarding_file}"
 
     return False, None
 
@@ -333,6 +351,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     agy_bin, skipped_internal = resolve_agy_cli_binary(source)
     cfg_dir = agy_cli_config_dir(source)
     auth_ok, cred_source = _inspect_auth_files(cfg_dir, source)
+    _onboarding_ok, companion_project, tier_id = _read_onboarding_metadata(cfg_dir)
     managed_bin = managed_agy_bin_dir(source) / MANAGED_CLI_BIN_NAME
 
     explicit_bin = _explicit_cli_bin_override(source)
@@ -374,6 +393,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         "managed_bin_path": str(managed_bin),
         "auth_configured": auth_ok,
         "credential_source": cred_source,
+        "companion_project": companion_project,
+        "tier_id": tier_id,
         "skipped_internal_binaries": skipped_internal,
         "config_dir": str(cfg_dir),
         "error": error,

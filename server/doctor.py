@@ -17,8 +17,15 @@ from server.jobs import detect_project_test_runner
 from server.receipts import ReceiptStore, resolve_workspace_root
 from server.verify import run_git
 from server.regions import (
+    is_in_place_allowed,
     is_strict_mode_enabled,
+    read_adc_quota_project,
+    resolve_allowed_projects,
     resolve_auth_config,
+    resolve_auto_apply_on_pass,
+    resolve_auto_apply_override,
+    resolve_blocked_projects,
+    resolve_configured_auth_mode,
     resolve_cost_profile,
     resolve_default_ask_model,
     resolve_default_delegate_model,
@@ -66,6 +73,16 @@ def run_doctor(
     default_delegate_model = resolve_default_delegate_model(None, env=active_env)
     default_ask_model = resolve_default_ask_model(None, env=active_env)
     strict_mode = is_strict_mode_enabled(active_env)
+    allowed_projects = list(resolve_allowed_projects(active_env))
+    blocked_projects = list(resolve_blocked_projects(active_env))
+    auto_apply_override = resolve_auto_apply_override(active_env)
+    auto_apply_on_pass = resolve_auto_apply_on_pass(active_env)
+    in_place_allowed = is_in_place_allowed(active_env)
+    configured_auth_mode: str | None = None
+    try:
+        configured_auth_mode = resolve_configured_auth_mode(env=active_env)
+    except ValueError:
+        configured_auth_mode = None
 
     # 1. MCP tool catalog self-check
     try:
@@ -103,19 +120,26 @@ def run_doctor(
         auth_mode = str(resolved_auth.get("auth_mode") or "")
         active_auth_mode = auth_mode
         adc_found: bool | None = None
+        adc_quota_project: str | None = None
         ent_cred_source: str | None = None
+        active_project_id: str | None = resolved_auth.get("project")
         auth_ok = True
         if auth_mode == "gemini_enterprise":
             from server.agy_cli import inspect_agy_cli_offline
 
             ent_check = inspect_agy_cli_offline(active_env)
             ent_cred_source = str(ent_check.get("credential_source") or "") or None
+            comp_proj = ent_check.get("companion_project")
+            if isinstance(comp_proj, str) and comp_proj.strip() and not active_project_id:
+                active_project_id = comp_proj.strip()
             agy_cli_info = {
                 "binary_found": bool(ent_check.get("binary_found")),
                 "agy_bin": ent_check.get("agy_bin"),
                 "managed_bin_path": ent_check.get("managed_bin_path"),
                 "auth_configured": bool(ent_check.get("auth_configured")),
                 "credential_source": ent_cred_source,
+                "companion_project": comp_proj,
+                "tier_id": ent_check.get("tier_id"),
                 "config_dir": ent_check.get("config_dir"),
             }
             if not ent_check.get("ok"):
@@ -125,6 +149,13 @@ def run_doctor(
                     remediations.append(str(ent_check["remediation"]))
         elif auth_mode == "vertex":
             adc_found = any(p.is_file() for p in _default_adc_candidates(active_env))
+            adc_quota_project = read_adc_quota_project(active_env, explicit_env=env)
+            if configured_auth_mode is None and not custom_gateway:
+                warnings.append(
+                    f"Auth mode is 'auto' and selected pay-as-you-go Vertex AI project "
+                    f"'{resolved_auth.get('project')}' from your shell environment. Pass `--auth vertex` to "
+                    "confirm or `--auth gemini-enterprise` / `--auth api-key` to pin another backend."
+                )
             if not adc_found and not custom_gateway:
                 warnings.append(
                     "Vertex project is configured, but no local Application Default Credentials file was found "
@@ -134,11 +165,14 @@ def run_doctor(
         auth_info = {
             "ok": auth_ok,
             "auth_mode": auth_mode,
+            "configured_auth_mode": configured_auth_mode or "auto",
+            "auth_mode_pinned": configured_auth_mode is not None,
             "api_key_configured": bool(resolved_auth.get("api_key")),
-            "project": resolved_auth.get("project"),
+            "project": active_project_id,
             "location": resolved_auth.get("location"),
             "custom_vertex_gateway": custom_gateway,
             **({"adc_file_found": adc_found} if adc_found is not None else {}),
+            **({"adc_quota_project": adc_quota_project} if adc_quota_project is not None else {}),
             **({"enterprise_credential_source": ent_cred_source} if ent_cred_source is not None else {}),
             **({"agy_cli": agy_cli_info} if agy_cli_info is not None else {}),
         }
@@ -146,10 +180,9 @@ def run_doctor(
         issues.append(str(exc))
         try:
             from server.agy_cli import inspect_agy_cli_offline
-            from server.regions import _should_auto_detect_agy_cli, resolve_configured_auth_mode
+            from server.regions import _should_auto_detect_agy_cli
 
-            cfg_mode = resolve_configured_auth_mode(env=active_env)
-            if cfg_mode in (None, "gemini_enterprise") and _should_auto_detect_agy_cli(env, active_env):
+            if configured_auth_mode in (None, "gemini_enterprise") and _should_auto_detect_agy_cli(env, active_env):
                 ent_probe = inspect_agy_cli_offline(active_env)
                 if ent_probe.get("binary_found"):
                     cli_detected_unsigned = True
@@ -159,6 +192,8 @@ def run_doctor(
                         "agy_bin": ent_probe.get("agy_bin"),
                         "auth_configured": False,
                         "credential_source": None,
+                        "companion_project": ent_probe.get("companion_project"),
+                        "tier_id": ent_probe.get("tier_id"),
                         "config_dir": ent_probe.get("config_dir"),
                     }
                     if ent_probe.get("remediation"):
@@ -283,6 +318,22 @@ def run_doctor(
         "writable": store_writable,
     }
 
+    user_controls = {
+        "configured_auth_mode": configured_auth_mode or "auto",
+        "auth_mode_pinned": configured_auth_mode is not None,
+        "active_auth_mode": active_auth_mode,
+        "active_project": auth_info.get("project"),
+        "allowed_projects": allowed_projects,
+        "blocked_projects": blocked_projects,
+        "max_daily_cents": daily_budget_info.get("max_daily_cents"),
+        "cost_profile": cost_profile,
+        "default_delegate_model": default_delegate_model,
+        "auto_apply_on_pass": auto_apply_on_pass,
+        "manual_apply_enforced": auto_apply_override is False,
+        "in_place_allowed": in_place_allowed,
+        "isolated_worktree_default": True,
+        "strict_mode": strict_mode,
+    }
     healthy = len(issues) == 0
     status = "ok" if (healthy and not warnings) else ("degraded" if healthy else "error")
     return {
@@ -292,6 +343,7 @@ def run_doctor(
         "default_delegate_model": default_delegate_model,
         "default_ask_model": default_ask_model,
         "strict_mode": strict_mode,
+        "user_controls": user_controls,
         "mcp": mcp_info,
         "auth": auth_info,
         "sdks": sdk_info,

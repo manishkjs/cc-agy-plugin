@@ -17,7 +17,10 @@
         "CC_AGY_USERCFG_STRICT_MODE": "${user_config.strict_delegation_mode}",
         "CC_AGY_USERCFG_VERTEX_BASE_URL": "${user_config.vertex_base_url}",
         "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN": "${user_config.vertex_base_url_token}",
-        "CC_AGY_USERCFG_MAX_DAILY_CENTS": "${user_config.max_daily_cents}"
+        "CC_AGY_USERCFG_MAX_DAILY_CENTS": "${user_config.max_daily_cents}",
+        "CC_AGY_USERCFG_ALLOWED_PROJECTS": "${user_config.allowed_projects}",
+        "CC_AGY_USERCFG_BLOCKED_PROJECTS": "${user_config.blocked_projects}",
+        "CC_AGY_USERCFG_AUTO_APPLY_ON_PASS": "${user_config.auto_apply_on_pass}"
       },
       "timeout": 1800000
     }

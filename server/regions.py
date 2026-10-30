@@ -507,6 +507,16 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_MAX_DAILY_CENTS",
         "CLAUDE_PLUGIN_OPTION_MAX_DAILY_CENTS",
         "CC_AGY_USERCFG_MAX_DAILY_CENTS",
+        "CC_AGY_ALLOWED_PROJECTS",
+        "CLAUDE_PLUGIN_OPTION_ALLOWED_PROJECTS",
+        "CC_AGY_USERCFG_ALLOWED_PROJECTS",
+        "CC_AGY_BLOCKED_PROJECTS",
+        "CLAUDE_PLUGIN_OPTION_BLOCKED_PROJECTS",
+        "CC_AGY_USERCFG_BLOCKED_PROJECTS",
+        "CC_AGY_AUTO_APPLY_ON_PASS",
+        "CLAUDE_PLUGIN_OPTION_AUTO_APPLY_ON_PASS",
+        "CC_AGY_USERCFG_AUTO_APPLY_ON_PASS",
+        "CC_AGY_ALLOW_IN_PLACE",
         "CC_AGY_DATA_DIR",
     ):
         val = os.environ.get(var)
@@ -620,6 +630,192 @@ def resolve_max_daily_cents(
             raise ValueError(f"CC_AGY_MAX_DAILY_CENTS must be a finite positive number of cents (got {cleaned!r})")
         return round(parsed, 6)
     return None
+
+
+def _parse_project_list(raw_values: tuple[Any, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    parsed: list[str] = []
+    for raw in raw_values:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.startswith("${") or cleaned.lower() in ("none", "null", "off"):
+            continue
+        for token in cleaned.replace(",", " ").split():
+            proj = token.strip()
+            if not proj or proj.startswith("${") or proj.lower() in ("none", "null", "off", "custom-endpoint"):
+                continue
+            low = proj.lower()
+            if low not in seen:
+                seen.add(low)
+                parsed.append(proj)
+    return tuple(parsed)
+
+
+def resolve_allowed_projects(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Resolve optional comma/space-separated GCP project allowlist (`CC_AGY_ALLOWED_PROJECTS`)."""
+    source_env = env if env is not None else os.environ
+    return _parse_project_list(
+        (
+            source_env.get("CC_AGY_ALLOWED_PROJECTS"),
+            source_env.get("CLAUDE_PLUGIN_OPTION_ALLOWED_PROJECTS"),
+            source_env.get("CC_AGY_USERCFG_ALLOWED_PROJECTS"),
+        )
+    )
+
+
+def resolve_blocked_projects(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Resolve optional comma/space-separated GCP project blocklist (`CC_AGY_BLOCKED_PROJECTS`)."""
+    source_env = env if env is not None else os.environ
+    return _parse_project_list(
+        (
+            source_env.get("CC_AGY_BLOCKED_PROJECTS"),
+            source_env.get("CLAUDE_PLUGIN_OPTION_BLOCKED_PROJECTS"),
+            source_env.get("CC_AGY_USERCFG_BLOCKED_PROJECTS"),
+        )
+    )
+
+
+def resolve_auto_apply_override(env: Mapping[str, str] | None = None) -> bool | None:
+    """Return explicit user override for auto-apply (`True`, `False`, or `None` when unset)."""
+    source_env = env if env is not None else os.environ
+    for key in (
+        "CC_AGY_AUTO_APPLY_ON_PASS",
+        "CLAUDE_PLUGIN_OPTION_AUTO_APPLY_ON_PASS",
+        "CC_AGY_USERCFG_AUTO_APPLY_ON_PASS",
+    ):
+        val = env_flag(key, source_env)
+        if val is not None:
+            return val
+    return None
+
+
+def resolve_auto_apply_on_pass(env: Mapping[str, str] | None = None) -> bool:
+    """Return effective default auto-apply behavior (`CC_AGY_AUTO_APPLY_ON_PASS` or strict-mode default)."""
+    override = resolve_auto_apply_override(env)
+    if override is not None:
+        return override
+    return is_strict_mode_enabled(env)
+
+
+def is_in_place_allowed(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether `in_place=True` direct workspace mutation is permitted by user configuration."""
+    source_env = env if env is not None else os.environ
+    explicit_in_place = env_flag("CC_AGY_ALLOW_IN_PLACE", source_env)
+    if explicit_in_place is not None:
+        return explicit_in_place
+    if resolve_auto_apply_override(source_env) is False:
+        return False
+    return True
+
+
+def read_adc_quota_project(
+    source_env: Mapping[str, str],
+    *,
+    explicit_env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read non-secret `quota_project_id` from Application Default Credentials JSON when present."""
+    import json
+
+    candidates: list[Path] = []
+    explicit_adc = (source_env.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if explicit_adc and not explicit_adc.startswith("${"):
+        candidates.append(Path(explicit_adc).expanduser())
+    gcloud_cfg = (source_env.get("CLOUDSDK_CONFIG") or "").strip()
+    if gcloud_cfg and not gcloud_cfg.startswith("${"):
+        candidates.append(Path(gcloud_cfg).expanduser() / "application_default_credentials.json")
+    home_override = first_valid_env(source_env, "HOME", "USERPROFILE", default="")
+    if home_override:
+        candidates.append(Path(home_override).expanduser() / ".config" / "gcloud" / "application_default_credentials.json")
+    elif explicit_env is None and "PYTEST_CURRENT_TEST" not in os.environ:
+        candidates.append(Path.home() / ".config" / "gcloud" / "application_default_credentials.json")
+    appdata = (source_env.get("APPDATA") or "").strip()
+    if appdata and not appdata.startswith("${"):
+        candidates.append(Path(appdata) / "gcloud" / "application_default_credentials.json")
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    qp = data.get("quota_project_id")
+                    if isinstance(qp, str) and qp.strip():
+                        return qp.strip()
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def enforce_project_controls(
+    *,
+    auth_mode: str,
+    project: str | None,
+    source_env: Mapping[str, str],
+    explicit_env: Mapping[str, str] | None = None,
+) -> None:
+    """Enforce `CC_AGY_BLOCKED_PROJECTS` and `CC_AGY_ALLOWED_PROJECTS` at 0 tokens before any call."""
+    allowed = resolve_allowed_projects(source_env)
+    blocked = resolve_blocked_projects(source_env)
+    if not allowed and not blocked:
+        return
+
+    blocked_lower = {p.lower() for p in blocked}
+    allowed_lower = {p.lower() for p in allowed}
+    candidates: list[tuple[str, str]] = []
+
+    real_proj = project.strip() if isinstance(project, str) and project.strip() and project != "custom-endpoint" else None
+    if real_proj:
+        candidates.append(("project", real_proj))
+
+    companion_proj: str | None = None
+    if auth_mode == "gemini_enterprise":
+        from server.agy_cli import inspect_agy_cli_offline
+
+        ent_info = inspect_agy_cli_offline(source_env)
+        raw_comp = ent_info.get("companion_project")
+        if isinstance(raw_comp, str) and raw_comp.strip():
+            companion_proj = raw_comp.strip()
+            candidates.append(("agy_cli.cloudaicompanionProject", companion_proj))
+    elif auth_mode == "vertex" and not resolve_vertex_base_url(env=source_env):
+        adc_qp = read_adc_quota_project(source_env, explicit_env=explicit_env)
+        if adc_qp:
+            candidates.append(("adc.quota_project_id", adc_qp))
+
+    for source_label, cand_proj in candidates:
+        if cand_proj.lower() in blocked_lower:
+            raise ValueError(
+                f"Blocked GCP project '{cand_proj}' (detected via {source_label}, matched CC_AGY_BLOCKED_PROJECTS). "
+                "Switch credentials (`--auth gemini-enterprise`, `GEMINI_API_KEY`, or `--project <allowed-id>`) "
+                "or update CC_AGY_BLOCKED_PROJECTS."
+            )
+
+    if not allowed:
+        return
+
+    if auth_mode == "vertex":
+        if resolve_vertex_base_url(env=source_env) and real_proj is None:
+            return
+        if real_proj is None or real_proj.lower() not in allowed_lower:
+            raise ValueError(
+                f"GCP project {real_proj!r} is not in CC_AGY_ALLOWED_PROJECTS ({', '.join(allowed)}). "
+                "Pass an approved `--project` or update CC_AGY_ALLOWED_PROJECTS."
+            )
+    elif auth_mode == "gemini_enterprise":
+        primary_ent = companion_proj or real_proj
+        if primary_ent is None:
+            raise ValueError(
+                f"CC_AGY_ALLOWED_PROJECTS ({', '.join(allowed)}) is set, so Gemini Enterprise mode requires a "
+                "verifiable `cloudaicompanionProject` in `agy` onboarding.json (or `--project <allowed-id>`). "
+                "Complete `agy` sign-in or use CC_AGY_BLOCKED_PROJECTS instead."
+            )
+        if primary_ent.lower() not in allowed_lower:
+            raise ValueError(
+                f"GCP project '{primary_ent}' (from `agy` CLI / environment) is not in CC_AGY_ALLOWED_PROJECTS "
+                f"({', '.join(allowed)})."
+            )
+    elif real_proj is not None and real_proj.lower() not in allowed_lower:
+        raise ValueError(
+            f"GCP project '{real_proj}' is not in CC_AGY_ALLOWED_PROJECTS ({', '.join(allowed)})."
+        )
 
 
 def resolve_vertex_project(
@@ -805,14 +1001,25 @@ def resolve_auth_config(
         if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
             explicit_project = cleaned_req_proj
 
+    def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        enforce_project_controls(
+            auth_mode=str(result.get("auth_mode") or ""),
+            project=result.get("project"),
+            source_env=source_env,
+            explicit_env=env,
+        )
+        return result
+
     if resolved_key and requested_api_key:
-        return {
-            "auth_mode": "api_key",
-            "api_key": resolved_key,
-            "project": None,
-            "location": None,
-            "reroute_note": None,
-        }
+        return _finish(
+            {
+                "auth_mode": "api_key",
+                "api_key": resolved_key,
+                "project": None,
+                "location": None,
+                "reroute_note": None,
+            }
+        )
 
     cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
     if cfg_mode == "gemini_enterprise":
@@ -821,26 +1028,30 @@ def resolve_auth_config(
         if req_loc_clean.startswith("${"):
             req_loc_clean = ""
         ent_loc = req_loc_clean or None
-        return {
-            "auth_mode": "gemini_enterprise",
-            "api_key": None,
-            "project": ent_proj,
-            "location": ent_loc,
-            "reroute_note": None,
-        }
+        return _finish(
+            {
+                "auth_mode": "gemini_enterprise",
+                "api_key": None,
+                "project": ent_proj,
+                "location": ent_loc,
+                "reroute_note": None,
+            }
+        )
 
     if cfg_mode == "api_key":
         if not resolved_key:
             raise ValueError(
                 "Missing Gemini API key for auth_mode='api_key'. Set userConfig.gemini_api_key or GEMINI_API_KEY."
             )
-        return {
-            "auth_mode": "api_key",
-            "api_key": resolved_key,
-            "project": None,
-            "location": None,
-            "reroute_note": None,
-        }
+        return _finish(
+            {
+                "auth_mode": "api_key",
+                "api_key": resolved_key,
+                "project": None,
+                "location": None,
+                "reroute_note": None,
+            }
+        )
 
     if cfg_mode == "gateway":
         if not resolve_vertex_base_url(env=source_env):
@@ -850,13 +1061,15 @@ def resolve_auth_config(
             )
         gw_proj = resolved_proj or "custom-endpoint"
         resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
-        return {
-            "auth_mode": "vertex",
-            "api_key": None,
-            "project": gw_proj,
-            "location": resolved_loc,
-            "reroute_note": reroute_note,
-        }
+        return _finish(
+            {
+                "auth_mode": "vertex",
+                "api_key": None,
+                "project": gw_proj,
+                "location": resolved_loc,
+                "reroute_note": reroute_note,
+            }
+        )
 
     if cfg_mode == "vertex":
         if not resolved_proj:
@@ -865,47 +1078,55 @@ def resolve_auth_config(
                 "Set userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT."
             )
         resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
-        return {
-            "auth_mode": "vertex",
-            "api_key": None,
-            "project": resolved_proj,
-            "location": resolved_loc,
-            "reroute_note": reroute_note,
-        }
+        return _finish(
+            {
+                "auth_mode": "vertex",
+                "api_key": None,
+                "project": resolved_proj,
+                "location": resolved_loc,
+                "reroute_note": reroute_note,
+            }
+        )
 
     has_gateway = bool(resolve_vertex_base_url(env=source_env))
 
     # Use API key when explicitly passed, or when present in the environment without an explicit project or gateway
     if resolved_key and (requested_api_key or (not explicit_project and not has_gateway)):
-        return {
-            "auth_mode": "api_key",
-            "api_key": resolved_key,
-            "project": None,
-            "location": None,
-            "reroute_note": None,
-        }
+        return _finish(
+            {
+                "auth_mode": "api_key",
+                "api_key": resolved_key,
+                "project": None,
+                "location": None,
+                "reroute_note": None,
+            }
+        )
 
     if resolved_proj:
         resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
-        return {
-            "auth_mode": "vertex",
-            "api_key": None,
-            "project": resolved_proj,
-            "location": resolved_loc,
-            "reroute_note": reroute_note,
-        }
+        return _finish(
+            {
+                "auth_mode": "vertex",
+                "api_key": None,
+                "project": resolved_proj,
+                "location": resolved_loc,
+                "reroute_note": reroute_note,
+            }
+        )
 
     if _should_auto_detect_agy_cli(env, source_env):
         from server.agy_cli import inspect_agy_cli_offline
 
         if inspect_agy_cli_offline(source_env).get("ok"):
-            return {
-                "auth_mode": "gemini_enterprise",
-                "api_key": None,
-                "project": None,
-                "location": None,
-                "reroute_note": None,
-            }
+            return _finish(
+                {
+                    "auth_mode": "gemini_enterprise",
+                    "api_key": None,
+                    "project": None,
+                    "location": None,
+                    "reroute_note": None,
+                }
+            )
 
     raise ValueError(
         "Missing credentials. Provide a Google AI Studio Gemini API key "

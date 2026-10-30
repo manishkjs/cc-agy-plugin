@@ -92,6 +92,24 @@
       "description": "Optional daily workspace spend limit in US cents (for example 500 for $5.00/day). Leave unset or 0 for no daily cap.",
       "type": "string",
       "sensitive": false
+    },
+    "allowed_projects": {
+      "title": "Allowed GCP Projects",
+      "description": "Optional comma-separated allowlist of Google Cloud project IDs permitted for Vertex AI or Gemini Enterprise (`agy` CLI). Any other project is rejected at 0 tokens.",
+      "type": "string",
+      "sensitive": false
+    },
+    "blocked_projects": {
+      "title": "Blocked GCP Projects",
+      "description": "Optional comma-separated blocklist of Google Cloud project IDs that must never be billed or used (checked across Vertex AI, ADC quota_project_id, and `agy` CLI onboarding).",
+      "type": "string",
+      "sensitive": false
+    },
+    "auto_apply_on_pass": {
+      "title": "Auto-Apply Verified Worker Diffs",
+      "description": "Set to false to require manual diff review (`get_diff` then `delegate_apply`) on every worker job and disable automatic shutdown salvage.",
+      "type": "boolean",
+      "sensitive": false
     }
   }
 }
