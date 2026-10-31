@@ -26,6 +26,7 @@ from server.genai_client import extract_usage_metadata
 from server.regions import (
     env_flag,
     is_strict_mode_enabled,
+    normalize_wire_model_name,
     resolve_auth_config,
     resolve_cost_profile,
     resolve_vertex_base_url,
@@ -2086,6 +2087,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
     eff_project = request.get("project")
     eff_location = request.get("location")
+    custom_gateway = False
     if request.get("api_key"):
         endpoint = types.GeminiAPIEndpoint(
             api_key=request["api_key"],
@@ -2093,6 +2095,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         )
     else:
         vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
+        custom_gateway = bool(vertex_base_url)
         if vertex_base_url:
             eff_project = eff_project or "custom-endpoint"
             eff_location = eff_location or "global"
@@ -2114,8 +2117,9 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         endpoint = types.VertexEndpoint(**ep_kwargs)
     # google-antigravity 0.1.x: the model is a ModelTarget(name, types, endpoint).
     resolved_model = str(request.get("model") or "")
+    wire_model = normalize_wire_model_name(resolved_model, custom_gateway=custom_gateway)
     model_cfg = types.ModelTarget(
-        name=request["model"],
+        name=wire_model,
         types=[types.ModelType.TEXT],
         endpoint=endpoint,
     )

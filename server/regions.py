@@ -52,6 +52,32 @@ DEFAULT_FLASH_MODEL = "gemini-flash-next"
 # solved every task Flash solved plus 2 more in the 26-task suite; override with CC_AGY_ESCALATE_MODEL_ON_FAILURE.
 DEFAULT_ESCALATION_MODEL = "gemini-4-carbon-zero"
 
+
+def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> str:
+    """Return the upstream API model ID for `model` while preserving plugin tier aliases on gateways.
+
+    On direct Google AI Studio and Vertex AI endpoints (`custom_gateway=False`), publisher models
+    use canonical IDs such as `gemini-4-carbon` while thinking depth is carried via `thinking_config`
+    (`thinking_budget=0` or `thinking_level`). Custom Vertex gateways (`custom_gateway=True`) receive
+    the tier-qualified alias verbatim so gateway routers can dispatch per-tier model targets.
+    """
+    cleaned = str(model or "").strip()
+    if not cleaned or custom_gateway:
+        return cleaned
+    low = cleaned.lower()
+    if low in (
+        "gemini-4-carbon-zero",
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-medium",
+        "gemini-4-carbon-high",
+        "carbon-g-zero",
+        "carbon-g",
+    ):
+        return "gemini-4-carbon"
+    if low.endswith("-zero") and len(cleaned) > 5:
+        return cleaned[:-5]
+    return cleaned
+
 # Standard Vertex regional locations supported by GA Gemini models.
 VALID_VERTEX_REGIONS: frozenset[str] = frozenset(
     {

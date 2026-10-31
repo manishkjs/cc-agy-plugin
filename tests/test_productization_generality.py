@@ -891,3 +891,22 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
     assert "escalated_from_model" not in jf2
 
 
+def test_normalize_wire_model_name_strips_tier_suffixes_only_on_direct_endpoints() -> None:
+    from server.regions import normalize_wire_model_name
+
+    for alias in (
+        "gemini-4-carbon-zero",
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-medium",
+        "gemini-4-carbon-high",
+        "carbon-g-zero",
+        "carbon-g",
+    ):
+        assert normalize_wire_model_name(alias, custom_gateway=False) == "gemini-4-carbon"
+        assert normalize_wire_model_name(alias, custom_gateway=True) == alias
+
+    assert normalize_wire_model_name("gemini-flash-next", custom_gateway=False) == "gemini-flash-next"
+    assert normalize_wire_model_name("gemini-4-argon", custom_gateway=False) == "gemini-4-argon"
+
+
+

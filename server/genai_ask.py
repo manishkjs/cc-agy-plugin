@@ -17,8 +17,10 @@ from server.genai_client import (
 from server.receipts import ReceiptStore, enforce_daily_budget, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
+    normalize_wire_model_name,
     resolve_auth_config,
     resolve_default_ask_model,
+    resolve_vertex_base_url,
     sanitize_placeholder_env,
     truncate_to_token_budget,
 )
@@ -59,9 +61,15 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
                 thinking_level=req_tl
             )
 
+        custom_gateway = bool(
+            not request.get("api_key") and resolve_vertex_base_url(request.get("base_url"))
+        )
+        wire_model = normalize_wire_model_name(
+            str(request["model"]), custom_gateway=custom_gateway
+        )
         config = genai_types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
         response = client.models.generate_content(
-            model=request["model"],
+            model=wire_model,
             contents=request["prompt"],
             config=config,
         )
