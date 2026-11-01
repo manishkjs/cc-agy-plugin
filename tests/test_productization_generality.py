@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -348,7 +349,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
     d1 = jm.delegate_start(
         "Update login in auth.py",
         allowed_paths=["auth.py"],
-        acceptance=["pytest -q test_auth.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_auth.py"],
         project="p",
         wait=True,
     )
@@ -359,7 +360,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
     d2 = jm.delegate_start(
         "Implement charge amount in billing.py",
         allowed_paths=["billing.py"],
-        acceptance=["pytest -q test_billing.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_billing.py"],
         project="p",
         wait=True,
     )
@@ -371,7 +372,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
     d3 = jm.delegate_start(
         "Fix regression in billing.py edge case",
         allowed_paths=["billing.py"],
-        acceptance=["pytest -q test_billing.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_billing.py"],
         project="p",
         wait=True,
     )
@@ -462,7 +463,7 @@ def test_sparse_worktree_monorepo_isolation_apply_and_revert(
     res = jm.delegate_start(
         "Update calc() in pkg_a/target.py to return 42",
         allowed_paths=["pkg_a/target.py"],
-        acceptance=["pytest -q tests/test_target.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q tests/test_target.py"],
         project="p",
         wait=True,
         auto_apply=False,
@@ -829,7 +830,7 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
         t1["job_id"],
         "Widen to pkg/c/other.py and set scale() to 5",
         allowed_paths=["pkg/a/foo.py", "pkg/c/other.py"],
-        acceptance=["pytest -q tests/test_foo.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q tests/test_foo.py"],
         project="p",
         wait=True,
         auto_apply=False,
@@ -870,7 +871,7 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
     jf1 = jm_f.delegate_start(
         "Update mod_fail.py",
         allowed_paths=["mod_fail.py"],
-        acceptance=["pytest -q test_mod_fail.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_mod_fail.py"],
         project="p",
         wait=True,
         auto_apply=False,
@@ -882,7 +883,7 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
     jf2 = jm_f.delegate_start(
         "Update mod_clean.py",
         allowed_paths=["mod_clean.py"],
-        acceptance=["pytest -q test_mod_clean.py"],
+        acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_mod_clean.py"],
         project="p",
         wait=True,
         auto_apply=False,

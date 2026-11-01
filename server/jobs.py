@@ -52,6 +52,7 @@ from server.receipts import (
 )
 from server.verification_policy import (
     classify_verification,
+    command_strength,
     has_real_acceptance_pass,
     is_non_smoke_passing_entry,
     satisfies_auto_apply_verification,
@@ -61,6 +62,7 @@ from server.regions import (
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
+    estimate_cost_usd,
     estimate_tokens,
     env_flag,
     is_strict_mode_enabled,
@@ -2486,6 +2488,7 @@ def run_acceptance(
             results.append(
                 {
                     "command": cmd_res.command,
+                    "strength": command_strength(cmd_res.command),
                     "exit_code": None,
                     "timed_out": True,
                     "passed": False,
@@ -2505,6 +2508,7 @@ def run_acceptance(
         filtered_missing_paths = meta.get("filtered_missing_paths")
         entry: dict[str, Any] = {
             "command": cmd_res.command,
+            "strength": command_strength(cmd_res.command),
             "exit_code": cmd_res.exit_code,
             "timed_out": cmd_res.timed_out,
             "passed": cmd_res.passed,
@@ -6691,12 +6695,18 @@ class JobManager:
 
         worker_nm_links: list[Path] = []
         host_nm_snap: dict[str, tuple[int, int, int]] | None = None
+        budget_guard = getattr(self.store, "budget", None)
         try:
             with self._lock:
                 if job_id in self._cancelled:
                     status = "cancelled"
                     error_msg = "Job cancelled before execution."
                     raise RuntimeError(error_msg)
+
+            # Delegate workers run as multi-turn CLI/SDK sessions: enforce the shared daily cap
+            # right before each worker phase (initial, continuation, or model escalation) without
+            # holding a multi-minute reservation that would stall concurrent unpriced batch/ask calls.
+            enforce_daily_budget(self.store, workspace_root=self.workspace_root)
 
             if not in_place:
                 allow_shallow = not (
@@ -6778,6 +6788,17 @@ class JobManager:
                 + usage["thoughts_token_count"],
             )
             self._append_phase_usage_requests(usage, new_usage, model)
+            if budget_guard is not None and any(int(new_usage.get(k) or 0) > 0 for k in token_keys):
+                phase_cost = estimate_cost_usd(model, new_usage, single_request=False)
+                phase_cents = float(phase_cost.get("total_cost_cents") or 0.0)
+                if phase_cents > 0.0:
+                    budget_guard.settle(
+                        None,
+                        job_id=job_id,
+                        actual_cents=phase_cents,
+                        workspace_root=self.workspace_root,
+                        record_live=True,
+                    )
             new_max_req = int(new_usage.get("max_request_prompt_tokens") or 0)
             if new_max_req > 0 or usage.get("max_request_prompt_tokens"):
                 usage["max_request_prompt_tokens"] = max(
@@ -7629,13 +7650,22 @@ class JobManager:
                 progress_path.with_suffix(".live.json").unlink(missing_ok=True)
             except OSError:
                 pass
-            saved = self.store.write_receipt(
-                job_id,
-                receipt_payload,
-                scrub=scrub_receipt,
-                workspace_root=str(self.workspace_root),
-                api_key=api_key,
-            )
+            wrote_receipt = False
+            try:
+                saved = self.store.write_receipt(
+                    job_id,
+                    receipt_payload,
+                    scrub=scrub_receipt,
+                    workspace_root=str(self.workspace_root),
+                    api_key=api_key,
+                )
+                wrote_receipt = True
+            finally:
+                if not wrote_receipt and budget_guard is not None:
+                    try:
+                        budget_guard.clear_job(job_id, workspace_root=self.workspace_root)
+                    except Exception:
+                        pass
             with self._lock:
                 if job_id in self._cancelled and wt_dir.exists():
                     self._cleanup_worktree(wt_dir)
@@ -9050,6 +9080,7 @@ class JobManager:
                         scrub_receipt=bool(receipt.get("scrub_receipt", False)),
                         backend=self.ask_backend,
                         record_receipt=False,
+                        budget_job_id=job_id,
                     )
                     cur_u = dict(res_q.get("usage") or {})
                     for _uk in agg_u:
@@ -10352,6 +10383,8 @@ class JobManager:
             if dst.is_file():
                 dst.unlink()
             dst.write_bytes(pre["data"])
+            if pre.get("mode") is not None:
+                os.chmod(dst, int(pre["mode"]))
 
     def _rollback_partial_apply(self, safe_id: str, pre_apply: dict[str, dict[str, Any]], rels: list[str]) -> list[str]:
         """Best-effort undo of a failed apply; returns the paths that could not be restored."""
@@ -10399,7 +10432,23 @@ class JobManager:
                         capture_output=True, check=False)
         if show.returncode != 0 or sha256_bytes(show.stdout) != base_hash:
             return {"state": "unknown", "sha256": base_hash}
-        return {"state": "git_blob", "sha256": base_hash, "data": show.stdout}
+        blob_mode = 0o644
+        tree_res = _git_raw(
+            ["ls-tree", sha, "--", rel],
+            cwd=str(self.workspace_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if tree_res.returncode == 0 and tree_res.stdout:
+            head_tok = tree_res.stdout.strip().split(None, 1)[0]
+            if head_tok == "100755":
+                blob_mode = 0o755
+            elif head_tok == "100644":
+                blob_mode = 0o644
+        return {"state": "git_blob", "sha256": base_hash, "data": show.stdout, "mode": blob_mode}
 
     def _delegate_revert_locked(self, safe_id: str, *, dry_run: bool, skip_dirty: bool) -> dict[str, Any]:
         receipt = self.store.read_receipt(safe_id)
@@ -11542,14 +11591,15 @@ class JobManager:
                 fut.cancel()
             still_running = fut is not None and not fut.done()
 
-        if callable(cancel_fn):
+        had_cancel_hook = callable(cancel_fn)
+        if had_cancel_hook:
             try:
                 cancel_fn()
             except Exception:
                 pass
         if still_running and fut is not None:
             try:
-                fut.result(timeout=2.0)
+                fut.result(timeout=2.0 if had_cancel_hook else 0.05)
             except Exception:
                 pass
             still_running = not fut.done()

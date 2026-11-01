@@ -477,7 +477,7 @@ def test_running_plugin_retry_clears_stale_fields_updates_budget_and_shows_live_
             encoding="utf-8",
         )
         attempt2_entered.set()
-        release_attempt2.wait(timeout=5.0)
+        release_attempt2.wait(timeout=15.0)
         (wt / "auth.py").write_text("def header():\n    return 'ok'\n# attempt 2 complete\n", encoding="utf-8")
         return {
             "text": "attempt 2 done",
@@ -494,9 +494,12 @@ def test_running_plugin_retry_clears_stale_fields_updates_budget_and_shows_live_
             acceptance=["python3 test_auth.py"],
             wait=True,
         )
-        # Acceptance now snapshots and checks the change set around every command (a few git calls),
-        # so allow more than 3 s on a loaded machine; the event still has to fire.
-        assert attempt2_entered.wait(timeout=10.0)
+        # Acceptance snapshots and checks the change set around every command; under heavy CPU load,
+        # the initial 1.8 s wait slice can return while Attempt 1 is still finishing post-turn acceptance.
+        # Once Attempt 2 enters (and blocks on release_attempt2), fetch the live running view if needed.
+        assert attempt2_entered.wait(timeout=15.0)
+        if mid.get("attempt", 1) < 2:
+            mid = jm.delegate_result(mid["job_id"], wait=True, timeout=0.1)
         if mid["status"] != "running":
             pytest.fail(f"Expected wait-sliced Attempt 2 to still be running, got {mid}")
 

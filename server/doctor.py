@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Mapping
 
 from server.jobs import detect_project_test_runner
@@ -277,6 +278,11 @@ def run_doctor(
                 tracked_files = sum(1 for entry in ls_probe.stdout.split(b"\x00") if entry)
         else:
             warnings.append(f"Workspace `{ws_path}` is not a git repository; isolated git diff checks require git.")
+    if not Path("/proc").is_dir() and shutil.which("pgrep") is None and shutil.which("ps") is None:
+        warnings.append(
+            "Process-tree cleanup fallback requires `pgrep` or `ps` on non-/proc platforms."
+        )
+
     detected_runner = detect_project_test_runner(ws_path) if ws_path.is_dir() else None
     workspace_info = {
         "workspace_root": str(ws_path),

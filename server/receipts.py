@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -13,14 +14,105 @@ from pathlib import Path
 import re
 import secrets
 import tempfile
+import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+import uuid
 
 from server.regions import estimate_cost_usd, resolve_max_daily_cents
 from server.verify import run_git
 
 _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _BINARY_DIFF_RE = re.compile(r"^Binary files (.+?) and (.+?) differ$")
+_BUDGET_CONDS: dict[str, threading.Condition] = {}
+_BUDGET_CONDS_GUARD = threading.Lock()
+_RECEIPT_SUMMARY_KEYS = (
+    "job_id",
+    "workspace_root",
+    "kind",
+    "status",
+    "applied",
+    "model",
+    "started_at_epoch",
+    "finished_at_epoch",
+    "updated_at_epoch",
+    "plan_fingerprint",
+    "workspace_state",
+    "worktree_dir",
+    "baseline_commit_sha",
+    "cost",
+    "cost_by_utc_day",
+    "usage",
+)
+
+
+def _get_budget_cond(data_dir: Path) -> threading.Condition:
+    key = str(data_dir.resolve())
+    with _BUDGET_CONDS_GUARD:
+        cond = _BUDGET_CONDS.get(key)
+        if cond is None:
+            cond = threading.Condition(threading.Lock())
+            _BUDGET_CONDS[key] = cond
+        return cond
+
+
+def _proc_stat_info(pid: int) -> tuple[str, int] | None:
+    """Return ``(proc_state_char, starttime_ticks)`` from ``/proc/<pid>/stat`` on Linux, else None."""
+    if pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return None
+        fields = raw[rparen + 1 :].split()
+        if len(fields) <= 19:
+            return None
+        return fields[0], int(fields[19])
+    except (OSError, ValueError):
+        return None
+
+
+def _current_proc_start_ticks() -> int | None:
+    info = _proc_stat_info(os.getpid())
+    return info[1] if info is not None else None
+
+
+def _reservation_owner_alive(entry: Mapping[str, Any], now_ts: float, ttl_seconds: float = 900.0) -> bool:
+    """True when an in-flight budget reservation's owning process is still alive (non-zombie, same start time) and within TTL."""
+    try:
+        ts = float(entry.get("ts") or 0.0)
+        pid = int(entry.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or (ts > 0.0 and (now_ts - ts) > ttl_seconds):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    info = _proc_stat_info(pid)
+    if info is not None:
+        state_ch, actual_start = info
+        if state_ch == "Z":
+            return False
+        expected_start = entry.get("proc_start")
+        if isinstance(expected_start, int) and expected_start != actual_start:
+            return False
+    return True
+
+
+def _extract_receipt_summary(rec: Mapping[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for k in _RECEIPT_SUMMARY_KEYS:
+        if k in rec:
+            val = rec[k]
+            summary[k] = dict(val) if isinstance(val, dict) else val
+    return summary
 
 
 def receipt_owner_pid_alive(receipt: Mapping[str, Any]) -> bool:
@@ -488,7 +580,10 @@ class ReceiptStore:
                 pass
         _register_empty_worktree_dir_cleanup(self.worktrees_dir)
         self._recorded_workspaces: set[str] = set()
+        self._cache_lock = threading.Lock()
+        self._receipt_cache: dict[str, tuple[tuple[int, int, int, int], dict[str, Any], dict[str, Any]]] = {}
         self._hmac_key = self._load_or_create_hmac_key()
+        self.budget = DailyBudgetGuard(self)
 
     @staticmethod
     def _resolve_data_dir(
@@ -792,6 +887,13 @@ class ReceiptStore:
         if workspace_root:
             record.setdefault("workspace_root", str(Path(workspace_root).resolve()))
 
+        try:
+            prev_rec = self.read_receipt(safe_id)
+            if not isinstance(prev_rec, dict):
+                prev_rec = {}
+        except (FileNotFoundError, OSError, ValueError):
+            prev_rec = {}
+
         usage = record.get("usage") or {}
         model = str(record.get("model") or "gemini-flash-next")
         precomputed = record.get("precomputed_cost")
@@ -804,7 +906,7 @@ class ReceiptStore:
                 usage,
                 single_request=(record.get("kind") == "ask"),
             )
-        record["cost_by_utc_day"] = self._cost_by_utc_day(safe_id, record)
+        record["cost_by_utc_day"] = self._cost_by_utc_day(safe_id, record, _prev=prev_rec)
         record["hmac_scope"] = 2
 
         # Always redact secret API keys even when scrub=False
@@ -830,7 +932,29 @@ class ReceiptStore:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(record, handle, indent=2, sort_keys=True)
                 handle.write("\n")
-            os.replace(tmp_path, target)
+
+            def _swap_and_cache() -> None:
+                os.replace(tmp_path, target)
+                try:
+                    st = os.stat(target, follow_symlinks=False)
+                    stat_key = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                    rec_copy = copy.deepcopy(record)
+                    with self._cache_lock:
+                        self._receipt_cache[target.name] = (
+                            stat_key,
+                            rec_copy,
+                            _extract_receipt_summary(rec_copy),
+                        )
+                except OSError:
+                    pass
+
+            self.budget.commit_receipt_with_replace(
+                safe_id,
+                replace_fn=_swap_and_cache,
+                workspace_root=record.get("workspace_root") or workspace_root,
+                prev_record=prev_rec,
+                new_record=record,
+            )
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -843,7 +967,13 @@ class ReceiptStore:
 
         return record
 
-    def _cost_by_utc_day(self, safe_id: str, record: dict[str, Any]) -> dict[str, float]:
+    def _cost_by_utc_day(
+        self,
+        safe_id: str,
+        record: dict[str, Any],
+        *,
+        _prev: dict[str, Any] | None = None,
+    ) -> dict[str, float]:
         """Per-UTC-day spend for a receipt, so a job resumed or continued across midnight is charged to
         the days its calls actually ran. The buckets always add up to the receipt's total cost.
 
@@ -856,12 +986,15 @@ class ReceiptStore:
         """
         total = _receipt_cost_cents(record)
         explicit = record.get("cost_by_utc_day")
-        try:
-            prev = self.read_receipt(safe_id)
-        except (FileNotFoundError, OSError, ValueError):
-            prev = {}
-        if not isinstance(prev, dict):
-            prev = {}
+        if _prev is not None:
+            prev = _prev
+        else:
+            try:
+                prev = self.read_receipt(safe_id)
+            except (FileNotFoundError, OSError, ValueError):
+                prev = {}
+            if not isinstance(prev, dict):
+                prev = {}
         buckets: dict[str, float] = {}
         if isinstance(explicit, dict) and explicit:
             buckets = {str(day): _finite_positive(cents) for day, cents in explicit.items()}
@@ -896,23 +1029,63 @@ class ReceiptStore:
             raise FileNotFoundError(f"No receipt found for job_id '{job_id}'")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _refresh_receipt_cache_locked(self) -> None:
+        seen: set[str] = set()
+        try:
+            it = os.scandir(self.receipts_dir)
+        except OSError:
+            self._receipt_cache.clear()
+            return
+        with it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(".json") or name.endswith(".live.json") or name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                stat_key = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                cached = self._receipt_cache.get(name)
+                if cached is not None and cached[0] == stat_key:
+                    seen.add(name)
+                    continue
+                try:
+                    rec = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(rec, dict) or not rec.get("job_id"):
+                    continue
+                self._receipt_cache[name] = (stat_key, rec, _extract_receipt_summary(rec))
+                seen.add(name)
+        stale = [k for k in self._receipt_cache if k not in seen]
+        for k in stale:
+            self._receipt_cache.pop(k, None)
+
+    def list_receipt_summaries(self, *, workspace_root: str | Path | None = None) -> list[dict[str, Any]]:
+        """Fast stat-cached lookup returning compact receipt summaries sorted by ``started_at_epoch``."""
+        target_ws = str(Path(workspace_root).resolve()) if workspace_root else None
+        with self._cache_lock:
+            self._refresh_receipt_cache_locked()
+            summaries = [
+                _extract_receipt_summary(summary)
+                for _, _, summary in self._receipt_cache.values()
+                if not target_ws or summary.get("workspace_root") in (None, "/workspace", target_ws)
+            ]
+        summaries.sort(key=lambda r: float(r.get("started_at_epoch") or 0.0))
+        return summaries
+
     def list_receipts(self, *, workspace_root: str | Path | None = None) -> list[dict[str, Any]]:
         target_ws = str(Path(workspace_root).resolve()) if workspace_root else None
-        receipts: list[dict[str, Any]] = []
-        for path in sorted(self.receipts_dir.glob("*.json")):
-            if path.name.endswith(".live.json"):
-                continue
-            try:
-                rec = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(rec, dict) or not rec.get("job_id"):
-                continue
-            if target_ws and rec.get("workspace_root") not in (None, "/workspace", target_ws):
-                continue
-            receipts.append(rec)
-        receipts.sort(key=lambda r: float(r.get("started_at_epoch") or 0.0))
-        return receipts
+        with self._cache_lock:
+            self._refresh_receipt_cache_locked()
+            matched = [
+                rec
+                for _, rec, summary in self._receipt_cache.values()
+                if not target_ws or summary.get("workspace_root") in (None, "/workspace", target_ws)
+            ]
+            matched.sort(key=lambda r: float(r.get("started_at_epoch") or 0.0))
+            return [copy.deepcopy(rec) for rec in matched]
 
     def summarize_costs(
         self,
@@ -921,7 +1094,7 @@ class ReceiptStore:
     ) -> dict[str, Any]:
         """Aggregate token usage and cost across receipts for the active workspace, including failed runs."""
         target_ws = workspace_root if workspace_root is not None else self.workspace_root
-        receipts = self.list_receipts(workspace_root=target_ws)
+        receipts = self.list_receipt_summaries(workspace_root=target_ws)
         totals: dict[str, Any] = {
             "total_jobs": len(receipts),
             "completed_jobs": 0,
@@ -948,18 +1121,17 @@ class ReceiptStore:
                 totals["completed_jobs"] += 1
             elif status == "checkpoint":
                 totals["checkpoint_jobs"] += 1
-                totals["in_progress_or_paused_jobs"] += 1
             elif status == "needs_input":
                 totals["needs_input_jobs"] += 1
-                totals["in_progress_or_paused_jobs"] += 1
             elif status == "running":
                 totals["running_jobs"] += 1
-                totals["in_progress_or_paused_jobs"] += 1
             elif status == "interrupted":
                 totals["interrupted_jobs"] += 1
                 totals["failed_or_timed_out_jobs"] += 1
             elif status in ("error", "timeout", "cancelled", "scope_violation", "security_violation"):
                 totals["failed_or_timed_out_jobs"] += 1
+            if status in ("checkpoint", "needs_input", "running"):
+                totals["in_progress_or_paused_jobs"] += 1
             if r.get("applied"):
                 totals["applied_jobs"] += 1
 
@@ -1016,42 +1188,24 @@ class ReceiptStore:
 
         return totals
 
-    def daily_spend_summary(
+    def _receipt_spend_summary_only(
         self,
         *,
         workspace_root: str | Path | None = None,
         now_epoch: float | None = None,
     ) -> dict[str, Any]:
-        """Sum Gemini spend in cents across receipts stamped on the current UTC calendar day."""
         now_ts = float(now_epoch if now_epoch is not None else time.time())
         utc_day = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
         target_ws = workspace_root if workspace_root is not None else self.workspace_root
-        receipts = self.list_receipts(workspace_root=target_ws)
+        receipts = self.list_receipt_summaries(workspace_root=target_ws)
         spent_usd = 0.0
         jobs_today = 0
         for rec in receipts:
-            stamp = float(rec.get("finished_at_epoch") or rec.get("started_at_epoch") or 0.0)
-            buckets = rec.get("cost_by_utc_day")
-            if isinstance(buckets, dict) and buckets:
-                # Per-day spend recorded as the job ran: a job resumed across midnight is split correctly.
-                cents_today = _finite_positive(buckets.get(utc_day))
-                if cents_today <= 0.0 and (stamp <= 0.0 or _utc_day(stamp) != utc_day):
-                    continue
-                jobs_today += 1
-                spent_usd = round(spent_usd + cents_today / 100.0, 8)
-                continue
-            if stamp <= 0.0:
-                continue
-            if datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d") != utc_day:
+            cents_today, counted_job = _receipt_cents_and_activity_on_utc_day(rec, utc_day)
+            if not counted_job:
                 continue
             jobs_today += 1
-            usage = rec.get("usage") or {}
-            cost = rec.get("cost") or estimate_cost_usd(
-                str(rec.get("model") or "gemini-flash-next"),
-                usage,
-                single_request=(rec.get("kind") == "ask"),
-            )
-            spent_usd = round(spent_usd + float(cost.get("total_cost_usd") or 0.0), 8)
+            spent_usd = round(spent_usd + cents_today / 100.0, 8)
         spent_cents = round(spent_usd * 100.0, 6)
         return {
             "utc_date": utc_day,
@@ -1060,6 +1214,465 @@ class ReceiptStore:
             "spent_today_cents": spent_cents,
             "workspace_root": str(Path(target_ws).resolve()) if target_ws else None,
         }
+
+    def daily_spend_summary(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+        now_epoch: float | None = None,
+    ) -> dict[str, Any]:
+        """Sum Gemini spend in cents across persisted receipts and unsettled live calls on the UTC calendar day."""
+        if self.budget.budget_dir.exists():
+            def _atomic_summary() -> dict[str, Any]:
+                base = self._receipt_spend_summary_only(workspace_root=workspace_root, now_epoch=now_epoch)
+                utc_day = str(base["utc_date"])
+                state, dirty = self.budget._load_day_state_locked(utc_day, float(now_epoch if now_epoch is not None else time.time()))
+                if dirty:
+                    self.budget._save_day_state_locked(utc_day, state)
+                ws_key = self.budget._ws_key(workspace_root)
+                ws_entry = (state.get("workspaces") or {}).get(ws_key) or {}
+                live_map = ws_entry.get("live")
+                live_cents = (
+                    round(sum(_finite_positive(v) for v in live_map.values()), 6)
+                    if isinstance(live_map, Mapping)
+                    else 0.0
+                )
+                if live_cents > 0.0:
+                    total_cents = round(float(base["spent_today_cents"]) + live_cents, 6)
+                    base["spent_today_cents"] = total_cents
+                    base["spent_today_usd"] = round(total_cents / 100.0, 8)
+                return base
+
+            try:
+                return self.budget._with_flock(_atomic_summary)
+            except OSError:
+                pass
+        base = self._receipt_spend_summary_only(workspace_root=workspace_root, now_epoch=now_epoch)
+        utc_day = str(base["utc_date"])
+        live_cents = self.budget.unsettled_live_cents(workspace_root=workspace_root, utc_day=utc_day)
+        if live_cents > 0.0:
+            total_cents = round(float(base["spent_today_cents"]) + live_cents, 6)
+            base["spent_today_cents"] = total_cents
+            base["spent_today_usd"] = round(total_cents / 100.0, 8)
+        return base
+
+
+def _receipt_cents_and_activity_on_utc_day(rec: Mapping[str, Any], utc_day: str) -> tuple[float, bool]:
+    stamp = float(rec.get("finished_at_epoch") or rec.get("started_at_epoch") or 0.0)
+    buckets = rec.get("cost_by_utc_day")
+    if isinstance(buckets, Mapping) and buckets:
+        cents_today = _finite_positive(buckets.get(utc_day))
+        if cents_today <= 0.0 and (stamp <= 0.0 or _utc_day(stamp) != utc_day):
+            return 0.0, False
+        return cents_today, True
+    if stamp <= 0.0 or _utc_day(stamp) != utc_day:
+        return 0.0, False
+    usage = rec.get("usage") or {}
+    cost = rec.get("cost") or estimate_cost_usd(
+        str(rec.get("model") or "gemini-flash-next"),
+        usage,
+        single_request=(rec.get("kind") == "ask"),
+    )
+    cents = round(float(cost.get("total_cost_usd") or 0.0) * 100.0, 6)
+    return cents, True
+
+
+class DailyBudgetGuard:
+    """Cross-thread and cross-process daily spend gate backed by ``fcntl.flock``.
+
+    Persists in-flight call reservations and settled-not-yet-receipted call spend under
+    ``<data_dir>/budget/<utc_day>.json`` keyed by normalized ``workspace_root``. Because
+    ``CC_AGY_MAX_DAILY_CENTS`` is evaluated per workspace (matching ``daily_spend_summary``),
+    shared ``CC_AGY_DATA_DIR`` / ``CLAUDE_PLUGIN_DATA`` directories isolate each workspace's cap
+    while coordinating concurrent threads, batches, delegations, and processes on the same workspace.
+    The cap is soft by at most one in-flight call whose actual token usage exceeds its pre-call estimate.
+    """
+
+    _POLL_SECONDS = 0.05
+    _RESERVATION_TTL_SECONDS = 900.0
+
+    def __init__(self, store: ReceiptStore) -> None:
+        self.store = store
+        self.budget_dir = store.data_dir / "budget"
+        self.lock_path = self.budget_dir / ".lock"
+        self._cond = _get_budget_cond(store.data_dir)
+
+    def _ws_key(self, workspace_root: str | Path | None) -> str:
+        ws = workspace_root if workspace_root is not None else self.store.workspace_root
+        return str(Path(ws).resolve()) if ws else "__global__"
+
+    def _day_path(self, utc_day: str) -> Path:
+        return self.budget_dir / f"{utc_day}.json"
+
+    def _with_flock(self, fn: Callable[[], Any]) -> Any:
+        self.budget_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.budget_dir, 0o700)
+        except OSError:
+            pass
+        fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                return fn()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _load_day_state_locked(self, utc_day: str, now_ts: float) -> tuple[dict[str, Any], bool]:
+        # Clean up any stale UTC-day ledger files older than today.
+        try:
+            for p in self.budget_dir.glob("*.json"):
+                stem = p.stem
+                if len(stem) == 10 and stem < utc_day:
+                    p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        dpath = self._day_path(utc_day)
+        dirty = False
+        state: dict[str, Any] = {"workspaces": {}}
+        if dpath.exists():
+            try:
+                loaded = json.loads(dpath.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("workspaces"), dict):
+                    state = loaded
+            except (OSError, json.JSONDecodeError):
+                state = {"workspaces": {}}
+        workspaces = state.setdefault("workspaces", {})
+        for ws_entry in workspaces.values():
+            if not isinstance(ws_entry, dict):
+                continue
+            res_map = ws_entry.get("reservations")
+            if isinstance(res_map, dict):
+                dead_ids = [
+                    rid
+                    for rid, rinfo in res_map.items()
+                    if not isinstance(rinfo, Mapping)
+                    or not _reservation_owner_alive(rinfo, now_ts, self._RESERVATION_TTL_SECONDS)
+                ]
+                for rid in dead_ids:
+                    res_map.pop(rid, None)
+                    dirty = True
+        return state, dirty
+
+    def _save_day_state_locked(self, utc_day: str, state: dict[str, Any]) -> None:
+        dpath = self._day_path(utc_day)
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{utc_day}-", suffix=".tmp", dir=str(self.budget_dir))
+        try:
+            os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+            os.replace(tmp_path, dpath)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def unsettled_live_cents(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+        utc_day: str | None = None,
+    ) -> float:
+        day = utc_day or _utc_day(time.time())
+        dpath = self._day_path(day)
+        if not dpath.exists():
+            return 0.0
+        ws_key = self._ws_key(workspace_root)
+
+        def _read() -> float:
+            state, dirty = self._load_day_state_locked(day, time.time())
+            if dirty:
+                self._save_day_state_locked(day, state)
+            ws_entry = (state.get("workspaces") or {}).get(ws_key) or {}
+            live_map = ws_entry.get("live")
+            if not isinstance(live_map, Mapping):
+                return 0.0
+            return round(sum(_finite_positive(v) for v in live_map.values()), 6)
+
+        try:
+            return float(self._with_flock(_read))
+        except OSError:
+            return 0.0
+
+    def commit_receipt_with_replace(
+        self,
+        job_id: str,
+        *,
+        replace_fn: Callable[[], None],
+        workspace_root: str | Path | None,
+        prev_record: Mapping[str, Any] | None,
+        new_record: Mapping[str, Any],
+    ) -> None:
+        """Atomically swap a receipt file into place and deduct its newly persisted spend from ``live``."""
+        if resolve_max_daily_cents() is None and not self.budget_dir.exists():
+            replace_fn()
+            return
+        now_ts = time.time()
+        utc_day = _utc_day(now_ts)
+        ws_key = self._ws_key(workspace_root)
+        old_today, _ = _receipt_cents_and_activity_on_utc_day(prev_record, utc_day) if prev_record else (0.0, False)
+        new_today, _ = _receipt_cents_and_activity_on_utc_day(new_record, utc_day)
+        delta_today = max(0.0, new_today - old_today)
+
+        def _op() -> None:
+            replace_fn()
+            if not self._day_path(utc_day).exists():
+                return
+            state, dirty = self._load_day_state_locked(utc_day, now_ts)
+            ws_entry = (state.get("workspaces") or {}).get(ws_key)
+            if isinstance(ws_entry, dict):
+                live_map = ws_entry.get("live")
+                if isinstance(live_map, dict) and job_id in live_map:
+                    status_str = str(new_record.get("status") or "")
+                    if status_str != "running":
+                        live_map.pop(job_id, None)
+                        dirty = True
+                    elif delta_today > 0.0:
+                        rem = _finite_positive(live_map.get(job_id)) - delta_today
+                        if rem <= 1e-6:
+                            live_map.pop(job_id, None)
+                        else:
+                            live_map[job_id] = round(rem, 6)
+                        dirty = True
+            if dirty:
+                self._save_day_state_locked(utc_day, state)
+
+        with self._cond:
+            self._with_flock(_op)
+            self._cond.notify_all()
+
+    def reserve(
+        self,
+        job_id: str,
+        estimate_cents: float = 0.0,
+        *,
+        unpriced: bool | None = None,
+        workspace_root: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        now_epoch: float | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        wait_timeout: float = 120.0,
+    ) -> str | None:
+        """Reserve budget before one paid model call; raise ``BudgetExceededError`` when cap is reached.
+
+        Returns a reservation ID to pass to ``settle`` / ``release``, or ``None`` when no daily cap is set.
+        """
+        cap_cents = resolve_max_daily_cents(env)
+        if cap_cents is None:
+            return None
+        est = _finite_positive(estimate_cents)
+        is_unpriced = (est <= 0.0) if unpriced is None else bool(unpriced)
+        ws_key = self._ws_key(workspace_root)
+        deadline = time.monotonic() + max(0.1, float(wait_timeout))
+        proc_start = _current_proc_start_ticks()
+
+        with self._cond:
+            while True:
+                if should_stop is not None and should_stop():
+                    return None
+                now_ts = float(now_epoch if now_epoch is not None else time.time())
+                utc_day = _utc_day(now_ts)
+
+                decision: dict[str, Any] = {}
+
+                def _try_admit() -> None:
+                    receipt_summary = self.store._receipt_spend_summary_only(
+                        workspace_root=ws_key if ws_key != "__global__" else None,
+                        now_epoch=now_ts,
+                    )
+                    receipt_cents = float(receipt_summary["spent_today_cents"])
+                    state, dirty = self._load_day_state_locked(utc_day, now_ts)
+                    workspaces = state.setdefault("workspaces", {})
+                    ws_entry = workspaces.setdefault(ws_key, {"live": {}, "reservations": {}})
+                    live_map = ws_entry.setdefault("live", {})
+                    res_map = ws_entry.setdefault("reservations", {})
+                    live_cents = sum(_finite_positive(v) for v in live_map.values())
+                    committed = round(receipt_cents + live_cents, 6)
+                    active_in_flight = sum(
+                        1
+                        for r in res_map.values()
+                        if bool(r.get("unpriced")) or _finite_positive(r.get("cents")) > 0.0
+                    )
+                    reserved_cents = sum(_finite_positive(r.get("cents")) for r in res_map.values())
+                    any_unpriced = any(bool(r.get("unpriced")) for r in res_map.values())
+
+                    if committed >= cap_cents:
+                        if dirty:
+                            self._save_day_state_locked(utc_day, state)
+                        decision["exceeded"] = committed
+                        return
+                    if est > 0.0 and committed + est > cap_cents:
+                        if dirty:
+                            self._save_day_state_locked(utc_day, state)
+                        decision["exceeded"] = committed
+                        decision["projected"] = round(committed + est, 6)
+                        return
+                    if (is_unpriced or est > 0.0) and (any_unpriced or (is_unpriced and active_in_flight > 0)):
+                        if dirty:
+                            self._save_day_state_locked(utc_day, state)
+                        decision["wait"] = True
+                        return
+                    if est > 0.0 and committed + reserved_cents + est > cap_cents and active_in_flight > 0:
+                        if dirty:
+                            self._save_day_state_locked(utc_day, state)
+                        decision["wait"] = True
+                        return
+
+                    res_id = f"res-{uuid.uuid4().hex[:12]}"
+                    res_map[res_id] = {
+                        "job_id": str(job_id),
+                        "cents": round(est, 6),
+                        "unpriced": bool(is_unpriced),
+                        "pid": os.getpid(),
+                        "proc_start": proc_start,
+                        "ts": round(now_ts, 3),
+                        "utc_day": utc_day,
+                        "ws_key": ws_key,
+                    }
+                    self._save_day_state_locked(utc_day, state)
+                    decision["res_id"] = res_id
+
+                self._with_flock(_try_admit)
+                if "res_id" in decision:
+                    return str(decision["res_id"])
+                if "exceeded" in decision:
+                    raise BudgetExceededError(
+                        spent_today_cents=float(decision["exceeded"]),
+                        max_daily_cents=cap_cents,
+                        utc_date=utc_day,
+                        workspace_root=ws_key if ws_key != "__global__" else None,
+                    )
+                rem_wait = deadline - time.monotonic()
+                if rem_wait <= 0.0:
+                    # Failsafe if an external process held an in-flight call past wait_timeout:
+                    # re-check committed spend under flock and admit if still under cap.
+                    late: dict[str, Any] = {}
+
+                    def _force_or_reject() -> None:
+                        now_late = float(now_epoch if now_epoch is not None else time.time())
+                        receipt_summary = self.store._receipt_spend_summary_only(
+                            workspace_root=ws_key if ws_key != "__global__" else None,
+                            now_epoch=now_late,
+                        )
+                        receipt_cents = float(receipt_summary["spent_today_cents"])
+                        state, dirty = self._load_day_state_locked(utc_day, now_late)
+                        ws_entry = state.setdefault("workspaces", {}).setdefault(
+                            ws_key, {"live": {}, "reservations": {}}
+                        )
+                        live_cents = sum(_finite_positive(v) for v in (ws_entry.get("live") or {}).values())
+                        committed = round(receipt_cents + live_cents, 6)
+                        if committed >= cap_cents or (est > 0.0 and committed + est > cap_cents):
+                            if dirty:
+                                self._save_day_state_locked(utc_day, state)
+                            late["exceeded"] = committed
+                            return
+                        res_id = f"res-{uuid.uuid4().hex[:12]}"
+                        ws_entry.setdefault("reservations", {})[res_id] = {
+                            "job_id": str(job_id),
+                            "cents": round(est, 6),
+                            "unpriced": False,
+                            "pid": os.getpid(),
+                            "proc_start": proc_start,
+                            "ts": round(now_late, 3),
+                            "utc_day": utc_day,
+                            "ws_key": ws_key,
+                        }
+                        self._save_day_state_locked(utc_day, state)
+                        late["res_id"] = res_id
+
+                    self._with_flock(_force_or_reject)
+                    if "res_id" in late:
+                        return str(late["res_id"])
+                    raise BudgetExceededError(
+                        spent_today_cents=float(late.get("exceeded", 0.0)),
+                        max_daily_cents=cap_cents,
+                        utc_date=utc_day,
+                        workspace_root=ws_key if ws_key != "__global__" else None,
+                    )
+                self._cond.wait(timeout=min(self._POLL_SECONDS, rem_wait))
+
+    def settle(
+        self,
+        res_id: str | None,
+        *,
+        job_id: str,
+        actual_cents: float = 0.0,
+        workspace_root: str | Path | None = None,
+        record_live: bool = True,
+        now_epoch: float | None = None,
+    ) -> None:
+        """Release reservation ``res_id`` and optionally record ``actual_cents`` in unsettled ``live`` spend."""
+        cents = _finite_positive(actual_cents)
+        if res_id is None and (not record_live or cents <= 0.0):
+            return
+        now_ts = float(now_epoch if now_epoch is not None else time.time())
+        settle_day = _utc_day(now_ts)
+        ws_key = self._ws_key(workspace_root)
+
+        def _op() -> None:
+            # Remove reservation from today's file (and yesterday's if call crossed UTC midnight).
+            candidate_days = [settle_day]
+            prev_day = _utc_day(now_ts - 86400.0)
+            if prev_day != settle_day and self._day_path(prev_day).exists():
+                candidate_days.append(prev_day)
+            for day in candidate_days:
+                if day != settle_day and not self._day_path(day).exists():
+                    continue
+                state, dirty = self._load_day_state_locked(day, now_ts)
+                workspaces = state.setdefault("workspaces", {})
+                ws_entry = workspaces.setdefault(ws_key, {"live": {}, "reservations": {}})
+                res_map = ws_entry.setdefault("reservations", {})
+                if res_id and res_id in res_map:
+                    res_map.pop(res_id, None)
+                    dirty = True
+                if day == settle_day and record_live and cents > 0.0:
+                    live_map = ws_entry.setdefault("live", {})
+                    live_map[str(job_id)] = round(_finite_positive(live_map.get(str(job_id))) + cents, 6)
+                    dirty = True
+                if dirty:
+                    self._save_day_state_locked(day, state)
+
+        with self._cond:
+            self._with_flock(_op)
+            self._cond.notify_all()
+
+    def clear_job(
+        self,
+        job_id: str,
+        *,
+        workspace_root: str | Path | None = None,
+    ) -> None:
+        """Remove any leftover unspent reservations for ``job_id`` while preserving ``live`` spend."""
+        if not self.budget_dir.exists():
+            return
+        now_ts = time.time()
+        utc_day = _utc_day(now_ts)
+        if not self._day_path(utc_day).exists():
+            return
+        ws_key = self._ws_key(workspace_root)
+
+        def _op() -> None:
+            state, dirty = self._load_day_state_locked(utc_day, now_ts)
+            ws_entry = (state.get("workspaces") or {}).get(ws_key)
+            if isinstance(ws_entry, dict):
+                res_map = ws_entry.get("reservations")
+                if isinstance(res_map, dict):
+                    stale = [rid for rid, r in res_map.items() if isinstance(r, Mapping) and r.get("job_id") == str(job_id)]
+                    for rid in stale:
+                        res_map.pop(rid, None)
+                        dirty = True
+            if dirty:
+                self._save_day_state_locked(utc_day, state)
+
+        with self._cond:
+            try:
+                self._with_flock(_op)
+            finally:
+                self._cond.notify_all()
 
 
 class BudgetExceededError(RuntimeError):

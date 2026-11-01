@@ -385,6 +385,8 @@ def test_auto_apply_in_delegate_start_and_continue_and_shutdown_salvage(
     assert res["status"] == "ok"
     assert res["applied"] is True
     assert res["applied_files"] == ["app.py"]
+    assert "real_acceptance_passed" not in res
+    assert "diff_preview" in res
     assert "auto_applied" in (repo / "app.py").read_text(encoding="utf-8")
     jm.shutdown()
 

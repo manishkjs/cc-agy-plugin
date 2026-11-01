@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -728,6 +730,10 @@ def test_wait_slice_clamping_and_auto_apply_on_delegate_result(tmp_path: Path, m
     repo = tmp_path / "repo_slice"
     _init_repo(repo)
     (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "import app\n\n\ndef test_x() -> None:\n    assert app.x == 42\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo), check=True)
 
@@ -747,7 +753,7 @@ def test_wait_slice_clamping_and_auto_apply_on_delegate_result(tmp_path: Path, m
             "Update x to 42",
             model="gemini-3.8-flash",
             project="p",
-            acceptance=["grep -q 42 app.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_app.py"],
             wait=True,
         )
         assert d_slice["status"] == "running"
@@ -773,6 +779,10 @@ def test_bash_workspace_reads_counted_and_clean_apply_skips_review_bonus_and_use
     repo = tmp_path / "repo_bash_cap"
     _init_repo(repo)
     (repo / "mod.py").write_text("class Blueprint:\n    def register(self) -> int:\n        return 1\n", encoding="utf-8")
+    (repo / "test_mod.py").write_text(
+        "from mod import Blueprint\n\n\ndef test_register() -> None:\n    assert Blueprint().register() == 99\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
     subprocess.run(["git", "commit", "-qm", "add mod"], cwd=str(repo), check=True)
 
@@ -832,7 +842,7 @@ def test_bash_workspace_reads_counted_and_clean_apply_skips_review_bonus_and_use
             "Update Blueprint.register in mod.py",
             model="gemini-3.8-flash",
             project="p",
-            acceptance=["grep -q 99 mod.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_mod.py"],
             wait=True,
         )
         assert d["applied"] is True

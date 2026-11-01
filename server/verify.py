@@ -123,8 +123,11 @@ class CommandResult:
     credential_env_removed: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
+        from server.verification_policy import command_strength
+
         out: dict[str, object] = {
             "command": self.command,
+            "strength": command_strength(self.command),
             "passed": self.passed,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
@@ -2976,6 +2979,7 @@ def execute_command_suite(
     log_dir: Path | None = None,
     clean_new_files: bool = True,
     allowed_mutations: Collection[str] = (),
+    per_command_allowed_mutations: Sequence[Collection[str]] | None = None,
     restore_tracked: bool = True,
     change_set: Collection[str] = (),
     quarantine_dir: Path | None = None,
@@ -2995,12 +2999,21 @@ def execute_command_suite(
     before_dirs: set[str] = set()
     own_logs: set[Path] = set()
     suite_started_mono = time.monotonic()
-    session = _SnapshotSession(cwd, extra_paths=(*allowed_mutations, *change_set))
+    all_allowed_paths = set(allowed_mutations)
+    if per_command_allowed_mutations is not None:
+        for per_cmd in per_command_allowed_mutations:
+            all_allowed_paths.update(per_cmd)
+    session = _SnapshotSession(cwd, extra_paths=(*all_allowed_paths, *change_set))
     baseline = session.baseline
     if clean_new_files and baseline is None:
         before = _non_git_files(cwd, unreadable_dirs_out=before_unreadable_dirs, dirs_out=before_dirs)
     try:
-        for cmd in commands:
+        for cmd_idx, cmd in enumerate(commands):
+            cmd_allowed = (
+                per_command_allowed_mutations[cmd_idx]
+                if (per_command_allowed_mutations is not None and cmd_idx < len(per_command_allowed_mutations))
+                else allowed_mutations
+            )
             eff_timeout = float(timeout)
             if total_wall_budget is not None:
                 rem_wall = float(total_wall_budget) - max(0.0, time.monotonic() - suite_started_mono)
@@ -3064,7 +3077,7 @@ def execute_command_suite(
                     log_handle.close()
                 changed, untrusted = session.after_command(
                     snapshot,
-                    allowed=allowed_mutations,
+                    allowed=cmd_allowed,
                     restore=restore_tracked,
                     change_set=change_set,
                 )
@@ -3170,6 +3183,7 @@ def run_commands(
     log_dir: Path | None = None,
     clean_new_files: bool = True,
     allowed_mutations: Collection[str] = (),
+    per_command_allowed_mutations: Sequence[Collection[str]] | None = None,
     restore_tracked: bool = True,
     change_set: Collection[str] = (),
 ) -> list[CommandResult]:
@@ -3183,6 +3197,7 @@ def run_commands(
         log_dir=log_dir,
         clean_new_files=clean_new_files,
         allowed_mutations=allowed_mutations,
+        per_command_allowed_mutations=per_command_allowed_mutations,
         restore_tracked=restore_tracked,
         change_set=change_set,
         max_tail_chars=TAIL_CHARS,
@@ -3197,63 +3212,17 @@ _ERROR_LINE_RE = re.compile(
 )
 
 
-_SYNTAX_ONLY_RE = re.compile(
-    r"^\s*(?:python3?\s+-m\s+(?:py_compile|compileall)|ruff\b|flake8\b|black\b|isort\b|mypy\b|pyright\b|"
-    r"(?:npx\s+)?(?:tsc|eslint|prettier|biome)\b|gofmt\b|go\s+vet\b|cargo\s+check\b|rustfmt\b|test\s+-[efds]\b)",
-    re.I,
-)
-
-_BEHAVIORAL_TEST_RE = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:uv|poetry|pipenv)\s+run\s+|bundle\s+exec\s+|env\s+)*(?:\S+/)?(?:"
-    r"pytest\b|py\.test\b|python[0-9.]*\s+-m\s+(?:pytest|unittest)\b|"
-    r"tox\b|nox\b|go\s+test\b|cargo\s+(?:test|nextest)\b|"
-    r"(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?::[a-z0-9_:-]+)?\b|"
-    r"(?:npx\s+)?(?:vitest|jest|mocha|ava|playwright|cypress)\b|"
-    r"rspec\b|rake\s+test\b|"
-    r"mvn\s+test\b|gradle(?:w)?\s+test\b|ctest\b|dotnet\s+test\b|bats\b|phpunit\b"
-    r")",
-    re.I,
-)
-
-
-_NON_EXEC_TEST_FLAG_RE = re.compile(
-    r"(?:^|\s)(?:--collect-only|--co|--setup-only|--no-run|--dry-run|--listTests|--fixtures|--markers|--version|-V|--help|-h|-run=\^\$)(?:\s|$)"
-    r"|\bgo\s+test\b[^\n;|&]*\s(?:-c|-list)(?:\s|$)"
-)
-_EXIT_MASK_RE = re.compile(
-    r"\|\|\s*(?:true\b|:(?=\s|$)|exit\s+0\b|echo\b)|;\s*(?:exit\s+0\b|true\b|:(?=\s|$))",
-    re.I,
-)
-
-
 def is_behavioral_check(cmd: str) -> bool:
-    """Return True if ``cmd`` executes a behavioral test runner rather than syntax/type/lint checks."""
-    text = (cmd or "").strip()
-    if not text or text.startswith("#") or _SYNTAX_ONLY_RE.match(text):
-        return False
-    if _EXIT_MASK_RE.search(text) or _NON_EXEC_TEST_FLAG_RE.search(text):
-        return False
-    has_pipefail = bool(re.search(r"\bset\s+-o\s+pipefail\b", text))
-    has_errexit = bool(re.search(r"\bset\s+-[a-z]*e", text))
-    semi_parts = [s.strip() for s in re.split(r";|\n", text) if s.strip() and not s.strip().startswith("#")]
-    if not semi_parts:
-        return False
-    candidate_semi = semi_parts if has_errexit else [semi_parts[-1]]
-    for semi_seg in candidate_semi:
-        for and_seg in semi_seg.split("&&"):
-            pipe_parts = [p.strip() for p in re.split(r"(?<!\|)\|(?!\|)", and_seg) if p.strip()]
-            if not pipe_parts:
-                continue
-            if len(pipe_parts) > 1 and not has_pipefail:
-                continue
-            cleaned = pipe_parts[0].lstrip("(").strip()
-            if cleaned and not cleaned.startswith("#") and _BEHAVIORAL_TEST_RE.match(cleaned):
-                return True
-    return False
+    """Return True if ``cmd`` executes a behavioral test runner rather than syntax/type/lint/noop checks."""
+    from server.verification_policy import is_behavioral_check as _policy_is_behavioral
+
+    return _policy_is_behavioral(cmd)
 
 
 def has_behavioral_check(cmds: list[str] | tuple[str, ...]) -> bool:
-    return any(is_behavioral_check(c) for c in cmds)
+    from server.verification_policy import has_behavioral_check as _policy_has_behavioral
+
+    return _policy_has_behavioral(cmds)
 
 
 def failure_tail(results: list[CommandResult], max_chars: int = 1_200) -> str:

@@ -333,7 +333,35 @@ def test_codex_upsert_replaces_only_its_own_tables() -> None:
     assert fresh.startswith("[mcp_servers.agy]")
 
 
-@pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not installed")
+def _openai_codex_cli_available() -> bool:
+    if shutil.which("codex") is None:
+        return False
+    try:
+        probe = subprocess.run(
+            ["codex", "mcp", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and "mcp" in (probe.stdout + probe.stderr).lower()
+
+
+def test_codex_server_block_is_valid_toml() -> None:
+    import tomllib
+
+    raw = build_codex_server_block(name="agy", python_bin="/py", profile="economy")
+    parsed = tomllib.loads(raw)
+    srv = parsed["mcp_servers"]["agy"]
+    assert srv["command"] == "/py"
+    assert srv["tool_timeout_sec"] == 1800
+    assert "GEMINI_API_KEY" in srv["env_vars"]
+    assert srv["env"]["CC_AGY_COST_PROFILE"] == "economy"
+
+
+@pytest.mark.skipif(not _openai_codex_cli_available(), reason="OpenAI codex CLI with `codex mcp` not installed")
 def test_codex_cli_parses_installed_block(tmp_path: Path) -> None:
     home = tmp_path / "codex_home"
     home.mkdir()

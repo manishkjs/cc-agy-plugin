@@ -1292,7 +1292,13 @@ class MCPServer:
                 auth = self._batch_auth(args, settings.model)
             except ValueError as exc:
                 return {"status": "error", "is_error": True, "writers": [], "error": str(exc)}
-            return probe_writers(settings, auth, writer_factory=self.batch_writer_factory)
+            return probe_writers(
+                settings,
+                auth,
+                writer_factory=self.batch_writer_factory,
+                store=self.store,
+                workspace_root=self.job_manager.workspace_root,
+            )
 
         if name == "ask_gemini":
             prompt_str = _require_str(args.get("prompt"), "prompt")
@@ -1779,6 +1785,65 @@ class MCPServer:
         return digest
 
 
+_CONTROL_TOOLS = frozenset(
+    {
+        "delegate_cancel",
+        "delegate_status",
+        "batch_task_log",
+        "get_diff",
+        "doctor",
+    }
+)
+
+_WORKER_TOOLS = frozenset(
+    {
+        "cost_report",
+        "delegate_file_batch",
+        "draft_document",
+        "write_tests_from_cases",
+        "replicate_edit",
+        "probe_writers",
+        "ask_gemini",
+        "delegate_start",
+        "delegate_to_gemini",
+        "delegate_continue",
+        "delegate_apply",
+        "delegate_revert",
+    }
+)
+
+
+def _select_tool_lane(msg: dict[str, Any]) -> str:
+    """Classify a ``tools/call`` JSON-RPC message into ``'control'``, ``'wait'``, or ``'worker'``."""
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return "control"
+    name = params.get("name")
+    if not isinstance(name, str) or not name:
+        return "control"
+    args = params.get("arguments")
+    args_dict = args if isinstance(args, dict) else {}
+    if name in _CONTROL_TOOLS:
+        return "control"
+    if name == "delegate_result":
+        try:
+            wait_b = parse_bool(args_dict.get("wait"), True)
+        except ValueError:
+            return "control"
+        if not wait_b:
+            return "control"
+        raw_timeout = args_dict.get("timeout")
+        try:
+            t_val = float(raw_timeout) if raw_timeout is not None else 240.0
+        except (TypeError, ValueError):
+            return "control"
+        return "control" if t_val <= 2.0 else "wait"
+    if name in _WORKER_TOOLS:
+        return "worker"
+    # Unknown tool names fail fast in _dispatch_tool; never queue them behind 8 long-running workers.
+    return "control"
+
+
 def serve_stdio(
     server: MCPServer | None = None,
     in_stream: BinaryIO | None = None,
@@ -1790,6 +1855,8 @@ def serve_stdio(
     writer = out_stream or sys.stdout.buffer
     write_lock = threading.Lock()
     in_flight_futures: list[Future[None]] = []
+    req_futures: dict[Any, Future[None]] = {}
+    req_futures_lock = threading.Lock()
     last_framing = {"content_length": False}
 
     def _notify(message: dict[str, Any]) -> None:
@@ -1800,14 +1867,14 @@ def serve_stdio(
 
     def _process_and_write(msg_obj: Any, framed: bool) -> None:
         last_framing["content_length"] = framed
+        req_id = msg_obj.get("id") if isinstance(msg_obj, dict) else None
         try:
             resp = active_server.handle_Message(msg_obj)
         except (Exception, asyncio.CancelledError) as exc:
-            msg_id = msg_obj.get("id") if isinstance(msg_obj, dict) else None
             resp = (
                 {
                     "jsonrpc": "2.0",
-                    "id": msg_id,
+                    "id": req_id,
                     "result": {
                         "content": [
                             {
@@ -1821,15 +1888,22 @@ def serve_stdio(
                         "isError": True,
                     },
                 }
-                if msg_id is not None
+                if req_id is not None
                 else None
             )
+        finally:
+            if req_id is not None:
+                with req_futures_lock:
+                    req_futures.pop(req_id, None)
         if resp is not None:
             with write_lock:
                 _write_response(writer, resp, framed)
 
     is_live_process_stdin = in_stream is None
+    control_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cc-agy-ctl")
+    wait_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cc-agy-wait")
     rpc_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cc-agy-rpc")
+    pools = (control_pool, wait_pool, rpc_pool)
     try:
         while True:
             first_line = reader.readline()
@@ -1922,13 +1996,40 @@ def serve_stdio(
                         _write_response(writer, err_resp, use_content_length)
                     continue
 
-            # Dispatch tools/call concurrently so ping, delegate_status, and delegate_cancel
-            # never block behind an in-flight synchronous worker call.
+            # Route fast control/status calls to control_pool, long result waits to wait_pool, and
+            # heavy worker/batch calls to rpc_pool so cancellation and status never starve behind 8 workers.
             for msg in parsed_messages:
-                if isinstance(msg, dict) and msg.get("method") == "tools/call":
-                    fut = rpc_pool.submit(_process_and_write, msg, use_content_length)
+                if isinstance(msg, dict) and msg.get("method") == "notifications/cancelled":
+                    params_c = msg.get("params")
+                    target_req_id = params_c.get("requestId") if isinstance(params_c, dict) else None
+                    if target_req_id is not None:
+                        with req_futures_lock:
+                            queued_fut = req_futures.pop(target_req_id, None)
+                        if queued_fut is not None:
+                            queued_fut.cancel()
+                    _process_and_write(msg, use_content_length)
+                elif isinstance(msg, dict) and msg.get("method") == "tools/call":
+                    lane = _select_tool_lane(msg)
+                    pool = control_pool if lane == "control" else (wait_pool if lane == "wait" else rpc_pool)
+                    fut = pool.submit(_process_and_write, msg, use_content_length)
+                    req_id = msg.get("id")
+                    if req_id is not None:
+                        with req_futures_lock:
+                            req_futures[req_id] = fut
                     # Keep only unfinished calls: a long session would otherwise hold every finished
                     # future (and its result) until shutdown.
+                    in_flight_futures[:] = [f for f in in_flight_futures if not f.done()]
+                    in_flight_futures.append(fut)
+                elif isinstance(msg, list) and any(
+                    isinstance(it, dict) and it.get("method") == "tools/call" for it in msg
+                ):
+                    lanes = {
+                        _select_tool_lane(it)
+                        for it in msg
+                        if isinstance(it, dict) and it.get("method") == "tools/call"
+                    }
+                    pool = rpc_pool if "worker" in lanes else (wait_pool if "wait" in lanes else control_pool)
+                    fut = pool.submit(_process_and_write, msg, use_content_length)
                     in_flight_futures[:] = [f for f in in_flight_futures if not f.done()]
                     in_flight_futures.append(fut)
                 else:
@@ -1936,7 +2037,7 @@ def serve_stdio(
 
         if is_live_process_stdin:
             # Host CLI closed stdin (e.g. session exit or cohort timeout): immediately interrupt
-            # and cancel active workers instead of blocking up to 240s in rpc_pool.shutdown(wait=True).
+            # and cancel active workers instead of blocking up to 240s in pool.shutdown(wait=True).
             try:
                 active_server.job_manager.mark_running_interrupted()
             except Exception:
@@ -1945,17 +2046,20 @@ def serve_stdio(
                 active_server.job_manager.shutdown(wait=False)
             except Exception:
                 pass
-            rpc_pool.shutdown(wait=False, cancel_futures=True)
+            for p in pools:
+                p.shutdown(wait=False, cancel_futures=True)
         else:
             for fut in in_flight_futures:
                 try:
                     fut.result(timeout=60.0)
                 except Exception:
                     pass
-            rpc_pool.shutdown(wait=True)
+            for p in pools:
+                p.shutdown(wait=True)
     finally:
         if is_live_process_stdin:
-            rpc_pool.shutdown(wait=False, cancel_futures=True)
+            for p in pools:
+                p.shutdown(wait=False, cancel_futures=True)
 
 
 def _write_response(

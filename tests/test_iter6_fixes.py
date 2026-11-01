@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -137,7 +139,7 @@ def test_item_a_baseline_cwd_probe_hygiene_and_post_worker_subtraction(
         digest = jm.delegate_start(
             "Add save_manifest(columns) to Pipeline in pkg/pipeline.py.",
             project="p",
-            acceptance=["pytest -x -q tests"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -x -q tests"],
             wait=True,
         )
         # 1. Pre-flight probe left 100% clean worktree for the worker
@@ -215,7 +217,7 @@ def test_item_a_does_not_mask_failing_new_tests_or_unfixed_tdd_tests(
         dig1 = jm1.delegate_start(
             "Update compute in pkg/service.py",
             project="p",
-            acceptance=["pytest -x -q tests"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -x -q tests"],
             auto_apply=False,
             wait=True,
         )
@@ -249,7 +251,7 @@ def test_item_a_does_not_mask_failing_new_tests_or_unfixed_tdd_tests(
         dig2 = jm2.delegate_start(
             "Fix add(a, b) in calc.py",
             project="p",
-            acceptance=["pytest -q test_calc.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_calc.py"],
             auto_apply=False,
             wait=True,
         )
@@ -367,7 +369,7 @@ def test_item_c_plugin_escalation_preserves_full_task_specification_and_checklis
             ],
             plan=["Update Exporter.dump in exporter.py", "Run pytest -q test_exporter.py"],
             context_files=["exporter.py"],
-            acceptance=["pytest -q test_exporter.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_exporter.py"],
             wait=True,
         )
         assert [m for m, _ in seen_calls] == ["gemini-3.8-flash", "gemini-4-argon"]
@@ -529,7 +531,7 @@ def test_item_d_digest_hooks_and_lead_guidance_gate_on_contract_warnings(
         digest = jm.delegate_start(
             "Update Client in service.py",
             project="p",
-            acceptance=["pytest -q test_service.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_service.py"],
             wait=True,
         )
         assert digest["applied"] is True
@@ -581,7 +583,7 @@ def test_item_d_digest_hooks_and_lead_guidance_gate_on_contract_warnings(
         dig_clean = jm_clean.delegate_start(
             "Add ping() to Client in service.py",
             project="p",
-            acceptance=["pytest -q test_service.py"],
+            acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_service.py"],
             wait=True,
         )
         assert dig_clean["applied"] is True

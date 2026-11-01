@@ -98,6 +98,7 @@ def ask_gemini(
     scrub_receipt: bool = False,
     backend: GenaiBackend | None = None,
     record_receipt: bool = True,
+    budget_job_id: str | None = None,
 ) -> dict[str, Any]:
     """Run a single-shot Google AI Studio or Vertex AI Gemini query without spinning up Antigravity.
 
@@ -151,6 +152,28 @@ def ask_gemini(
     full_prompt = "\n\n".join(assembled_parts)
 
     job_id = f"ask-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    effective_budget_job_id = budget_job_id or job_id
+    from server.regions import estimate_cost_usd
+
+    est_input_tok = max(1, len(full_prompt) // 4)
+    est_cost_cents = float(
+        estimate_cost_usd(
+            chosen_model,
+            {"prompt_token_count": est_input_tok},
+            single_request=True,
+        ).get("total_cost_cents")
+        or 0.0
+    )
+    budget_guard = getattr(receipt_store, "budget", None)
+    res_id: str | None = None
+    if budget_guard is not None:
+        res_id = budget_guard.reserve(
+            effective_budget_job_id,
+            estimate_cents=est_cost_cents,
+            unpriced=est_cost_cents <= 0.0,
+            workspace_root=ws_root,
+        )
+
     started_at = round(time.time(), 3)
     usage: dict[str, int] = {
         "prompt_token_count": 0,
@@ -247,14 +270,28 @@ def ask_gemini(
                 api_key=resolved_key,
             )
             computed_cost = saved_receipt["cost"]
+            if budget_guard is not None and res_id is not None:
+                budget_guard.settle(
+                    res_id,
+                    job_id=effective_budget_job_id,
+                    actual_cents=0.0,
+                    workspace_root=ws_root,
+                    record_live=False,
+                )
         else:
-            from server.regions import estimate_cost_usd
-
             computed_cost = estimate_cost_usd(
                 chosen_model,
                 usage,
                 single_request=True,
             )
+            if budget_guard is not None:
+                budget_guard.settle(
+                    res_id,
+                    job_id=effective_budget_job_id,
+                    actual_cents=float(computed_cost.get("total_cost_cents") or 0.0),
+                    workspace_root=ws_root,
+                    record_live=True,
+                )
 
     return {
         "job_id": job_id,

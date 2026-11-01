@@ -128,6 +128,7 @@ class AppliedAnswer:
     path: str
     new_bytes: bytes
     previous_bytes: bytes | None
+    previous_mode: int | None = None
 
 
 @dataclass
@@ -142,6 +143,7 @@ class LadderOutcome:
     transient_waits: int = 0
     pricing_known: bool = True
     history: list[dict[str, Any]] = field(default_factory=list)
+    rung_index: int = 0
 
 
 Writer = Callable[[WriterRequest], WriterReply]
@@ -236,7 +238,11 @@ def apply_writer_answer(
     if not has_content and not has_edits:
         raise AnswerRejected("answer has neither 'content' nor 'edits'")
 
-    previous = target.read_bytes() if target.is_file() else None
+    previous: bytes | None = None
+    previous_mode: int | None = None
+    if target.is_file() and not target.is_symlink():
+        previous_mode = target.lstat().st_mode & 0o7777
+        previous = target.read_bytes()
     if task.action == "modify" and previous is None:
         raise AnswerRejected(f"cannot modify {task.path!r}: the file does not exist")
     if task.action == "create" and previous is not None and not allow_existing:
@@ -252,7 +258,7 @@ def apply_writer_answer(
             raise AnswerRejected("answer 'content' is empty")
         if previous is not None and _detect_eol(previous) == "\r\n":
             content = content.replace("\r\n", "\n").replace("\n", "\r\n")
-        return AppliedAnswer(task.path, content.encode("utf-8"), previous)
+        return AppliedAnswer(task.path, content.encode("utf-8"), previous, previous_mode)
 
     edits = answer.get("edits")
     if not isinstance(edits, list) or not edits:
@@ -281,7 +287,7 @@ def apply_writer_answer(
     new_bytes = text.encode("utf-8")
     if not new_bytes.strip():
         raise AnswerRejected("edits leave the file empty")
-    return AppliedAnswer(task.path, new_bytes, previous)
+    return AppliedAnswer(task.path, new_bytes, previous, previous_mode)
 
 
 # --------------------------------------------------------------------------------------------
@@ -323,6 +329,8 @@ def run_writer_ladder(
     on_transient: Callable[[float], None] | None = None,
     after_call: Callable[[str, WriterReply | None], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    start_rung: int = 0,
+    initial_failure_tail: str = "",
 ) -> LadderOutcome:
     """Run one task up the writer ladder until an answer passes verification or the ladder ends.
 
@@ -340,10 +348,10 @@ def run_writer_ladder(
     rungs = _resolve_ladder(routed)
     workspace = Path(root) if root is not None else Path.cwd()
     make = build_request or (lambda t, name, tail: WriterRequest(task=t, prompt=t.intent, failure_tail=tail))
-    outcome = LadderOutcome(state="failed", attempts=0, writer_used="")
-    failure_tail = ""
+    outcome = LadderOutcome(state="failed", attempts=0, writer_used="", detail=initial_failure_tail)
+    failure_tail = initial_failure_tail
     waits_by_writer: dict[str, int] = {}
-    idx = 0
+    idx = max(0, int(start_rung))
 
     def note(name: str, result: str, detail: str = "", cost: float = 0.0) -> None:
         outcome.history.append({"writer": name, "result": result, "detail": detail[-300:], "cost_cents": round(cost, 4)})
@@ -425,6 +433,7 @@ def run_writer_ladder(
             outcome.state = "landed"
             outcome.answer = answer
             outcome.detail = ""
+            outcome.rung_index = idx
             return outcome
         note(name, "checks_failed", tail, reply.cost_cents)
         failure_tail = tail or "checks failed"

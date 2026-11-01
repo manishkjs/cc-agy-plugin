@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -1217,6 +1218,10 @@ class TestExternalAgentFeedbackFixes:
     """RED-first regression tests for macOS /proc-less cleanup, SQLite schema bounds,
     spec/traceback dictation precision, and native sandbox + shell guardrails."""
 
+    @pytest.mark.skipif(
+        shutil.which("pgrep") is None and shutil.which("ps") is None,
+        reason="requires pgrep or ps for /proc-less process-tree fallback",
+    )
     def test_macos_procless_process_tree_cleanup_escalates_sigkill_and_kills_grandchildren(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
