@@ -1,0 +1,25 @@
+{
+  "name": "cc-agy-plugin",
+  "version": "0.3.0",
+  "description": "Delegate coding, batch edits, and reviews from Cursor to Gemini models (gemini-flash-next and gemini-4-argon) via your Gemini Enterprise subscription (agy CLI), Google AI Studio, or Vertex AI with isolated git copies and signed receipts.",
+  "author": {
+    "name": "Manish Kumar",
+    "url": "https://github.com/manishkjs"
+  },
+  "repository": "https://github.com/manishkjs/cc-agy-plugin",
+  "homepage": "https://github.com/manishkjs/cc-agy-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cursor",
+    "gemini",
+    "vertex-ai",
+    "antigravity",
+    "mcp",
+    "delegation"
+  ],
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "commands": "./commands/",
+  "mcpServers": "./.cursor-plugin/mcp.json",
+  "hooks": "./.cursor-plugin/hooks.json"
+}

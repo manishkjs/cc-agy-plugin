@@ -17,6 +17,9 @@ for rel in \
   .mcp.json \
   .claude-plugin/plugin.json \
   .claude-plugin/marketplace.json \
+  .cursor-plugin/plugin.json \
+  .cursor-plugin/mcp.json \
+  .cursor-plugin/hooks.json \
   .agents/plugins/marketplace.json \
   plugins/cc-agy-plugin/.codex-plugin/plugin.json \
   plugins/cc-agy-plugin/LICENSE \
@@ -49,12 +52,19 @@ ver = m_ver.group(1)
 
 claude_plugin = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
 claude_market = json.loads((root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+cursor_plugin = json.loads((root / ".cursor-plugin" / "plugin.json").read_text(encoding="utf-8"))
+cursor_mcp = json.loads((root / ".cursor-plugin" / "mcp.json").read_text(encoding="utf-8"))
+cursor_hooks = json.loads((root / ".cursor-plugin" / "hooks.json").read_text(encoding="utf-8"))
 codex_market = json.loads((root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
 codex_plugin = json.loads((root / "plugins" / "cc-agy-plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
 
 assert claude_plugin["version"] == ver, (claude_plugin["version"], ver)
 assert claude_market["plugins"][0]["version"] == ver, (claude_market["plugins"][0]["version"], ver)
+assert cursor_plugin["version"] == ver, (cursor_plugin["version"], ver)
+assert cursor_plugin["name"] == "cc-agy-plugin", cursor_plugin
+assert "agy" in cursor_mcp.get("mcpServers", {}), cursor_mcp
+assert isinstance(cursor_hooks.get("hooks"), dict), cursor_hooks
 assert codex_plugin["version"] == ver, (codex_plugin["version"], ver)
 assert codex_market["plugins"][0]["name"] == codex_plugin["name"] == "cc-agy-plugin"
 assert codex_market["plugins"][0]["source"]["path"] == "./plugins/cc-agy-plugin"
@@ -104,6 +114,29 @@ if grep -q "test-key-not-written" "$tmp_home/config.toml"; then
   exit 1
 fi
 
+cursor_gw_json="$(
+  cd "$root"
+  CURSOR_CONFIG_DIR="$tmp_home/cursor" GEMINI_API_KEY="test-key-not-written" \
+    python3 -m server.install --host cursor --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --no-bootstrap --non-interactive --json || true
+)"
+
+python3 - "$cursor_gw_json" <<'PY'
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+assert report["preflight"]["auth_mode"] == "gateway", report["preflight"]
+cursor_host = next(h for h in report["hosts"] if h["host"] == "cursor")
+assert cursor_host["status"] == "installed", cursor_host
+PY
+
+test -f "$tmp_home/cursor/mcp.json"
+test -f "$tmp_home/cursor/skills/cc-agy-plugin/SKILL.md"
+if grep -q "test-key-not-written" "$tmp_home/cursor/mcp.json"; then
+  printf 'API key leaked into Cursor mcp.json!\n' >&2
+  exit 1
+fi
+
 ent_home="$(mktemp -d "${TMPDIR:-/tmp}/cc-agy-validate-ent.XXXXXX")"
 trap 'rm -rf "$tmp_home" "$ent_home"' EXIT
 
@@ -139,7 +172,16 @@ agy_host_json="$(
     python3 -m server.install --host agy --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
 )"
 
-python3 - "$ent_json" "$ent_home/config.toml" "$agy_host_json" "$ent_home/gemini-config/mcp_config.json" <<'PY'
+cursor_ent_json="$(
+  cd "$root"
+  CURSOR_CONFIG_DIR="$ent_home/cursor" \
+  CC_AGY_CLI_BIN="$ent_home/bin/agy" \
+  CC_AGY_CLI_CONFIG_DIR="$ent_home/agy-cfg" \
+  ANTIGRAVITY_OAUTH_TOKEN="tok-not-written" \
+    python3 -m server.install --host cursor --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
+)"
+
+python3 - "$ent_json" "$ent_home/config.toml" "$agy_host_json" "$ent_home/gemini-config/mcp_config.json" "$cursor_ent_json" "$ent_home/cursor/mcp.json" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -158,6 +200,14 @@ agy_mcp_text = Path(sys.argv[4]).read_text(encoding="utf-8")
 agy_mcp = json.loads(agy_mcp_text)
 assert agy_mcp["mcpServers"]["agy"]["env"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise", agy_mcp
 assert "tok-not-written" not in agy_mcp_text, "Enterprise OAuth token leaked into mcp_config.json!"
+
+cursor_report = json.loads(sys.argv[5])
+cursor_host = next(h for h in cursor_report["hosts"] if h["host"] == "cursor")
+assert cursor_host["status"] == "installed", cursor_host
+cursor_mcp_text = Path(sys.argv[6]).read_text(encoding="utf-8")
+cursor_mcp = json.loads(cursor_mcp_text)
+assert cursor_mcp["mcpServers"]["agy"]["env"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise", cursor_mcp
+assert "tok-not-written" not in cursor_mcp_text, "Enterprise OAuth token leaked into Cursor mcp.json!"
 PY
 
 printf 'Validation passed.\n'

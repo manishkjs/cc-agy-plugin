@@ -1,11 +1,11 @@
 ---
 name: vertex
-description: Route work from Claude Code to Gemini (Gemini Enterprise subscription, AI Studio, Vertex AI, or an AI gateway). Use for multi-file changes with a clear plan (delegate_file_batch), read-only investigation (delegate_start), drafting docs, writing tests from cases, repeating one edit across files, second-opinion reviews, and auditing true cost.
+description: Route work from Claude Code or Cursor to Gemini (Gemini Enterprise subscription, AI Studio, Vertex AI, or an AI gateway). Use for multi-file changes with a clear plan (delegate_file_batch), read-only investigation (delegate_start), drafting docs, writing tests from cases, repeating one edit across files, second-opinion reviews, and auditing true cost.
 ---
 
 # Gemini & Antigravity Delegation Skill (`cc-agy-plugin`)
 
-Use the `vertex` MCP server tools to split work between two execution tiers using your **Gemini Enterprise subscription** (`CC_AGY_AUTH_MODE=gemini_enterprise` via the standalone Antigravity CLI `agy` Google sign-in, or auto-detected when signed into `agy` with no API key or GCP project set), a **Google AI Studio API Key** (`GEMINI_API_KEY` / `api_key`, `auth_mode="api_key"`), **Google Cloud Vertex AI** (`GOOGLE_CLOUD_PROJECT` / `project`, `auth_mode="vertex"`), or a **Vertex-compatible AI Gateway** (`CC_AGY_VERTEX_BASE_URL`):
+Use the `vertex` (Claude Code) or `agy` (Cursor) MCP server tools to split work between two execution tiers using your **Gemini Enterprise subscription** (`CC_AGY_AUTH_MODE=gemini_enterprise` via the standalone Antigravity CLI `agy` Google sign-in, or auto-detected when signed into `agy` with no API key or GCP project set), a **Google AI Studio API Key** (`GEMINI_API_KEY` / `api_key`, `auth_mode="api_key"`), **Google Cloud Vertex AI** (`GOOGLE_CLOUD_PROJECT` / `project`, `auth_mode="vertex"`), or a **Vertex-compatible AI Gateway** (`CC_AGY_VERTEX_BASE_URL`):
 
 1. **Single-Shot Review Tier (`ask_gemini`)**:
    - Calls Gemini directly via `google-genai` (or `agy --output-format json --mode plan` on Gemini Enterprise seats) without loading an agent workspace copy.

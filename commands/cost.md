@@ -1,4 +1,5 @@
 ---
+name: cost
 description: Workspace cost. Pass --true-total to add your own Claude Code session (rebuilt from transcripts) to the Gemini spend the plugin dispatched.
 ---
 

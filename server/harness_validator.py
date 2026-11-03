@@ -30,6 +30,32 @@ VALID_HOOK_EVENTS: frozenset[str] = frozenset(
     }
 )
 
+VALID_CURSOR_HOOK_EVENTS: frozenset[str] = frozenset(
+    {
+        "sessionStart",
+        "sessionEnd",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "subagentStart",
+        "subagentStop",
+        "beforeShellExecution",
+        "afterShellExecution",
+        "beforeMCPExecution",
+        "afterMCPExecution",
+        "beforeReadFile",
+        "afterFileEdit",
+        "beforeSubmitPrompt",
+        "preCompact",
+        "stop",
+        "afterAgentResponse",
+        "afterAgentThought",
+        "beforeTabFileRead",
+        "afterTabFileEdit",
+        "workspaceOpen",
+    }
+)
+
 _TRIGGER_PHRASES: tuple[str, ...] = (
     "use when",
     "use for",
@@ -40,7 +66,7 @@ _TRIGGER_PHRASES: tuple[str, ...] = (
 )
 
 _SCRIPT_REF_RE = re.compile(
-    r"(?:(?:\$\{CLAUDE_PLUGIN_ROOT\}|\.)/)?(?:scripts|server|hooks)/[A-Za-z0-9_./-]+\.(?:py|sh)\b"
+    r"(?:(?:\$\{CLAUDE_PLUGIN_ROOT\}|\$\{CURSOR_PLUGIN_ROOT\}|\.)/)?(?:scripts|server|hooks)/[A-Za-z0-9_./-]+\.(?:py|sh)\b"
 )
 
 _TOKEN_WORD_RE = re.compile(r"[a-z0-9_]{3,}")
@@ -205,6 +231,8 @@ def _check_script_file(root: Path, raw_ref: str, source_label: str) -> list[str]
     cleaned = raw_ref.strip().strip("'\"")
     if cleaned.startswith("${CLAUDE_PLUGIN_ROOT}/"):
         cleaned = cleaned[len("${CLAUDE_PLUGIN_ROOT}/") :]
+    elif cleaned.startswith("${CURSOR_PLUGIN_ROOT}/"):
+        cleaned = cleaned[len("${CURSOR_PLUGIN_ROOT}/") :]
     elif cleaned.startswith("./"):
         cleaned = cleaned[2:]
 
@@ -317,6 +345,128 @@ def validate_hooks_config(
     return errors
 
 
+def validate_cursor_plugin(plugin_root: Path) -> list[str]:
+    """Validate `.cursor-plugin/plugin.json`, `.cursor-plugin/mcp.json`, and `.cursor-plugin/hooks.json`."""
+    root = Path(plugin_root).resolve()
+    errors: list[str] = []
+
+    manifest_path = root / ".cursor-plugin" / "plugin.json"
+    if not manifest_path.is_file():
+        return [f"Cursor plugin manifest does not exist: {manifest_path}"]
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{manifest_path}: invalid JSON ({exc})"]
+    if not isinstance(manifest, dict):
+        return [f"{manifest_path}: top-level JSON value must be an object"]
+
+    if manifest.get("name") != "cc-agy-plugin":
+        errors.append(f"{manifest_path}: expected name 'cc-agy-plugin', got {manifest.get('name')!r}")
+
+    pyproject_path = root / "pyproject.toml"
+    if pyproject_path.is_file():
+        m_ver = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_path.read_text(encoding="utf-8"), re.M)
+        if m_ver and manifest.get("version") != m_ver.group(1):
+            errors.append(
+                f"{manifest_path}: version {manifest.get('version')!r} does not match pyproject.toml {m_ver.group(1)!r}"
+            )
+
+    for dir_field in ("skills", "agents", "commands"):
+        rel_val = manifest.get(dir_field)
+        if not isinstance(rel_val, str) or not rel_val.strip():
+            errors.append(f"{manifest_path}: missing non-empty '{dir_field}' directory path")
+            continue
+        target_dir = (root / rel_val).resolve()
+        try:
+            target_dir.relative_to(root)
+        except ValueError:
+            errors.append(f"{manifest_path}: '{dir_field}' path {rel_val!r} escapes plugin root")
+            continue
+        if not target_dir.is_dir():
+            errors.append(f"{manifest_path}: '{dir_field}' directory does not exist: {target_dir}")
+
+    mcp_ref = manifest.get("mcpServers")
+    if not isinstance(mcp_ref, str) or not mcp_ref.strip():
+        errors.append(f"{manifest_path}: 'mcpServers' must point to a dedicated Cursor MCP config path")
+    else:
+        mcp_path = (root / mcp_ref).resolve()
+        if mcp_path == (root / ".mcp.json").resolve():
+            errors.append(
+                f"{manifest_path}: 'mcpServers' must not point to Claude Code root '.mcp.json' (${{user_config.*}} trap)"
+            )
+        elif not mcp_path.is_file():
+            errors.append(f"{manifest_path}: MCP config does not exist: {mcp_path}")
+        else:
+            raw_mcp = mcp_path.read_text(encoding="utf-8", errors="replace")
+            if "${user_config." in raw_mcp:
+                errors.append(f"{mcp_path}: contains Claude Code ${{user_config.*}} placeholder unsupported by Cursor")
+            if "${PLUGIN_ROOT}" in raw_mcp or "${PLUGIN_DATA}" in raw_mcp:
+                errors.append(
+                    f"{mcp_path}: contains ${{PLUGIN_ROOT}} or ${{PLUGIN_DATA}}; Cursor expands ${{CURSOR_PLUGIN_ROOT}} instead"
+                )
+            try:
+                mcp_data = json.loads(raw_mcp)
+            except json.JSONDecodeError as exc:
+                errors.append(f"{mcp_path}: invalid JSON ({exc})")
+                mcp_data = None
+            if isinstance(mcp_data, dict):
+                servers = mcp_data.get("mcpServers")
+                if not isinstance(servers, dict) or not servers:
+                    errors.append(f"{mcp_path}: missing or empty 'mcpServers' object")
+                else:
+                    for srv_name, srv_cfg in servers.items():
+                        if not isinstance(srv_cfg, dict):
+                            errors.append(f"{mcp_path}: mcpServers.{srv_name} must be an object")
+                            continue
+                        for arg in srv_cfg.get("args") or []:
+                            if isinstance(arg, str):
+                                for match in _SCRIPT_REF_RE.finditer(arg):
+                                    errors.extend(_check_script_file(root, match.group(0), f"{mcp_path}:{srv_name}"))
+
+    # Cursor auto-discovers root `hooks/hooks.json` when `hooks` is omitted from `.cursor-plugin/plugin.json`.
+    # Require an explicit Cursor-formatted hooks config so Claude Code's PascalCase `hooks/hooks.json` is never scanned.
+    hooks_ref = manifest.get("hooks")
+    if not isinstance(hooks_ref, str) or not hooks_ref.strip():
+        errors.append(
+            f"{manifest_path}: 'hooks' must point to a Cursor hooks file so Cursor does not auto-discover Claude's hooks/hooks.json"
+        )
+    else:
+        cursor_hooks_path = (root / hooks_ref).resolve()
+        if cursor_hooks_path == (root / "hooks" / "hooks.json").resolve():
+            errors.append(
+                f"{manifest_path}: 'hooks' must not point to Claude Code 'hooks/hooks.json' (PascalCase event schema mismatch)"
+            )
+        elif not cursor_hooks_path.is_file():
+            errors.append(f"{manifest_path}: Cursor hooks config does not exist: {cursor_hooks_path}")
+        else:
+            try:
+                ch_data = json.loads(cursor_hooks_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(f"{cursor_hooks_path}: invalid JSON ({exc})")
+                ch_data = None
+            if isinstance(ch_data, dict):
+                ch_hooks = ch_data.get("hooks")
+                if not isinstance(ch_hooks, dict):
+                    errors.append(f"{cursor_hooks_path}: 'hooks' field must be an object")
+                else:
+                    for ev_name, entries in ch_hooks.items():
+                        if ev_name not in VALID_CURSOR_HOOK_EVENTS:
+                            errors.append(
+                                f"{cursor_hooks_path}: invalid Cursor hook event {ev_name!r}"
+                            )
+                        if not isinstance(entries, list):
+                            errors.append(f"{cursor_hooks_path}: event {ev_name!r} must map to a list")
+                            continue
+                        for idx, item in enumerate(entries):
+                            if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+                                errors.append(
+                                    f"{cursor_hooks_path}:{ev_name}[{idx}] must be a flat object with string 'command'"
+                                )
+
+    return errors
+
+
 def validate_plugin_tree(root: Path) -> list[str]:
     """Run all pre-flight harness checks against the `cc-agy-plugin` repository tree."""
     plugin_root = Path(root).resolve()
@@ -355,7 +505,10 @@ def validate_plugin_tree(root: Path) -> list[str]:
     hooks_json = plugin_root / "hooks" / "hooks.json"
     errors.extend(validate_hooks_config(hooks_json, plugin_root=plugin_root))
 
-    # 5. Shared routing table and worker budget constant sync across README, skills, and subagent docs
+    # 5. Native Cursor plugin manifest and MCP/hooks compatibility checks
+    errors.extend(validate_cursor_plugin(plugin_root))
+
+    # 6. Shared routing table and worker budget constant sync across README, skills, and subagent docs
     sync_script = plugin_root / "scripts" / "sync_docs.py"
     if sync_script.is_file():
         from scripts.sync_docs import sync_routing_blocks

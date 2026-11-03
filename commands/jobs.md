@@ -1,4 +1,5 @@
 ---
+name: jobs
 description: List active and completed Gemini delegation jobs and their workspace status
 argument-hint: [optional-job-id]
 ---

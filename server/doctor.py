@@ -96,11 +96,22 @@ def run_doctor(
         mcp_ok = not missing
         if missing:
             issues.append(f"Missing core MCP tools: {', '.join(missing)}")
+        codex_cfg = Path(active_env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser() / "config.toml"
+        cursor_cfg = Path(active_env.get("CURSOR_CONFIG_DIR") or (Path.home() / ".cursor")).expanduser() / "mcp.json"
+        agy_cfg = (
+            Path(active_env.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")).expanduser()
+            / "mcp_config.json"
+        )
         mcp_info = {
             "ok": mcp_ok,
             "active_tool_count": len(active_names),
             "total_registered_tools": len(TOOL_DEFINITIONS),
             "active_tools": active_names,
+            "host_configs": {
+                "codex": {"path": str(codex_cfg), "exists": codex_cfg.is_file()},
+                "cursor": {"path": str(cursor_cfg), "exists": cursor_cfg.is_file()},
+                "agy": {"path": str(agy_cfg), "exists": agy_cfg.is_file()},
+            },
         }
     except Exception as exc:
         issues.append(f"MCP tool catalog failed to load: {type(exc).__name__}: {exc}")

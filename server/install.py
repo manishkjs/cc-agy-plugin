@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""One-command setup of cc-agy-plugin for Claude Code, Codex, and Antigravity.
+"""One-command setup of cc-agy-plugin for Claude Code, Codex, Cursor, and Antigravity.
 
 Usage (from a clone of this repository):
 
     python3 -m server.install --host claude --auth gemini-enterprise
     python3 -m server.install --host codex  --auth gemini-enterprise
+    python3 -m server.install --host cursor --auth gemini-enterprise
     python3 -m server.install --host agy    --auth gemini-enterprise
     python3 -m server.install --host all --profile quality
 
 Automatically sets up a PEP 668-safe per-user Python virtualenv (`~/.local/share/cc-agy-plugin/venv`)
 when system Python does not already have `google-antigravity` and `google-genai`, and forwards
 non-secret configuration to Codex (`~/.codex/config.toml`), Claude Code (`--config` / `userConfig`),
-and Antigravity (`~/.gemini/config/mcp_config.json` and `~/.gemini/config/plugins/cc-agy-plugin/`).
+Cursor (`~/.cursor/mcp.json` and `~/.cursor/skills/cc-agy-plugin/SKILL.md`), and Antigravity
+(`~/.gemini/config/mcp_config.json` and `~/.gemini/config/plugins/cc-agy-plugin/`).
 API keys and OAuth tokens are never written into config files on disk.
 """
 
@@ -715,6 +717,151 @@ def install_agy(
     return result
 
 
+class CursorConfigError(RuntimeError):
+    """Raised when ~/.cursor/mcp.json cannot be updated without risking existing settings."""
+
+
+def build_cursor_server_entry(
+    *,
+    python_bin: str | None = None,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Build the stdio MCP server entry for Cursor's `~/.cursor/mcp.json`."""
+    return build_agy_server_entry(
+        python_bin=python_bin,
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        agy_cli_path=agy_cli_path,
+        max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
+        strict=strict,
+    )
+
+
+def upsert_cursor_mcp_config(
+    config_text: str,
+    entry: dict[str, Any],
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+) -> str:
+    """Upsert `mcpServers[name]` inside a Cursor `mcp.json` document without touching other keys."""
+    stripped = config_text.strip()
+    if not stripped:
+        parsed: dict[str, Any] = {}
+    else:
+        try:
+            loaded = json.loads(stripped)
+        except Exception as exc:
+            raise CursorConfigError(f"existing mcp.json is not valid JSON ({exc}); fix it first") from exc
+        if not isinstance(loaded, dict):
+            raise CursorConfigError("existing mcp.json top-level value must be a JSON object")
+        parsed = dict(loaded)
+    servers = parsed.get("mcpServers")
+    if servers is None:
+        servers_map: dict[str, Any] = {}
+    elif isinstance(servers, dict):
+        servers_map = dict(servers)
+    else:
+        raise CursorConfigError("existing mcp.json 'mcpServers' field must be a JSON object")
+    servers_map[name] = entry
+    parsed["mcpServers"] = servers_map
+    return json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+
+
+def install_cursor(
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
+    strict: bool = False,
+    dry_run: bool = False,
+    cursor_config_dir: Path | None = None,
+    python_bin: str | None = None,
+) -> dict[str, Any]:
+    """Register cc-agy-plugin in Cursor's `~/.cursor/mcp.json` and `~/.cursor/skills/cc-agy-plugin/SKILL.md`."""
+    cfg_dir = cursor_config_dir or Path(
+        os.environ.get("CURSOR_CONFIG_DIR") or (Path.home() / ".cursor")
+    ).expanduser()
+    mcp_cfg_path = cfg_dir / "mcp.json"
+    skill_dst = cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"
+
+    entry = build_cursor_server_entry(
+        python_bin=python_bin,
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        agy_cli_path=agy_cli_path,
+        max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
+        strict=strict,
+    )
+
+    existing = mcp_cfg_path.read_text(encoding="utf-8") if mcp_cfg_path.is_file() else ""
+    result: dict[str, Any] = {
+        "host": "cursor",
+        "config_path": str(mcp_cfg_path),
+        "skill_path": str(skill_dst),
+        "server_name": name,
+        "entry": entry,
+    }
+    try:
+        updated = upsert_cursor_mcp_config(existing, entry, name=name)
+    except CursorConfigError as exc:
+        result["status"] = "refused"
+        result["error"] = str(exc)
+        return result
+    if dry_run:
+        result["status"] = "dry_run"
+        return result
+
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_mode = (mcp_cfg_path.stat().st_mode & 0o777) if mcp_cfg_path.is_file() else 0o600
+    if existing and existing != updated:
+        backup = mcp_cfg_path.with_name(f"mcp.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        _write_private(backup, existing, 0o600)
+        result["backup_path"] = str(backup)
+    if existing != updated:
+        _write_private(mcp_cfg_path, updated, cfg_mode)
+
+    skill_changed = False
+    skill_text = CODEX_SKILL_SOURCE.read_text(encoding="utf-8") if CODEX_SKILL_SOURCE.is_file() else ""
+    if skill_text:
+        skill_dst.parent.mkdir(parents=True, exist_ok=True)
+        if not skill_dst.is_file() or skill_dst.read_text(encoding="utf-8") != skill_text:
+            skill_dst.write_text(skill_text, encoding="utf-8")
+            skill_changed = True
+
+    result["status"] = "installed" if (existing != updated or skill_changed) else "unchanged"
+    return result
+
+
 def preflight(
     env: dict[str, str] | None = None,
     *,
@@ -830,7 +977,7 @@ def run_interactive_wizard(
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
     host_raw = str(
-        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity] (1): ") or ""
+        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor] (1): ") or ""
     ).strip().lower()
     host_map = {
         "": "all",
@@ -845,6 +992,8 @@ def run_interactive_wizard(
         "agy": "agy",
         "antigravity": "agy",
         "jetski": "agy",
+        "5": "cursor",
+        "cursor": "cursor",
     }
     host = host_map.get(host_raw, "all")
 
@@ -939,11 +1088,11 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="cc-agy-install",
-        description="Set up cc-agy-plugin for Claude Code, Codex, and/or Antigravity.",
+        description="Set up cc-agy-plugin for Claude Code, Codex, Cursor, and/or Antigravity.",
     )
     parser.add_argument(
         "--host",
-        choices=("codex", "claude", "agy", "antigravity", "jetski", "all"),
+        choices=("codex", "claude", "cursor", "agy", "antigravity", "jetski", "all"),
         default="all",
     )
     parser.add_argument(
@@ -1061,6 +1210,24 @@ def main(argv: list[str] | None = None) -> int:
                 strict=args.strict,
             )
         )
+    if args.host in ("cursor", "all"):
+        report["hosts"].append(
+            install_cursor(
+                name=args.name,
+                profile=args.profile,
+                auth_mode=args.auth,
+                project=args.project,
+                location=args.location,
+                base_url=args.base_url,
+                agy_cli_path=args.agy_cli_path,
+                max_daily_cents=args.max_daily_cents,
+                allowed_projects=args.allowed_projects,
+                blocked_projects=args.blocked_projects,
+                no_auto_apply=args.no_auto_apply,
+                strict=args.strict,
+                dry_run=args.dry_run,
+            )
+        )
     if args.host in ("agy", "antigravity", "jetski", "all"):
         report["hosts"].append(
             install_agy(
@@ -1100,6 +1267,14 @@ def main(argv: list[str] | None = None) -> int:
             if host["status"] == "dry_run":
                 print(host["block"])
             print('  Next: run `codex` in your repository and ask: "Run doctor to verify my Gemini setup."')
+        elif host["host"] == "cursor":
+            print(f"\nCursor: {host['status']} -> {host['config_path']} [mcpServers.{host['server_name']}]")
+            if host.get("error"):
+                print(f"  ! {host['error']}")
+            if host.get("backup_path"):
+                print(f"  backup: {host['backup_path']}")
+            print(f"  skill: {host['skill_path']}")
+            print('  Next: open your repository in Cursor and ask: "Run doctor to verify my Gemini setup."')
         elif host["host"] == "agy":
             print(f"\nAntigravity: {host['status']} -> {host['config_path']} [mcpServers.{host['server_name']}]")
             if host.get("error"):

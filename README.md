@@ -2,13 +2,13 @@
 
 # cc-agy-plugin
 
-**Cut coding agent token spend by 20% to 50% in Claude Code, Antigravity (`agy`), and Codex by delegating file edits and test loops to fast, low-cost Gemini workers in an isolated git copy.**
+**Cut coding agent token spend by 20% to 50% in Claude Code, Cursor, Antigravity (`agy`), and Codex by delegating file edits and test loops to fast, low-cost Gemini workers in an isolated git copy.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
 [![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
-[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
+[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
 
 [Why use it](#why-use-it) · [Video walkthrough](#video-walkthrough) · [Quick start](#quick-start) · [How to use it](#how-to-use-it) · [Options](#options) · [Benchmark results](#benchmark-results) · [Technical reference](#technical-reference)
 
@@ -16,11 +16,11 @@
 
 ## Why use it
 
-You already work inside **Claude Code (`claude`)**, **Antigravity (`agy` CLI / Antigravity IDE)**, or **Codex (`codex`)**. Installing `cc-agy-plugin` cuts your per-task token bill by **20% to 50%** by routing everyday file reads, edits, and test retries to **Gemini Flash** (`gemini-flash-next`, `50¢` in / `300¢` out per 1M tokens) and stepping up to **Gemini Carbon with zero thinking** (`200¢` / `1,200¢`) only when checks fail, without changing how you type prompts or review diffs. Based on how you connect, the plugin automatically uses the standalone **Antigravity CLI (`agy`)** for included **Gemini Enterprise** seats or the **Google Antigravity Python SDK** for **AI Studio** and **Vertex AI**.
+You already work inside **Claude Code (`claude`)**, **Cursor**, **Antigravity (`agy` CLI / Antigravity IDE)**, or **Codex (`codex`)**. Installing `cc-agy-plugin` cuts your per-task token bill by **20% to 50%** by routing everyday file reads, edits, and test retries to **Gemini Flash** (`gemini-flash-next`, `50¢` in / `300¢` out per 1M tokens) and stepping up to **Gemini Carbon with zero thinking** (`200¢` / `1,200¢`) only when checks fail, without changing how you type prompts or review diffs. Based on how you connect, the plugin automatically uses the standalone **Antigravity CLI (`agy`)** for included **Gemini Enterprise** seats or the **Google Antigravity Python SDK** for **AI Studio** and **Vertex AI**.
 
-Your main agent (whether Claude Opus in Claude Code or Gemini Argon / Carbon in Antigravity) stays in charge of planning and code review. When files need to be written, refactored, or debugged, it hands a short brief to a Gemini worker inside a separate git copy of your repo. The plugin checks that your code compiles and passes tests, merges only verified changes back into your workspace, and writes a signed cost receipt with a one-call undo.
+Your main agent (whether Claude Opus in Claude Code or Cursor, or Gemini Argon / Carbon in Antigravity) stays in charge of planning and code review. When files need to be written, refactored, or debugged, it hands a short brief to a Gemini worker inside a separate git copy of your repo. The plugin checks that your code compiles and passes tests, merges only verified changes back into your workspace, and writes a signed cost receipt with a one-call undo.
 
-| Without `cc-agy-plugin` | With `cc-agy-plugin` (in Claude Code, Antigravity, or Codex) |
+| Without `cc-agy-plugin` | With `cc-agy-plugin` (in Claude Code, Cursor, Antigravity, or Codex) |
 |:--|:--|
 | Your lead model (Opus at `400¢`/`2,000¢` or Argon/Carbon at `200¢`/`1,200¢`) pays top-tier token rates to read files, type boilerplate, and retry failing tests | **20% to 50% lower cost:** your lead model plans and reviews while **Gemini Flash** (`50¢`/`300¢`) handles everyday edits and steps up to **Gemini 4 Argon / Carbon** only on hard failures (`-31%` in Claude Code, `-20%` to `-50%` in Antigravity, and `-24%` even with Argon on both Lead and Worker) |
 | Failed or interrupted edits leave half-finished changes in your working tree | Workers edit an isolated git copy; broken builds or failed checks never auto-apply |
@@ -54,15 +54,17 @@ Setup takes about a minute in a normal terminal shell. The installer automatical
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
 ```
 
-### 2. Install for Claude Code, Codex, or Antigravity (pick your connection)
+### 2. Install for Claude Code, Cursor, Codex, or Antigravity (pick your connection)
 
 Run one of the commands below in a normal terminal shell (or run `python3 -m server.install` with no flags for a 4-question interactive wizard):
 
 **Option A: Gemini Enterprise work subscription (uses your included monthly seat)**
 ```bash
-# Install for Claude Code, Codex, or Antigravity (--host claude | codex | agy | all)
+# Install for Claude Code, Cursor, Codex, or Antigravity (--host claude | cursor | codex | agy | all)
 # and download ~/.local/share/cc-agy-plugin/bin/agy:
 python3 -m server.install --host claude --auth gemini-enterprise
+# Or install directly into Cursor (~/.cursor/mcp.json + ~/.cursor/skills/):
+python3 -m server.install --host cursor --auth gemini-enterprise
 # Or install directly into Antigravity CLI / IDE (~/.gemini/config/):
 python3 -m server.install --host agy --auth gemini-enterprise
 
@@ -73,24 +75,25 @@ python3 -m server.install --host agy --auth gemini-enterprise
 **Option B: Google AI Studio API key (fastest personal setup, pay-as-you-go)**
 ```bash
 export GEMINI_API_KEY="your-key"
-python3 -m server.install --host claude   # or --host codex, --host agy, or --host all
+python3 -m server.install --host claude   # or --host cursor, --host codex, --host agy, or --host all
 ```
 
 **Option C: Google Cloud Vertex AI project (pay-as-you-go)**
 ```bash
 gcloud auth application-default login
 export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-python3 -m server.install --host claude   # or --host codex, --host agy, or --host all
+python3 -m server.install --host claude   # or --host cursor, --host codex, --host agy, or --host all
 ```
 
 > [!TIP]
-> **One install, automatic backend routing:** Gemini Enterprise seats run through the standalone `agy` CLI, while AI Studio keys, Vertex AI projects, and gateways run through the Python SDK. Passing `--host agy` (or `--host all`) registers the `agy` MCP server in `~/.gemini/config/mcp_config.json`, installs the routing skill in `~/.gemini/config/skills/cc-agy-plugin/SKILL.md`, and writes a native Antigravity plugin bundle in `~/.gemini/config/plugins/cc-agy-plugin/`. See [Options](#options), [Authentication precedence](#authentication-precedence), and the [Configuration reference](#configuration-reference) for flags and fallback rules.
+> **One install, automatic backend routing:** Gemini Enterprise seats run through the standalone `agy` CLI, while AI Studio keys, Vertex AI projects, and gateways run through the Python SDK. Passing `--host cursor` registers the `agy` MCP server in `~/.cursor/mcp.json` and installs the routing skill in `~/.cursor/skills/cc-agy-plugin/SKILL.md` (this repository also includes a native `.cursor-plugin/plugin.json` manifest). Passing `--host agy` registers `~/.gemini/config/mcp_config.json`, `~/.gemini/config/skills/cc-agy-plugin/SKILL.md`, and `~/.gemini/config/plugins/cc-agy-plugin/`. See [Options](#options), [Authentication precedence](#authentication-precedence), and the [Configuration reference](#configuration-reference) for flags and fallback rules.
 
 If `claude` is already open in another terminal tab, run `/reload-plugins` inside that session (or restart with `claude --continue`), or prefix shell commands inside Claude Code with `!`.
 
 ### 3. Verify your setup (free, 0 tokens)
 
 - **In Claude Code:** type `/cc-agy-plugin:doctor`
+- **In Cursor:** open your project in Cursor (check **Cursor Settings -> Tools & MCP** to see `agy`) and ask in Agent chat: `"Run doctor to verify my Gemini setup."`
 - **In Codex:** start `codex` in your project and ask: `"Run doctor to verify my Gemini setup."`
 - **In Antigravity (`agy` CLI or IDE):** start `agy` in your project (or run `agy mcp list` to confirm `agy` is registered) and ask: `"Run doctor to verify my Gemini setup."`
 
@@ -100,7 +103,7 @@ If `claude` is already open in another terminal tab, run `/reload-plugins` insid
   <img src="assets/overview.svg" alt="The Lead agent sends a brief to cc-agy-plugin, which runs a Gemini worker in an isolated copy, tests the result, and returns a signed, costed diff" width="100%">
 </p>
 
-Once installed, open your project in Claude Code, Codex, or Antigravity and work normally. All three hosts load the plugin's routing skill automatically, so you do not need to memorize internal MCP tool names.
+Once installed, open your project in Claude Code, Cursor, Codex, or Antigravity and work normally. All four hosts load the plugin's routing skill automatically, so you do not need to memorize internal MCP tool names.
 
 ### Plain-English prompts you can type right away
 
@@ -163,7 +166,7 @@ Every model call, file edit, and spend ceiling is governed by explicit settings 
 
 ### Installer flags and runtime configuration
 
-Pass `--host codex|claude|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--max-daily-cents`, or `--strict` to `python3 -m server.install` (or run `claude --plugin-dir /path/to/cc-agy-plugin` for a single session). All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference).
+Pass `--host codex|claude|cursor|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--max-daily-cents`, or `--strict` to `python3 -m server.install` (or run `claude --plugin-dir /path/to/cc-agy-plugin` for a single session). All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference).
 
 ## Benchmark results
 
@@ -222,7 +225,7 @@ Internals, rate cards, and full tool documentation for engineers. Click any sect
 
 ![Technical architecture](assets/architecture.svg)
 
-`cc-agy-plugin` connects Claude Code, Codex, and MCP clients to the standalone Antigravity CLI (`agy`) or Google Antigravity Python SDK so one workspace combines a lead planner/reviewer with Gemini workers:
+`cc-agy-plugin` connects Claude Code, Cursor, Codex, and MCP clients to the standalone Antigravity CLI (`agy`) or Google Antigravity Python SDK so one workspace combines a lead planner/reviewer with Gemini workers:
 
 1. **Your lead agent plans and reviews**:
    - Reads the user prompt, inspects key interfaces, and writes a short outcome-only task brief with ordered `plan` steps and read-only `acceptance` checks (`pytest`, `ruff`, `mypy`, `go test`, `vitest`).
@@ -381,7 +384,7 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 
 | Setting (`install` flag / `userConfig` / env var) | Default | What it controls |
 |---|---|---|
-| `--host codex\|claude\|agy\|all` | `all` | Target host(s) for `python3 -m server.install` (`agy` / `antigravity` / `jetski` installs into `~/.gemini/config/`; or pass `claude --plugin-dir /path/to/cc-agy-plugin` / `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main`). |
+| `--host codex\|claude\|cursor\|agy\|all` | `all` | Target host(s) for `python3 -m server.install` (`cursor` installs into `~/.cursor/mcp.json` and `~/.cursor/skills/`; `agy` / `antigravity` / `jetski` installs into `~/.gemini/config/`; or pass `claude --plugin-dir /path/to/cc-agy-plugin` / `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main`). |
 | `--auth` / `userConfig.auth_mode` / `CC_AGY_AUTH_MODE` | `auto` | Connection mode (`gemini_enterprise`, `agy_cli`, `api_key`, `vertex`, `gateway`, or `auto`; alias `CC_AGY_GEMINI_ENTERPRISE=true`). |
 | `--agy-cli-path`, `--install-agy-cli` / `userConfig.agy_cli_path` / `CC_AGY_CLI_BIN`, `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | External `agy` binary and OAuth config directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
 | `userConfig.gemini_api_key` / `GEMINI_API_KEY` (`GOOGLE_API_KEY`) | unset | Google AI Studio API key (redacted from child shells and receipts). |
@@ -425,6 +428,10 @@ cc-agy-plugin/
 ├── .claude-plugin/
 │   ├── plugin.json           # Claude Code plugin manifest + userConfig schema
 │   └── marketplace.json      # Local Claude Code plugin marketplace catalog
+├── .cursor-plugin/
+│   ├── plugin.json           # Native Cursor plugin manifest
+│   ├── mcp.json              # Cursor stdio MCP config (${CURSOR_PLUGIN_ROOT})
+│   └── hooks.json            # Cursor hooks override (prevents scanning Claude hooks)
 ├── .agents/plugins/
 │   └── marketplace.json      # Native Codex repository plugin marketplace catalog
 ├── plugins/cc-agy-plugin/    # Native Codex plugin bundle (.codex-plugin/plugin.json + skill)
@@ -433,7 +440,7 @@ cc-agy-plugin/
 │   ├── main.py               # MCP stdio entry point + managed venv re-exec
 │   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
 │   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
-│   ├── install.py            # Interactive 4-step wizard + Codex/Claude/Antigravity installer (cc-agy-install)
+│   ├── install.py            # Interactive 4-step wizard + Codex/Claude/Cursor/Antigravity installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
 │   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / gateway), routing, pricing, daily cap
 │   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing

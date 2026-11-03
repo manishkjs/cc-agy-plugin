@@ -1,4 +1,5 @@
 ---
+name: doctor
 description: Run offline environment, authentication, SDK, workspace, and test-runner diagnostics for cc-agy-plugin
 ---
 
