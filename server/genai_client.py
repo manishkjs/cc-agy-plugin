@@ -35,7 +35,14 @@ def build_genai_client(
 
     base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
     if base_url:
-        token = resolve_vertex_base_url_token() or "custom-endpoint"
+        token = (
+            resolve_vertex_base_url_token(
+                auth.get("base_url_token"),
+                base_url=base_url,
+                requested_audience=auth.get("base_url_audience"),
+            )
+            or "custom-endpoint"
+        )
         headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
         if zero_thinking:
             headers["X-CC-AGY-Thinking-Budget"] = "0"

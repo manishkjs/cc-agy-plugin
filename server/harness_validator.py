@@ -66,7 +66,7 @@ _TRIGGER_PHRASES: tuple[str, ...] = (
 )
 
 _SCRIPT_REF_RE = re.compile(
-    r"(?:(?:\$\{CLAUDE_PLUGIN_ROOT\}|\$\{CURSOR_PLUGIN_ROOT\}|\.)/)?(?:scripts|server|hooks)/[A-Za-z0-9_./-]+\.(?:py|sh)\b"
+    r"(?:(?:\$\{CLAUDE_PLUGIN_ROOT\}|\$\{CURSOR_PLUGIN_ROOT\}|\.)/)?(?:scripts|server|hooks)/[A-Za-z0-9_./-]+\.(?:py|sh|ps1)\b"
 )
 
 _TOKEN_WORD_RE = re.compile(r"[a-z0-9_]{3,}")
@@ -508,7 +508,21 @@ def validate_plugin_tree(root: Path) -> list[str]:
     # 5. Native Cursor plugin manifest and MCP/hooks compatibility checks
     errors.extend(validate_cursor_plugin(plugin_root))
 
-    # 6. Shared routing table and worker budget constant sync across README, skills, and subagent docs
+    # 6. Declarative rate card schema check
+    rate_card_json = plugin_root / "server" / "rate_card.json"
+    if not rate_card_json.is_file():
+        errors.append(f"missing declarative rate card: {rate_card_json}")
+    else:
+        try:
+            from server.rate_card import validate_rate_card
+
+            loaded_card = json.loads(rate_card_json.read_text(encoding="utf-8"))
+            for rc_err in validate_rate_card(loaded_card):
+                errors.append(f"{rate_card_json}: {rc_err}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{rate_card_json}: failed to validate ({exc})")
+
+    # 7. Shared routing table and worker budget constant sync across README, skills, and subagent docs
     sync_script = plugin_root / "scripts" / "sync_docs.py"
     if sync_script.is_file():
         from scripts.sync_docs import sync_routing_blocks

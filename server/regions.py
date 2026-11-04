@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import math
 import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import threading
+import time
 from typing import Any, Mapping
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from server.rate_card import (
+    MODEL_PRICING_PER_1M_USD,
+    check_promotional_rate_expiry,
+    clamp_gemini_thinking_level,
+    supported_gemini_thinking_levels,
+)
 
 
 def _real_account_home() -> Path | None:
@@ -37,6 +55,8 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
         "bon-experiment-arm-226",
         "gemini-flash-next",
         "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.5-flash-lite-preview",
         "gemini-3.1-pro-preview",
@@ -113,151 +133,8 @@ VALID_VERTEX_REGIONS: frozenset[str] = frozenset(
     }
 )
 
-# Per-1M token pricing in USD on Vertex AI (standard tier <= 200k context).
-# Cached input tokens are billed at 10% of the base input rate on Gemini 2.5/3.x.
-MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
-    "gemini-2.5-flash-lite": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "output": 0.40,
-    },
-    "gemini-2.5-flash-lite-preview": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "output": 0.40,
-    },
-    "gemini-3.5-flash-lite": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "output": 0.40,
-    },
-    "gemini-3.5-flash-lite-preview": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "output": 0.40,
-    },
-    "gemini-3.1-flash-lite-preview": {
-        "input": 0.10,
-        "cached_input": 0.01,
-        "output": 0.40,
-    },
-    "gemini-2.5-flash": {
-        "input": 0.30,
-        "cached_input": 0.03,
-        "output": 2.50,
-    },
-    "gemini-2.5-flash-preview": {
-        "input": 0.30,
-        "cached_input": 0.03,
-        "output": 2.50,
-    },
-    "gemini-3-flash-preview": {
-        "input": 0.50,
-        "cached_input": 0.05,
-        "output": 3.00,
-    },
-    "gemini-flash-next": {
-        "input": 0.50,
-        "cached_input": 0.05,
-        "output": 3.00,
-    },
-    "gemini-3.8-flash": {
-        "input": 0.50,
-        "cached_input": 0.05,
-        "output": 3.00,
-    },
-    "gemini-2.5-pro": {
-        "input": 1.25,
-        "cached_input": 0.125,
-        "output": 10.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-3-pro-preview": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-3.1-pro-preview": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-argon": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "argon": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-carbon": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-carbon-high": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-carbon-medium": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-carbon-low": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "gemini-4-carbon-zero": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "carbon-g": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "carbon-g-zero": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-    "bon-experiment-arm-226": {
-        "input": 2.00,
-        "cached_input": 0.20,
-        "output": 12.00,
-        "long_context_input_multiplier": 2.0,
-        "long_context_output_multiplier": 1.5,
-    },
-}
+# Per-1M token pricing in USD on Vertex AI is loaded from `server/rate_card.json`
+# via `server.rate_card.MODEL_PRICING_PER_1M_USD` (re-exported above for callers).
 
 # Claude Code warns when a single MCP tool response exceeds 10,000 tokens
 # and truncates at 25,000 tokens. We keep digests below 8,000 tokens.
@@ -522,6 +399,18 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_VERTEX_BASE_URL_TOKEN",
         "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN",
         "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN",
+        "CC_AGY_VERTEX_BASE_URL_AUDIENCE",
+        "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_AUDIENCE",
+        "CC_AGY_USERCFG_VERTEX_BASE_URL_AUDIENCE",
+        "CC_AGY_VERTEX_OIDC",
+        "CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT",
+        "CC_AGY_TELEMETRY_SINK",
+        "CLAUDE_PLUGIN_OPTION_TELEMETRY_SINK",
+        "CC_AGY_USERCFG_TELEMETRY_SINK",
+        "CC_AGY_TELEMETRY_TOKEN",
+        "CLAUDE_PLUGIN_OPTION_TELEMETRY_TOKEN",
+        "CC_AGY_USERCFG_TELEMETRY_TOKEN",
+        "CC_AGY_USER_ID",
         "CC_AGY_AUTH_MODE",
         "CLAUDE_PLUGIN_OPTION_AUTH_MODE",
         "CC_AGY_USERCFG_AUTH_MODE",
@@ -608,12 +497,694 @@ def resolve_vertex_base_url(
     return None
 
 
-def resolve_vertex_base_url_token(
+_OIDC_CACHE_LOCK = threading.Lock()
+_OIDC_TOKEN_CACHE: dict[tuple[str, ...], tuple[str, float, float]] = {}
+_OIDC_KEY_LOCKS: dict[tuple[str, ...], threading.Lock] = {}
+_OIDC_SOURCE_CHOICES: tuple[str, ...] = ("auto", "gac", "gcloud", "metadata")
+_ALLOWED_AUDIENCE_PREFIXES: tuple[str, ...] = (
+    "https://",
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+    "iap://",
+    "api://",
+)
+_AUDIENCE_METACHAR_RE = re.compile(r"[\s\x00-\x1f\x7f&|;<>`$\"'%^!()]")
+
+
+class _NoMetadataRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise urllib.error.HTTPError(req.full_url, code, f"Metadata server redirect rejected ({code})", headers, fp)
+
+
+def clear_oidc_token_cache() -> None:
+    """Clear cached OIDC identity tokens (used by tests and credential rotation)."""
+    with _OIDC_CACHE_LOCK:
+        _OIDC_TOKEN_CACHE.clear()
+
+
+def _validate_oidc_audience(audience: str) -> str:
+    cleaned = (audience or "").strip()
+    if not cleaned:
+        raise ValueError("OIDC audience must be a non-empty URL or URI")
+    if cleaned.startswith("-"):
+        raise ValueError("Invalid OIDC audience: must not start with '-'")
+    authority_source = cleaned.split("://", 1)[1] if "://" in cleaned else cleaned
+    authority_part = authority_source.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in authority_part:
+        raise ValueError("Invalid OIDC audience: URL must not embed userinfo credentials")
+    if _AUDIENCE_METACHAR_RE.search(cleaned):
+        raise ValueError(
+            "Invalid OIDC audience: must not contain whitespace, control characters, or shell metacharacters"
+        )
+    low = cleaned.lower()
+    if not low.startswith(_ALLOWED_AUDIENCE_PREFIXES):
+        raise ValueError(
+            f"Unsupported OIDC audience {cleaned!r}: expected 'https://...' (or 'iap://...', 'api://...', or loopback 'http://localhost')"
+        )
+    parsed_aud = urllib.parse.urlsplit(cleaned)
+    if parsed_aud.username is not None or parsed_aud.password is not None or "@" in (parsed_aud.netloc or ""):
+        raise ValueError("Invalid OIDC audience: URL must not embed userinfo credentials")
+    return cleaned
+
+
+def resolve_vertex_base_url_audience(
+    requested_audience: str | None = None,
+    *,
+    base_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an optional OIDC target audience for zero-key Cloud Run / WIF gateway auth."""
+    source_env = env if env is not None else os.environ
+    raw_aud: str | None = None
+    for candidate in (
+        requested_audience,
+        source_env.get("CC_AGY_VERTEX_BASE_URL_AUDIENCE"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_AUDIENCE"),
+        source_env.get("CC_AGY_USERCFG_VERTEX_BASE_URL_AUDIENCE"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            cleaned = candidate.strip()
+            if (
+                cleaned
+                and not cleaned.startswith("${")
+                and cleaned.lower() not in ("<audience>", "dummy", "none", "null", "off", "false", "0")
+            ):
+                raw_aud = cleaned
+                break
+
+    if raw_aud is None and env_flag("CC_AGY_VERTEX_OIDC", source_env) is True:
+        raw_aud = "auto"
+
+    if raw_aud is None:
+        return None
+
+    if raw_aud.lower() in ("auto", "true", "1", "yes", "on"):
+        eff_base = resolve_vertex_base_url(base_url, env=source_env)
+        if not eff_base:
+            return None
+        base_authority_src = eff_base.split("://", 1)[1] if "://" in eff_base else eff_base
+        if "@" in base_authority_src.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]:
+            raise ValueError("CC_AGY_VERTEX_BASE_URL must not embed userinfo credentials when deriving OIDC audience")
+        parsed = urllib.parse.urlsplit(eff_base)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Cannot derive OIDC audience from base_url {eff_base!r}")
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            raise ValueError("CC_AGY_VERTEX_BASE_URL must not embed userinfo credentials when deriving OIDC audience")
+        raw_aud = f"{parsed.scheme}://{parsed.netloc}"
+
+    return _validate_oidc_audience(raw_aud)
+
+
+def _resolve_oidc_source(source_env: Mapping[str, str]) -> str:
+    raw = str(source_env.get("CC_AGY_VERTEX_OIDC_SOURCE") or "").strip().lower()
+    if not raw:
+        return "auto"
+    if raw not in _OIDC_SOURCE_CHOICES:
+        raise ValueError(
+            f"Unsupported CC_AGY_VERTEX_OIDC_SOURCE={raw!r}; expected one of {_OIDC_SOURCE_CHOICES}."
+        )
+    return raw
+
+
+def _is_managed_workload_env(source_env: Mapping[str, str]) -> bool:
+    return any(
+        bool(str(source_env.get(k) or "").strip())
+        for k in ("K_SERVICE", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION")
+    )
+
+
+def _oidc_cache_key(validated_aud: str, source_env: Mapping[str, str]) -> tuple[str, ...]:
+    return (
+        validated_aud,
+        str(source_env.get("CLOUDSDK_CONFIG") or ""),
+        first_valid_env(source_env, "GOOGLE_APPLICATION_CREDENTIALS", default=""),
+        first_valid_env(source_env, "CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT", default=""),
+        first_valid_env(source_env, "CLOUDSDK_CORE_ACCOUNT", default=""),
+        _resolve_oidc_source(source_env),
+        "workload" if _is_managed_workload_env(source_env) else "dev",
+    )
+
+
+def peek_cached_oidc_token(
+    *,
+    env: Mapping[str, str] | None = None,
+    audience: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Return a non-expired cached OIDC identity token for `env` without blocking or minting."""
+    source_env = env if env is not None else os.environ
+    try:
+        resolved_aud = resolve_vertex_base_url_audience(audience, base_url=base_url, env=source_env)
+        cache_key = _oidc_cache_key(resolved_aud, source_env) if resolved_aud else None
+    except ValueError:
+        return None
+    if not cache_key:
+        return None
+    now = time.time()
+    with _OIDC_CACHE_LOCK:
+        entry = _OIDC_TOKEN_CACHE.get(cache_key)
+        if entry is not None:
+            cached_tok, refresh_at, _minted_ttl = entry
+            if now < refresh_at:
+                return cached_tok
+    return None
+
+
+def _decode_jwt_segment_dict(segment: str) -> dict[str, Any] | None:
+    if not segment or not re.fullmatch(r"[A-Za-z0-9_-]+", segment):
+        return None
+    padded = segment + ("=" * ((4 - (len(segment) % 4)) % 4))
+    try:
+        obj = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _jwt_exp_epoch(token: str) -> float | None:
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        return None
+    payload = _decode_jwt_segment_dict(parts[1])
+    if payload is None:
+        return None
+    exp = payload.get("exp")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    exp_f = float(exp)
+    return exp_f if math.isfinite(exp_f) else None
+
+
+def _jwt_email_claim(token: str) -> str:
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        return ""
+    payload = _decode_jwt_segment_dict(parts[1])
+    if payload is None:
+        return ""
+    email = payload.get("email")
+    return email.strip() if isinstance(email, str) else ""
+
+
+def _is_valid_oidc_jwt(
+    token: str,
+    *,
+    expected_audience: str | None = None,
+    require_audience: bool = False,
+) -> bool:
+    if not token or any(ch.isspace() for ch in token):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return False
+    hdr = _decode_jwt_segment_dict(parts[0])
+    payload = _decode_jwt_segment_dict(parts[1])
+    if hdr is None or payload is None:
+        return False
+    alg = str(hdr.get("alg") or "").strip()
+    if not alg or alg.lower() == "none":
+        return False
+    if _jwt_exp_epoch(token) is None:
+        return False
+    aud = payload.get("aud")
+    has_nonempty_aud = False
+    if isinstance(aud, str):
+        has_nonempty_aud = bool(aud.strip())
+    elif isinstance(aud, list):
+        has_nonempty_aud = any(isinstance(item, str) and bool(item.strip()) for item in aud)
+    has_identity_claim = has_nonempty_aud or any(
+        isinstance(payload.get(k), str) and bool(str(payload.get(k)).strip())
+        for k in ("iss", "sub", "email")
+    )
+    if not has_identity_claim:
+        return False
+    if expected_audience:
+        if "aud" in payload and aud is not None:
+            if isinstance(aud, str):
+                return aud.strip() == expected_audience
+            if isinstance(aud, list):
+                return any(isinstance(item, str) and item.strip() == expected_audience for item in aud)
+            return False
+        if require_audience:
+            return False
+    elif require_audience and not has_nonempty_aud:
+        return False
+    return True
+
+
+def _jwt_refresh_deadline(token: str, now: float) -> float:
+    exp_f = _jwt_exp_epoch(token)
+    if exp_f is not None:
+        remaining = exp_f - now
+        if remaining <= 60.0:
+            return now
+        if remaining < 600.0:
+            return now + (remaining * 0.5)
+        return min(now + 3300.0, exp_f - 300.0)
+    return now + 1800.0
+
+
+def _is_cached_oidc_fresh(
+    cached_tok: str,
+    refresh_at: float,
+    minted_ttl: float,
+    now: float,
+    min_remaining_seconds: float,
+) -> bool:
+    if now >= refresh_at:
+        return False
+    if min_remaining_seconds > 0.0:
+        exp_f = _jwt_exp_epoch(cached_tok)
+        if exp_f is not None:
+            eff_min_rem = (
+                min(min_remaining_seconds, max(0.0, minted_ttl - 60.0))
+                if minted_ttl > 0.0
+                else min_remaining_seconds
+            )
+            return (exp_f - now) >= eff_min_rem
+        return (refresh_at - now) >= min_remaining_seconds
+    return True
+
+
+def _fetch_metadata_identity_token(audience: str, *, timeout: float = 3.0) -> str:
+    query = urllib.parse.urlencode({"audience": audience, "format": "full"})
+    meta_url = f"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?{query}"
+    req = urllib.request.Request(
+        meta_url,
+        headers={"Metadata-Flavor": "Google"},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoMetadataRedirectHandler(),
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        token = resp.read(16_384).decode("utf-8", errors="replace").strip()
+    if not _is_valid_oidc_jwt(token, expected_audience=audience):
+        raise RuntimeError("Metadata server returned an empty or malformed OIDC identity token")
+    return token
+
+
+def _extract_impersonated_principal(impersonation_url: str) -> str:
+    match = re.search(r"/serviceAccounts/([^/:?]+):generateAccessToken", impersonation_url or "")
+    return match.group(1).strip() if match else ""
+
+
+def _peek_credentials_file_type(gac_path: str) -> str:
+    try:
+        gac_file = Path(gac_path).expanduser()
+        if not gac_file.is_file():
+            return ""
+        loaded = json.loads(gac_file.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return str(loaded.get("type") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _mint_from_credentials_file(
+    gac_path: str,
+    validated_aud: str,
+    *,
+    impersonate_sa: str = "",
+) -> str:
+    """Mint an OIDC ID token directly from a service-account, WIF, or impersonated JSON file."""
+    from google.auth import aws, identity_pool, impersonated_credentials, pluggable
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import credentials as oauth2_credentials
+    from google.oauth2 import service_account
+
+    cloud_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    user_oidc_scopes = [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/cloud-platform",
+    ]
+    gac_file = Path(gac_path).expanduser()
+    if not gac_file.is_file():
+        raise RuntimeError(f"Credentials file {gac_path!r} does not exist or is not a regular file")
+    try:
+        loaded = json.loads(gac_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Failed to read credentials JSON {gac_path!r}: {exc}") from exc
+    if not isinstance(loaded, dict) or not loaded:
+        raise RuntimeError(f"Credentials file {gac_path!r} is not a non-empty JSON object")
+
+    raw_json = loaded
+    cred_type = str(raw_json.get("type") or "").strip().lower()
+    req = GoogleAuthRequest()
+
+    if cred_type == "service_account" and not impersonate_sa:
+        sa_id_creds = service_account.IDTokenCredentials.from_service_account_info(
+            raw_json,
+            target_audience=validated_aud,
+        )
+        sa_id_creds.refresh(req)
+        tok = str(getattr(sa_id_creds, "token", "") or "").strip()
+        if _is_valid_oidc_jwt(tok, expected_audience=validated_aud):
+            return tok
+        raise RuntimeError(f"Service account file {gac_path!r} did not return a valid OIDC JWT for {validated_aud!r}")
+
+    if cred_type not in (
+        "service_account",
+        "external_account",
+        "impersonated_service_account",
+        "authorized_user",
+    ):
+        raise RuntimeError(
+            f"Unsupported credentials file type {cred_type!r} in {gac_path!r} for OIDC identity token minting"
+        )
+
+    target_sa = impersonate_sa.strip()
+    imp_creds = None
+    base_creds = None
+    if cred_type == "impersonated_service_account":
+        imp_creds = impersonated_credentials.Credentials.from_impersonated_service_account_info(
+            raw_json,
+            scopes=cloud_scopes,
+        )
+        if target_sa:
+            imp_creds = impersonated_credentials.Credentials(
+                source_credentials=imp_creds,
+                target_principal=target_sa,
+                target_scopes=cloud_scopes,
+            )
+    else:
+        if cred_type == "service_account":
+            base_creds = service_account.Credentials.from_service_account_info(
+                raw_json,
+                scopes=cloud_scopes,
+            )
+        elif cred_type == "authorized_user":
+            base_creds = oauth2_credentials.Credentials.from_authorized_user_info(
+                raw_json,
+                scopes=user_oidc_scopes,
+            )
+        elif cred_type == "external_account":
+            if not target_sa:
+                target_sa = _extract_impersonated_principal(
+                    str(raw_json.get("service_account_impersonation_url") or "")
+                )
+            if not target_sa:
+                raise RuntimeError(
+                    "Workload Identity Federation (external_account) OIDC minting requires "
+                    "'service_account_impersonation_url' in the credentials JSON or "
+                    "CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT."
+                )
+            base_info = {k: v for k, v in raw_json.items() if k != "service_account_impersonation_url"}
+            cred_src = base_info.get("credential_source")
+            if isinstance(cred_src, dict) and "environment_id" in cred_src:
+                base_creds = aws.Credentials.from_info(base_info, scopes=cloud_scopes)
+            elif isinstance(cred_src, dict) and "executable" in cred_src:
+                base_creds = pluggable.Credentials.from_info(base_info, scopes=cloud_scopes)
+            else:
+                base_creds = identity_pool.Credentials.from_info(base_info, scopes=cloud_scopes)
+
+        if base_creds is not None and target_sa:
+            imp_creds = impersonated_credentials.Credentials(
+                source_credentials=base_creds,
+                target_principal=target_sa,
+                target_scopes=cloud_scopes,
+            )
+
+    if imp_creds is not None:
+        id_creds = impersonated_credentials.IDTokenCredentials(
+            imp_creds,
+            target_audience=validated_aud,
+            include_email=True,
+        )
+        id_creds.refresh(req)
+        tok = str(getattr(id_creds, "token", "") or "").strip()
+        if _is_valid_oidc_jwt(tok, expected_audience=validated_aud):
+            if impersonate_sa.strip() and _jwt_email_claim(tok).lower() != impersonate_sa.strip().lower():
+                raise RuntimeError(
+                    f"Impersonated credentials returned principal {_jwt_email_claim(tok) or 'unknown'!r} "
+                    f"instead of CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT={impersonate_sa!r}"
+                )
+            return tok
+        raise RuntimeError(
+            f"Impersonated credentials for {target_sa!r} did not return a valid OIDC JWT for {validated_aud!r}"
+        )
+
+    if base_creds is not None:
+        base_creds.refresh(req)
+        direct_id_tok = str(getattr(base_creds, "id_token", None) or "").strip()
+        if direct_id_tok and _is_valid_oidc_jwt(
+            direct_id_tok,
+            expected_audience=validated_aud,
+            require_audience=True,
+        ):
+            return direct_id_tok
+
+    raise RuntimeError(
+        f"Credentials file {gac_path!r} ({cred_type}) did not yield a signed OIDC identity token "
+        f"matching audience {validated_aud!r}; set CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT to mint an "
+        "audience-scoped service account ID token."
+    )
+
+
+def _mint_oidc_identity_token(
+    audience: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    force_refresh: bool = False,
+    min_remaining_seconds: float = 0.0,
+) -> str:
+    """Mint and cache a Google OIDC identity token for `audience` via WIF/SA, `gcloud`, or GCE metadata."""
+    validated_aud = _validate_oidc_audience(audience)
+    source_env = env if env is not None else os.environ
+    oidc_source = _resolve_oidc_source(source_env)
+    cache_key = _oidc_cache_key(validated_aud, source_env)
+    min_rem = max(0.0, float(min_remaining_seconds or 0.0))
+
+    with _OIDC_CACHE_LOCK:
+        if not force_refresh and cache_key in _OIDC_TOKEN_CACHE:
+            cached_tok, refresh_at, minted_ttl = _OIDC_TOKEN_CACHE[cache_key]
+            if _is_cached_oidc_fresh(cached_tok, refresh_at, minted_ttl, time.time(), min_rem):
+                return cached_tok
+        key_lock = _OIDC_KEY_LOCKS.setdefault(cache_key, threading.Lock())
+
+    with key_lock:
+        with _OIDC_CACHE_LOCK:
+            if not force_refresh and cache_key in _OIDC_TOKEN_CACHE:
+                cached_tok, refresh_at, minted_ttl = _OIDC_TOKEN_CACHE[cache_key]
+                if _is_cached_oidc_fresh(cached_tok, refresh_at, minted_ttl, time.time(), min_rem):
+                    return cached_tok
+
+        errors: list[str] = []
+        minted: str | None = None
+        gac_path = cache_key[2]
+        impersonate_sa = cache_key[3]
+        workload_env = cache_key[6] == "workload"
+
+        if oidc_source in ("auto", "gac"):
+            if gac_path:
+                gac_type = _peek_credentials_file_type(gac_path)
+                try:
+                    minted = _mint_from_credentials_file(
+                        gac_path,
+                        validated_aud,
+                        impersonate_sa=impersonate_sa,
+                    )
+                except RuntimeError as exc:
+                    if oidc_source == "auto" and gac_type == "authorized_user" and not impersonate_sa:
+                        errors.append(f"GOOGLE_APPLICATION_CREDENTIALS ({gac_type}): {exc}")
+                    else:
+                        raise
+            elif oidc_source == "gac":
+                raise RuntimeError("CC_AGY_VERTEX_OIDC_SOURCE='gac' requires GOOGLE_APPLICATION_CREDENTIALS.")
+
+        user_gcloud_fallback_args: tuple[str, dict[str, str]] | None = None
+        human_gcloud_session_broken = False
+        impersonation_gcloud_failed = False
+        expected_sa = impersonate_sa.strip().lower()
+        if minted is None and oidc_source in ("auto", "gcloud"):
+            path_val = source_env.get("PATH") or os.environ.get("PATH")
+            gcloud_bin = shutil.which("gcloud", path=path_val) or shutil.which("gcloud.cmd", path=path_val)
+            if gcloud_bin:
+                sub_env = dict(os.environ)
+                for k, v in source_env.items():
+                    if isinstance(v, str):
+                        sub_env[k] = v
+                try:
+                    cmd = [gcloud_bin, "auth", "print-identity-token", f"--audiences={validated_aud}", "--quiet"]
+                    if impersonate_sa:
+                        cmd.extend([f"--impersonate-service-account={impersonate_sa}", "--include-email"])
+                    proc = subprocess.run(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                        env=sub_env,
+                    )
+                    out = (proc.stdout or "").strip()
+                    if proc.returncode == 0 and _is_valid_oidc_jwt(out, expected_audience=validated_aud):
+                        tok_email = _jwt_email_claim(out).lower()
+                        if expected_sa and tok_email != expected_sa:
+                            impersonation_gcloud_failed = True
+                            errors.append(
+                                f"gcloud returned principal '{tok_email or 'unknown'}' instead of CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT='{impersonate_sa}'"
+                            )
+                        else:
+                            minted = out
+                    elif proc.returncode == 0:
+                        if impersonate_sa:
+                            impersonation_gcloud_failed = True
+                        errors.append("gcloud returned a non-JWT or audience-mismatched OIDC token")
+                    else:
+                        stderr_text = (proc.stderr or proc.stdout or "").strip()
+                        low_err = stderr_text.lower()
+                        if impersonate_sa:
+                            impersonation_gcloud_failed = True
+                            errors.append(f"gcloud (exit {proc.returncode}): {stderr_text[-240:]}")
+                        elif (
+                            "invalid account type" in low_err
+                            or "wrongaccounttypeerror" in low_err
+                            or "requires valid service account" in low_err
+                        ):
+                            user_gcloud_fallback_args = (gcloud_bin, sub_env)
+                        else:
+                            # Google Cloud SDK appends 'Please run: $ gcloud auth login' to base
+                            # AuthenticationException even when no account is configured or when a
+                            # scopeless GCE VM fails metadata token lookup; exclude those non-human
+                            # headless errors so GCE/GKE VMs still reach metadata identity tokens.
+                            is_non_human_gcloud_error = any(
+                                marker in low_err
+                                for marker in (
+                                    "you do not currently have an active account selected",
+                                    "no credentialed accounts",
+                                    "metadata.google.internal",
+                                    "computemetadata",
+                                    "compute engine metadata service",
+                                    "no service account scopes",
+                                )
+                            )
+                            if not is_non_human_gcloud_error and any(
+                                marker in low_err
+                                for marker in (
+                                    "reauth",
+                                    "invalid_grant",
+                                    "expired or revoked",
+                                    "refresherror",
+                                    "problem refreshing auth tokens",
+                                    "problem refreshing your current auth tokens",
+                                )
+                            ):
+                                human_gcloud_session_broken = True
+                            errors.append(f"gcloud (exit {proc.returncode}): {stderr_text[-240:]}")
+                except subprocess.TimeoutExpired as exc:
+                    if impersonate_sa:
+                        impersonation_gcloud_failed = True
+                    else:
+                        human_gcloud_session_broken = True
+                    errors.append(f"gcloud: TimeoutExpired: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    if impersonate_sa:
+                        impersonation_gcloud_failed = True
+                    errors.append(f"gcloud: {type(exc).__name__}: {exc}")
+            else:
+                errors.append("gcloud CLI not found on PATH")
+
+        def _try_user_gcloud() -> str | None:
+            nonlocal human_gcloud_session_broken
+            if user_gcloud_fallback_args is None:
+                return None
+            gcloud_bin_fb, sub_env_fb = user_gcloud_fallback_args
+            try:
+                fallback_proc = subprocess.run(
+                    [gcloud_bin_fb, "auth", "print-identity-token", "--quiet"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                    env=sub_env_fb,
+                )
+                fb_out = (fallback_proc.stdout or "").strip()
+                if fallback_proc.returncode == 0 and _is_valid_oidc_jwt(fb_out):
+                    return fb_out
+                human_gcloud_session_broken = True
+                if fallback_proc.returncode == 0:
+                    errors.append("gcloud user fallback returned a non-JWT OIDC token")
+                else:
+                    fb_err = (fallback_proc.stderr or fallback_proc.stdout or "").strip()[-240:]
+                    errors.append(f"gcloud user fallback (exit {fallback_proc.returncode}): {fb_err}")
+            except Exception as exc:  # noqa: BLE001
+                human_gcloud_session_broken = True
+                errors.append(f"gcloud user fallback: {type(exc).__name__}: {exc}")
+            return None
+
+        def _try_metadata() -> str | None:
+            try:
+                meta_out = _fetch_metadata_identity_token(validated_aud)
+                if _is_valid_oidc_jwt(meta_out, expected_audience=validated_aud):
+                    if expected_sa:
+                        meta_email = _jwt_email_claim(meta_out).lower()
+                        if meta_email != expected_sa:
+                            errors.append(
+                                f"metadata server principal '{meta_email or 'unknown'}' does not match "
+                                f"CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT='{impersonate_sa}'"
+                            )
+                            return None
+                    return meta_out
+                errors.append("metadata server returned a non-JWT or audience-mismatched OIDC token")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"metadata server: {type(exc).__name__}: {exc}")
+            return None
+
+        if minted is None:
+            if oidc_source == "metadata":
+                minted = _try_metadata()
+            elif oidc_source == "gcloud":
+                minted = _try_user_gcloud()
+            elif oidc_source == "auto":
+                if workload_env:
+                    # Managed Cloud Run container runtimes use the workload service account first,
+                    # unless an explicit gcloud SA impersonation call just failed.
+                    if not impersonation_gcloud_failed:
+                        minted = _try_metadata()
+                    if minted is None:
+                        minted = _try_user_gcloud()
+                else:
+                    # Interactive developer environments preserve an active human gcloud login and never
+                    # silently swap an expired/broken human or impersonation session onto a VM service account.
+                    minted = _try_user_gcloud()
+                    if (
+                        minted is None
+                        and not human_gcloud_session_broken
+                        and not impersonation_gcloud_failed
+                    ):
+                        minted = _try_metadata()
+
+        if not minted:
+            detail = "; ".join(errors) if errors else "no credential provider succeeded"
+            raise RuntimeError(
+                f"Failed to mint OIDC identity token for gateway audience '{validated_aud}' ({detail}). "
+                "Run `gcloud auth login`, set `CC_AGY_VERTEX_OIDC_SOURCE=metadata`, set "
+                "`CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT`, configure Workload Identity Federation "
+                "(`GOOGLE_APPLICATION_CREDENTIALS`), or export `CC_AGY_VERTEX_BASE_URL_TOKEN`."
+            )
+
+        now = time.time()
+        exp_f = _jwt_exp_epoch(minted)
+        minted_ttl = max(0.0, exp_f - now) if exp_f is not None else 1800.0
+        refresh_at = _jwt_refresh_deadline(minted, now)
+        if refresh_at > now:
+            with _OIDC_CACHE_LOCK:
+                _OIDC_TOKEN_CACHE[cache_key] = (minted, refresh_at, minted_ttl)
+        return minted
+
+
+def resolve_static_vertex_base_url_token(
     requested_token: str | None = None,
     *,
     env: Mapping[str, str] | None = None,
 ) -> str | None:
-    """Resolve an optional bearer/virtual-key token for a custom Vertex AI gateway."""
+    """Resolve an explicitly configured static bearer/virtual-key token without minting OIDC."""
     source_env = env if env is not None else os.environ
     for candidate in (
         requested_token,
@@ -629,6 +1200,34 @@ def resolve_vertex_base_url_token(
                 and cleaned.lower() not in ("<token>", "dummy-key", "dummy", "none", "null")
             ):
                 return cleaned
+    return None
+
+
+def resolve_vertex_base_url_token(
+    requested_token: str | None = None,
+    *,
+    base_url: str | None = None,
+    requested_audience: str | None = None,
+    env: Mapping[str, str] | None = None,
+    min_remaining_seconds: float = 0.0,
+) -> str | None:
+    """Resolve a static bearer/virtual-key token or mint a cached OIDC identity token for an AI gateway."""
+    source_env = env if env is not None else os.environ
+    static_tok = resolve_static_vertex_base_url_token(requested_token, env=source_env)
+    if static_tok:
+        return static_tok
+
+    audience = resolve_vertex_base_url_audience(
+        requested_audience,
+        base_url=base_url,
+        env=source_env,
+    )
+    if audience:
+        return _mint_oidc_identity_token(
+            audience,
+            env=source_env,
+            min_remaining_seconds=min_remaining_seconds,
+        )
     return None
 
 
@@ -1031,6 +1630,13 @@ def resolve_auth_config(
             explicit_project = cleaned_req_proj
 
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
+        if result.get("auth_mode") == "vertex":
+            gw_base = resolve_vertex_base_url(env=source_env)
+            if gw_base:
+                result.setdefault("base_url", gw_base)
+                gw_aud = resolve_vertex_base_url_audience(base_url=gw_base, env=source_env)
+                if gw_aud:
+                    result.setdefault("base_url_audience", gw_aud)
         enforce_project_controls(
             auth_mode=str(result.get("auth_mode") or ""),
             project=result.get("project"),
@@ -1203,7 +1809,11 @@ def _resolve_rates_for_model(model_str: str) -> tuple[dict[str, float], bool]:
     known = norm in MODEL_PRICING_PER_1M_USD
     resolved = MODEL_PRICING_PER_1M_USD.get(norm)
     if resolved is None:
-        for known_prefix, known_rates in MODEL_PRICING_PER_1M_USD.items():
+        for known_prefix, known_rates in sorted(
+            MODEL_PRICING_PER_1M_USD.items(),
+            key=lambda kv: len(kv[0]),
+            reverse=True,
+        ):
             if norm.startswith(known_prefix):
                 resolved = known_rates
                 known = True

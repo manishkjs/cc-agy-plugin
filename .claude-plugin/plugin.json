@@ -87,6 +87,24 @@
       "type": "string",
       "sensitive": true
     },
+    "vertex_base_url_audience": {
+      "title": "Custom AI Gateway OIDC Audience",
+      "description": "Optional OIDC target audience URL (or 'auto') for zero-key Cloud Run / Workload Identity Federation gateway authentication via gcloud or GCE metadata.",
+      "type": "string",
+      "sensitive": false
+    },
+    "telemetry_sink": {
+      "title": "Opt-In Telemetry Receipt Sink",
+      "description": "Optional local NDJSON file path or https:// collector URL for sanitized cost and token receipts (off by default).",
+      "type": "string",
+      "sensitive": false
+    },
+    "telemetry_token": {
+      "title": "Opt-In Telemetry Bearer Token",
+      "description": "Optional bearer token sent to an https:// telemetry_sink collector.",
+      "type": "string",
+      "sensitive": true
+    },
     "max_daily_cents": {
       "title": "Daily Spend Cap (Cents)",
       "description": "Optional daily workspace spend limit in US cents (for example 500 for $5.00/day). Leave unset or 0 for no daily cap.",

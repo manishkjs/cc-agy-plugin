@@ -390,8 +390,12 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 | `userConfig.gemini_api_key` / `GEMINI_API_KEY` (`GOOGLE_API_KEY`) | unset | Google AI Studio API key (redacted from child shells and receipts). |
 | `--project` / `userConfig.google_cloud_project` / `GOOGLE_CLOUD_PROJECT` | unset (required on Vertex) | Google Cloud project ID for pay-as-you-go Vertex AI (`aiplatform.googleapis.com`). |
 | `--location` / `userConfig.google_cloud_location` / `GOOGLE_CLOUD_LOCATION` | `us-central1` | Preferred Vertex AI region (`gemini-flash-next` and `gemini-4-argon` route to `global` automatically). |
-| `--base-url` / `userConfig.vertex_base_url` / `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`) | unset | Custom Vertex-compatible AI gateway URL (takes priority over an ambient shell `GEMINI_API_KEY`). |
+| `--base-url` / `userConfig.vertex_base_url` / `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`) | unset | Custom Vertex-compatible AI gateway URL (takes priority over an ambient shell `GEMINI_API_KEY`; Windows PowerShell bootstrap in `scripts/bootstrap-gateway.ps1`). |
 | `userConfig.vertex_base_url_token` / `CC_AGY_VERTEX_BASE_URL_TOKEN` | unset | Bearer token or virtual key sent to `CC_AGY_VERTEX_BASE_URL` (redacted from child shells and receipts). |
+| `--gateway-audience` / `userConfig.vertex_base_url_audience` / `CC_AGY_VERTEX_BASE_URL_AUDIENCE` (`CC_AGY_VERTEX_OIDC=1`, `CC_AGY_VERTEX_OIDC_SOURCE`) | unset | OIDC target audience URL (or `auto`) for zero-key Cloud Run and Workload Identity Federation gateway auth. Mints and caches refreshing OIDC identity tokens (up to ~55 minutes per single worker job) via WIF/SA JSON, `gcloud` with `CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT`, human `gcloud auth login` on developer machines (failing closed on expired sessions or `gcloud` timeouts rather than swapping to a VM service account), or Cloud Run/GCE metadata (`CC_AGY_VERTEX_OIDC_SOURCE=auto\|gac\|gcloud\|metadata`; GKE pods without `K_SERVICE` can set `metadata` explicitly). When a custom gateway verifies an exact custom `aud` claim, use SA impersonation, WIF, or `CC_AGY_VERTEX_OIDC_SOURCE=metadata`. |
+| `--telemetry-sink` / `userConfig.telemetry_sink` / `CC_AGY_TELEMETRY_SINK` (`CC_AGY_TELEMETRY_TOKEN`) | unset (off) | Opt-in absolute/`~`/`file://` local NDJSON file path (`0o600`) or `https://` collector URL for sanitized receipt telemetry (deterministic `event_id`, delta and cumulative token counts and cents, model, verification mode, ISO `timestamp`, and IAP/OIDC/self-reported caller provenance; never sends prompts, diffs, or secrets; aggregate spend across process restarts via `max(cumulative_cost_cents)` per `job_id`, with 256 KiB tail delta recovery on local NDJSON sinks). |
+| `--doctor` (`python3 -m server.install --doctor [--probe-oidc]` or `python3 -m server.doctor [--probe-oidc]`) | off | Runs offline environment, gateway/OIDC, SDK, receipt-store, and telemetry-sink diagnostics as JSON (pass `--probe-oidc` to live-mint once and verify the OIDC principal claim) and exits non-zero when unhealthy. |
+| `CC_AGY_LEAD_RATES` (alias `CC_AGY_LEAD_RATES_JSON`) | `server/rate_card.json` | Optional JSON override table `{model_substring: [in, cache_read, cache_5m, cache_1h, out]}` in USD per 1M tokens for Lead cost reporting; matching substrings apply longest-key-first across matching model IDs. |
 | `--profile` / `userConfig.cost_profile` / `CC_AGY_COST_PROFILE` | `balanced` | Model routing profile (`balanced`, `economy`, or `quality`). |
 | `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL` | from `--profile` | Default Gemini model override for worker jobs or `ask_gemini` calls (overridden by `model=` per call). |
 | `--max-daily-cents` / `userConfig.max_daily_cents` / `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | UTC daily workspace spend cap in US cents (for example `500` for 500¢/day). |
@@ -442,8 +446,11 @@ cc-agy-plugin/
 │   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
 │   ├── install.py            # Interactive 4-step wizard + Codex/Claude/Cursor/Antigravity installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
-│   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / gateway), routing, pricing, daily cap
+│   ├── rate_card.json        # Declarative Gemini & Claude pricing rate card + promo-expiry metadata
+│   ├── rate_card.py          # Rate-card validator, promo-expiry check & per-model thinkingLevel clamping
+│   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / OIDC gateway), routing, pricing, daily cap
 │   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing
+│   ├── telemetry.py          # Opt-in non-blocking NDJSON / HTTPS receipt sink + verified identity tiers
 │   ├── genai_client.py       # Shared google-genai client factory, cleanup & usage normalization
 │   ├── genai_ask.py          # Single-shot google-genai / `agy` plan-mode helper
 │   ├── agy_runner.py         # Antigravity SDK / `agy` CLI worker runner + Straitjacket containment
@@ -468,6 +475,7 @@ cc-agy-plugin/
 ├── hooks/hooks.json          # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
 ├── scripts/
 │   ├── install_agy_cli.sh    # SHA-512 verified standalone Antigravity CLI (`agy`) installer
+│   ├── bootstrap-gateway.ps1 # Windows PowerShell enterprise gateway + OIDC setup script
 │   ├── sync_docs.py          # Shared routing table & budget constant synchronizer
 │   ├── validate.sh           # Manifest, badge, doc-sync, and dry-run installer validator
 │   ├── session_start.py      # SessionStart hook: records the per-session baseline and --doctor CLI

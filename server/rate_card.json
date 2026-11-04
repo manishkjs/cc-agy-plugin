@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-04",
+  "promotional_rates": [
+    {
+      "models": [
+        "gemini-3-flash-preview",
+        "gemini-3-flash",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-flash-next"
+      ],
+      "expires_after": "2026-12-31",
+      "note": "Promotional Gemini 3.x Flash pricing ($0.50 input / $0.05 cached / $3.00 output per 1M tokens); re-verify public Vertex AI rate card after 2026-12-31."
+    },
+    {
+      "models": [
+        "sonnet-5",
+        "sonnet-5.0",
+        "sonnet-5-5",
+        "sonnet-5.5",
+        "claude-5-sonnet",
+        "claude-5.5-sonnet",
+        "claude-5-0-sonnet",
+        "claude-5-5-sonnet",
+        "claude-sonnet-5"
+      ],
+      "expires_after": "2026-12-31",
+      "standard_rates": [3.00, 0.30, 3.75, 6.00, 15.00],
+      "note": "Promotional Claude Sonnet 5.x pricing ($2.00 input / $0.20 cache read / $10.00 output per 1M tokens; standard tier $3.00 / $0.30 / $15.00 after 2026-12-31)."
+    }
+  ],
+  "gemini_models": {
+    "gemini-2.5-flash-lite": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-2.5-flash-lite-preview": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-3.5-flash-lite": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-3.5-flash-lite-preview": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-3.1-flash-lite": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.40
+    },
+    "gemini-2.5-flash": {
+      "input": 0.30,
+      "cached_input": 0.03,
+      "output": 2.50
+    },
+    "gemini-2.5-flash-preview": {
+      "input": 0.30,
+      "cached_input": 0.03,
+      "output": 2.50
+    },
+    "gemini-3-flash": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-3-flash-preview": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-3.5-flash": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-3.6-flash": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-3.7-flash": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-flash-next": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-3.8-flash": {
+      "input": 0.50,
+      "cached_input": 0.05,
+      "output": 3.00
+    },
+    "gemini-2.5-pro": {
+      "input": 1.25,
+      "cached_input": 0.125,
+      "output": 10.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-3-pro": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-3-pro-preview": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-3.1-pro": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-3.1-pro-preview": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-argon": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "argon": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-carbon": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-carbon-high": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-carbon-medium": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-carbon-low": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "gemini-4-carbon-zero": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "carbon-g": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "carbon-g-zero": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
+    "bon-experiment-arm-226": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    }
+  },
+  "claude_lead_models": {
+    "claude-3-opus": [15.00, 1.50, 18.75, 30.00, 75.00],
+    "opus-3": [15.00, 1.50, 18.75, 30.00, 75.00],
+    "claude-4-opus": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "4-opus": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4-8": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4.8": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-5-0": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-5.0": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-5-5": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "opus-5.5": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "opus": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "3-5-sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "3.5-sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "3-7-sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "3.7-sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "sonnet-5": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "sonnet-5.0": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "sonnet-5-5": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "sonnet-5.5": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "claude-5-sonnet": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "claude-5.5-sonnet": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "claude-5-0-sonnet": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "claude-5-5-sonnet": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "claude-sonnet-5": [2.00, 0.20, 2.50, 4.00, 10.00],
+    "sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "haiku": [1.00, 0.10, 1.25, 2.00, 5.00]
+  },
+  "gemini_thinking_levels": {
+    "default": ["LOW", "MEDIUM", "HIGH"],
+    "prefixes": {
+      "gemini-3.8-flash": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-3.7-flash": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-3.6-flash": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+      "gemini-3.5-flash-lite": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+      "gemini-3.5-flash": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-3.1-pro": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-3.1-flash-lite": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+      "gemini-3-pro": ["LOW", "HIGH"],
+      "gemini-3-flash": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+      "gemini-2.5": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-robotics-er-2": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
+      "gemini-flash-next": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-4-argon": ["LOW", "MEDIUM", "HIGH"],
+      "argon": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-4-carbon": ["LOW", "MEDIUM", "HIGH"],
+      "carbon": ["LOW", "MEDIUM", "HIGH"]
+    }
+  }
+}

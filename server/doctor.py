@@ -8,16 +8,18 @@ discovery, and receipt store writability without making any network or model cal
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import importlib.util
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Mapping
+from typing import Any
 
 from server.jobs import detect_project_test_runner
 from server.receipts import ReceiptStore, resolve_workspace_root
 from server.verify import run_git
 from server.regions import (
+    check_promotional_rate_expiry,
     is_in_place_allowed,
     is_strict_mode_enabled,
     read_adc_quota_project,
@@ -32,7 +34,9 @@ from server.regions import (
     resolve_default_delegate_model,
     resolve_max_daily_cents,
     resolve_vertex_base_url,
+    resolve_vertex_base_url_audience,
 )
+from server.telemetry import resolve_telemetry_sink, validate_telemetry_sink
 
 
 def _module_available(module_name: str) -> bool:
@@ -63,6 +67,7 @@ def run_doctor(
     *,
     env: Mapping[str, str] | None = None,
     store: ReceiptStore | None = None,
+    probe_oidc: bool = False,
 ) -> dict[str, Any]:
     """Run local zero-network readiness checks and return a structured report."""
     active_env: Mapping[str, str] = os.environ if env is None else env
@@ -118,7 +123,18 @@ def run_doctor(
         mcp_info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     # 2. Authentication configuration (never expose raw API key or OAuth token values)
-    custom_gateway = bool(resolve_vertex_base_url(env=active_env))
+    resolved_gateway_url = resolve_vertex_base_url(env=active_env)
+    custom_gateway = bool(resolved_gateway_url)
+    gateway_oidc_audience: str | None = None
+    oidc_config_ok = True
+    try:
+        gateway_oidc_audience = resolve_vertex_base_url_audience(
+            base_url=resolved_gateway_url,
+            env=active_env,
+        )
+    except ValueError as exc:
+        oidc_config_ok = False
+        issues.append(str(exc))
     auth_info: dict[str, Any]
     agy_cli_info: dict[str, Any] | None = None
     active_auth_mode: str | None = None
@@ -174,8 +190,60 @@ def run_doctor(
                     "(metadata-server ADC may still work on GCE/Cloudtop)."
                 )
                 remediations.append("Run `gcloud auth application-default login` or set `GEMINI_API_KEY`.")
+        gateway_oidc_principal: str | None = None
+        gateway_oidc_principal_status: str | None = None
+        gateway_oidc_source: str | None = None
+        if custom_gateway:
+            from server.regions import (
+                _resolve_oidc_source,
+                peek_cached_oidc_token,
+                resolve_static_vertex_base_url_token,
+                resolve_vertex_base_url_token,
+            )
+            from server.telemetry import _extract_oidc_jwt_claim
+
+            try:
+                gateway_oidc_source = _resolve_oidc_source(active_env)
+            except ValueError as exc:
+                oidc_config_ok = False
+                issues.append(str(exc))
+            static_tok = resolve_static_vertex_base_url_token(None, env=active_env) or ""
+            cached_tok = (
+                peek_cached_oidc_token(
+                    env=active_env,
+                    audience=gateway_oidc_audience,
+                    base_url=resolved_gateway_url,
+                )
+                or ""
+            )
+            if static_tok:
+                gateway_oidc_principal = _extract_oidc_jwt_claim(static_tok)
+                gateway_oidc_principal_status = "static_token"
+            elif cached_tok:
+                gateway_oidc_principal = _extract_oidc_jwt_claim(cached_tok)
+                gateway_oidc_principal_status = "cached"
+            elif gateway_oidc_audience:
+                if probe_oidc:
+                    if not oidc_config_ok:
+                        gateway_oidc_principal_status = "probe_skipped"
+                    else:
+                        try:
+                            minted_tok = resolve_vertex_base_url_token(
+                                None,
+                                base_url=resolved_gateway_url,
+                                requested_audience=gateway_oidc_audience,
+                                env=active_env,
+                            )
+                            if minted_tok:
+                                gateway_oidc_principal = _extract_oidc_jwt_claim(minted_tok)
+                                gateway_oidc_principal_status = "probed"
+                        except Exception as exc:  # noqa: BLE001
+                            issues.append(f"OIDC probe failed: {exc}")
+                            gateway_oidc_principal_status = "probe_failed"
+                else:
+                    gateway_oidc_principal_status = "unminted_until_first_request"
         auth_info = {
-            "ok": auth_ok,
+            "ok": auth_ok and not issues,
             "auth_mode": auth_mode,
             "configured_auth_mode": configured_auth_mode or "auto",
             "auth_mode_pinned": configured_auth_mode is not None,
@@ -183,6 +251,14 @@ def run_doctor(
             "project": active_project_id,
             "location": resolved_auth.get("location"),
             "custom_vertex_gateway": custom_gateway,
+            **({"gateway_oidc_audience": gateway_oidc_audience} if gateway_oidc_audience else {}),
+            **({"gateway_oidc_source": gateway_oidc_source} if gateway_oidc_source else {}),
+            **({"gateway_oidc_principal": gateway_oidc_principal} if gateway_oidc_principal else {}),
+            **(
+                {"gateway_oidc_principal_status": gateway_oidc_principal_status}
+                if gateway_oidc_principal_status
+                else {}
+            ),
             **({"adc_file_found": adc_found} if adc_found is not None else {}),
             **({"adc_quota_project": adc_quota_project} if adc_quota_project is not None else {}),
             **({"enterprise_credential_source": ent_cred_source} if ent_cred_source is not None else {}),
@@ -335,7 +411,19 @@ def run_doctor(
         "writable": store_writable,
     }
 
-    user_controls = {
+    telemetry_sink = resolve_telemetry_sink(active_env)
+    telemetry_sink_valid = True
+    telemetry_sink_warning: str | None = None
+    if telemetry_sink:
+        try:
+            validate_telemetry_sink(telemetry_sink, check_dns=False)
+        except ValueError as exc:
+            telemetry_sink_valid = False
+            telemetry_sink_warning = str(exc)
+            issues.append(str(exc))
+    rate_card_notices = check_promotional_rate_expiry()
+
+    user_controls: dict[str, Any] = {
         "configured_auth_mode": configured_auth_mode or "auto",
         "auth_mode_pinned": configured_auth_mode is not None,
         "active_auth_mode": active_auth_mode,
@@ -350,7 +438,11 @@ def run_doctor(
         "in_place_allowed": in_place_allowed,
         "isolated_worktree_default": True,
         "strict_mode": strict_mode,
+        "telemetry_sink_enabled": bool(telemetry_sink),
+        "telemetry_sink_valid": telemetry_sink_valid,
     }
+    if telemetry_sink_warning is not None:
+        user_controls["telemetry_sink_warning"] = telemetry_sink_warning
     healthy = len(issues) == 0
     status = "ok" if (healthy and not warnings) else ("degraded" if healthy else "error")
     return {
@@ -367,7 +459,28 @@ def run_doctor(
         "workspace": workspace_info,
         "receipt_store": receipt_store_info,
         "daily_budget": daily_budget_info,
+        "rate_card_notices": rate_card_notices,
         "issues": issues,
         "warnings": warnings,
         "remediations": list(dict.fromkeys(remediations)),
     }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Run cc-agy-plugin environment and gateway diagnostics.")
+    parser.add_argument(
+        "--probe-oidc",
+        action="store_true",
+        help="Mint a live OIDC identity token once when gateway OIDC is configured and display the principal claim.",
+    )
+    args = parser.parse_args(argv)
+    report = run_doctor(workspace_root=os.getcwd(), probe_oidc=bool(args.probe_oidc))
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("healthy") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

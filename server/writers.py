@@ -596,25 +596,40 @@ def make_genai_writer(
             timeout_seconds=max(5.0, float(timeout_ms) / 1000.0),
             read_budget=0,
         )
-    from server.regions import estimate_cost_usd
+    from server.regions import clamp_gemini_thinking_level, estimate_cost_usd
 
     def _write(req: WriterRequest) -> WriterReply:
         from google.genai import types as gt
 
-        client = _build_genai_client(auth, timeout_ms=timeout_ms)
+        eff_model = req.model or model
+        req_tl = str(thinking_level or "").strip().upper().replace("-", "_")
+        if req_tl.startswith("THINKING_LEVEL_"):
+            req_tl = req_tl[len("THINKING_LEVEL_"):]
+        is_zero = req_tl in ("ZERO", "0", "OFF")
+        client = _build_genai_client(auth, timeout_ms=timeout_ms, zero_thinking=is_zero)
         try:
+            clamped_tl = clamp_gemini_thinking_level(
+                eff_model,
+                req_tl,
+                allow_extra_high=False,
+            )
+            thinking_cfg = (
+                gt.ThinkingConfig(thinking_budget=0)
+                if is_zero
+                else gt.ThinkingConfig(thinking_level=clamped_tl or "LOW")
+            )
             cfg: dict[str, Any] = {
                 "response_mime_type": "application/json",
                 "response_schema": ANSWER_SCHEMA,
                 "max_output_tokens": req.max_output_tokens,
-                "thinking_config": gt.ThinkingConfig(thinking_level=thinking_level),
+                "thinking_config": thinking_cfg,
             }
             if cached_content:
                 cfg["cached_content"] = cached_content
             else:
                 cfg["system_instruction"] = req.system + ("\n\n" + req.shared_prefix if req.shared_prefix else "")
             try:
-                resp = client.models.generate_content(model=model, contents=req.prompt, config=gt.GenerateContentConfig(**cfg))
+                resp = client.models.generate_content(model=eff_model, contents=req.prompt, config=gt.GenerateContentConfig(**cfg))
             except Exception as exc:  # noqa: BLE001 - classified below by status code / type
                 _raise_classified(exc)
                 raise
@@ -623,13 +638,13 @@ def make_genai_writer(
             cands = getattr(resp, "candidates", None) or []
             if cands:
                 finish = str(getattr(cands[0], "finish_reason", "") or "")
-            cost = estimate_cost_usd(model, usage, single_request=True)
+            cost = estimate_cost_usd(eff_model, usage, single_request=True)
             return WriterReply(
                 text=getattr(resp, "text", "") or "",
                 cut_off=finish.endswith("MAX_TOKENS"),
                 usage=usage,
                 cost_cents=float(cost.get("total_cost_cents") or 0.0),
-                model=model,
+                model=eff_model,
                 pricing_known=bool(cost.get("pricing_known", True)),
                 diagnostics="" if getattr(resp, "text", "") else f"finish_reason={finish}",
             )
@@ -705,9 +720,28 @@ def make_agent_writer(
     def _write(req: WriterRequest) -> WriterReply:
         from google import antigravity as ag
         from google.antigravity import policy, types
-        from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
+        from server.regions import (
+            clamp_gemini_thinking_level,
+            resolve_vertex_base_url,
+            resolve_vertex_base_url_token,
+        )
 
-        options = types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, thinking_level))
+        eff_model = req.model or model
+        req_tl = str(thinking_level or "").strip().upper().replace("-", "_")
+        if req_tl.startswith("THINKING_LEVEL_"):
+            req_tl = req_tl[len("THINKING_LEVEL_"):]
+        is_zero = req_tl in ("ZERO", "0", "OFF")
+        clamped_tl = (
+            clamp_gemini_thinking_level(
+                eff_model,
+                req_tl,
+                allow_extra_high=True,
+                map_zero_to_minimal=True,
+            )
+            or "LOW"
+        )
+        sdk_tl_enum = getattr(types.ThinkingLevel, clamped_tl, None) or getattr(types.ThinkingLevel, "LOW")
+        options = types.GeminiModelOptions(thinking_level=sdk_tl_enum)
         eff_proj = auth.get("project")
         eff_loc = auth.get("location")
         if auth.get("api_key"):
@@ -719,10 +753,23 @@ def make_agent_writer(
                 eff_loc = eff_loc or "global"
             ep_kw: dict[str, Any] = {"project": eff_proj, "location": eff_loc, "options": options}
             if gw_url:
-                gw_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+                gw_tok = (
+                    resolve_vertex_base_url_token(
+                        auth.get("base_url_token"),
+                        base_url=gw_url,
+                        requested_audience=auth.get("base_url_audience"),
+                        min_remaining_seconds=min(3300.0, max(900.0, float(int(timeout_seconds or 300)) + 60.0)),
+                    )
+                    or "custom-endpoint"
+                )
                 ep_kw["base_url"] = gw_url
                 ep_kw["api_key"] = gw_tok
-                ep_kw["http_headers"] = {"Authorization": f"Bearer {gw_tok}"}
+                hdrs = {"Authorization": f"Bearer {gw_tok}"}
+                if is_zero:
+                    hdrs["X-CC-AGY-Thinking-Budget"] = "0"
+                ep_kw["http_headers"] = hdrs
+            elif is_zero:
+                ep_kw["http_headers"] = {"X-CC-AGY-Thinking-Budget": "0"}
             endpoint = types.VertexEndpoint(**ep_kw)
         scratch = tempfile.mkdtemp(prefix="cc-agy-writer-")
         save_dir = tempfile.mkdtemp(prefix="cc-agy-writer-save-")

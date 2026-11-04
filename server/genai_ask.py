@@ -17,6 +17,7 @@ from server.genai_client import (
 from server.receipts import ReceiptStore, enforce_daily_budget, resolve_workspace_root
 from server.regions import (
     MAX_TOOL_RESPONSE_TOKENS,
+    clamp_gemini_thinking_level,
     normalize_wire_model_name,
     resolve_auth_config,
     resolve_default_ask_model,
@@ -39,7 +40,9 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
     from google.genai import types as genai_types
 
     timeout_ms = int(request.get("timeout_ms") or 600_000)
-    req_tl = str(request.get("thinking_level") or "").strip().upper()
+    req_tl = str(request.get("thinking_level") or "").strip().upper().replace("-", "_")
+    if req_tl.startswith("THINKING_LEVEL_"):
+        req_tl = req_tl[len("THINKING_LEVEL_"):]
     is_zero_thinking = req_tl in ("ZERO", "0", "OFF")
     client = build_genai_client(
         request,
@@ -52,21 +55,27 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
             cfg_kwargs["system_instruction"] = request["system_instruction"]
         if request.get("temperature") is not None:
             cfg_kwargs["temperature"] = float(request["temperature"])
-        if is_zero_thinking:
-            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_budget=0
-            )
-        elif req_tl:
-            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_level=req_tl
-            )
-
         custom_gateway = bool(
             not request.get("api_key") and resolve_vertex_base_url(request.get("base_url"))
         )
         wire_model = normalize_wire_model_name(
             str(request["model"]), custom_gateway=custom_gateway
         )
+        if is_zero_thinking:
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=0
+            )
+        elif req_tl:
+            clamped_tl = clamp_gemini_thinking_level(
+                str(request.get("model") or wire_model),
+                req_tl,
+                allow_extra_high=False,
+            )
+            if clamped_tl:
+                cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                    thinking_level=clamped_tl
+                )
+
         config = genai_types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
         response = client.models.generate_content(
             model=wire_model,

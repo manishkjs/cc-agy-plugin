@@ -24,6 +24,7 @@ import urllib.parse
 
 from server.genai_client import extract_usage_metadata
 from server.regions import (
+    clamp_gemini_thinking_level,
     env_flag,
     is_strict_mode_enabled,
     normalize_wire_model_name,
@@ -2076,12 +2077,27 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     from google import antigravity as ag
     from google.antigravity import policy, types
 
-    req_tl = str(request.get("thinking_level") or "").strip().upper()
+    req_tl = str(request.get("thinking_level") or "").strip().upper().replace("-", "_")
+    if req_tl.startswith("THINKING_LEVEL_"):
+        req_tl = req_tl[len("THINKING_LEVEL_"):]
     is_zero_thinking = req_tl in ("ZERO", "0", "OFF")
-    sdk_tl_name = "MINIMAL" if is_zero_thinking else req_tl
-    options = (
-        types.GeminiModelOptions(thinking_level=getattr(types.ThinkingLevel, sdk_tl_name))
+    sdk_tl_name = (
+        clamp_gemini_thinking_level(
+            str(request.get("model") or ""),
+            req_tl,
+            allow_extra_high=True,
+            map_zero_to_minimal=True,
+        )
+        or ""
+    )
+    sdk_tl_enum = (
+        getattr(types.ThinkingLevel, sdk_tl_name, None) or getattr(types.ThinkingLevel, "HIGH", None)
         if sdk_tl_name
+        else None
+    )
+    options = (
+        types.GeminiModelOptions(thinking_level=sdk_tl_enum)
+        if sdk_tl_enum is not None
         else None
     )
 
@@ -2105,7 +2121,16 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             "options": options,
         }
         if vertex_base_url:
-            gw_tok = resolve_vertex_base_url_token() or "custom-endpoint"
+            req_timeout_s = float(request.get("timeout_seconds") or 300.0)
+            gw_tok = (
+                resolve_vertex_base_url_token(
+                    request.get("base_url_token"),
+                    base_url=vertex_base_url,
+                    requested_audience=request.get("base_url_audience"),
+                    min_remaining_seconds=min(3300.0, max(900.0, req_timeout_s + 60.0)),
+                )
+                or "custom-endpoint"
+            )
             ep_kwargs["base_url"] = vertex_base_url
             ep_kwargs["api_key"] = gw_tok
             hdrs = {"Authorization": f"Bearer {gw_tok}"}

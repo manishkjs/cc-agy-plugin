@@ -19,60 +19,92 @@ import os
 import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
-# Claude list prices in USD per 1M tokens:
-# (input, cache_read, cache_write_5m, cache_write_1h, output).
-# Matched by longest substring of the model id first. Override specific keys via
-# CC_AGY_LEAD_RATES='{"opus": [4, 0.2, 5, 8, 20], ...}' (merges onto DEFAULT_LEAD_RATES).
-# Opus 5.5 official rate card uses 0.05x cache read ($0.20/1M), 1.25x 5m write ($5.00/1M),
-# and 2.0x 1h write ($8.00/1M); legacy Opus 4.x / 5.0 remain at $5.00 / $0.50 / $25.00,
-# and Claude 3 Opus remains at $15.00 / $1.50 / $75.00.
-DEFAULT_LEAD_RATES: dict[str, tuple[float, float, float, float, float]] = {
-    "claude-3-opus": (15.00, 1.50, 18.75, 30.00, 75.00),
-    "opus-3": (15.00, 1.50, 18.75, 30.00, 75.00),
-    "opus-4": (5.00, 0.50, 6.25, 10.00, 25.00),
-    "4-opus": (5.00, 0.50, 6.25, 10.00, 25.00),
-    "opus-5-0": (5.00, 0.50, 6.25, 10.00, 25.00),
-    "opus-5.0": (5.00, 0.50, 6.25, 10.00, 25.00),
-    "opus-5-5": (4.00, 0.20, 5.00, 8.00, 20.00),
-    "opus-5.5": (4.00, 0.20, 5.00, 8.00, 20.00),
-    "opus": (4.00, 0.20, 5.00, 8.00, 20.00),
-    "sonnet": (3.00, 0.30, 3.75, 6.00, 15.00),
-    "haiku": (1.00, 0.10, 1.25, 2.00, 5.00),
-}
+from server.rate_card import DEFAULT_LEAD_RATES, resolve_claude_lead_rates
+
+_SONNET_5_ALIASES: tuple[str, ...] = (
+    "sonnet-5",
+    "sonnet-5.0",
+    "sonnet-5-5",
+    "sonnet-5.5",
+    "claude-5-sonnet",
+    "claude-5.5-sonnet",
+    "claude-5-0-sonnet",
+    "claude-5-5-sonnet",
+    "claude-sonnet-5",
+)
 
 
-def lead_rates() -> dict[str, tuple[float, float, float, float, float]]:
-    raw = os.environ.get("CC_AGY_LEAD_RATES", "").strip()
+def _parse_lead_rate_overrides() -> dict[str, tuple[float, float, float, float, float]]:
+    primary = (os.environ.get("CC_AGY_LEAD_RATES") or "").strip()
+    alias = (os.environ.get("CC_AGY_LEAD_RATES_JSON") or "").strip()
+    env_name = "CC_AGY_LEAD_RATES" if primary else "CC_AGY_LEAD_RATES_JSON"
+    raw = primary or alias
     if not raw:
-        return dict(DEFAULT_LEAD_RATES)
+        return {}
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError("top-level JSON value must be an object")
-        out = dict(DEFAULT_LEAD_RATES)
-        explicit_keys: set[str] = set()
+        explicit: dict[str, tuple[float, float, float, float, float]] = {}
         for k, v in parsed.items():
             vals = [float(x) for x in v]
             if len(vals) != 5:
                 raise ValueError(f"rate for {k!r} needs 5 numbers")
-            lk = str(k).lower()
-            explicit_keys.add(lk)
-            out[lk] = tuple(vals)  # type: ignore[assignment]
-        if "opus" in explicit_keys:
-            for alias in ("opus-5-5", "opus-5.5"):
-                if alias not in explicit_keys:
-                    out[alias] = out["opus"]
-        return out
+            explicit[str(k).lower()] = tuple(vals)  # type: ignore[assignment]
+        return explicit
     except (ValueError, TypeError, AttributeError) as exc:
-        raise ValueError(f"CC_AGY_LEAD_RATES is not valid JSON rate table: {exc}") from exc
+        raise ValueError(f"{env_name} is not valid JSON rate table: {exc}") from exc
 
 
-def rate_for_model(model: str, rates: dict[str, tuple[float, ...]] | None = None) -> tuple[float, ...] | None:
-    table = rates if rates is not None else lead_rates()
+def lead_rates(
+    as_of: date | str | None = None,
+) -> dict[str, tuple[float, float, float, float, float]]:
+    base_rates = resolve_claude_lead_rates(as_of=as_of) if as_of is not None else resolve_claude_lead_rates()
+    explicit = _parse_lead_rate_overrides()
+    if not explicit:
+        return dict(base_rates)
+    out = dict(base_rates)
+    out.update(explicit)
+    sorted_explicit = sorted(explicit.items(), key=lambda kv: len(kv[0]), reverse=True)
+    for base_key in list(out.keys()):
+        if base_key in explicit:
+            continue
+        for exp_key, exp_val in sorted_explicit:
+            if exp_key in base_key:
+                out[base_key] = exp_val
+                break
+    if "opus" in explicit:
+        for alias in ("opus-5-5", "opus-5.5"):
+            if alias not in explicit:
+                out[alias] = explicit["opus"]
+    if "sonnet" in explicit:
+        for alias in _SONNET_5_ALIASES:
+            if alias not in explicit:
+                out[alias] = explicit["sonnet"]
+    return out
+
+
+def rate_for_model(
+    model: str,
+    rates: dict[str, tuple[float, ...]] | None = None,
+    *,
+    as_of: date | str | None = None,
+) -> tuple[float, ...] | None:
     m = (model or "").lower()
+    if rates is None:
+        explicit = _parse_lead_rate_overrides()
+        for key, val in sorted(explicit.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if key in m:
+                return val
+        table: dict[str, tuple[float, ...]] = (
+            resolve_claude_lead_rates(as_of=as_of) if as_of is not None else resolve_claude_lead_rates()
+        )
+    else:
+        table = rates
     for key, val in sorted(table.items(), key=lambda kv: len(kv[0]), reverse=True):
         if key in m:
             return val
@@ -162,13 +194,18 @@ def collect_lead_usage(
                     overlapping.append(f)
                     break
         files = overlapping
-    rates = lead_rates()
+    # Validate CC_AGY_LEAD_RATES eagerly even when transcripts are empty.
+    _ = lead_rates()
+    rates_cache: dict[str | None, dict[str, tuple[float, ...]]] = {}
     seen: set[str] = set()
     per_model: dict[str, dict[str, Any]] = {}
+    per_model_usd: dict[str, float] = {}
+    unpriced_models: list[str] = []
     notes: list[str] = []
     messages = 0
     for rec in _iter_assistant_usage(files):
-        ts = _iso_to_epoch(str(rec.get("timestamp") or ""))
+        raw_ts = str(rec.get("timestamp") or "")
+        ts = _iso_to_epoch(raw_ts)
         if ts is None:
             continue
         if since_epoch is not None and ts < since_epoch:
@@ -191,6 +228,9 @@ def collect_lead_usage(
         w_total = int(u.get("cache_creation_input_tokens") or 0)
         if w5 + w1h < w_total:
             w5 += w_total - (w5 + w1h)  # unsplit writes priced at the 5-minute rate
+        in_tok = int(u.get("input_tokens") or 0)
+        cr_tok = int(u.get("cache_read_input_tokens") or 0)
+        out_tok = int(u.get("output_tokens") or 0)
         row = per_model.setdefault(
             model,
             {"messages": 0, "input_tokens": 0, "cache_read_input_tokens": 0,
@@ -198,28 +238,39 @@ def collect_lead_usage(
              "cost_cents": 0.0, "priced": True},
         )
         row["messages"] += 1
-        row["input_tokens"] += int(u.get("input_tokens") or 0)
-        row["cache_read_input_tokens"] += int(u.get("cache_read_input_tokens") or 0)
+        row["input_tokens"] += in_tok
+        row["cache_read_input_tokens"] += cr_tok
         row["cache_write_5m_tokens"] += w5
         row["cache_write_1h_tokens"] += w1h
-        row["output_tokens"] += int(u.get("output_tokens") or 0)
+        row["output_tokens"] += out_tok
         messages += 1
-    total_cents = 0.0
-    all_priced = True
-    for model, row in per_model.items():
-        r = rate_for_model(model, rates)
+
+        msg_date = raw_ts[:10] if len(raw_ts) >= 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_ts[:10]) else None
+        if msg_date not in rates_cache:
+            rates_cache[msg_date] = lead_rates(as_of=msg_date)
+        r = rate_for_model(model, rates_cache[msg_date])
         if r is None:
             row["priced"] = False
-            all_priced = False
-            notes.append(f"No lead rate for model {model!r}; its tokens are counted but not priced.")
+            if model not in unpriced_models:
+                unpriced_models.append(model)
+        else:
+            msg_usd = (
+                in_tok * r[0]
+                + cr_tok * r[1]
+                + w5 * r[2]
+                + w1h * r[3]
+                + out_tok * r[4]
+            ) / 1_000_000.0
+            per_model_usd[model] = per_model_usd.get(model, 0.0) + msg_usd
+
+    total_cents = 0.0
+    all_priced = len(unpriced_models) == 0
+    for unpriced_model in unpriced_models:
+        notes.append(f"No lead rate for model {unpriced_model!r}; its tokens are counted but not priced.")
+    for model, row in per_model.items():
+        if not row["priced"]:
             continue
-        usd = (
-            row["input_tokens"] * r[0]
-            + row["cache_read_input_tokens"] * r[1]
-            + row["cache_write_5m_tokens"] * r[2]
-            + row["cache_write_1h_tokens"] * r[3]
-            + row["output_tokens"] * r[4]
-        ) / 1_000_000.0
+        usd = per_model_usd.get(model, 0.0)
         row["cost_cents"] = round(usd * 100.0, 4)
         total_cents += usd * 100.0
     if not files:

@@ -71,6 +71,11 @@ CODEX_FORWARDED_ENV_VARS = (
     "CC_AGY_VERTEX_BASE_URL",
     "GOOGLE_VERTEX_BASE_URL",
     "CC_AGY_VERTEX_BASE_URL_TOKEN",
+    "CC_AGY_VERTEX_BASE_URL_AUDIENCE",
+    "CC_AGY_VERTEX_OIDC",
+    "CC_AGY_TELEMETRY_SINK",
+    "CC_AGY_TELEMETRY_TOKEN",
+    "CC_AGY_USER_ID",
     "CC_AGY_MAX_DAILY_CENTS",
     "CC_AGY_ALLOWED_PROJECTS",
     "CC_AGY_BLOCKED_PROJECTS",
@@ -123,6 +128,8 @@ def build_codex_server_block(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -143,6 +150,10 @@ def build_codex_server_block(
         env["GOOGLE_CLOUD_LOCATION"] = location
     if base_url:
         env["CC_AGY_VERTEX_BASE_URL"] = base_url
+    if gateway_audience and gateway_audience.strip():
+        env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
+    if telemetry_sink and telemetry_sink.strip():
+        env["CC_AGY_TELEMETRY_SINK"] = telemetry_sink.strip()
     if agy_cli_path:
         env["CC_AGY_CLI_BIN"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
@@ -266,6 +277,8 @@ def install_codex(
     project: str | None,
     location: str | None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -283,6 +296,8 @@ def install_codex(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -348,6 +363,8 @@ def build_claude_user_config(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -368,6 +385,10 @@ def build_claude_user_config(
         cfg["google_cloud_location"] = location
     if base_url:
         cfg["vertex_base_url"] = base_url
+    if gateway_audience and gateway_audience.strip():
+        cfg["vertex_base_url_audience"] = gateway_audience.strip()
+    if telemetry_sink and telemetry_sink.strip():
+        cfg["telemetry_sink"] = telemetry_sink.strip()
     if agy_cli_path:
         cfg["agy_cli_path"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
@@ -390,6 +411,8 @@ def claude_install_commands(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -403,6 +426,8 @@ def claude_install_commands(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -428,6 +453,8 @@ def install_claude(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -441,6 +468,8 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -454,6 +483,8 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -541,6 +572,8 @@ def build_agy_server_entry(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -562,6 +595,10 @@ def build_agy_server_entry(
         env["GOOGLE_CLOUD_LOCATION"] = location
     if base_url:
         env["CC_AGY_VERTEX_BASE_URL"] = base_url
+    if gateway_audience and gateway_audience.strip():
+        env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
+    if telemetry_sink and telemetry_sink.strip():
+        env["CC_AGY_TELEMETRY_SINK"] = telemetry_sink.strip()
     if agy_cli_path:
         env["CC_AGY_CLI_BIN"] = agy_cli_path
     if max_daily_cents is not None and max_daily_cents > 0:
@@ -619,6 +656,8 @@ def install_agy(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -647,6 +686,8 @@ def install_agy(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -729,6 +770,8 @@ def build_cursor_server_entry(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -744,6 +787,8 @@ def build_cursor_server_entry(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -791,6 +836,8 @@ def install_cursor(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
@@ -815,6 +862,8 @@ def install_cursor(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
@@ -1106,6 +1155,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default=None, help="Google Cloud project ID (required for pay-as-you-go Vertex AI).")
     parser.add_argument("--location", default=None, help="Vertex AI region (for example 'global' or 'us-central1').")
     parser.add_argument("--base-url", default=None, help="Optional AI gateway base URL (sets CC_AGY_VERTEX_BASE_URL).")
+    parser.add_argument("--gateway-audience", default=None,
+                        help="Optional OIDC target audience URL (or 'auto') for zero-key Cloud Run / WIF gateway auth.")
+    parser.add_argument("--telemetry-sink", default=None,
+                        help="Optional local NDJSON path or https:// webhook URL for opt-in receipt telemetry.")
     parser.add_argument("--agy-cli-path", default=None, help="Optional path to an external Antigravity CLI (`agy`) binary.")
     parser.add_argument("--install-agy-cli", action="store_true",
                         help="Download and verify the standalone Antigravity CLI (`agy`) into ~/.local/share/cc-agy-plugin/bin.")
@@ -1123,9 +1176,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Do not automatically install ~/.local/share/cc-agy-plugin/venv or standalone `agy` CLI.")
     parser.add_argument("--name", default=DEFAULT_SERVER_NAME, help="Codex MCP server name (default: agy).")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
+    parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics as JSON and exit.")
+    parser.add_argument("--probe-oidc", action="store_true", help="With --doctor, mint a live OIDC token once to verify and display the resolved principal.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing anything.")
     parser.add_argument("--json", action="store_true", help="Print the result as JSON.")
     args = parser.parse_args(raw_argv)
+    if args.probe_oidc and not args.doctor:
+        parser.error("--probe-oidc requires --doctor")
+    if args.doctor:
+        from server.doctor import run_doctor
+
+        report = run_doctor(workspace_root=os.getcwd(), probe_oidc=bool(args.probe_oidc))
+        print(json.dumps(report, indent=2))
+        return 0 if report.get("healthy") else 1
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
         parser.error("--name may only contain letters, digits, '-' and '_'")
     if args.max_daily_cents is not None:
@@ -1133,6 +1196,27 @@ def main(argv: list[str] | None = None) -> int:
 
         if not math.isfinite(args.max_daily_cents) or args.max_daily_cents <= 0:
             parser.error("--max-daily-cents must be a finite number greater than 0")
+    if args.gateway_audience:
+        from server.regions import resolve_vertex_base_url_audience
+
+        try:
+            resolve_vertex_base_url_audience(
+                args.gateway_audience,
+                base_url=args.base_url,
+                env=os.environ,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.telemetry_sink:
+        from server.telemetry import validate_webhook_sink_url, _resolve_local_sink_path
+
+        try:
+            if args.telemetry_sink.strip().lower().startswith(("http://", "https://")):
+                validate_webhook_sink_url(args.telemetry_sink, check_dns=False)
+            else:
+                _resolve_local_sink_path(args.telemetry_sink)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     bootstrap_info: dict[str, Any] | None = None
     agy_cli_bootstrap: dict[str, Any] | None = None
@@ -1185,6 +1269,8 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_audience=args.gateway_audience,
+                telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
@@ -1202,6 +1288,8 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_audience=args.gateway_audience,
+                telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
@@ -1219,6 +1307,8 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_audience=args.gateway_audience,
+                telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
@@ -1237,6 +1327,8 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_audience=args.gateway_audience,
+                telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,

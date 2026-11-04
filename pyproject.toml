@@ -35,7 +35,8 @@ include = ["server*", "scripts*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-scripts = ["*.sh"]
+server = ["*.json"]
+scripts = ["*.sh", "*.ps1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

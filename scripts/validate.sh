@@ -26,9 +26,13 @@ for rel in \
   plugins/cc-agy-plugin/skills/vertex/SKILL.md \
   skills/vertex/SKILL.md \
   scripts/install_agy_cli.sh \
+  scripts/bootstrap-gateway.ps1 \
   scripts/sync_docs.py \
   server/agy_cli.py \
   server/genai_client.py \
+  server/rate_card.json \
+  server/rate_card.py \
+  server/telemetry.py \
   server/verification_policy.py; do
   require_file "$root/$rel"
 done

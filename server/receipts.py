@@ -423,7 +423,12 @@ def _redact_obj_values(obj: Any, secrets: list[str], *, parent_key: str = "") ->
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if k in ("api_key", "ANTIGRAVITY_OAUTH_TOKEN", "CC_AGY_ENTERPRISE_ACCESS_TOKEN"):
+            if k in (
+                "api_key",
+                "ANTIGRAVITY_OAUTH_TOKEN",
+                "CC_AGY_ENTERPRISE_ACCESS_TOKEN",
+                "CC_AGY_TELEMETRY_TOKEN",
+            ):
                 out[k] = "<api-key>"
             else:
                 out[k] = _redact_obj_values(v, secrets, parent_key=str(k))
@@ -433,6 +438,11 @@ def _redact_obj_values(obj: Any, secrets: list[str], *, parent_key: str = "") ->
     if isinstance(obj, str):
         s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "<api-key>", obj)
         s = re.sub(r"\bya29\.[0-9A-Za-z\-_.]{8,}", "<oauth-token>", s)
+        s = re.sub(
+            r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+            "<oidc-token>",
+            s,
+        )
         for sec in secrets:
             if len(sec) >= 4 and parent_key not in _ENUM_METADATA_KEYS:
                 s = s.replace(sec, "<api-key>")
@@ -457,6 +467,9 @@ def redact_api_keys(
         os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN"),
+        os.environ.get("CC_AGY_TELEMETRY_TOKEN"),
+        os.environ.get("CLAUDE_PLUGIN_OPTION_TELEMETRY_TOKEN"),
+        os.environ.get("CC_AGY_USERCFG_TELEMETRY_TOKEN"),
         os.environ.get("ANTIGRAVITY_OAUTH_TOKEN"),
         os.environ.get("CC_AGY_ENTERPRISE_ACCESS_TOKEN"),
     ):
@@ -964,6 +977,13 @@ class ReceiptStore:
 
         with open(self.ledger_path, "a", encoding="utf-8") as ledger_file:
             ledger_file.write(json.dumps(record, sort_keys=True) + "\n")
+
+        try:
+            from server.telemetry import emit_receipt_telemetry
+
+            emit_receipt_telemetry(record)
+        except Exception:  # noqa: BLE001 - optional telemetry must never block receipt persistence
+            pass
 
         return record
 
