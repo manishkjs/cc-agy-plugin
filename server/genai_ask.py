@@ -21,7 +21,7 @@ from server.regions import (
     normalize_wire_model_name,
     resolve_auth_config,
     resolve_default_ask_model,
-    resolve_vertex_base_url,
+    resolve_effective_gateway_url,
     sanitize_placeholder_env,
     truncate_to_token_budget,
 )
@@ -55,9 +55,8 @@ def _default_genai_backend(request: dict[str, Any]) -> dict[str, Any]:
             cfg_kwargs["system_instruction"] = request["system_instruction"]
         if request.get("temperature") is not None:
             cfg_kwargs["temperature"] = float(request["temperature"])
-        custom_gateway = bool(
-            not request.get("api_key") and resolve_vertex_base_url(request.get("base_url"))
-        )
+        eff_gw_url = resolve_effective_gateway_url(request)
+        custom_gateway = bool(eff_gw_url)
         wire_model = normalize_wire_model_name(
             str(request["model"]), custom_gateway=custom_gateway
         )
@@ -203,6 +202,11 @@ def ask_gemini(
             "project": resolved_project,
             "location": resolved_location,
             "location_explicit": bool(auth.get("location_explicit")),
+            "base_url": auth.get("base_url"),
+            "gateway_wire": auth.get("gateway_wire"),
+            "base_url_token": auth.get("base_url_token"),
+            "base_url_audience": auth.get("base_url_audience"),
+            "bifrost_virtual_key": auth.get("bifrost_virtual_key"),
             "model": chosen_model,
             "prompt": full_prompt,
             "system_instruction": system_instruction,

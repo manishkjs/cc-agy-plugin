@@ -82,6 +82,13 @@ def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> st
     the tier-qualified alias verbatim so gateway routers can dispatch per-tier model targets.
     """
     cleaned = str(model or "").strip()
+    if not cleaned:
+        return cleaned
+    low_prefix = cleaned.lower()
+    if "/models/" in low_prefix:
+        cleaned = cleaned[low_prefix.rfind("/models/") + len("/models/") :]
+    elif low_prefix.startswith("models/"):
+        cleaned = cleaned[len("models/") :]
     if not cleaned or custom_gateway:
         return cleaned
     low = cleaned.lower()
@@ -396,9 +403,20 @@ def sanitize_placeholder_env() -> None:
         "GOOGLE_VERTEX_BASE_URL",
         "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL",
         "CC_AGY_USERCFG_VERTEX_BASE_URL",
+        "CC_AGY_GEMINI_BASE_URL",
+        "GOOGLE_GEMINI_BASE_URL",
+        "CLAUDE_PLUGIN_OPTION_GEMINI_BASE_URL",
+        "CC_AGY_USERCFG_GEMINI_BASE_URL",
+        "CC_AGY_GATEWAY_WIRE",
+        "CC_AGY_GATEWAY_STYLE",
+        "CLAUDE_PLUGIN_OPTION_GATEWAY_WIRE",
+        "CC_AGY_USERCFG_GATEWAY_WIRE",
         "CC_AGY_VERTEX_BASE_URL_TOKEN",
         "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN",
         "CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN",
+        "CC_AGY_BIFROST_VIRTUAL_KEY",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_VIRTUAL_KEY",
+        "CC_AGY_USERCFG_BIFROST_VIRTUAL_KEY",
         "CC_AGY_VERTEX_BASE_URL_AUDIENCE",
         "CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_AUDIENCE",
         "CC_AGY_USERCFG_VERTEX_BASE_URL_AUDIENCE",
@@ -472,6 +490,37 @@ def resolve_api_key(
     return None
 
 
+GATEWAY_WIRE_CHOICES: tuple[str, ...] = ("auto", "vertex", "gemini")
+GATEWAY_WIRE_CLI_CHOICES: tuple[str, ...] = (
+    "auto",
+    "vertex",
+    "gemini",
+    "litellm-vertex",
+    "litellm-gemini",
+    "bifrost",
+)
+_GATEWAY_WIRE_VERTEX_ALIASES: frozenset[str] = frozenset(
+    {"vertex", "vertex_ai", "vertexai", "litellm_vertex"}
+)
+_GATEWAY_WIRE_GEMINI_ALIASES: frozenset[str] = frozenset(
+    {"gemini", "gemini_api", "genai", "bifrost", "litellm_gemini", "ai_studio", "aistudio"}
+)
+
+
+def _clean_base_url_candidate(candidate: Any) -> str | None:
+    """Return a stripped gateway URL candidate when non-empty and not an unsubstituted placeholder."""
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    cleaned = candidate.strip()
+    if (
+        cleaned
+        and not cleaned.startswith("${")
+        and cleaned.lower() not in ("<base-url>", "dummy", "none", "null")
+    ):
+        return cleaned
+    return None
+
+
 def resolve_vertex_base_url(
     requested_base_url: str | None = None,
     *,
@@ -486,15 +535,168 @@ def resolve_vertex_base_url(
         source_env.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL"),
         source_env.get("CC_AGY_USERCFG_VERTEX_BASE_URL"),
     ):
+        cleaned = _clean_base_url_candidate(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+_STARTUP_JETSKI_SHIM_GEMINI_URL: str | None = (
+    (os.environ.get("GOOGLE_GEMINI_BASE_URL") or "").strip()
+    if (os.environ.get("GEMINI_API_KEY") or "").strip().lower() in ("dummy-key", "dummy", "<api-key>")
+    else None
+)
+
+
+def _usable_google_gemini_base_url(source_env: Mapping[str, str]) -> str | None:
+    """Return `GOOGLE_GEMINI_BASE_URL` while ignoring host-injected `dummy-key` loopback shims."""
+    cleaned = _clean_base_url_candidate(source_env.get("GOOGLE_GEMINI_BASE_URL"))
+    if not cleaned:
+        return None
+    raw_gem_key = (source_env.get("GEMINI_API_KEY") or "").strip().lower()
+    if raw_gem_key in ("dummy-key", "dummy", "<api-key>"):
+        return None
+    # Also ignore the host's startup loopback shim if `os.environ` is passed directly without `GEMINI_API_KEY`.
+    if source_env is os.environ and _STARTUP_JETSKI_SHIM_GEMINI_URL and cleaned == _STARTUP_JETSKI_SHIM_GEMINI_URL:
+        return None
+    return cleaned
+
+
+def resolve_gemini_base_url(
+    requested_base_url: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an optional Gemini API-wire gateway URL (for example Bifrost `/genai` or LiteLLM `/gemini`)."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_base_url,
+        source_env.get("CC_AGY_GEMINI_BASE_URL"),
+        _usable_google_gemini_base_url(source_env),
+    ):
+        cleaned = _clean_base_url_candidate(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def resolve_gateway_base_url(
+    requested_base_url: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve any configured AI gateway base URL across Vertex-wire and Gemini-wire settings."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_base_url,
+        source_env.get("CC_AGY_VERTEX_BASE_URL"),
+        source_env.get("CC_AGY_GEMINI_BASE_URL"),
+        source_env.get("GOOGLE_VERTEX_BASE_URL"),
+        _usable_google_gemini_base_url(source_env),
+        source_env.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL"),
+        source_env.get("CC_AGY_USERCFG_VERTEX_BASE_URL"),
+    ):
+        cleaned = _clean_base_url_candidate(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def resolve_effective_gateway_url(
+    auth_or_req: Mapping[str, Any],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Return the effective gateway base URL for an auth/request mapping without hijacking direct api_key calls."""
+    explicit = _clean_base_url_candidate(auth_or_req.get("base_url"))
+    if explicit:
+        return explicit
+    if "base_url" in auth_or_req or auth_or_req.get("api_key") or auth_or_req.get("auth_mode") == "api_key":
+        return ""
+    return resolve_gateway_base_url(env=env) or ""
+
+
+def resolve_bifrost_virtual_key(
+    requested_virtual_key: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve an optional Bifrost governance virtual key (`x-bf-vk`) from arguments or environment."""
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_virtual_key,
+        source_env.get("CC_AGY_BIFROST_VIRTUAL_KEY"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_BIFROST_VIRTUAL_KEY"),
+        source_env.get("CC_AGY_USERCFG_BIFROST_VIRTUAL_KEY"),
+    ):
         if isinstance(candidate, str) and candidate:
             cleaned = candidate.strip()
             if (
                 cleaned
                 and not cleaned.startswith("${")
-                and cleaned.lower() not in ("<base-url>", "dummy", "none", "null")
+                and cleaned.lower() not in ("<virtual-key>", "<token>", "dummy-key", "dummy", "none", "null")
             ):
                 return cleaned
     return None
+
+
+def resolve_gateway_wire(
+    requested_wire: str | None = None,
+    *,
+    base_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the HTTP wire contract (`'vertex'` or `'gemini'`) for a custom AI gateway.
+
+    - `'vertex'`: `/v1beta1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent`
+      (LiteLLM `/vertex_ai`, Cloud Run Vertex proxies, Apigee Vertex routes).
+    - `'gemini'`: `/v1beta/models/{model}:generateContent`
+      (Bifrost `/genai`, LiteLLM `/gemini`, `GOOGLE_GEMINI_BASE_URL` / `CC_AGY_GEMINI_BASE_URL`).
+    """
+    source_env = env if env is not None else os.environ
+    for candidate in (
+        requested_wire,
+        source_env.get("CC_AGY_GATEWAY_WIRE"),
+        source_env.get("CC_AGY_GATEWAY_STYLE"),
+        source_env.get("CLAUDE_PLUGIN_OPTION_GATEWAY_WIRE"),
+        source_env.get("CC_AGY_USERCFG_GATEWAY_WIRE"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            cleaned = candidate.strip()
+            if not cleaned or cleaned.startswith("${") or cleaned.lower() in ("none", "null"):
+                continue
+            normalized = cleaned.lower().replace("-", "_")
+            if normalized == "auto":
+                break
+            if normalized in _GATEWAY_WIRE_VERTEX_ALIASES:
+                return "vertex"
+            if normalized in _GATEWAY_WIRE_GEMINI_ALIASES:
+                return "gemini"
+            raise ValueError(
+                f"Unsupported gateway wire mode {cleaned!r}; expected one of {GATEWAY_WIRE_CLI_CHOICES}."
+            )
+
+    explicit_base = _clean_base_url_candidate(base_url)
+    eff_base = explicit_base or resolve_gateway_base_url(env=source_env) or ""
+    if eff_base:
+        parsed_path = urllib.parse.urlsplit(eff_base).path.rstrip("/").lower()
+        segments = [seg for seg in parsed_path.split("/") if seg]
+        for seg in reversed(segments):
+            if seg in ("genai", "gemini"):
+                return "gemini"
+            if seg in ("vertex_ai", "vertex", "v1internal"):
+                return "vertex"
+
+    gemini_base = resolve_gemini_base_url(env=source_env)
+    vertex_base = resolve_vertex_base_url(env=source_env)
+    if gemini_base and (
+        (explicit_base and explicit_base == gemini_base)
+        or (not explicit_base and not vertex_base)
+    ):
+        return "gemini"
+    if resolve_bifrost_virtual_key(env=source_env) and not vertex_base:
+        return "gemini"
+    return "vertex"
 
 
 _OIDC_CACHE_LOCK = threading.Lock()
@@ -580,7 +782,7 @@ def resolve_vertex_base_url_audience(
         return None
 
     if raw_aud.lower() in ("auto", "true", "1", "yes", "on"):
-        eff_base = resolve_vertex_base_url(base_url, env=source_env)
+        eff_base = resolve_gateway_base_url(base_url, env=source_env)
         if not eff_base:
             return None
         base_authority_src = eff_base.split("://", 1)[1] if "://" in eff_base else eff_base
@@ -1231,6 +1433,63 @@ def resolve_vertex_base_url_token(
     return None
 
 
+def resolve_gateway_credentials(
+    auth_or_req: Mapping[str, Any],
+    *,
+    base_url: str,
+    wire: str,
+    zero_thinking: bool = False,
+    min_remaining_seconds: float = 0.0,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Resolve `(effective_token, http_headers)` for Vertex-wire and Gemini-wire AI gateways.
+
+    Supports static gateway bearer/virtual keys (`CC_AGY_VERTEX_BASE_URL_TOKEN`), refreshing
+    Cloud Run / WIF OIDC tokens (`CC_AGY_VERTEX_BASE_URL_AUDIENCE`), Bifrost governance virtual
+    keys (`CC_AGY_BIFROST_VIRTUAL_KEY` -> `x-bf-vk`, composable alongside Cloud Run OIDC), and
+    `api_key` credentials when `GOOGLE_GEMINI_BASE_URL` / `CC_AGY_GEMINI_BASE_URL` is paired with
+    `GEMINI_API_KEY` in `auto` mode without a gateway token or virtual key, while never letting an
+    ambient personal `GEMINI_API_KEY` outrank a configured gateway credential or leak into
+    `auth_mode='gateway'` / `'vertex'`.
+    """
+    source_env = env if env is not None else os.environ
+    bearer_or_oidc = resolve_vertex_base_url_token(
+        auth_or_req.get("base_url_token"),
+        base_url=base_url,
+        requested_audience=auth_or_req.get("base_url_audience"),
+        env=source_env,
+        min_remaining_seconds=min_remaining_seconds,
+    )
+    bf_vk = resolve_bifrost_virtual_key(
+        auth_or_req.get("bifrost_virtual_key"),
+        env=source_env,
+    )
+    explicit_api_key = _clean_base_url_candidate(auth_or_req.get("api_key"))
+    if explicit_api_key and explicit_api_key.lower() in ("<api-key>", "dummy-key"):
+        explicit_api_key = None
+
+    non_jwt_bearer = (
+        bearer_or_oidc
+        if (bearer_or_oidc and not bearer_or_oidc.startswith("eyJ"))
+        else None
+    )
+    auth_bearer = bearer_or_oidc or bf_vk or explicit_api_key or "custom-endpoint"
+    gemini_key = non_jwt_bearer or bf_vk or explicit_api_key
+    effective_token = (gemini_key or "custom-endpoint") if wire == "gemini" else auth_bearer
+
+    headers: dict[str, str] = {"Authorization": f"Bearer {auth_bearer}"}
+    if wire == "gemini" and gemini_key:
+        headers["x-goog-api-key"] = gemini_key
+    elif wire == "vertex" and non_jwt_bearer:
+        # LiteLLM `/vertex_ai` pass-through and API-key gateways accept `x-goog-api-key` or `Authorization`.
+        headers["x-goog-api-key"] = non_jwt_bearer
+    if bf_vk:
+        headers["x-bf-vk"] = bf_vk
+    if zero_thinking:
+        headers["X-CC-AGY-Thinking-Budget"] = "0"
+    return effective_token, headers
+
+
 def resolve_max_daily_cents(
     env: Mapping[str, str] | None = None,
 ) -> float | None:
@@ -1403,7 +1662,7 @@ def enforce_project_controls(
         if isinstance(raw_comp, str) and raw_comp.strip():
             companion_proj = raw_comp.strip()
             candidates.append(("agy_cli.cloudaicompanionProject", companion_proj))
-    elif auth_mode == "vertex" and not resolve_vertex_base_url(env=source_env):
+    elif auth_mode == "vertex" and not resolve_gateway_base_url(env=source_env):
         adc_qp = read_adc_quota_project(source_env, explicit_env=explicit_env)
         if adc_qp:
             candidates.append(("adc.quota_project_id", adc_qp))
@@ -1420,7 +1679,7 @@ def enforce_project_controls(
         return
 
     if auth_mode == "vertex":
-        if resolve_vertex_base_url(env=source_env) and real_proj is None:
+        if resolve_gateway_base_url(env=source_env) and real_proj is None:
             return
         if real_proj is None or real_proj.lower() not in allowed_lower:
             raise ValueError(
@@ -1469,7 +1728,22 @@ def resolve_vertex_project(
             cleaned = candidate.strip()
             if cleaned and not cleaned.startswith("${") and cleaned != "<paying-project>":
                 return cleaned
-    if resolve_vertex_base_url(env=source_env):
+    if (
+        resolve_vertex_base_url(env=source_env)
+        or _clean_base_url_candidate(source_env.get("CC_AGY_GEMINI_BASE_URL"))
+        or (
+            _usable_google_gemini_base_url(source_env)
+            and (
+                resolve_configured_auth_mode(env=source_env) == "gateway"
+                or resolve_bifrost_virtual_key(env=source_env)
+                or resolve_static_vertex_base_url_token(env=source_env)
+                or resolve_vertex_base_url_audience(
+                    base_url=_usable_google_gemini_base_url(source_env),
+                    env=source_env,
+                )
+            )
+        )
+    ):
         return "custom-endpoint"
     if allow_missing:
         return None
@@ -1620,6 +1894,10 @@ def resolve_auth_config(
     """
     source_env = env if env is not None else os.environ
     resolved_key = resolve_api_key(requested_api_key, env=source_env)
+    env_key = resolve_api_key(None, env=source_env)
+    # A `requested_api_key` equal to the ambient `env_key` is a pass-1 echo (`_execute_job` / `followup_job`),
+    # not a distinct per-call override, so configured Gemini gateways stay attached across two-pass worker calls.
+    is_per_call_key_override = bool(requested_api_key and resolved_key != env_key)
     resolved_proj = resolve_vertex_project(requested_project, env=source_env, allow_missing=True)
 
     # Clean requested_project so scrubbed/placeholder values do not count as an explicit project override
@@ -1629,14 +1907,79 @@ def resolve_auth_config(
         if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
             explicit_project = cleaned_req_proj
 
+    cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
+    env_cfg_mode = resolve_configured_auth_mode(None, env=source_env)
+    # A requested `api_key` mode that merely echoes pass-1 output (same ambient key + Gemini gateway)
+    # keeps the gateway so two-pass worker resolution is idempotent; env `CC_AGY_AUTH_MODE=api_key`
+    # or a different per-call key still forces direct AI Studio.
+    is_explicit_api_key_mode = bool(
+        env_cfg_mode == "api_key"
+        or (
+            cfg_mode == "api_key"
+            and not (env_key and resolved_key == env_key and resolve_gemini_base_url(env=source_env))
+        )
+    )
+
     def _finish(result: dict[str, Any]) -> dict[str, Any]:
         if result.get("auth_mode") == "vertex":
-            gw_base = resolve_vertex_base_url(env=source_env)
+            usable_gem = _usable_google_gemini_base_url(source_env)
+            gem_gateway_signal = bool(
+                usable_gem
+                and (
+                    resolve_static_vertex_base_url_token(env=source_env)
+                    or resolve_bifrost_virtual_key(env=source_env)
+                    or resolve_vertex_base_url_audience(base_url=usable_gem, env=source_env)
+                )
+            )
+            gw_base = (
+                resolve_gateway_base_url(env=source_env)
+                if (
+                    cfg_mode == "gateway"
+                    or env_cfg_mode == "gateway"
+                    or result.get("project") == "custom-endpoint"
+                    or gem_gateway_signal
+                )
+                else (
+                    resolve_vertex_base_url(env=source_env)
+                    or _clean_base_url_candidate(source_env.get("CC_AGY_GEMINI_BASE_URL"))
+                )
+            )
             if gw_base:
                 result.setdefault("base_url", gw_base)
+                result.setdefault("gateway_wire", resolve_gateway_wire(base_url=gw_base, env=source_env))
                 gw_aud = resolve_vertex_base_url_audience(base_url=gw_base, env=source_env)
                 if gw_aud:
                     result.setdefault("base_url_audience", gw_aud)
+                gw_tok = resolve_static_vertex_base_url_token(env=source_env)
+                if gw_tok:
+                    result.setdefault("base_url_token", gw_tok)
+                bf_vk = resolve_bifrost_virtual_key(env=source_env)
+                if bf_vk:
+                    result.setdefault("bifrost_virtual_key", bf_vk)
+                if (
+                    result.get("gateway_wire") == "gemini"
+                    and not resolve_vertex_base_url(env=source_env)
+                    and not gw_tok
+                    and not bf_vk
+                    and resolved_key
+                    and (cfg_mode == "gateway" or env_cfg_mode == "gateway")
+                ):
+                    result["api_key"] = resolved_key
+        elif (
+            result.get("auth_mode") == "api_key"
+            and not is_per_call_key_override
+            and not is_explicit_api_key_mode
+        ):
+            # Token and Bifrost-VK gateways route via the `vertex` branch above (`has_vertex_or_bifrost_gateway`).
+            gem_base = resolve_gemini_base_url(env=source_env)
+            if gem_base:
+                result.setdefault("base_url", gem_base)
+                result.setdefault("gateway_wire", resolve_gateway_wire(base_url=gem_base, env=source_env))
+                gw_aud = resolve_vertex_base_url_audience(base_url=gem_base, env=source_env)
+                if gw_aud:
+                    result.setdefault("base_url_audience", gw_aud)
+        result.setdefault("base_url", None)
+        result.setdefault("gateway_wire", None)
         enforce_project_controls(
             auth_mode=str(result.get("auth_mode") or ""),
             project=result.get("project"),
@@ -1645,7 +1988,7 @@ def resolve_auth_config(
         )
         return result
 
-    if resolved_key and requested_api_key:
+    if resolved_key and is_per_call_key_override:
         return _finish(
             {
                 "auth_mode": "api_key",
@@ -1655,8 +1998,6 @@ def resolve_auth_config(
                 "reroute_note": None,
             }
         )
-
-    cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
     if cfg_mode == "gemini_enterprise":
         ent_proj = _resolve_explicit_project_only(requested_project, env=source_env)
         req_loc_clean = (requested_location or "").strip().lower()
@@ -1673,7 +2014,7 @@ def resolve_auth_config(
             }
         )
 
-    if cfg_mode == "api_key":
+    if is_explicit_api_key_mode:
         if not resolved_key:
             raise ValueError(
                 "Missing Gemini API key for auth_mode='api_key'. Set userConfig.gemini_api_key or GEMINI_API_KEY."
@@ -1689,10 +2030,10 @@ def resolve_auth_config(
         )
 
     if cfg_mode == "gateway":
-        if not resolve_vertex_base_url(env=source_env):
+        if not resolve_gateway_base_url(env=source_env):
             raise ValueError(
                 "Missing gateway URL for auth_mode='gateway'. "
-                "Set userConfig.vertex_base_url or CC_AGY_VERTEX_BASE_URL."
+                "Set userConfig.vertex_base_url, CC_AGY_VERTEX_BASE_URL, or CC_AGY_GEMINI_BASE_URL."
             )
         gw_proj = resolved_proj or "custom-endpoint"
         resolved_loc, reroute_note = resolve_vertex_location(model, requested_location, env=source_env)
@@ -1723,10 +2064,18 @@ def resolve_auth_config(
             }
         )
 
-    has_gateway = bool(resolve_vertex_base_url(env=source_env))
+    has_vertex_or_bifrost_gateway = bool(
+        resolve_vertex_base_url(env=source_env)
+        or resolve_bifrost_virtual_key(env=source_env)
+        or (
+            resolve_gemini_base_url(env=source_env)
+            and resolve_static_vertex_base_url_token(env=source_env)
+        )
+    )
 
-    # Use API key when explicitly passed, or when present in the environment without an explicit project or gateway
-    if resolved_key and (requested_api_key or (not explicit_project and not has_gateway)):
+    # Use API key when explicitly passed, or when present in the environment without an explicit project or gateway token/VK.
+    # (If GOOGLE_GEMINI_BASE_URL or CC_AGY_GEMINI_BASE_URL is also set, `_finish` routes API-key calls through that Gemini gateway.)
+    if resolved_key and (is_per_call_key_override or (not explicit_project and not has_vertex_or_bifrost_gateway)):
         return _finish(
             {
                 "auth_mode": "api_key",

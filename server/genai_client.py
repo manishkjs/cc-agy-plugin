@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from server.regions import resolve_vertex_base_url, resolve_vertex_base_url_token
+from server.regions import (
+    resolve_effective_gateway_url,
+    resolve_gateway_credentials,
+    resolve_gateway_wire,
+)
 
 USAGE_TOKEN_KEYS: tuple[str, ...] = (
     "prompt_token_count",
@@ -26,26 +30,25 @@ def build_genai_client(
     from google.genai import types as genai_types
     from google.oauth2.credentials import Credentials as OAuth2Credentials
 
-    if auth.get("api_key"):
-        http_opts = genai_types.HttpOptions(timeout=timeout_ms) if timeout_ms else None
+    base_url = resolve_effective_gateway_url(auth)
+    if not base_url and auth.get("api_key"):
+        direct_opts: dict[str, Any] = {"base_url": "https://generativelanguage.googleapis.com/"}
+        if timeout_ms:
+            direct_opts["timeout"] = timeout_ms
         return genai.Client(
+            vertexai=False,
             api_key=auth["api_key"],
-            **({"http_options": http_opts} if http_opts else {}),
+            http_options=genai_types.HttpOptions(**direct_opts),
         )
 
-    base_url = resolve_vertex_base_url(auth.get("base_url")) or ""
     if base_url:
-        token = (
-            resolve_vertex_base_url_token(
-                auth.get("base_url_token"),
-                base_url=base_url,
-                requested_audience=auth.get("base_url_audience"),
-            )
-            or "custom-endpoint"
+        gw_wire = resolve_gateway_wire(auth.get("gateway_wire"), base_url=base_url)
+        token, headers = resolve_gateway_credentials(
+            auth,
+            base_url=base_url,
+            wire=gw_wire,
+            zero_thinking=zero_thinking,
         )
-        headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
-        if zero_thinking:
-            headers["X-CC-AGY-Thinking-Budget"] = "0"
         opt_kwargs: dict[str, Any] = {
             "base_url": base_url,
             "headers": headers,
@@ -55,6 +58,12 @@ def build_genai_client(
             opt_kwargs["client_args"] = {"follow_redirects": False}
         if timeout_ms:
             opt_kwargs["timeout"] = timeout_ms
+        if gw_wire == "gemini":
+            return genai.Client(
+                vertexai=False,
+                api_key=token,
+                http_options=genai_types.HttpOptions(**opt_kwargs),
+            )
         client = genai.Client(
             vertexai=True,
             project=auth.get("project") or "custom-endpoint",

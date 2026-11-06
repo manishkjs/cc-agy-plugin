@@ -20,6 +20,12 @@ for rel in \
   .cursor-plugin/plugin.json \
   .cursor-plugin/mcp.json \
   .cursor-plugin/hooks.json \
+  .opencode/skills/cc-agy-plugin/SKILL.md \
+  .opencode/agents/gemini-delegator.md \
+  .opencode/commands/delegate.md \
+  .opencode/commands/doctor.md \
+  .opencode/commands/jobs.md \
+  .opencode/commands/cost.md \
   .agents/plugins/marketplace.json \
   plugins/cc-agy-plugin/.codex-plugin/plugin.json \
   plugins/cc-agy-plugin/LICENSE \
@@ -141,6 +147,40 @@ if grep -q "test-key-not-written" "$tmp_home/cursor/mcp.json"; then
   exit 1
 fi
 
+opencode_gw_json="$(
+  cd "$root"
+  OPENCODE_CONFIG_DIR="$tmp_home/opencode" GEMINI_API_KEY="test-key-not-written" \
+    python3 -m server.install --host opencode --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --no-bootstrap --non-interactive --json || true
+)"
+
+python3 - "$opencode_gw_json" "$tmp_home/opencode/opencode.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+assert report["preflight"]["auth_mode"] == "gateway", report["preflight"]
+opencode_host = next(h for h in report["hosts"] if h["host"] == "opencode")
+assert opencode_host["status"] == "installed", opencode_host
+oc_cfg = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+assert oc_cfg["$schema"] == "https://opencode.ai/config.json", oc_cfg
+assert oc_cfg["mcp"]["agy"]["type"] == "local", oc_cfg
+assert oc_cfg["mcp"]["agy"]["enabled"] is True, oc_cfg
+assert oc_cfg["mcp"]["agy"]["timeout"] == 1800000, oc_cfg
+PY
+
+test -f "$tmp_home/opencode/opencode.json"
+test -f "$tmp_home/opencode/skills/cc-agy-plugin/SKILL.md"
+test -f "$tmp_home/opencode/commands/doctor.md"
+test -f "$tmp_home/opencode/commands/delegate.md"
+test -f "$tmp_home/opencode/commands/jobs.md"
+test -f "$tmp_home/opencode/commands/cost.md"
+test -f "$tmp_home/opencode/agents/gemini-delegator.md"
+if grep -q "test-key-not-written" "$tmp_home/opencode/opencode.json"; then
+  printf 'API key leaked into OpenCode opencode.json!\n' >&2
+  exit 1
+fi
+
 ent_home="$(mktemp -d "${TMPDIR:-/tmp}/cc-agy-validate-ent.XXXXXX")"
 trap 'rm -rf "$tmp_home" "$ent_home"' EXIT
 
@@ -185,7 +225,16 @@ cursor_ent_json="$(
     python3 -m server.install --host cursor --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
 )"
 
-python3 - "$ent_json" "$ent_home/config.toml" "$agy_host_json" "$ent_home/gemini-config/mcp_config.json" "$cursor_ent_json" "$ent_home/cursor/mcp.json" <<'PY'
+opencode_ent_json="$(
+  cd "$root"
+  OPENCODE_CONFIG_DIR="$ent_home/opencode" \
+  CC_AGY_CLI_BIN="$ent_home/bin/agy" \
+  CC_AGY_CLI_CONFIG_DIR="$ent_home/agy-cfg" \
+  ANTIGRAVITY_OAUTH_TOKEN="tok-not-written" \
+    python3 -m server.install --host opencode --auth gemini-enterprise --profile balanced --no-bootstrap --non-interactive --json
+)"
+
+python3 - "$ent_json" "$ent_home/config.toml" "$agy_host_json" "$ent_home/gemini-config/mcp_config.json" "$cursor_ent_json" "$ent_home/cursor/mcp.json" "$opencode_ent_json" "$ent_home/opencode/opencode.json" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -212,6 +261,14 @@ cursor_mcp_text = Path(sys.argv[6]).read_text(encoding="utf-8")
 cursor_mcp = json.loads(cursor_mcp_text)
 assert cursor_mcp["mcpServers"]["agy"]["env"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise", cursor_mcp
 assert "tok-not-written" not in cursor_mcp_text, "Enterprise OAuth token leaked into Cursor mcp.json!"
+
+opencode_report = json.loads(sys.argv[7])
+opencode_host = next(h for h in opencode_report["hosts"] if h["host"] == "opencode")
+assert opencode_host["status"] == "installed", opencode_host
+opencode_mcp_text = Path(sys.argv[8]).read_text(encoding="utf-8")
+opencode_mcp = json.loads(opencode_mcp_text)
+assert opencode_mcp["mcp"]["agy"]["environment"]["CC_AGY_AUTH_MODE"] == "gemini_enterprise", opencode_mcp
+assert "tok-not-written" not in opencode_mcp_text, "Enterprise OAuth token leaked into OpenCode opencode.json!"
 PY
 
 printf 'Validation passed.\n'

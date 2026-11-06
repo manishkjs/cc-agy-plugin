@@ -23,6 +23,7 @@ from server.install import (
     build_claude_user_config,
     build_codex_server_block,
     build_cursor_server_entry,
+    build_opencode_server_entry,
     main as install_main,
 )
 from server.rate_card import (
@@ -260,12 +261,20 @@ class TestOidcGatewayAuthAndBootstrap:
             gateway_audience="https://gateway.example.com",
             telemetry_sink=str(sink_file),
         )
+        opencode_entry = build_opencode_server_entry(
+            auth_mode="gateway",
+            base_url="https://gateway.example.com",
+            gateway_audience="https://gateway.example.com",
+            telemetry_sink=str(sink_file),
+        )
         agy_entry = build_agy_server_entry(
             auth_mode="gateway",
             base_url="https://gateway.example.com",
             gateway_audience="https://gateway.example.com",
         )
         assert cursor_entry["env"]["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] == "https://gateway.example.com"
+        assert opencode_entry["environment"]["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] == "https://gateway.example.com"
+        assert opencode_entry["environment"]["CC_AGY_TELEMETRY_SINK"] == str(sink_file)
         assert agy_entry["env"]["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] == "https://gateway.example.com"
 
         rc = install_main(

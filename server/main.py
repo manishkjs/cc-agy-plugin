@@ -83,14 +83,14 @@ def _maybe_reexec_into_sdk_venv() -> None:
                 _should_auto_detect_agy_cli,
                 resolve_api_key,
                 resolve_configured_auth_mode,
-                resolve_vertex_base_url,
+                resolve_gateway_base_url,
             )
 
             if (
                 resolve_configured_auth_mode() in (None, "gemini_enterprise")
                 and not resolve_api_key()
                 and not _resolve_explicit_project_only()
-                and not resolve_vertex_base_url()
+                and not resolve_gateway_base_url()
                 and _should_auto_detect_agy_cli(None, os.environ)
                 and inspect_agy_cli_offline().get("binary_found")
             ):

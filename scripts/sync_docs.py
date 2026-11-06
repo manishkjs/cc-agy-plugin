@@ -25,11 +25,20 @@ SHARED_ROUTING_DOC_PATHS: tuple[str, ...] = (
     "skills/vertex/SKILL.md",
     "plugins/cc-agy-plugin/skills/vertex/SKILL.md",
     "agents/gemini-delegator.md",
+    ".opencode/skills/cc-agy-plugin/SKILL.md",
+    ".opencode/agents/gemini-delegator.md",
 )
 
 _STALE_BUDGET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"default\s+`?40`?\s+on\s+Flash", re.IGNORECASE), "stale Flash tool-call cap 40"),
     (re.compile(r"\b75\s+calls\b", re.IGNORECASE), "stale Flash tool-call cap 75"),
+    (
+        re.compile(
+            r"(?:escalat(?:es|ing)(?:\s+automatically)?\s+to|steps\s+up\s+to|step-up\s+to)\s+(?:Argon\b|`?gemini-4-argon`?)",
+            re.IGNORECASE,
+        ),
+        "stale balanced escalation model Argon / gemini-4-argon (expected Carbon Zero-Think / gemini-4-carbon-zero)",
+    ),
 )
 
 _STALE_FIXED_TEST_COUNT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -82,7 +91,7 @@ def sync_routing_blocks(root: Path, *, write: bool = False) -> list[str]:
         for pat, desc in _STALE_BUDGET_PATTERNS:
             if pat.search(content):
                 errors.append(f"{rel}: contains {desc}")
-        if rel in ("README.md", "skills/vertex/SKILL.md"):
+        if rel in ("README.md", "skills/vertex/SKILL.md", ".opencode/skills/cc-agy-plugin/SKILL.md"):
             flash_cap_str = f"`{DEFAULT_FLASH_MAX_TOOL_CALLS}`"
             econ_cap_str = f"`{DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS}`"
             if flash_cap_str not in content or econ_cap_str not in content:

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""One-command setup of cc-agy-plugin for Claude Code, Codex, Cursor, and Antigravity.
+"""One-command setup of cc-agy-plugin for Claude Code, Codex, Cursor, OpenCode, and Antigravity.
 
 Usage (from a clone of this repository):
 
-    python3 -m server.install --host claude --auth gemini-enterprise
-    python3 -m server.install --host codex  --auth gemini-enterprise
-    python3 -m server.install --host cursor --auth gemini-enterprise
-    python3 -m server.install --host agy    --auth gemini-enterprise
+    python3 -m server.install --host claude   --auth gemini-enterprise
+    python3 -m server.install --host codex    --auth gemini-enterprise
+    python3 -m server.install --host cursor   --auth gemini-enterprise
+    python3 -m server.install --host opencode --auth gemini-enterprise
+    python3 -m server.install --host agy      --auth gemini-enterprise
     python3 -m server.install --host all --profile quality
 
 Automatically sets up a PEP 668-safe per-user Python virtualenv (`~/.local/share/cc-agy-plugin/venv`)
 when system Python does not already have `google-antigravity` and `google-genai`, and forwards
 non-secret configuration to Codex (`~/.codex/config.toml`), Claude Code (`--config` / `userConfig`),
-Cursor (`~/.cursor/mcp.json` and `~/.cursor/skills/cc-agy-plugin/SKILL.md`), and Antigravity
+Cursor (`~/.cursor/mcp.json` and `~/.cursor/skills/cc-agy-plugin/SKILL.md`), OpenCode
+(`~/.config/opencode/opencode.json` plus global skill, commands, and subagent), and Antigravity
 (`~/.gemini/config/mcp_config.json` and `~/.gemini/config/plugins/cc-agy-plugin/`).
 API keys and OAuth tokens are never written into config files on disk.
 """
@@ -20,6 +22,8 @@ API keys and OAuth tokens are never written into config files on disk.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,15 +33,22 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
+from server.regions import GATEWAY_WIRE_CLI_CHOICES  # noqa: E402
 from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python  # noqa: E402
 
 SERVER_ENTRY = PLUGIN_ROOT / "server" / "main.py"
 CODEX_SKILL_SOURCE = PLUGIN_ROOT / "plugins" / "cc-agy-plugin" / "skills" / "vertex" / "SKILL.md"
+OPENCODE_BUNDLE_DIR = PLUGIN_ROOT / ".opencode"
+OPENCODE_SKILL_SOURCE = OPENCODE_BUNDLE_DIR / "skills" / "cc-agy-plugin" / "SKILL.md"
+OPENCODE_COMMANDS_DIR = OPENCODE_BUNDLE_DIR / "commands"
+OPENCODE_AGENT_SOURCE = OPENCODE_BUNDLE_DIR / "agents" / "gemini-delegator.md"
+OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json"
 DEFAULT_SERVER_NAME = "agy"
 MARKETPLACE_NAME = "cc-agy"
 PLUGIN_NAME = "cc-agy-plugin"
@@ -70,7 +81,11 @@ CODEX_FORWARDED_ENV_VARS = (
     "ANTIGRAVITY_OAUTH_TOKEN",
     "CC_AGY_VERTEX_BASE_URL",
     "GOOGLE_VERTEX_BASE_URL",
+    "CC_AGY_GEMINI_BASE_URL",
+    "GOOGLE_GEMINI_BASE_URL",
+    "CC_AGY_GATEWAY_WIRE",
     "CC_AGY_VERTEX_BASE_URL_TOKEN",
+    "CC_AGY_BIFROST_VIRTUAL_KEY",
     "CC_AGY_VERTEX_BASE_URL_AUDIENCE",
     "CC_AGY_VERTEX_OIDC",
     "CC_AGY_TELEMETRY_SINK",
@@ -82,9 +97,197 @@ CODEX_FORWARDED_ENV_VARS = (
     "CC_AGY_AUTO_APPLY_ON_PASS",
     "CC_AGY_ALLOW_IN_PLACE",
 )
-# Worker jobs run for minutes; Codex's default MCP tool timeout is far shorter.
+# Worker jobs run for minutes; Codex and OpenCode default MCP tool timeouts are far shorter.
 CODEX_TOOL_TIMEOUT_SEC = 1800
 CODEX_STARTUP_TIMEOUT_SEC = 30
+OPENCODE_TOOL_TIMEOUT_MS = CODEX_TOOL_TIMEOUT_SEC * 1000
+OPENCODE_STARTUP_TIMEOUT_MS = CODEX_STARTUP_TIMEOUT_SEC * 1000
+
+_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_OPENCODE_RESERVED_SERVER_NAMES: frozenset[str] = frozenset({"servers", "timeout"})
+_OPENCODE_MCP_ENTRY_KEYS: tuple[str, ...] = ("type", "command", "url", "enabled", "disabled")
+_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost")
+_PLUGIN_MANAGED_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "CC_AGY_COST_PROFILE",
+        "CC_AGY_AUTH_MODE",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "CC_AGY_VERTEX_BASE_URL",
+        "CC_AGY_GEMINI_BASE_URL",
+        "CC_AGY_GATEWAY_WIRE",
+        "CC_AGY_VERTEX_BASE_URL_AUDIENCE",
+        "CC_AGY_TELEMETRY_SINK",
+        "CC_AGY_CLI_BIN",
+        "CC_AGY_MAX_DAILY_CENTS",
+        "CC_AGY_ALLOWED_PROJECTS",
+        "CC_AGY_BLOCKED_PROJECTS",
+        "CC_AGY_AUTO_APPLY_ON_PASS",
+        "CC_AGY_STRICT_MODE",
+    }
+)
+_SECRET_KEY_TOKENS: frozenset[str] = frozenset(
+    {
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "pass",
+        "pw",
+        "jwt",
+        "sid",
+        "assertion",
+        "sig",
+        "signature",
+        "auth",
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+    }
+)
+_SECRET_TOKEN_SUFFIXES: tuple[str, ...] = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "accesskey",
+    "authkey",
+    "privatekey",
+    "secretkey",
+    "virtualkey",
+    "signature",
+    "credential",
+    "credentials",
+)
+_SECRET_COMPOUND_KEYS: frozenset[str] = frozenset(
+    {
+        "apikey",
+        "xapikey",
+        "accesstoken",
+        "authtoken",
+        "idtoken",
+        "refreshtoken",
+        "bearertoken",
+        "sessiontoken",
+        "clientsecret",
+        "appsecret",
+        "apisecret",
+        "jwtsecret",
+        "privatekey",
+        "secretkey",
+        "accesskey",
+        "authkey",
+        "virtualkey",
+    }
+)
+_OPENCODE_MAX_SAFE_INT = 9_007_199_254_740_991
+_OPENCODE_V2_PROTOCOLS: frozenset[str] = frozenset({"legacy", "auto", "2026-07-28"})
+_OPENCODE_V2_TIMEOUT_KEYS: tuple[str, ...] = ("startup", "catalog", "execution")
+_OPENCODE_ASSET_MANIFEST_NAME = ".cc-agy-plugin-assets.json"
+_OPENCODE_SERVER_REF_RE = re.compile(
+    r"(?P<backtick_srv>`agy` MCP server)"
+    r"|(?P<backtick_tools>`agy` MCP tools)"
+    r"|(?P<via_srv>via the agy MCP server)"
+    r"|(?P<prefix_doc>`agy_` prefix)"
+    r"|(?P<install_flag>--host opencode\b(?!\s+--name\b))"
+    r"|(?P<tool_call>\bagy_(?!cli\b)(?P<tool_suffix>[a-z<][a-z0-9_>]*))"
+)
+
+
+def _key_looks_secret(raw_key: str) -> bool:
+    """Return True when a URL query or fragment parameter name denotes a credential or secret."""
+    decoded = unquote(raw_key).strip()
+    if not decoded:
+        return False
+    acronym_split = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", decoded)
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", acronym_split)
+    tokens = [tok for tok in re.split(r"[^a-zA-Z0-9]+", camel_split.lower()) if tok]
+    for tok in tokens:
+        tok_alpha = tok.rstrip("0123456789")
+        if tok in _SECRET_KEY_TOKENS or tok_alpha in _SECRET_KEY_TOKENS:
+            return True
+        if re.fullmatch(r"sigv\d+", tok) is not None:
+            return True
+        if tok_alpha and any(tok_alpha.endswith(sfx) for sfx in _SECRET_TOKEN_SUFFIXES):
+            return True
+    joined = "".join(tokens)
+    joined_alpha = "".join(tok.rstrip("0123456789") for tok in tokens)
+    return joined in _SECRET_COMPOUND_KEYS or joined_alpha in _SECRET_COMPOUND_KEYS
+
+
+def _validate_gateway_base_url_no_secrets(base_url: str | None) -> None:
+    """Reject gateway URLs that embed userinfo credentials or secret query/fragment parameters."""
+    if not base_url or not base_url.strip():
+        return
+    parsed = urlsplit(base_url.strip())
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        raise ValueError(
+            "Gateway base URL must not embed username or password credentials; "
+            "use --gateway-audience (OIDC) or export CC_AGY_VERTEX_BASE_URL_TOKEN at runtime."
+        )
+    normalized_query = parsed.query.replace(";", "&")
+    for query_key, _query_val in parse_qsl(normalized_query, keep_blank_values=True):
+        if _key_looks_secret(query_key):
+            raise ValueError(
+                f"Gateway base URL must not embed secret query parameter {query_key!r}; "
+                "export CC_AGY_VERTEX_BASE_URL_TOKEN at runtime instead."
+            )
+    if parsed.fragment:
+        normalized_fragment = parsed.fragment.replace(";", "&")
+        for frag_key, _frag_val in parse_qsl(normalized_fragment, keep_blank_values=True):
+            if _key_looks_secret(frag_key):
+                raise ValueError(
+                    f"Gateway base URL must not embed secret fragment parameter {frag_key!r}; "
+                    "export CC_AGY_VERTEX_BASE_URL_TOKEN at runtime instead."
+                )
+
+
+def resolve_home_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Resolve the user's home directory, honoring `HOME` / `USERPROFILE` in `env` when supplied."""
+    if env is not None:
+        raw_home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+        if raw_home:
+            return Path(raw_home).expanduser()
+    return Path.home()
+
+
+def expand_path_with_env(raw_path: str | Path, env: Mapping[str, str] | None = None) -> Path:
+    """Expand a leading `~` against `env` when provided before falling back to `Path.expanduser()`."""
+    path_str = str(raw_path)
+    if env is not None and path_str.startswith("~"):
+        if path_str == "~":
+            return resolve_home_dir(env)
+        if path_str.startswith(("~/", "~\\")):
+            return resolve_home_dir(env) / path_str[2:]
+    return Path(raw_path).expanduser()
+
+
+def _write_unique_backup_bytes(path: Path, data: bytes, mode: int = 0o600) -> Path:
+    """Atomically claim and write raw bytes to a unique `.bak-YYYYMMDD-HHMMSS[-N]` file with `O_CREAT | O_EXCL`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    counter = 0
+    while True:
+        suffix = f"{stamp}" if counter == 0 else f"{stamp}-{counter}"
+        candidate = path.with_name(f"{path.name}.bak-{suffix}")
+        try:
+            fd = os.open(str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            counter += 1
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(candidate, mode)
+        return candidate
+
+
+def _write_unique_backup(path: Path, text: str, mode: int = 0o600) -> Path:
+    """Atomically claim and write UTF-8 text to a unique `.bak-YYYYMMDD-HHMMSS[-N]` backup file."""
+    return _write_unique_backup_bytes(path, text.encode("utf-8"), mode)
 
 
 def _toml_str(value: str) -> str:
@@ -119,6 +322,18 @@ def resolve_python_bin() -> str:
     return resolve_sdk_python(PLUGIN_ROOT)
 
 
+def _normalize_gateway_wire_choice(gateway_wire: str | None) -> str | None:
+    """Validate an optional `--gateway-wire` override (`auto`, `vertex`, `gemini`, `litellm-vertex`, `litellm-gemini`, `bifrost`), returning None when `auto`/unset."""
+    if gateway_wire is None or not str(gateway_wire).strip():
+        return None
+    cleaned = str(gateway_wire).strip().lower().replace("-", "_")
+    if cleaned == "auto":
+        return None
+    from server.regions import resolve_gateway_wire
+
+    return resolve_gateway_wire(cleaned, env={})
+
+
 def build_codex_server_block(
     *,
     name: str = DEFAULT_SERVER_NAME,
@@ -128,6 +343,7 @@ def build_codex_server_block(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -137,6 +353,8 @@ def build_codex_server_block(
     no_auto_apply: bool = False,
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
+    _validate_gateway_base_url_no_secrets(base_url)
+    norm_wire = _normalize_gateway_wire_choice(gateway_wire)
     py = python_bin or resolve_python_bin()
     norm_auth = _normalize_auth_choice(auth_mode)
     env: dict[str, str] = {"CC_AGY_COST_PROFILE": profile}
@@ -148,10 +366,13 @@ def build_codex_server_block(
         env["GOOGLE_CLOUD_PROJECT"] = project
     if location and norm_auth != "gemini_enterprise":
         env["GOOGLE_CLOUD_LOCATION"] = location
-    if base_url:
-        env["CC_AGY_VERTEX_BASE_URL"] = base_url
-    if gateway_audience and gateway_audience.strip():
-        env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
+    if norm_auth != "api_key":
+        if base_url:
+            env["CC_AGY_VERTEX_BASE_URL"] = base_url
+        if norm_wire:
+            env["CC_AGY_GATEWAY_WIRE"] = norm_wire
+        if gateway_audience and gateway_audience.strip():
+            env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
     if telemetry_sink and telemetry_sink.strip():
         env["CC_AGY_TELEMETRY_SINK"] = telemetry_sink.strip()
     if agy_cli_path:
@@ -262,11 +483,12 @@ def upsert_codex_server_block(config_text: str, block: str, *, name: str = DEFAU
 
 
 def _write_private(path: Path, text: str, mode: int = 0o600) -> None:
-    """Write `text` to `path`, creating it with `mode` and tightening an existing file to `mode`."""
+    """Write `text` to `path`, creating it with `mode` and tightening regular files (never symlink targets) to `mode`."""
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
-    os.chmod(path, mode)
+    if not path.is_symlink():
+        os.chmod(path, mode)
 
 
 def install_codex(
@@ -277,6 +499,7 @@ def install_codex(
     project: str | None,
     location: str | None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -296,6 +519,7 @@ def install_codex(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -329,8 +553,7 @@ def install_codex(
     home.mkdir(parents=True, exist_ok=True)
     cfg_mode = (cfg.stat().st_mode & 0o777) if cfg.is_file() else 0o600
     if existing and existing != updated:
-        backup = cfg.with_name(f"config.toml.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        _write_private(backup, existing, 0o600)
+        backup = _write_unique_backup(cfg, existing, 0o600)
         result["backup_path"] = str(backup)
     if existing != updated:
         _write_private(cfg, updated, cfg_mode)
@@ -363,6 +586,7 @@ def build_claude_user_config(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -373,6 +597,8 @@ def build_claude_user_config(
     strict: bool = False,
 ) -> dict[str, Any]:
     """Build non-secret Claude Code `userConfig` key/value pairs matching `.claude-plugin/plugin.json`."""
+    _validate_gateway_base_url_no_secrets(base_url)
+    norm_wire = _normalize_gateway_wire_choice(gateway_wire)
     cfg: dict[str, Any] = {}
     norm_auth = _normalize_auth_choice(auth_mode)
     if norm_auth in ("gemini_enterprise", "api_key", "vertex", "gateway"):
@@ -383,10 +609,13 @@ def build_claude_user_config(
         cfg["google_cloud_project"] = project
     if location and norm_auth != "gemini_enterprise":
         cfg["google_cloud_location"] = location
-    if base_url:
-        cfg["vertex_base_url"] = base_url
-    if gateway_audience and gateway_audience.strip():
-        cfg["vertex_base_url_audience"] = gateway_audience.strip()
+    if norm_auth != "api_key":
+        if base_url:
+            cfg["vertex_base_url"] = base_url
+        if norm_wire:
+            cfg["gateway_wire"] = norm_wire
+        if gateway_audience and gateway_audience.strip():
+            cfg["vertex_base_url_audience"] = gateway_audience.strip()
     if telemetry_sink and telemetry_sink.strip():
         cfg["telemetry_sink"] = telemetry_sink.strip()
     if agy_cli_path:
@@ -411,6 +640,7 @@ def claude_install_commands(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -426,6 +656,7 @@ def claude_install_commands(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -453,6 +684,7 @@ def install_claude(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -468,6 +700,7 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -483,6 +716,7 @@ def install_claude(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -572,6 +806,7 @@ def build_agy_server_entry(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -582,6 +817,8 @@ def build_agy_server_entry(
     strict: bool = False,
 ) -> dict[str, Any]:
     """Build the stdio MCP server entry for Antigravity's `~/.gemini/config/mcp_config.json`."""
+    _validate_gateway_base_url_no_secrets(base_url)
+    norm_wire = _normalize_gateway_wire_choice(gateway_wire)
     py = python_bin or resolve_python_bin()
     norm_auth = _normalize_auth_choice(auth_mode)
     env: dict[str, str] = {"CC_AGY_COST_PROFILE": profile}
@@ -593,10 +830,13 @@ def build_agy_server_entry(
         env["GOOGLE_CLOUD_PROJECT"] = project
     if location and norm_auth != "gemini_enterprise":
         env["GOOGLE_CLOUD_LOCATION"] = location
-    if base_url:
-        env["CC_AGY_VERTEX_BASE_URL"] = base_url
-    if gateway_audience and gateway_audience.strip():
-        env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
+    if norm_auth != "api_key":
+        if base_url:
+            env["CC_AGY_VERTEX_BASE_URL"] = base_url
+        if norm_wire:
+            env["CC_AGY_GATEWAY_WIRE"] = norm_wire
+        if gateway_audience and gateway_audience.strip():
+            env["CC_AGY_VERTEX_BASE_URL_AUDIENCE"] = gateway_audience.strip()
     if telemetry_sink and telemetry_sink.strip():
         env["CC_AGY_TELEMETRY_SINK"] = telemetry_sink.strip()
     if agy_cli_path:
@@ -656,6 +896,7 @@ def install_agy(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -686,6 +927,7 @@ def install_agy(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -721,8 +963,7 @@ def install_agy(
     cfg_dir.mkdir(parents=True, exist_ok=True)
     cfg_mode = (mcp_cfg_path.stat().st_mode & 0o777) if mcp_cfg_path.is_file() else 0o600
     if existing and existing != updated:
-        backup = mcp_cfg_path.with_name(f"mcp_config.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        _write_private(backup, existing, 0o600)
+        backup = _write_unique_backup(mcp_cfg_path, existing, 0o600)
         result["backup_path"] = str(backup)
     if existing != updated:
         _write_private(mcp_cfg_path, updated, cfg_mode)
@@ -770,6 +1011,7 @@ def build_cursor_server_entry(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -787,6 +1029,7 @@ def build_cursor_server_entry(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -836,6 +1079,7 @@ def install_cursor(
     project: str | None = None,
     location: str | None = None,
     base_url: str | None = None,
+    gateway_wire: str | None = None,
     gateway_audience: str | None = None,
     telemetry_sink: str | None = None,
     agy_cli_path: str | None = None,
@@ -862,6 +1106,7 @@ def install_cursor(
         project=project,
         location=location,
         base_url=base_url,
+        gateway_wire=gateway_wire,
         gateway_audience=gateway_audience,
         telemetry_sink=telemetry_sink,
         agy_cli_path=agy_cli_path,
@@ -893,8 +1138,7 @@ def install_cursor(
     cfg_dir.mkdir(parents=True, exist_ok=True)
     cfg_mode = (mcp_cfg_path.stat().st_mode & 0o777) if mcp_cfg_path.is_file() else 0o600
     if existing and existing != updated:
-        backup = mcp_cfg_path.with_name(f"mcp.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        _write_private(backup, existing, 0o600)
+        backup = _write_unique_backup(mcp_cfg_path, existing, 0o600)
         result["backup_path"] = str(backup)
     if existing != updated:
         _write_private(mcp_cfg_path, updated, cfg_mode)
@@ -911,6 +1155,724 @@ def install_cursor(
     return result
 
 
+class OpenCodeConfigError(RuntimeError):
+    """Raised when an OpenCode opencode.json / opencode.jsonc file cannot be safely updated."""
+
+
+def _validate_opencode_server_name(name: str) -> None:
+    """Validate `name` for OpenCode MCP config keys, tool prefixes, and YAML frontmatter."""
+    if not isinstance(name, str) or not _SERVER_NAME_RE.fullmatch(name):
+        raise OpenCodeConfigError(
+            f"invalid OpenCode server name {name!r}; only ASCII letters, digits, '-' and '_' are allowed"
+        )
+    if name in _OPENCODE_RESERVED_SERVER_NAMES:
+        raise OpenCodeConfigError(
+            f"server name {name!r} is reserved by OpenCode's mcp config schema; pass a different --name"
+        )
+
+
+def resolve_opencode_config_dir(
+    env: Mapping[str, str] | None = None,
+    explicit_dir: Path | None = None,
+) -> Path:
+    """Resolve OpenCode's global config directory (`OPENCODE_CONFIG_DIR` -> `XDG_CONFIG_HOME/opencode` -> `~/.config/opencode`)."""
+    if explicit_dir is not None:
+        return expand_path_with_env(explicit_dir, env)
+    source = env if env is not None else os.environ
+    override = (source.get("OPENCODE_CONFIG_DIR") or "").strip()
+    if override:
+        return expand_path_with_env(override, env)
+    xdg = (source.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg:
+        return expand_path_with_env(xdg, env) / "opencode"
+    return resolve_home_dir(env) / ".config" / "opencode"
+
+
+def resolve_opencode_config_path(
+    cfg_dir: Path,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the active OpenCode config file (`OPENCODE_CONFIG` when passed, `opencode.jsonc` when alone, else `opencode.json`)."""
+    if env is not None:
+        explicit_cfg = (env.get("OPENCODE_CONFIG") or "").strip()
+        if explicit_cfg:
+            return expand_path_with_env(explicit_cfg, env)
+    json_path = cfg_dir / "opencode.json"
+    jsonc_path = cfg_dir / "opencode.jsonc"
+    if jsonc_path.is_file() and not json_path.is_file():
+        return jsonc_path
+    return json_path
+
+
+def _strip_jsonc(text: str) -> str:
+    """Strip UTF-8 BOM, `//` and `/* */` comments, and trailing commas outside JSON string literals."""
+    src = text.lstrip("\ufeff")
+    n = len(src)
+    out: list[str] = []
+    idx = 0
+
+    def _next_meaningful_char(pos: int) -> str:
+        cur = pos
+        while cur < n:
+            ch = src[cur]
+            if ch in " \t\r\n":
+                cur += 1
+            elif src[cur : cur + 2] == "//":
+                nl = src.find("\n", cur + 2)
+                cur = n if nl == -1 else nl + 1
+            elif src[cur : cur + 2] == "/*":
+                end = src.find("*/", cur + 2)
+                if end == -1:
+                    return ""
+                cur = end + 2
+            else:
+                return ch
+        return ""
+
+    while idx < n:
+        ch = src[idx]
+        if ch == '"':
+            out.append(ch)
+            idx += 1
+            while idx < n:
+                s_ch = src[idx]
+                out.append(s_ch)
+                if s_ch == "\\" and idx + 1 < n:
+                    idx += 1
+                    out.append(src[idx])
+                elif s_ch == '"':
+                    idx += 1
+                    break
+                idx += 1
+        elif src[idx : idx + 2] == "//":
+            nl = src.find("\n", idx + 2)
+            if nl == -1:
+                break
+            out.append("\n")
+            idx = nl + 1
+        elif src[idx : idx + 2] == "/*":
+            end = src.find("*/", idx + 2)
+            if end == -1:
+                raise json.JSONDecodeError("Unterminated /* comment in JSONC", src, idx)
+            out.append("\n" * src[idx + 2 : end].count("\n"))
+            idx = end + 2
+        elif ch == ",":
+            if _next_meaningful_char(idx + 1) not in ("}", "]"):
+                out.append(ch)
+            idx += 1
+        else:
+            out.append(ch)
+            idx += 1
+    return "".join(out)
+
+
+def _loads_jsonc(text: str) -> Any:
+    """Parse a JSONC string (allowing UTF-8 BOM, comments, and trailing commas)."""
+    return json.loads(_strip_jsonc(text))
+
+
+def build_opencode_server_entry(
+    *,
+    python_bin: str | None = None,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    gateway_wire: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Build the local MCP server entry for OpenCode's `opencode.json` (`mcp.<name>`).
+
+    Fresh configs write OpenCode's legacy-compatible V1 `mcp.<name>` shape (`deprecated: true` in the v2
+    schema while remaining schema-valid across both OpenCode v1.x and v2, using a single `1800000` ms
+    timeout so long `delegate_result` runs do not time out), whereas `upsert_opencode_mcp_config` preserves
+    any existing V2 `mcp.servers` envelope in place with split `startup` / `execution` timeouts.
+    """
+    agy_entry = build_agy_server_entry(
+        python_bin=python_bin,
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        gateway_wire=gateway_wire,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
+        agy_cli_path=agy_cli_path,
+        max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
+        strict=strict,
+    )
+    return {
+        "type": "local",
+        "command": [agy_entry["command"], *agy_entry["args"]],
+        "environment": dict(agy_entry["env"]),
+        "enabled": True,
+        "timeout": OPENCODE_TOOL_TIMEOUT_MS,
+    }
+
+
+def _is_opencode_v2_servers_envelope(mcp_obj: Mapping[str, Any]) -> bool:
+    """Return True when `mcp` uses OpenCode's V2 `{servers?: {...}, timeout?: ...}` envelope."""
+    if not mcp_obj or not (set(mcp_obj.keys()) <= {"servers", "timeout"}):
+        return False
+    if "servers" in mcp_obj:
+        servers = mcp_obj["servers"]
+        if not isinstance(servers, dict):
+            return False
+        if any(k in servers for k in _OPENCODE_MCP_ENTRY_KEYS):
+            return False
+    if "timeout" in mcp_obj:
+        timeout_val = mcp_obj["timeout"]
+        if isinstance(timeout_val, bool) or not isinstance(timeout_val, (int, float, dict)):
+            return False
+        if isinstance(timeout_val, dict) and any(k in timeout_val for k in _OPENCODE_MCP_ENTRY_KEYS):
+            return False
+    return True
+
+
+def _merge_opencode_env(existing_env: Any, plugin_env: Mapping[str, str]) -> dict[str, str]:
+    """Preserve user-added environment keys while refreshing all plugin-managed keys."""
+    preserved: dict[str, str] = {}
+    if isinstance(existing_env, Mapping):
+        for key, val in existing_env.items():
+            if key not in _PLUGIN_MANAGED_ENV_KEYS and isinstance(val, str):
+                preserved[str(key)] = val
+    return {**preserved, **dict(plugin_env)}
+
+
+def _is_valid_opencode_timeout_int(val: Any) -> bool:
+    """Return True when `val` is a positive JSON-safe integer within OpenCode's `Number.MAX_SAFE_INTEGER` schema cap."""
+    return isinstance(val, int) and not isinstance(val, bool) and 0 < val <= _OPENCODE_MAX_SAFE_INT
+
+
+def _merge_opencode_v1_entry(existing_srv: Any, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge `entry` into an existing V1 `mcp.<name>` object, keeping only schema-valid `McpLocalConfig` keys."""
+    src = existing_srv if isinstance(existing_srv, Mapping) else {}
+    is_local = src.get("type") in (None, "local")
+    if isinstance(src.get("enabled"), bool):
+        enabled_val = src["enabled"]
+    elif isinstance(src.get("disabled"), bool):
+        enabled_val = not src["disabled"]
+    else:
+        enabled_val = bool(entry.get("enabled", True))
+    existing_timeout = src.get("timeout") if is_local else None
+    timeout_val = (
+        int(existing_timeout)
+        if _is_valid_opencode_timeout_int(existing_timeout)
+        else int(entry.get("timeout", OPENCODE_TOOL_TIMEOUT_MS))
+    )
+    merged: dict[str, Any] = {
+        "type": "local",
+        "command": list(entry["command"]),
+        "environment": (
+            _merge_opencode_env(src.get("environment"), entry.get("environment") or {})
+            if is_local
+            else dict(entry.get("environment") or {})
+        ),
+        "enabled": enabled_val,
+        "timeout": timeout_val,
+    }
+    if is_local and isinstance(src.get("cwd"), str):
+        merged["cwd"] = src["cwd"]
+    return merged
+
+
+def _merge_opencode_v2_entry(existing_srv: Any, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge `entry` into an existing V2 `mcp.servers.<name>` object, keeping only valid `Mcp.LocalConfigEncoded` keys."""
+    src = existing_srv if isinstance(existing_srv, Mapping) else {}
+    is_local = src.get("type") in (None, "local")
+    if isinstance(src.get("disabled"), bool):
+        disabled_val = src["disabled"]
+    elif isinstance(src.get("enabled"), bool):
+        disabled_val = not src["enabled"]
+    else:
+        disabled_val = not bool(entry.get("enabled", True))
+    default_timeout: dict[str, int] = {
+        "startup": OPENCODE_STARTUP_TIMEOUT_MS,
+        "execution": int(entry.get("timeout", OPENCODE_TOOL_TIMEOUT_MS)),
+    }
+    existing_timeout = src.get("timeout") if is_local else None
+    if isinstance(existing_timeout, Mapping):
+        cleaned_timeout = {
+            key: int(existing_timeout[key])
+            for key in _OPENCODE_V2_TIMEOUT_KEYS
+            if key in existing_timeout and _is_valid_opencode_timeout_int(existing_timeout[key])
+        }
+        timeout_val = cleaned_timeout if cleaned_timeout else default_timeout
+    elif _is_valid_opencode_timeout_int(existing_timeout):
+        timeout_val = {
+            "startup": OPENCODE_STARTUP_TIMEOUT_MS,
+            "execution": int(existing_timeout),
+        }
+    else:
+        timeout_val = default_timeout
+    merged: dict[str, Any] = {
+        "type": "local",
+        "command": list(entry["command"]),
+        "environment": (
+            _merge_opencode_env(src.get("environment"), entry.get("environment") or {})
+            if is_local
+            else dict(entry.get("environment") or {})
+        ),
+        "disabled": disabled_val,
+        "timeout": timeout_val,
+    }
+    if is_local:
+        if isinstance(src.get("cwd"), str):
+            merged["cwd"] = src["cwd"]
+        if isinstance(src.get("codemode"), bool):
+            merged["codemode"] = src["codemode"]
+        protocol_val = src.get("protocol")
+        if isinstance(protocol_val, str) and protocol_val in _OPENCODE_V2_PROTOCOLS:
+            merged["protocol"] = protocol_val
+        if isinstance(src.get("pool"), bool):
+            merged["pool"] = src["pool"]
+    return merged
+
+
+def upsert_opencode_mcp_config(
+    config_text: str,
+    entry: dict[str, Any],
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+    filename: str = "opencode.json",
+) -> str:
+    """Upsert `mcp[name]` (or V2 `mcp.servers[name]`) inside an OpenCode config without touching other settings."""
+    _validate_opencode_server_name(name)
+    stripped = config_text.lstrip("\ufeff").strip()
+    if not stripped:
+        parsed: dict[str, Any] = {"$schema": OPENCODE_SCHEMA_URL}
+    else:
+        try:
+            loaded = json.loads(stripped)
+        except ValueError as exc:
+            raise OpenCodeConfigError(
+                f"existing {filename} is not strict JSON ({exc}); if it uses JSONC comments or trailing commas, "
+                f"add mcp.{name} manually so comments are preserved"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise OpenCodeConfigError(f"existing {filename} top-level value must be a JSON object")
+        parsed = dict(loaded)
+
+    mcp_val = parsed.get("mcp")
+    if mcp_val is None:
+        parsed["mcp"] = {name: _merge_opencode_v1_entry(None, entry)}
+    elif not isinstance(mcp_val, dict):
+        raise OpenCodeConfigError(f"existing {filename} 'mcp' field must be a JSON object")
+    elif _is_opencode_v2_servers_envelope(mcp_val):
+        mcp_map = dict(mcp_val)
+        servers_map = dict(mcp_val.get("servers") or {})
+        servers_map[name] = _merge_opencode_v2_entry(servers_map.get(name), entry)
+        mcp_map["servers"] = servers_map
+        parsed["mcp"] = mcp_map
+    else:
+        mcp_map = dict(mcp_val)
+        mcp_map[name] = _merge_opencode_v1_entry(mcp_map.get(name), entry)
+        nested_servers = mcp_map.get("servers")
+        if (
+            isinstance(nested_servers, dict)
+            and not any(k in nested_servers for k in _OPENCODE_MCP_ENTRY_KEYS)
+            and name in nested_servers
+        ):
+            cleaned_nested = dict(nested_servers)
+            cleaned_nested.pop(name, None)
+            if cleaned_nested:
+                mcp_map["servers"] = cleaned_nested
+            else:
+                mcp_map.pop("servers", None)
+        parsed["mcp"] = mcp_map
+    return json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+
+
+def _rewrite_opencode_server_refs(text: str, server_name: str) -> str:
+    """Adapt pristine bundled `.opencode/` markdown source text for a custom `--name` in one regex pass.
+
+    Precondition: `text` must be the unmodified bundled source markdown (`OPENCODE_SKILL_SOURCE`,
+    `OPENCODE_COMMANDS_DIR/*.md`, or `OPENCODE_AGENT_SOURCE`), never already-rewritten output.
+    """
+    _validate_opencode_server_name(server_name)
+    if server_name == DEFAULT_SERVER_NAME:
+        return text
+
+    def _replace_match(match: re.Match[str]) -> str:
+        if match.group("backtick_srv") is not None:
+            return f"`{server_name}` MCP server"
+        if match.group("backtick_tools") is not None:
+            return f"`{server_name}` MCP tools"
+        if match.group("via_srv") is not None:
+            return f"via the {server_name} MCP server"
+        if match.group("prefix_doc") is not None:
+            return f"`{server_name}_` prefix"
+        if match.group("install_flag") is not None:
+            return f"--host opencode --name {server_name}"
+        return f"{server_name}_{match.group('tool_suffix')}"
+
+    return _OPENCODE_SERVER_REF_RE.sub(_replace_match, text)
+
+
+def _opencode_doc_defines_server(parsed_doc: Any, name: str) -> bool:
+    """Return True when a parsed OpenCode config dict defines `mcp.<name>` or `mcp.servers.<name>`."""
+    if not isinstance(parsed_doc, Mapping):
+        return False
+    mcp_obj = parsed_doc.get("mcp")
+    if not isinstance(mcp_obj, Mapping):
+        return False
+    nested = mcp_obj.get("servers")
+    if (
+        isinstance(nested, Mapping)
+        and not any(k in nested for k in _OPENCODE_MCP_ENTRY_KEYS)
+        and name in nested
+    ):
+        return True
+    return name in mcp_obj
+
+
+def _check_opencode_jsonc_shadow_conflict(cfg_dir: Path, name: str, *, target_cfg_path: Path) -> None:
+    """Refuse writing `opencode.json` if a sibling `opencode.jsonc` would override `mcp.<name>`."""
+    json_path = cfg_dir / "opencode.json"
+    jsonc_path = cfg_dir / "opencode.jsonc"
+    if target_cfg_path != json_path or not jsonc_path.is_file():
+        return
+    raw_jsonc = jsonc_path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff").strip()
+    if not raw_jsonc:
+        return
+    try:
+        parsed_jsonc = _loads_jsonc(raw_jsonc)
+    except ValueError as exc:
+        raise OpenCodeConfigError(
+            f"opencode.jsonc in {cfg_dir} is not valid JSONC ({exc}); "
+            f"OpenCode merges opencode.jsonc on top of opencode.json, so fix opencode.jsonc first"
+        ) from exc
+    if _opencode_doc_defines_server(parsed_jsonc, name):
+        raise OpenCodeConfigError(
+            f"opencode.jsonc in {cfg_dir} already defines mcp.{name} "
+            f"(which overrides opencode.json in OpenCode); remove or update the entry in opencode.jsonc"
+        )
+
+
+def _sha256_bytes(data: bytes) -> str:
+    """Return the hex-encoded SHA-256 digest of `data`."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _load_opencode_asset_manifest(cfg_dir: Path) -> dict[str, str]:
+    """Load recorded SHA-256 hashes of plugin-installed OpenCode assets, returning `{}` if missing or unreadable."""
+    manifest_path = cfg_dir / _OPENCODE_ASSET_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return {}
+    try:
+        parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(parsed, Mapping):
+        return {}
+    files = parsed.get("files")
+    if not isinstance(files, Mapping):
+        return {}
+    return {str(k): str(v) for k, v in files.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _save_opencode_asset_manifest(cfg_dir: Path, files_map: Mapping[str, str]) -> None:
+    """Persist SHA-256 hashes of plugin-installed OpenCode assets with private `0o600` permissions."""
+    manifest_path = cfg_dir / _OPENCODE_ASSET_MANIFEST_NAME
+    payload = json.dumps(
+        {"version": 1, "files": dict(sorted(files_map.items()))},
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+    _write_private(manifest_path, payload, 0o600)
+
+
+def _write_opencode_asset(
+    dst: Path,
+    rel_key: str,
+    new_text: str,
+    asset_backups: list[str],
+    manifest_files: dict[str, str],
+) -> bool:
+    """Write `new_text` to `dst`, backing up raw bytes of any non-matching file and unlinking symlinks first."""
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        new_bytes = new_text.encode("utf-8")
+        new_hash = _sha256_bytes(new_bytes)
+        was_symlink = dst.is_symlink()
+        if dst.is_file():
+            old_bytes = dst.read_bytes()
+            if old_bytes == new_bytes and not was_symlink:
+                manifest_files[rel_key] = new_hash
+                return False
+            old_hash = _sha256_bytes(old_bytes)
+            if manifest_files.get(rel_key) != old_hash:
+                backup = _write_unique_backup_bytes(dst, old_bytes, 0o600)
+                asset_backups.append(str(backup))
+        if was_symlink:
+            dst.unlink()
+        dst.write_bytes(new_bytes)
+        manifest_files[rel_key] = new_hash
+        return True
+    except OSError as exc:
+        raise OSError(f"{dst}: {exc}") from exc
+
+
+def _resolve_opencode_target_config(
+    cfg_dir: Path,
+    mcp_cfg_path: Path,
+    entry: dict[str, Any],
+    *,
+    name: str,
+) -> tuple[Path, str, bytes, str, str | None]:
+    """Read, conflict-check, and merge the target OpenCode config file without writing to disk."""
+    try:
+        existing_bytes = mcp_cfg_path.read_bytes() if mcp_cfg_path.is_file() else b""
+        existing = existing_bytes.decode("utf-8") if existing_bytes else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise OSError(f"{mcp_cfg_path}: {exc}") from exc
+    existing_for_upsert = existing
+    preserved_jsonc_path: str | None = None
+    if mcp_cfg_path == cfg_dir / "opencode.jsonc" and existing.lstrip("\ufeff").strip():
+        try:
+            json.loads(existing.lstrip("\ufeff").strip())
+        except ValueError:
+            try:
+                parsed_standalone_jsonc = _loads_jsonc(existing)
+            except ValueError as exc:
+                raise OpenCodeConfigError(f"existing opencode.jsonc is not valid JSONC ({exc}); fix it first") from exc
+            if not isinstance(parsed_standalone_jsonc, dict):
+                raise OpenCodeConfigError("existing opencode.jsonc top-level value must be a JSON object")
+            if _opencode_doc_defines_server(parsed_standalone_jsonc, name):
+                raise OpenCodeConfigError(
+                    f"existing opencode.jsonc uses comments or trailing commas and already defines mcp.{name}; "
+                    f"update mcp.{name} in opencode.jsonc manually so comments are preserved"
+                )
+            preserved_jsonc_path = str(mcp_cfg_path)
+            mcp_cfg_path = cfg_dir / "opencode.json"
+            try:
+                existing_bytes = mcp_cfg_path.read_bytes() if mcp_cfg_path.is_file() else b""
+                existing = existing_bytes.decode("utf-8") if existing_bytes else ""
+            except (OSError, UnicodeDecodeError) as exc:
+                raise OSError(f"{mcp_cfg_path}: {exc}") from exc
+            existing_for_upsert = existing
+            standalone_mcp = parsed_standalone_jsonc.get("mcp")
+            if not existing and isinstance(standalone_mcp, Mapping) and _is_opencode_v2_servers_envelope(standalone_mcp):
+                existing_for_upsert = json.dumps({"$schema": OPENCODE_SCHEMA_URL, "mcp": {"servers": {}}})
+
+    _check_opencode_jsonc_shadow_conflict(cfg_dir, name, target_cfg_path=mcp_cfg_path)
+    updated = upsert_opencode_mcp_config(
+        existing_for_upsert,
+        entry,
+        name=name,
+        filename=mcp_cfg_path.name,
+    )
+    return mcp_cfg_path, existing, existing_bytes, updated, preserved_jsonc_path
+
+
+def _sync_opencode_assets(
+    cfg_dir: Path,
+    command_sources: list[Path],
+    *,
+    name: str,
+    asset_backups: list[str],
+) -> bool:
+    """Install OpenCode skill, commands, and subagent, persisting SHA-256 manifest updates even on partial failure."""
+    manifest_before = _load_opencode_asset_manifest(cfg_dir)
+    manifest_files = dict(manifest_before)
+    assets_changed = False
+    try:
+        skill_text = _rewrite_opencode_server_refs(OPENCODE_SKILL_SOURCE.read_text(encoding="utf-8"), name)
+        if _write_opencode_asset(
+            cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md",
+            f"skills/{PLUGIN_NAME}/SKILL.md",
+            skill_text,
+            asset_backups,
+            manifest_files,
+        ):
+            assets_changed = True
+
+        for src_cmd in command_sources:
+            cmd_text = _rewrite_opencode_server_refs(src_cmd.read_text(encoding="utf-8"), name)
+            if _write_opencode_asset(
+                cfg_dir / "commands" / src_cmd.name,
+                f"commands/{src_cmd.name}",
+                cmd_text,
+                asset_backups,
+                manifest_files,
+            ):
+                assets_changed = True
+
+        agent_text = _rewrite_opencode_server_refs(OPENCODE_AGENT_SOURCE.read_text(encoding="utf-8"), name)
+        if _write_opencode_asset(
+            cfg_dir / "agents" / "gemini-delegator.md",
+            "agents/gemini-delegator.md",
+            agent_text,
+            asset_backups,
+            manifest_files,
+        ):
+            assets_changed = True
+    except OSError:
+        if manifest_files != manifest_before:
+            try:
+                _save_opencode_asset_manifest(cfg_dir, manifest_files)
+            except OSError:
+                pass
+        raise
+    if manifest_files != manifest_before:
+        _save_opencode_asset_manifest(cfg_dir, manifest_files)
+    return assets_changed
+
+
+def install_opencode(
+    *,
+    name: str = DEFAULT_SERVER_NAME,
+    profile: str = "balanced",
+    auth_mode: str | None = None,
+    project: str | None = None,
+    location: str | None = None,
+    base_url: str | None = None,
+    gateway_wire: str | None = None,
+    gateway_audience: str | None = None,
+    telemetry_sink: str | None = None,
+    agy_cli_path: str | None = None,
+    max_daily_cents: float | None = None,
+    allowed_projects: str | None = None,
+    blocked_projects: str | None = None,
+    no_auto_apply: bool = False,
+    strict: bool = False,
+    dry_run: bool = False,
+    opencode_config_dir: Path | None = None,
+    python_bin: str | None = None,
+) -> dict[str, Any]:
+    """Register cc-agy-plugin in OpenCode's global config, skills, commands, and agents directories."""
+    cfg_dir = resolve_opencode_config_dir(explicit_dir=opencode_config_dir)
+    active_env = os.environ if opencode_config_dir is None else None
+    mcp_cfg_path = resolve_opencode_config_path(cfg_dir, env=active_env)
+    commands_dst_dir = cfg_dir / "commands"
+
+    entry = build_opencode_server_entry(
+        python_bin=python_bin,
+        profile=profile,
+        auth_mode=auth_mode,
+        project=project,
+        location=location,
+        base_url=base_url,
+        gateway_wire=gateway_wire,
+        gateway_audience=gateway_audience,
+        telemetry_sink=telemetry_sink,
+        agy_cli_path=agy_cli_path,
+        max_daily_cents=max_daily_cents,
+        allowed_projects=allowed_projects,
+        blocked_projects=blocked_projects,
+        no_auto_apply=no_auto_apply,
+        strict=strict,
+    )
+
+    command_sources = sorted(OPENCODE_COMMANDS_DIR.glob("*.md")) if OPENCODE_COMMANDS_DIR.is_dir() else []
+    result: dict[str, Any] = {
+        "host": "opencode",
+        "config_path": str(mcp_cfg_path),
+        "skill_path": str(cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"),
+        "commands_dir": str(commands_dst_dir),
+        "command_paths": [str(commands_dst_dir / src.name) for src in command_sources],
+        "agent_path": str(cfg_dir / "agents" / "gemini-delegator.md"),
+        "server_name": name,
+        "mcp_key_path": f"mcp.{name}",
+        "entry": entry,
+    }
+    if active_env is not None and (active_env.get("OPENCODE_CONFIG") or "").strip() and not mcp_cfg_path.is_absolute():
+        result["status"] = "refused"
+        result["error"] = (
+            f"OPENCODE_CONFIG ({mcp_cfg_path}) must be an absolute path (or start with ~/...) "
+            "so the installer and OpenCode resolve the same config file"
+        )
+        return result
+
+    try:
+        _validate_opencode_server_name(name)
+    except OpenCodeConfigError as exc:
+        result["status"] = "refused"
+        result["error"] = str(exc)
+        return result
+
+    missing_assets = [
+        str(asset_path)
+        for asset_path in (
+            OPENCODE_SKILL_SOURCE,
+            OPENCODE_AGENT_SOURCE,
+            *(OPENCODE_COMMANDS_DIR / f"{req_cmd}.md" for req_cmd in _REQUIRED_OPENCODE_COMMANDS),
+        )
+        if not asset_path.is_file()
+    ]
+    if missing_assets:
+        result["status"] = "failed"
+        result["error"] = f"OpenCode bundle assets missing from plugin checkout: {', '.join(missing_assets)}"
+        return result
+
+    asset_backups: list[str] = []
+    try:
+        mcp_cfg_path, existing, existing_bytes, updated, preserved_jsonc = _resolve_opencode_target_config(
+            cfg_dir, mcp_cfg_path, entry, name=name
+        )
+        if preserved_jsonc is not None:
+            result["preserved_jsonc_path"] = preserved_jsonc
+            result["config_path"] = str(mcp_cfg_path)
+        updated_mcp = json.loads(updated).get("mcp") or {}
+        result["mcp_key_path"] = (
+            f"mcp.servers.{name}" if _is_opencode_v2_servers_envelope(updated_mcp) else f"mcp.{name}"
+        )
+        if dry_run:
+            result["status"] = "dry_run"
+            return result
+
+        updated_bytes = updated.encode("utf-8")
+        config_changed = existing_bytes != updated_bytes
+        mcp_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        if (
+            mcp_cfg_path.is_file()
+            and not mcp_cfg_path.is_symlink()
+            and (mcp_cfg_path.stat().st_mode & 0o777) != 0o600
+        ):
+            os.chmod(mcp_cfg_path, 0o600)
+            result["mode_tightened"] = True
+        if existing_bytes and config_changed:
+            backup = _write_unique_backup_bytes(mcp_cfg_path, existing_bytes, 0o600)
+            result["backup_path"] = str(backup)
+        if config_changed:
+            _write_private(mcp_cfg_path, updated, 0o600)
+
+        assets_changed = _sync_opencode_assets(
+            cfg_dir,
+            command_sources,
+            name=name,
+            asset_backups=asset_backups,
+        )
+    except OpenCodeConfigError as exc:
+        result["status"] = "refused"
+        result["error"] = str(exc)
+        return result
+    except (OSError, UnicodeDecodeError) as exc:
+        if asset_backups:
+            result["asset_backups"] = asset_backups
+        result["status"] = "failed"
+        result["error"] = f"OpenCode config/asset I/O failed: {exc}"
+        return result
+
+    if asset_backups:
+        result["asset_backups"] = asset_backups
+    result["status"] = "installed" if (config_changed or assets_changed) else "unchanged"
+    return result
+
+
 def preflight(
     env: dict[str, str] | None = None,
     *,
@@ -922,10 +1884,12 @@ def preflight(
     """Zero-network readiness: Python, SDKs / `agy` CLI, git and credentials."""
     from server.agy_cli import inspect_agy_cli_offline
     from server.regions import (
+        _clean_base_url_candidate,
         _resolve_explicit_project_only,
         _should_auto_detect_agy_cli,
         resolve_api_key,
         resolve_configured_auth_mode,
+        resolve_gateway_base_url,
         resolve_vertex_base_url,
     )
 
@@ -937,6 +1901,7 @@ def preflight(
 
     py_bin = resolve_python_bin()
     issues: list[str] = []
+    warnings: list[str] = []
     if sys.version_info < (3, 10):
         issues.append(f"Python 3.10+ is required (found {sys.version.split()[0]}).")
     if not shutil.which("git"):
@@ -949,7 +1914,12 @@ def preflight(
     norm_auth = cfg_mode or _normalize_auth_choice(auth_mode)
 
     resolved_key = resolve_api_key(env=source)
-    resolved_gateway = resolve_vertex_base_url(base_url, env=source)
+    resolved_gateway = resolve_gateway_base_url(base_url, env=source)
+    has_explicit_or_plugin_gateway = bool(
+        _clean_base_url_candidate(base_url)
+        or resolve_vertex_base_url(env=source)
+        or _clean_base_url_candidate(source.get("CC_AGY_GEMINI_BASE_URL"))
+    )
     explicit_proj_arg = _resolve_explicit_project_only(project, env={}) if project else None
     resolved_proj = _resolve_explicit_project_only(project, env=source)
 
@@ -969,10 +1939,21 @@ def preflight(
         auth = "api_key" if has_key else "missing"
         if not has_key:
             issues.append("Export `GEMINI_API_KEY` in your shell for API-key mode.")
+        conflict_msg = (
+            "Explicit `--auth api-key` (`CC_AGY_AUTH_MODE=api_key`) always connects directly to Google AI Studio "
+            "and ignores `--base-url` / gateway URLs. Use `--auth auto` (with `GOOGLE_GEMINI_BASE_URL` or "
+            "`CC_AGY_GEMINI_BASE_URL`) or `--auth gateway` to route through a gateway."
+        )
+        if has_explicit_or_plugin_gateway:
+            issues.append(conflict_msg)
+        elif has_gateway:
+            warnings.append(conflict_msg)
     elif norm_auth == "gateway":
         auth = "gateway" if has_gateway else "missing"
         if not has_gateway:
-            issues.append("Pass `--base-url` or export `CC_AGY_VERTEX_BASE_URL` for gateway mode.")
+            issues.append(
+                "Pass `--base-url` or export `CC_AGY_VERTEX_BASE_URL` / `CC_AGY_GEMINI_BASE_URL` for gateway mode."
+            )
     elif norm_auth == "vertex":
         auth = "vertex" if has_project else "missing"
         if not has_project:
@@ -1000,7 +1981,13 @@ def preflight(
     if not sdk_ok and auth != "gemini_enterprise":
         issues.append("Antigravity SDK missing. Run `python3 -m server.install` (without `--no-bootstrap`).")
 
-    out: dict[str, Any] = {"python_bin": py_bin, "auth_mode": auth, "issues": issues, "ready": not issues}
+    out: dict[str, Any] = {
+        "python_bin": py_bin,
+        "auth_mode": auth,
+        "issues": issues,
+        "warnings": warnings,
+        "ready": not issues,
+    }
     if agy_cli_status is not None:
         out["agy_cli"] = {
             "binary_found": bool(agy_cli_status.get("binary_found")),
@@ -1026,7 +2013,7 @@ def run_interactive_wizard(
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
     host_raw = str(
-        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor] (1): ") or ""
+        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor, 6=OpenCode] (1): ") or ""
     ).strip().lower()
     host_map = {
         "": "all",
@@ -1043,19 +2030,45 @@ def run_interactive_wizard(
         "jetski": "agy",
         "5": "cursor",
         "cursor": "cursor",
+        "6": "opencode",
+        "opencode": "opencode",
+        "open-code": "opencode",
     }
     host = host_map.get(host_raw, "all")
 
-    from server.regions import _should_auto_detect_agy_cli
+    from server.regions import (
+        _clean_base_url_candidate,
+        _should_auto_detect_agy_cli,
+        resolve_api_key,
+        resolve_bifrost_virtual_key,
+        resolve_gateway_base_url,
+        resolve_gemini_base_url,
+        resolve_static_vertex_base_url_token,
+        resolve_vertex_base_url,
+    )
 
     detected_proj = str(source.get("GOOGLE_CLOUD_PROJECT") or "").strip()
-    detected_gw = str(source.get("CC_AGY_VERTEX_BASE_URL") or source.get("GOOGLE_VERTEX_BASE_URL") or "").strip()
+    detected_gw = str(resolve_gateway_base_url(env=source) or "").strip()
+    detected_vtx_gw = str(resolve_vertex_base_url(env=source) or "").strip()
+    detected_gem_gw = str(resolve_gemini_base_url(env=source) or "").strip()
+    has_dedicated_gw_url = bool(
+        detected_vtx_gw or _clean_base_url_candidate(source.get("CC_AGY_GEMINI_BASE_URL"))
+    )
+    has_gw_cred = bool(
+        resolve_static_vertex_base_url_token(env=source)
+        or resolve_bifrost_virtual_key(env=source)
+        or str(source.get("CC_AGY_VERTEX_BASE_URL_AUDIENCE") or "").strip()
+    )
+    has_real_key = bool(resolve_api_key(env=source))
     explicit_ent = _normalize_auth_choice(str(source.get("CC_AGY_AUTH_MODE") or "")) == "gemini_enterprise"
     auto_ent = _should_auto_detect_agy_cli(env, source) and bool(inspect_agy_cli_offline(source).get("ok"))
     has_key = any(str(source.get(k) or "").strip() for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+    is_gemini_cli_key_pairing = bool(
+        detected_gw and not has_dedicated_gw_url and has_real_key and not has_gw_cred
+    )
     if explicit_ent:
         default_auth_label = "gemini-enterprise"
-    elif detected_gw:
+    elif detected_gw and not is_gemini_cli_key_pairing:
         default_auth_label = "gateway"
     elif has_key:
         default_auth_label = "api_key"
@@ -1075,6 +2088,7 @@ def run_interactive_wizard(
     auth_flag: str | None = None
     project: str | None = None
     base_url: str | None = None
+    gateway_wire: str | None = None
     if auth_raw in ("4", "gemini-enterprise", "gemini_enterprise", "enterprise", "agy", "agy-cli", "agy_cli") or (
         not auth_raw and default_auth_label == "gemini-enterprise"
     ):
@@ -1095,6 +2109,13 @@ def run_interactive_wizard(
         entered_gw = str(input_fn(gw_prompt) or "").strip() or detected_gw
         if entered_gw:
             base_url = entered_gw
+            if not detected_vtx_gw and detected_gem_gw and entered_gw == detected_gem_gw:
+                gateway_wire = "gemini"
+        if not has_gw_cred:
+            output_fn(
+                "   Tip: export CC_AGY_VERTEX_BASE_URL_TOKEN='your-token' or CC_AGY_BIFROST_VIRTUAL_KEY='your-vk' "
+                "in your shell (or pass --gateway-audience for OIDC)."
+            )
     elif not has_key:
         output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
@@ -1121,6 +2142,8 @@ def run_interactive_wizard(
         built.extend(["--project", project])
     if base_url:
         built.extend(["--base-url", base_url])
+    if gateway_wire:
+        built.extend(["--gateway-wire", gateway_wire])
     if cap_raw:
         built.extend(["--max-daily-cents", cap_raw])
     return built
@@ -1137,11 +2160,11 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="cc-agy-install",
-        description="Set up cc-agy-plugin for Claude Code, Codex, Cursor, and/or Antigravity.",
+        description="Set up cc-agy-plugin for Claude Code, Codex, Cursor, OpenCode, and/or Antigravity.",
     )
     parser.add_argument(
         "--host",
-        choices=("codex", "claude", "cursor", "agy", "antigravity", "jetski", "all"),
+        choices=("codex", "claude", "cursor", "opencode", "agy", "antigravity", "jetski", "all"),
         default="all",
     )
     parser.add_argument(
@@ -1151,10 +2174,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Connection mode: 'gemini-enterprise' / 'agy-cli' (included seat quota via standalone `agy` CLI), 'api-key', 'vertex', 'gateway', or 'auto'.",
     )
     parser.add_argument("--profile", choices=COST_PROFILES, default="balanced",
-                        help="economy: Flash only; balanced: Flash, escalating to Argon on failure; quality: Argon first.")
+                        help="economy: Flash only; balanced: Flash, escalating to Carbon Zero-Think on failure; quality: Argon first.")
     parser.add_argument("--project", default=None, help="Google Cloud project ID (required for pay-as-you-go Vertex AI).")
     parser.add_argument("--location", default=None, help="Vertex AI region (for example 'global' or 'us-central1').")
     parser.add_argument("--base-url", default=None, help="Optional AI gateway base URL (sets CC_AGY_VERTEX_BASE_URL).")
+    parser.add_argument(
+        "--gateway-wire",
+        choices=GATEWAY_WIRE_CLI_CHOICES,
+        default=None,
+        help="Gateway wire protocol: 'auto' (detects /genai and /gemini vs Vertex paths), 'vertex' / 'litellm-vertex', or 'gemini' / 'litellm-gemini' / 'bifrost'.",
+    )
     parser.add_argument("--gateway-audience", default=None,
                         help="Optional OIDC target audience URL (or 'auto') for zero-key Cloud Run / WIF gateway auth.")
     parser.add_argument("--telemetry-sink", default=None,
@@ -1174,7 +2203,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Enable strict orchestrator mode in Claude Code userConfig.")
     parser.add_argument("--no-bootstrap", action="store_true",
                         help="Do not automatically install ~/.local/share/cc-agy-plugin/venv or standalone `agy` CLI.")
-    parser.add_argument("--name", default=DEFAULT_SERVER_NAME, help="Codex MCP server name (default: agy).")
+    parser.add_argument(
+        "--name",
+        default=DEFAULT_SERVER_NAME,
+        help="MCP server name for Codex, Cursor, OpenCode, and Antigravity (default: agy).",
+    )
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
     parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics as JSON and exit.")
     parser.add_argument("--probe-oidc", action="store_true", help="With --doctor, mint a live OIDC token once to verify and display the resolved principal.")
@@ -1196,13 +2229,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if not math.isfinite(args.max_daily_cents) or args.max_daily_cents <= 0:
             parser.error("--max-daily-cents must be a finite number greater than 0")
+    try:
+        _validate_gateway_base_url_no_secrets(args.base_url)
+        norm_gateway_wire = _normalize_gateway_wire_choice(args.gateway_wire)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.gateway_audience:
-        from server.regions import resolve_vertex_base_url_audience
+        from server.regions import resolve_gateway_base_url, resolve_vertex_base_url_audience
 
         try:
             resolve_vertex_base_url_audience(
                 args.gateway_audience,
-                base_url=args.base_url,
+                base_url=resolve_gateway_base_url(args.base_url, env=os.environ),
                 env=os.environ,
             )
         except ValueError as exc:
@@ -1269,6 +2307,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_wire=norm_gateway_wire,
                 gateway_audience=args.gateway_audience,
                 telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
@@ -1288,6 +2327,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_wire=norm_gateway_wire,
                 gateway_audience=args.gateway_audience,
                 telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
@@ -1307,6 +2347,28 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_wire=norm_gateway_wire,
+                gateway_audience=args.gateway_audience,
+                telemetry_sink=args.telemetry_sink,
+                agy_cli_path=args.agy_cli_path,
+                max_daily_cents=args.max_daily_cents,
+                allowed_projects=args.allowed_projects,
+                blocked_projects=args.blocked_projects,
+                no_auto_apply=args.no_auto_apply,
+                strict=args.strict,
+                dry_run=args.dry_run,
+            )
+        )
+    if args.host in ("opencode", "all"):
+        report["hosts"].append(
+            install_opencode(
+                name=args.name,
+                profile=args.profile,
+                auth_mode=args.auth,
+                project=args.project,
+                location=args.location,
+                base_url=args.base_url,
+                gateway_wire=norm_gateway_wire,
                 gateway_audience=args.gateway_audience,
                 telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
@@ -1327,6 +2389,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.project,
                 location=args.location,
                 base_url=args.base_url,
+                gateway_wire=norm_gateway_wire,
                 gateway_audience=args.gateway_audience,
                 telemetry_sink=args.telemetry_sink,
                 agy_cli_path=args.agy_cli_path,
@@ -1347,6 +2410,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  python: {pre['python_bin']}  auth: {pre['auth_mode']}  profile: {args.profile}")
     for issue in pre["issues"]:
         print(f"  ! {issue}")
+    for warning in pre.get("warnings", []):
+        print(f"  ~ {warning}")
     for host in report["hosts"]:
         if host["host"] == "codex":
             print(f"\nCodex: {host['status']} -> {host['config_path']} [mcp_servers.{host['server_name']}]")
@@ -1367,6 +2432,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  backup: {host['backup_path']}")
             print(f"  skill: {host['skill_path']}")
             print('  Next: open your repository in Cursor and ask: "Run doctor to verify my Gemini setup."')
+        elif host["host"] == "opencode":
+            key_path = host.get("mcp_key_path") or f"mcp.{host['server_name']}"
+            print(f"\nOpenCode: {host['status']} -> {host['config_path']} [{key_path}]")
+            if host.get("error"):
+                print(f"  ! {host['error']}")
+            if host.get("preserved_jsonc_path"):
+                print(f"  preserved jsonc: {host['preserved_jsonc_path']}")
+            if host.get("backup_path"):
+                print(f"  backup: {host['backup_path']}")
+            for asset_bak in host.get("asset_backups") or []:
+                print(f"  asset backup: {asset_bak}")
+            print(f"  skill: {host['skill_path']}")
+            print(f"  commands: {host['commands_dir']} (/delegate, /doctor, /jobs, /cost)")
+            print(f"  subagent: {host['agent_path']}")
+            print(
+                '  Next: run `opencode` in your repository and type `/doctor` '
+                '(or ask: "Run doctor to verify my Gemini setup.").'
+            )
         elif host["host"] == "agy":
             print(f"\nAntigravity: {host['status']} -> {host['config_path']} [mcpServers.{host['server_name']}]")
             if host.get("error"):

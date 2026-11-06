@@ -77,13 +77,25 @@
     },
     "vertex_base_url": {
       "title": "Custom AI Gateway URL",
-      "description": "Optional corporate or AI gateway base URL for Gemini calls (for example Bifrost or an internal proxy). Leave unset for direct Google endpoints.",
+      "description": "Optional corporate or AI gateway base URL for Gemini calls (for example LiteLLM /vertex_ai or /gemini, Bifrost /genai, Cloud Run, or Apigee). Leave unset for direct Google endpoints.",
+      "type": "string",
+      "sensitive": false
+    },
+    "gateway_wire": {
+      "title": "Custom AI Gateway Wire Protocol",
+      "description": "Optional wire format for vertex_base_url: 'auto' (default: infers 'gemini' for /genai or /gemini URL paths, CC_AGY_GEMINI_BASE_URL / GOOGLE_GEMINI_BASE_URL, or Bifrost virtual keys when no Vertex URL is set; 'vertex' otherwise), 'vertex' / 'litellm-vertex' (/v1beta1/projects/.../models/...), or 'gemini' / 'litellm-gemini' / 'bifrost' (/v1beta/models/...).",
       "type": "string",
       "sensitive": false
     },
     "vertex_base_url_token": {
       "title": "Custom AI Gateway Virtual Key / Token",
-      "description": "Optional bearer token or virtual key sent to vertex_base_url when using an AI gateway.",
+      "description": "Optional bearer token or virtual key sent to vertex_base_url when using an AI gateway (for example a LiteLLM sk-... key).",
+      "type": "string",
+      "sensitive": true
+    },
+    "bifrost_virtual_key": {
+      "title": "Bifrost Governance Virtual Key (x-bf-vk)",
+      "description": "Optional Bifrost virtual key sent in the x-bf-vk header (composable alongside Cloud Run OIDC).",
       "type": "string",
       "sensitive": true
     },

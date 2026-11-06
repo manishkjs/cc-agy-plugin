@@ -460,6 +460,8 @@ def redact_api_keys(
     for candidate in (
         api_key,
         receipt.get("api_key"),
+        receipt.get("base_url_token"),
+        receipt.get("bifrost_virtual_key"),
         os.environ.get("GEMINI_API_KEY"),
         os.environ.get("GOOGLE_API_KEY"),
         os.environ.get("CLAUDE_PLUGIN_OPTION_GEMINI_API_KEY"),
@@ -467,6 +469,9 @@ def redact_api_keys(
         os.environ.get("CC_AGY_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CLAUDE_PLUGIN_OPTION_VERTEX_BASE_URL_TOKEN"),
         os.environ.get("CC_AGY_USERCFG_VERTEX_BASE_URL_TOKEN"),
+        os.environ.get("CC_AGY_BIFROST_VIRTUAL_KEY"),
+        os.environ.get("CLAUDE_PLUGIN_OPTION_BIFROST_VIRTUAL_KEY"),
+        os.environ.get("CC_AGY_USERCFG_BIFROST_VIRTUAL_KEY"),
         os.environ.get("CC_AGY_TELEMETRY_TOKEN"),
         os.environ.get("CLAUDE_PLUGIN_OPTION_TELEMETRY_TOKEN"),
         os.environ.get("CC_AGY_USERCFG_TELEMETRY_TOKEN"),
@@ -514,6 +519,9 @@ def scrub_receipt_for_export(
         scrubbed["vertex_project"] = "<paying-project>"
     if "api_key" in scrubbed:
         scrubbed["api_key"] = "<api-key>"
+    for gw_sec_key in ("base_url_token", "bifrost_virtual_key"):
+        if gw_sec_key in scrubbed and scrubbed[gw_sec_key] is not None:
+            scrubbed[gw_sec_key] = "<api-key>"
     return scrubbed
 
 

@@ -596,7 +596,12 @@ def make_genai_writer(
             timeout_seconds=max(5.0, float(timeout_ms) / 1000.0),
             read_budget=0,
         )
-    from server.regions import clamp_gemini_thinking_level, estimate_cost_usd
+    from server.regions import (
+        clamp_gemini_thinking_level,
+        estimate_cost_usd,
+        normalize_wire_model_name,
+        resolve_effective_gateway_url,
+    )
 
     def _write(req: WriterRequest) -> WriterReply:
         from google.genai import types as gt
@@ -608,6 +613,8 @@ def make_genai_writer(
         is_zero = req_tl in ("ZERO", "0", "OFF")
         client = _build_genai_client(auth, timeout_ms=timeout_ms, zero_thinking=is_zero)
         try:
+            custom_gw = bool(resolve_effective_gateway_url(auth))
+            wire_model = normalize_wire_model_name(eff_model, custom_gateway=custom_gw)
             clamped_tl = clamp_gemini_thinking_level(
                 eff_model,
                 req_tl,
@@ -629,7 +636,7 @@ def make_genai_writer(
             else:
                 cfg["system_instruction"] = req.system + ("\n\n" + req.shared_prefix if req.shared_prefix else "")
             try:
-                resp = client.models.generate_content(model=eff_model, contents=req.prompt, config=gt.GenerateContentConfig(**cfg))
+                resp = client.models.generate_content(model=wire_model, contents=req.prompt, config=gt.GenerateContentConfig(**cfg))
             except Exception as exc:  # noqa: BLE001 - classified below by status code / type
                 _raise_classified(exc)
                 raise
@@ -663,10 +670,12 @@ def create_shared_cache(
     client: Any = None
     try:
         from google.genai import types as gt
+        from server.regions import normalize_wire_model_name, resolve_effective_gateway_url
 
         client = _build_genai_client(auth)
+        wire_model = normalize_wire_model_name(model, custom_gateway=bool(resolve_effective_gateway_url(auth)))
         cache = client.caches.create(
-            model=model,
+            model=wire_model,
             config=gt.CreateCachedContentConfig(
                 system_instruction=system,
                 contents=[gt.Content(role="user", parts=[gt.Part(text=shared_text)])],
@@ -722,8 +731,10 @@ def make_agent_writer(
         from google.antigravity import policy, types
         from server.regions import (
             clamp_gemini_thinking_level,
-            resolve_vertex_base_url,
-            resolve_vertex_base_url_token,
+            normalize_wire_model_name,
+            resolve_effective_gateway_url,
+            resolve_gateway_credentials,
+            resolve_gateway_wire,
         )
 
         eff_model = req.model or model
@@ -744,33 +755,52 @@ def make_agent_writer(
         options = types.GeminiModelOptions(thinking_level=sdk_tl_enum)
         eff_proj = auth.get("project")
         eff_loc = auth.get("location")
-        if auth.get("api_key"):
-            endpoint: Any = types.GeminiAPIEndpoint(api_key=auth["api_key"], options=options)
+        gw_url = resolve_effective_gateway_url(auth)
+        gw_wire = resolve_gateway_wire(auth.get("gateway_wire"), base_url=gw_url) if gw_url else "vertex"
+        use_gemini_endpoint = False
+        gemini_endpoint_api_key: str | None = None
+        if not gw_url and auth.get("api_key"):
+            use_gemini_endpoint = True
+            gemini_endpoint_api_key = str(auth["api_key"])
+            endpoint: Any = types.GeminiAPIEndpoint(api_key=gemini_endpoint_api_key, options=options)
+        elif gw_url and gw_wire == "gemini":
+            use_gemini_endpoint = True
+            gw_tok, hdrs = resolve_gateway_credentials(
+                auth,
+                base_url=gw_url,
+                wire="gemini",
+                zero_thinking=is_zero,
+                min_remaining_seconds=min(3300.0, max(900.0, float(int(timeout_seconds or 300)) + 60.0)),
+            )
+            # Keep the real gateway token on the explicit TEXT endpoint while passing a non-secret
+            # placeholder to LocalAgentConfig so the SDK's default base_url=None IMAGE target never carries it.
+            gemini_endpoint_api_key = "custom-gateway-no-direct-api-key"
+            endpoint = types.GeminiAPIEndpoint(
+                api_key=gw_tok,
+                base_url=gw_url,
+                http_headers=hdrs,
+                options=options,
+            )
         else:
-            gw_url = resolve_vertex_base_url(auth.get("base_url")) or ""
             if gw_url:
                 eff_proj = eff_proj or "custom-endpoint"
                 eff_loc = eff_loc or "global"
             ep_kw: dict[str, Any] = {"project": eff_proj, "location": eff_loc, "options": options}
             if gw_url:
-                gw_tok = (
-                    resolve_vertex_base_url_token(
-                        auth.get("base_url_token"),
-                        base_url=gw_url,
-                        requested_audience=auth.get("base_url_audience"),
-                        min_remaining_seconds=min(3300.0, max(900.0, float(int(timeout_seconds or 300)) + 60.0)),
-                    )
-                    or "custom-endpoint"
+                gw_tok, hdrs = resolve_gateway_credentials(
+                    auth,
+                    base_url=gw_url,
+                    wire="vertex",
+                    zero_thinking=is_zero,
+                    min_remaining_seconds=min(3300.0, max(900.0, float(int(timeout_seconds or 300)) + 60.0)),
                 )
                 ep_kw["base_url"] = gw_url
                 ep_kw["api_key"] = gw_tok
-                hdrs = {"Authorization": f"Bearer {gw_tok}"}
-                if is_zero:
-                    hdrs["X-CC-AGY-Thinking-Budget"] = "0"
                 ep_kw["http_headers"] = hdrs
             elif is_zero:
                 ep_kw["http_headers"] = {"X-CC-AGY-Thinking-Budget": "0"}
             endpoint = types.VertexEndpoint(**ep_kw)
+        wire_model = normalize_wire_model_name(eff_model, custom_gateway=bool(gw_url))
         scratch = tempfile.mkdtemp(prefix="cc-agy-writer-")
         save_dir = tempfile.mkdtemp(prefix="cc-agy-writer-save-")
         ws_root = str(Path(workspace_dir).resolve()) if (read_budget > 0 and workspace_dir is not None) else scratch
@@ -816,8 +846,8 @@ def make_agent_writer(
                 pass
         cfg_kwargs: dict[str, Any] = dict(
             workspaces=[ws_root],
-            vertex=not bool(auth.get("api_key")),
-            model=types.ModelTarget(name=model, types=[types.ModelType.TEXT], endpoint=endpoint),
+            vertex=not use_gemini_endpoint,
+            model=types.ModelTarget(name=wire_model, types=[types.ModelType.TEXT], endpoint=endpoint),
             policies=agent_policies,
             capabilities=types.CapabilitiesConfig(
                 enable_subagents=False,
@@ -832,8 +862,8 @@ def make_agent_writer(
         )
         if custom_tools:
             cfg_kwargs["tools"] = custom_tools
-        if auth.get("api_key"):
-            cfg_kwargs["api_key"] = auth["api_key"]
+        if use_gemini_endpoint:
+            cfg_kwargs["api_key"] = gemini_endpoint_api_key
         else:
             cfg_kwargs["project"] = eff_proj
             cfg_kwargs["location"] = eff_loc
@@ -852,10 +882,10 @@ def make_agent_writer(
                 usage = await resolve_turn_usage(resp)
                 stop = str(await resolve_stop_reason(resp) or "")
                 payload = json.dumps(structured) if isinstance(structured, (dict, list)) else (structured or text)
-                cost = estimate_cost_usd(model, usage)
+                cost = estimate_cost_usd(eff_model, usage)
                 return WriterReply(
                     text=str(payload), cut_off="MAX_TOKENS" in stop.upper(), usage=dict(usage),
-                    cost_cents=float(cost.get("total_cost_cents") or 0.0), model=model,
+                    cost_cents=float(cost.get("total_cost_cents") or 0.0), model=eff_model,
                 )
 
         try:

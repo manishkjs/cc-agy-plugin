@@ -30,8 +30,9 @@ from server.regions import (
     normalize_wire_model_name,
     resolve_auth_config,
     resolve_cost_profile,
-    resolve_vertex_base_url,
-    resolve_vertex_base_url_token,
+    resolve_effective_gateway_url,
+    resolve_gateway_credentials,
+    resolve_gateway_wire,
     sanitize_placeholder_env,
 )
 
@@ -2103,16 +2104,41 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
 
     eff_project = request.get("project")
     eff_location = request.get("location")
-    custom_gateway = False
-    if request.get("api_key"):
+    gw_base_url = resolve_effective_gateway_url(request)
+    custom_gateway = bool(gw_base_url)
+    gw_wire = (
+        resolve_gateway_wire(request.get("gateway_wire"), base_url=gw_base_url)
+        if gw_base_url
+        else "vertex"
+    )
+    use_gemini_endpoint = False
+    gemini_endpoint_api_key: str | None = None
+    if not gw_base_url and request.get("api_key"):
+        use_gemini_endpoint = True
+        gemini_endpoint_api_key = str(request["api_key"])
+        endpoint: Any = types.GeminiAPIEndpoint(
+            api_key=gemini_endpoint_api_key,
+            options=options,
+        )
+    elif gw_base_url and gw_wire == "gemini":
+        use_gemini_endpoint = True
+        req_timeout_s = float(request.get("timeout_seconds") or 300.0)
+        gw_tok, hdrs = resolve_gateway_credentials(
+            request,
+            base_url=gw_base_url,
+            wire="gemini",
+            zero_thinking=is_zero_thinking,
+            min_remaining_seconds=min(3300.0, max(900.0, req_timeout_s + 60.0)),
+        )
+        gemini_endpoint_api_key = "custom-gateway-no-direct-api-key"
         endpoint = types.GeminiAPIEndpoint(
-            api_key=request["api_key"],
+            api_key=gw_tok,
+            base_url=gw_base_url,
+            http_headers=hdrs,
             options=options,
         )
     else:
-        vertex_base_url = resolve_vertex_base_url(request.get("base_url")) or ""
-        custom_gateway = bool(vertex_base_url)
-        if vertex_base_url:
+        if gw_base_url:
             eff_project = eff_project or "custom-endpoint"
             eff_location = eff_location or "global"
         ep_kwargs: dict[str, Any] = {
@@ -2120,22 +2146,17 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             "location": eff_location,
             "options": options,
         }
-        if vertex_base_url:
+        if gw_base_url:
             req_timeout_s = float(request.get("timeout_seconds") or 300.0)
-            gw_tok = (
-                resolve_vertex_base_url_token(
-                    request.get("base_url_token"),
-                    base_url=vertex_base_url,
-                    requested_audience=request.get("base_url_audience"),
-                    min_remaining_seconds=min(3300.0, max(900.0, req_timeout_s + 60.0)),
-                )
-                or "custom-endpoint"
+            gw_tok, hdrs = resolve_gateway_credentials(
+                request,
+                base_url=gw_base_url,
+                wire="vertex",
+                zero_thinking=is_zero_thinking,
+                min_remaining_seconds=min(3300.0, max(900.0, req_timeout_s + 60.0)),
             )
-            ep_kwargs["base_url"] = vertex_base_url
+            ep_kwargs["base_url"] = gw_base_url
             ep_kwargs["api_key"] = gw_tok
-            hdrs = {"Authorization": f"Bearer {gw_tok}"}
-            if is_zero_thinking:
-                hdrs["X-CC-AGY-Thinking-Budget"] = "0"
             ep_kwargs["http_headers"] = hdrs
         elif is_zero_thinking:
             ep_kwargs["http_headers"] = {"X-CC-AGY-Thinking-Budget": "0"}
@@ -2315,11 +2336,10 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 f"running with standard built-in tools."
             )
 
-    # For Vertex AI: Always set vertex=True at top-level of LocalAgentConfig so the
-    # Antigravity SDK does not inject the default GeminiAPIEndpoint image model
-    # (which crashes when GEMINI_API_KEY is unset in Vertex-only environments).
-    # For Google AI Studio direct API key: set vertex=False and pass api_key.
-    is_api_key = bool(request.get("api_key"))
+    # For Vertex AI and Vertex-wire gateways: set vertex=True at top-level of LocalAgentConfig so the
+    # Antigravity SDK does not inject the default GeminiAPIEndpoint image model without an api_key.
+    # For Google AI Studio or Gemini-wire gateways (Bifrost `/genai`, LiteLLM `/gemini`): set vertex=False
+    # and pass the non-empty `gemini_endpoint_api_key` so default shorthand endpoints stay valid.
     ws_str = str(Path(request["workspace_dir"]).resolve())
     agent_policies: list[Any] = [policy.allow_all()]
     if hasattr(policy, "workspace_only"):
@@ -2333,15 +2353,15 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             pass
     cfg_kwargs: dict[str, Any] = dict(
         workspaces=[ws_str],
-        vertex=not is_api_key,
+        vertex=not use_gemini_endpoint,
         model=model_cfg,
         policies=agent_policies,
         capabilities=capabilities,
         save_dir=save_dir,
         env={"CC_AGY_HARNESS_SAVE_DIR": str(save_dir)},
     )
-    if is_api_key:
-        cfg_kwargs["api_key"] = request["api_key"]
+    if use_gemini_endpoint:
+        cfg_kwargs["api_key"] = gemini_endpoint_api_key
     else:
         cfg_kwargs["project"] = eff_project
         cfg_kwargs["location"] = eff_location
@@ -3119,6 +3139,11 @@ def run_antigravity_worker(
         "project": resolved_project,
         "location": resolved_location,
         "location_explicit": bool(resolved_auth.get("location_explicit")),
+        "base_url": resolved_auth.get("base_url"),
+        "gateway_wire": resolved_auth.get("gateway_wire"),
+        "base_url_token": resolved_auth.get("base_url_token"),
+        "base_url_audience": resolved_auth.get("base_url_audience"),
+        "bifrost_virtual_key": resolved_auth.get("bifrost_virtual_key"),
         "reroute_note": reroute_note,
         "timeout_seconds": timeout_seconds,
         "enabled_tools": enabled_tools,

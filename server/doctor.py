@@ -15,6 +15,12 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+from server.install import (
+    expand_path_with_env,
+    resolve_home_dir,
+    resolve_opencode_config_dir,
+    resolve_opencode_config_path,
+)
 from server.jobs import detect_project_test_runner
 from server.receipts import ReceiptStore, resolve_workspace_root
 from server.verify import run_git
@@ -28,12 +34,14 @@ from server.regions import (
     resolve_auto_apply_on_pass,
     resolve_auto_apply_override,
     resolve_blocked_projects,
+    resolve_bifrost_virtual_key,
     resolve_configured_auth_mode,
     resolve_cost_profile,
     resolve_default_ask_model,
     resolve_default_delegate_model,
+    resolve_gateway_base_url,
+    resolve_gateway_wire,
     resolve_max_daily_cents,
-    resolve_vertex_base_url,
     resolve_vertex_base_url_audience,
 )
 from server.telemetry import resolve_telemetry_sink, validate_telemetry_sink
@@ -50,11 +58,11 @@ def _default_adc_candidates(env: Mapping[str, str]) -> list[Path]:
     explicit = (env.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     candidates: list[Path] = []
     if explicit and not explicit.startswith("${"):
-        candidates.append(Path(explicit).expanduser())
+        candidates.append(expand_path_with_env(explicit, env))
     gcloud_cfg = (env.get("CLOUDSDK_CONFIG") or "").strip()
     if gcloud_cfg and not gcloud_cfg.startswith("${"):
-        candidates.append(Path(gcloud_cfg).expanduser() / "application_default_credentials.json")
-    home = Path.home()
+        candidates.append(expand_path_with_env(gcloud_cfg, env) / "application_default_credentials.json")
+    home = resolve_home_dir(env)
     candidates.append(home / ".config" / "gcloud" / "application_default_credentials.json")
     appdata = (env.get("APPDATA") or "").strip()
     if appdata:
@@ -101,10 +109,28 @@ def run_doctor(
         mcp_ok = not missing
         if missing:
             issues.append(f"Missing core MCP tools: {', '.join(missing)}")
-        codex_cfg = Path(active_env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser() / "config.toml"
-        cursor_cfg = Path(active_env.get("CURSOR_CONFIG_DIR") or (Path.home() / ".cursor")).expanduser() / "mcp.json"
+        home_dir = resolve_home_dir(active_env)
+        codex_cfg = (
+            expand_path_with_env(active_env.get("CODEX_HOME") or (home_dir / ".codex"), active_env)
+            / "config.toml"
+        )
+        cursor_cfg = (
+            expand_path_with_env(active_env.get("CURSOR_CONFIG_DIR") or (home_dir / ".cursor"), active_env)
+            / "mcp.json"
+        )
+        opencode_cfg = resolve_opencode_config_path(
+            resolve_opencode_config_dir(active_env),
+            env=active_env,
+        )
+        if (active_env.get("OPENCODE_CONFIG") or "").strip() and not opencode_cfg.is_absolute():
+            warnings.append(
+                f"OPENCODE_CONFIG ({opencode_cfg}) is a relative path; use an absolute path so OpenCode and server.install resolve the same file."
+            )
         agy_cfg = (
-            Path(active_env.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")).expanduser()
+            expand_path_with_env(
+                active_env.get("AGY_CONFIG_DIR") or (home_dir / ".gemini" / "config"),
+                active_env,
+            )
             / "mcp_config.json"
         )
         mcp_info = {
@@ -115,6 +141,7 @@ def run_doctor(
             "host_configs": {
                 "codex": {"path": str(codex_cfg), "exists": codex_cfg.is_file()},
                 "cursor": {"path": str(cursor_cfg), "exists": cursor_cfg.is_file()},
+                "opencode": {"path": str(opencode_cfg), "exists": opencode_cfg.is_file()},
                 "agy": {"path": str(agy_cfg), "exists": agy_cfg.is_file()},
             },
         }
@@ -123,8 +150,16 @@ def run_doctor(
         mcp_info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     # 2. Authentication configuration (never expose raw API key or OAuth token values)
-    resolved_gateway_url = resolve_vertex_base_url(env=active_env)
+    env_gateway_url = resolve_gateway_base_url(env=active_env)
+    resolved_gateway_url = env_gateway_url
     custom_gateway = bool(resolved_gateway_url)
+    gateway_wire: str | None = None
+    try:
+        resolved_wire = resolve_gateway_wire(base_url=resolved_gateway_url, env=active_env)
+        if custom_gateway:
+            gateway_wire = resolved_wire
+    except ValueError as exc:
+        issues.append(str(exc))
     gateway_oidc_audience: str | None = None
     oidc_config_ok = True
     try:
@@ -147,11 +182,36 @@ def run_doctor(
         )
         auth_mode = str(resolved_auth.get("auth_mode") or "")
         active_auth_mode = auth_mode
+        eff_gw_from_auth = resolved_auth.get("base_url")
+        custom_gateway = bool(eff_gw_from_auth)
+        resolved_gateway_url = str(eff_gw_from_auth) if eff_gw_from_auth else None
+        gateway_wire = str(resolved_auth.get("gateway_wire") or "") or None if custom_gateway else None
         adc_found: bool | None = None
         adc_quota_project: str | None = None
         ent_cred_source: str | None = None
         active_project_id: str | None = resolved_auth.get("project")
         auth_ok = True
+        if env_gateway_url and not custom_gateway and configured_auth_mode == "api_key":
+            from server.regions import _clean_base_url_candidate, resolve_vertex_base_url
+
+            has_dedicated_plugin_gateway = bool(
+                resolve_vertex_base_url(env=active_env)
+                or _clean_base_url_candidate(active_env.get("CC_AGY_GEMINI_BASE_URL"))
+            )
+            msg = (
+                "Explicit `CC_AGY_AUTH_MODE=api_key` (`--auth api-key`) always connects directly to Google AI Studio "
+                f"and ignores configured gateway URL '{env_gateway_url}'. Use `CC_AGY_AUTH_MODE=auto` or `gateway` "
+                "to route through the gateway."
+            )
+            if has_dedicated_plugin_gateway:
+                issues.append(msg)
+            else:
+                warnings.append(msg)
+        elif active_project_id == "custom-endpoint" and not custom_gateway:
+            issues.append(
+                "Project resolved to 'custom-endpoint' without an active gateway base URL; "
+                "set `CC_AGY_VERTEX_BASE_URL` or `CC_AGY_GEMINI_BASE_URL`."
+            )
         if auth_mode == "gemini_enterprise":
             from server.agy_cli import inspect_agy_cli_offline
 
@@ -193,6 +253,7 @@ def run_doctor(
         gateway_oidc_principal: str | None = None
         gateway_oidc_principal_status: str | None = None
         gateway_oidc_source: str | None = None
+        gateway_credential_source: str | None = None
         if custom_gateway:
             from server.regions import (
                 _resolve_oidc_source,
@@ -208,6 +269,7 @@ def run_doctor(
                 oidc_config_ok = False
                 issues.append(str(exc))
             static_tok = resolve_static_vertex_base_url_token(None, env=active_env) or ""
+            bf_vk_tok = resolve_bifrost_virtual_key(None, env=active_env) or ""
             cached_tok = (
                 peek_cached_oidc_token(
                     env=active_env,
@@ -242,6 +304,22 @@ def run_doctor(
                             gateway_oidc_principal_status = "probe_failed"
                 else:
                     gateway_oidc_principal_status = "unminted_until_first_request"
+            elif bf_vk_tok:
+                gateway_oidc_principal_status = "static_token"
+            if static_tok:
+                gateway_credential_source = "vertex_base_url_token"
+            elif bf_vk_tok and gateway_oidc_audience:
+                gateway_credential_source = "oidc+bifrost_virtual_key"
+            elif bf_vk_tok:
+                gateway_credential_source = "bifrost_virtual_key"
+            elif gateway_oidc_audience and resolved_auth.get("api_key"):
+                gateway_credential_source = "oidc+gemini_api_key"
+            elif gateway_oidc_audience:
+                gateway_credential_source = "oidc"
+            elif resolved_auth.get("api_key"):
+                gateway_credential_source = "gemini_api_key"
+            else:
+                gateway_credential_source = "none"
         auth_info = {
             "ok": auth_ok and not issues,
             "auth_mode": auth_mode,
@@ -251,7 +329,18 @@ def run_doctor(
             "project": active_project_id,
             "location": resolved_auth.get("location"),
             "custom_vertex_gateway": custom_gateway,
-            **({"gateway_oidc_audience": gateway_oidc_audience} if gateway_oidc_audience else {}),
+            **({"gateway_wire": gateway_wire} if custom_gateway and gateway_wire else {}),
+            **(
+                {"gateway_credential_source": gateway_credential_source}
+                if custom_gateway and gateway_credential_source
+                else {}
+            ),
+            **(
+                {"bifrost_virtual_key_configured": bool(resolve_bifrost_virtual_key(env=active_env))}
+                if custom_gateway
+                else {}
+            ),
+            **({"gateway_oidc_audience": gateway_oidc_audience} if custom_gateway and gateway_oidc_audience else {}),
             **({"gateway_oidc_source": gateway_oidc_source} if gateway_oidc_source else {}),
             **({"gateway_oidc_principal": gateway_oidc_principal} if gateway_oidc_principal else {}),
             **(

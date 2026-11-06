@@ -1,13 +1,13 @@
 ---
 name: vertex
-description: Route coding, multi-file edits, debugging, and second-opinion reviews from Codex, Cursor, Claude Code, or Antigravity to Gemini (Gemini Enterprise subscription via standalone agy CLI, or AI Studio, Vertex AI, and AI gateways via the Antigravity SDK MCP server).
+description: Route coding, multi-file edits, debugging, and second-opinion reviews from Codex, Cursor, OpenCode, Claude Code, or Antigravity to Gemini (Gemini Enterprise subscription via standalone agy CLI, or AI Studio, Vertex AI, and AI gateways via the Antigravity SDK MCP server).
 ---
 
 # Gemini & Antigravity Delegation (`cc-agy-plugin`)
 
-Use the `agy` (Codex, Cursor, Antigravity) or `vertex` (Claude Code) MCP tools to hand hands-on coding and investigation to Gemini (`gemini-flash-next` and `gemini-4-argon`) inside an isolated copy of the repository.
+Use the `agy` (Codex, Cursor, OpenCode, Antigravity) or `vertex` (Claude Code) MCP tools to hand hands-on coding and investigation to Gemini (`gemini-flash-next` with automatic step-up to `gemini-4-carbon-zero` under `balanced`, or `gemini-4-argon` under `quality`) inside an isolated copy of the repository.
 
-If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor`) are not registered yet, ask the user to run `python3 -m server.install --host codex` or `python3 -m server.install --host cursor` once from the plugin checkout (add `--auth gemini-enterprise` to install the standalone `agy` CLI and use an included Gemini Enterprise seat via Google sign-in).
+If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor`) are not registered yet, ask the user to run `python3 -m server.install --host codex`, `--host cursor`, `--host opencode`, or `--host agy` once from the plugin checkout (add `--auth gemini-enterprise` to install the standalone `agy` CLI and use an included Gemini Enterprise seat via Google sign-in).
 
 ## Pick the right tool first
 

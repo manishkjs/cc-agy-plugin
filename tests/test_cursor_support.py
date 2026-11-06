@@ -322,9 +322,11 @@ def test_install_cli_cursor_and_all_with_env_override_and_wizard(
 
     codex_dir = tmp_path / "codex"
     cursor_dir = tmp_path / "cursor"
+    opencode_dir = tmp_path / "opencode"
     agy_dir = tmp_path / "agy"
     monkeypatch.setenv("CODEX_HOME", str(codex_dir))
     monkeypatch.setenv("CURSOR_CONFIG_DIR", str(cursor_dir))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(opencode_dir))
     monkeypatch.setenv("AGY_CONFIG_DIR", str(agy_dir))
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-never-written")
 
@@ -365,7 +367,7 @@ def test_install_cli_cursor_and_all_with_env_override_and_wizard(
         )
     report_all = json.loads(buf_all.getvalue())
     host_names = [h["host"] for h in report_all["hosts"]]
-    assert host_names == ["codex", "claude", "cursor", "agy"]
+    assert host_names == ["codex", "claude", "cursor", "opencode", "agy"]
     assert rc in (0, 1)
 
 

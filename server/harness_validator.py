@@ -56,6 +56,38 @@ VALID_CURSOR_HOOK_EVENTS: frozenset[str] = frozenset(
     }
 )
 
+VALID_OPENCODE_SKILL_KEYS: frozenset[str] = frozenset(
+    {"name", "description", "license", "compatibility", "metadata"}
+)
+_OPENCODE_MAX_SAFE_INT = 9_007_199_254_740_991
+
+VALID_OPENCODE_COMMAND_KEYS: frozenset[str] = frozenset(
+    {"description", "agent", "model", "variant", "subtask"}
+)
+
+VALID_OPENCODE_AGENT_KEYS: frozenset[str] = frozenset(
+    {
+        "model",
+        "variant",
+        "temperature",
+        "top_p",
+        "prompt",
+        "tools",
+        "disable",
+        "description",
+        "mode",
+        "hidden",
+        "options",
+        "color",
+        "steps",
+        "maxSteps",
+        "permission",
+    }
+)
+
+_OPENCODE_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost")
+
 _TRIGGER_PHRASES: tuple[str, ...] = (
     "use when",
     "use for",
@@ -97,6 +129,34 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 
+def _strip_yaml_inline_comment(value: str) -> str:
+    """Strip an unquoted YAML `# ...` comment while preserving `#` inside quotes or mid-token."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double and (idx == 0 or value[idx - 1].isspace()):
+            return value[:idx].rstrip()
+    return value.rstrip()
+
+
+def _unquote_yaml_scalar(value: str) -> str:
+    """Remove matching outer `'...'` or `\"...\"` quotes from a scalar YAML value."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     """Extract simple YAML key: value frontmatter and return (metadata, body)."""
     lines = text.splitlines()
@@ -119,11 +179,99 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
         if ":" in raw and not raw.startswith((" ", "\t")):
             key, val = raw.split(":", 1)
             current_key = key.strip()
-            meta[current_key] = val.strip().strip("'\"")
+            cleaned_val = _strip_yaml_inline_comment(val.strip())
+            if cleaned_val in ("|", "|-", "|+", ">", ">-", ">+"):
+                meta[current_key] = ""
+            else:
+                meta[current_key] = _unquote_yaml_scalar(cleaned_val)
         elif current_key is not None:
-            meta[current_key] = (meta[current_key] + " " + stripped).strip()
+            cont = _strip_yaml_inline_comment(stripped)
+            if cont:
+                meta[current_key] = f"{meta[current_key]} {cont}".strip()
     body = "\n".join(lines[end_idx + 1 :]).lstrip("\n")
     return meta, body
+
+
+def _opencode_agent_effective_edit_permission(text: str) -> str | None:
+    """Evaluate sequential OpenCode `permission:` rules at the tool-map indent (last matching rule wins).
+
+    Direct children under `permission:` (`*`, `edit`, `bash`, ...) are evaluated in order, as well
+    as inline flow maps (`permission: {edit: deny}`). Nested pattern maps under non-`edit` tools
+    (such as `bash:\\n  "*": allow`) do not affect `edit`, while nested pattern maps under `edit:` or `*:`
+    must leave `edit` denied across all file patterns.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    end_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end_idx = idx
+            break
+    if end_idx is None:
+        return None
+
+    in_permission = False
+    child_indent: int | None = None
+    current_tool: str | None = None
+    effective: str | None = None
+    for raw in lines[1:end_idx]:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        expanded = raw.expandtabs(2)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if indent == 0:
+            in_permission = False
+            child_indent = None
+            current_tool = None
+            if ":" in raw:
+                top_key, top_val = raw.split(":", 1)
+                if top_key.strip() == "permission":
+                    raw_scalar = _strip_yaml_inline_comment(top_val.strip())
+                    if raw_scalar.startswith("{") and raw_scalar.endswith("}"):
+                        inner = raw_scalar[1:-1].strip()
+                        if not inner:
+                            return None
+                        flow_effective: str | None = None
+                        for part in inner.split(","):
+                            if ":" not in part:
+                                continue
+                            fk_raw, fv_raw = part.split(":", 1)
+                            fk = _unquote_yaml_scalar(_strip_yaml_inline_comment(fk_raw.strip()))
+                            fv = _unquote_yaml_scalar(_strip_yaml_inline_comment(fv_raw.strip()))
+                            if fk in ("*", "edit") and fv:
+                                flow_effective = fv
+                        return flow_effective
+                    scalar = _unquote_yaml_scalar(raw_scalar)
+                    if scalar and scalar not in ("|", "|-", "|+", ">", ">-", ">+"):
+                        return scalar
+                    in_permission = True
+            continue
+        if not in_permission or ":" not in stripped:
+            continue
+        if child_indent is None or indent < child_indent:
+            child_indent = indent
+        rule_key_raw, rule_val_raw = stripped.split(":", 1)
+        rule_key = _unquote_yaml_scalar(_strip_yaml_inline_comment(rule_key_raw.strip()))
+        rule_val = _unquote_yaml_scalar(_strip_yaml_inline_comment(rule_val_raw.strip()))
+        if indent == child_indent:
+            current_tool = rule_key
+            if rule_val and rule_val not in ("|", "|-", "|+", ">", ">-", ">+"):
+                if rule_key in ("*", "edit"):
+                    effective = rule_val
+        elif indent > child_indent and rule_val:
+            if current_tool == "edit":
+                if rule_val != "deny":
+                    return rule_val
+                if rule_key == "*":
+                    effective = "deny"
+            elif current_tool == "*":
+                if rule_val != "deny":
+                    effective = rule_val
+                elif rule_key == "*":
+                    effective = "deny"
+    return effective
 
 
 def check_always_on_budget(texts: Sequence[str], max_tokens: int = 1200) -> list[str]:
@@ -467,6 +615,107 @@ def validate_cursor_plugin(plugin_root: Path) -> list[str]:
     return errors
 
 
+def validate_opencode_bundle(plugin_root: Path) -> list[str]:
+    """Validate `.opencode/` skill, commands, and subagent against OpenCode v1.x schemas."""
+    root = Path(plugin_root).resolve()
+    bundle_dir = root / ".opencode"
+    if not bundle_dir.is_dir():
+        return [f"OpenCode bundle directory does not exist: {bundle_dir}"]
+
+    errors: list[str] = []
+
+    skills_dir = bundle_dir / "skills"
+    skill_files = sorted(skills_dir.rglob("SKILL.md")) if skills_dir.is_dir() else []
+    expected_skill = skills_dir / "cc-agy-plugin" / "SKILL.md"
+    if not expected_skill.is_file():
+        errors.append(f"OpenCode skill does not exist: {expected_skill}")
+    for skill_md in skill_files:
+        content = skill_md.read_text(encoding="utf-8", errors="replace")
+        meta, _body = parse_frontmatter(content)
+        unknown_skill_keys = sorted(set(meta.keys()) - VALID_OPENCODE_SKILL_KEYS)
+        if unknown_skill_keys:
+            errors.append(
+                f"{skill_md}: unsupported OpenCode skill frontmatter key(s) {unknown_skill_keys} "
+                f"(allowed: {sorted(VALID_OPENCODE_SKILL_KEYS)})"
+            )
+        name = (meta.get("name") or "").strip()
+        desc = (meta.get("description") or "").strip()
+        if not name:
+            errors.append(f"{skill_md}: missing required frontmatter 'name'")
+        else:
+            if len(name) > 64 or not _OPENCODE_SKILL_NAME_RE.fullmatch(name):
+                errors.append(
+                    f"{skill_md}: OpenCode skill 'name' {name!r} must match ^[a-z0-9]+(-[a-z0-9]+)*$ (1..64 chars)"
+                )
+            if name != skill_md.parent.name:
+                errors.append(
+                    f"{skill_md}: OpenCode skill 'name' {name!r} must match directory name {skill_md.parent.name!r}"
+                )
+        if not desc:
+            errors.append(f"{skill_md}: missing required frontmatter 'description'")
+        else:
+            if len(desc) > 1024:
+                errors.append(
+                    f"{skill_md}: OpenCode skill 'description' length {len(desc)} exceeds 1024-char limit"
+                )
+            if not any(phrase in desc.lower() for phrase in _TRIGGER_PHRASES):
+                errors.append(
+                    f"{skill_md}: description for skill '{name or '<unnamed>'}' lacks a trigger phrase"
+                )
+
+    commands_dir = bundle_dir / "commands"
+    for cmd_stem in _REQUIRED_OPENCODE_COMMANDS:
+        cmd_path = commands_dir / f"{cmd_stem}.md"
+        if not cmd_path.is_file():
+            errors.append(f"OpenCode command does not exist: {cmd_path}")
+    if commands_dir.is_dir():
+        for cmd_md in sorted(commands_dir.glob("*.md")):
+            content = cmd_md.read_text(encoding="utf-8", errors="replace")
+            meta, body = parse_frontmatter(content)
+            if not (meta.get("description") or "").strip():
+                errors.append(f"{cmd_md}: missing required frontmatter 'description'")
+            unknown_keys = sorted(set(meta.keys()) - VALID_OPENCODE_COMMAND_KEYS)
+            if unknown_keys:
+                errors.append(
+                    f"{cmd_md}: unsupported OpenCode command frontmatter key(s) {unknown_keys} "
+                    f"(allowed: {sorted(VALID_OPENCODE_COMMAND_KEYS)})"
+                )
+            if "on the `vertex` MCP server" in body:
+                errors.append(
+                    f"{cmd_md}: references Claude Code's 'vertex' MCP server instead of OpenCode's 'agy' server"
+                )
+
+    agents_dir = bundle_dir / "agents"
+    expected_agent_path = agents_dir / "gemini-delegator.md"
+    if not expected_agent_path.is_file():
+        errors.append(f"OpenCode subagent does not exist: {expected_agent_path}")
+    agent_files = sorted(agents_dir.glob("*.md")) if agents_dir.is_dir() else []
+    for agent_path in agent_files:
+        agent_content = agent_path.read_text(encoding="utf-8", errors="replace")
+        meta, _agent_body = parse_frontmatter(agent_content)
+        if not (meta.get("description") or "").strip():
+            errors.append(f"{agent_path}: missing required frontmatter 'description'")
+        if (meta.get("mode") or "").strip() != "subagent":
+            errors.append(f"{agent_path}: expected mode 'subagent', got {meta.get('mode')!r}")
+        if "permissions" in meta:
+            errors.append(
+                f"{agent_path}: uses plural 'permissions'; OpenCode v1 agent schema requires singular 'permission'"
+            )
+        unknown_agent_keys = sorted(set(meta.keys()) - VALID_OPENCODE_AGENT_KEYS)
+        if unknown_agent_keys:
+            errors.append(
+                f"{agent_path}: unsupported OpenCode agent frontmatter key(s) {unknown_agent_keys}"
+            )
+        if _opencode_agent_effective_edit_permission(agent_content) != "deny":
+            errors.append(
+                f"{agent_path}: OpenCode subagent effective 'permission.edit' must evaluate to 'deny' "
+                "(ensure no trailing '\"*\": allow' overrides 'edit: deny')"
+            )
+        errors.extend(check_always_on_budget([WORKER_SYSTEM_PROMPT, agent_content], max_tokens=1200))
+
+    return errors
+
+
 def validate_plugin_tree(root: Path) -> list[str]:
     """Run all pre-flight harness checks against the `cc-agy-plugin` repository tree."""
     plugin_root = Path(root).resolve()
@@ -493,9 +742,9 @@ def validate_plugin_tree(root: Path) -> list[str]:
         )
     )
 
-    # 3. Markdown script reference check across skills, agents, and commands
+    # 3. Markdown script reference check across skills, agents, commands, and .opencode
     md_files: list[Path] = []
-    for sub in ("skills", "agents", "commands"):
+    for sub in ("skills", "agents", "commands", ".opencode"):
         sub_dir = plugin_root / sub
         if sub_dir.exists():
             md_files.extend(sorted(sub_dir.rglob("*.md")))
@@ -507,6 +756,9 @@ def validate_plugin_tree(root: Path) -> list[str]:
 
     # 5. Native Cursor plugin manifest and MCP/hooks compatibility checks
     errors.extend(validate_cursor_plugin(plugin_root))
+
+    # 5b. Native OpenCode bundle (.opencode/) schema and prompt budget checks
+    errors.extend(validate_opencode_bundle(plugin_root))
 
     # 6. Declarative rate card schema check
     rate_card_json = plugin_root / "server" / "rate_card.json"
