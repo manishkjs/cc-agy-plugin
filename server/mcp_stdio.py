@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import math
 import os
+import re
 import sys
 import threading
 from typing import Any, BinaryIO
@@ -1116,8 +1117,34 @@ class MCPServer:
                     }
                 arguments = dict(raw_args or {})
                 meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-                payload = self._dispatch_tool(tool_name, arguments, progress_token=meta.get("progressToken"),
-                                              request_id=msg_id)
+                raw_oc_sid = meta.get("ai.opencode/sessionID")
+                opencode_session_id = (
+                    raw_oc_sid.strip()
+                    if isinstance(raw_oc_sid, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", raw_oc_sid.strip())
+                    else None
+                )
+                payload = self._dispatch_tool(
+                    tool_name,
+                    arguments,
+                    progress_token=meta.get("progressToken"),
+                    request_id=msg_id,
+                    opencode_session_id=opencode_session_id,
+                )
+                if (
+                    opencode_session_id
+                    and isinstance(payload, dict)
+                    and tool_name
+                    in (
+                        "delegate_start",
+                        "delegate_to_gemini",
+                        "delegate_continue",
+                        "delegate_file_batch",
+                        "draft_document",
+                        "write_tests_from_cases",
+                        "replicate_edit",
+                    )
+                ):
+                    payload.setdefault("opencode_session_id", opencode_session_id)
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
@@ -1193,7 +1220,7 @@ class MCPServer:
         )
 
     def _run_file_batch(self, plan: Any, args: dict[str, Any], progress_token: Any, *, request_id: Any = None,
-                        **runner_kwargs: Any) -> dict[str, Any]:
+                        opencode_session_id: str | None = None, **runner_kwargs: Any) -> dict[str, Any]:
         try:
             settings = resolve_batch_settings(args)
         except ValueError as exc:
@@ -1204,6 +1231,10 @@ class MCPServer:
         if request_id is not None:
             with self._cancel_lock:
                 self._active_stops[request_id] = stop
+        if opencode_session_id:
+            extra_rec = dict(runner_kwargs.get("extra_receipt") or {})
+            extra_rec.setdefault("opencode_session_id", opencode_session_id)
+            runner_kwargs["extra_receipt"] = extra_rec
         try:
             runner = FileBatchRunner(self.job_manager, writer_factory=self.batch_writer_factory, progress=report, stop=stop)
             return runner.run(plan, settings, auth, **runner_kwargs)
@@ -1214,7 +1245,7 @@ class MCPServer:
                     self._active_stops.pop(request_id, None)
 
     def _dispatch_tool(self, name: str, args: dict[str, Any], *, progress_token: Any = None,
-                       request_id: Any = None) -> dict[str, Any]:
+                       request_id: Any = None, opencode_session_id: str | None = None) -> dict[str, Any]:
         if name == "delegate_file_batch":
             if parse_bool(args.get("in_place"), False):
                 raise InvalidParamsError(
@@ -1239,6 +1270,7 @@ class MCPServer:
                 return {"status": "invalid_plan", **exc.as_dict(), "is_error": True}
             return self._run_file_batch(
                 plan, args, progress_token, allowed_paths=allowed, request_id=request_id,
+                opencode_session_id=opencode_session_id,
                 resume_job_id=_optional_str(args.get("resume_job_id"), "resume_job_id"),
             )
 
@@ -1273,8 +1305,8 @@ class MCPServer:
             except AssistRequestError as exc:
                 return exc.as_dict()
             return self._run_file_batch(
-                plan, args, progress_token, request_id=request_id, kind=name, content_gate=gate, shared_note=note,
-                edits_only=edits_only,
+                plan, args, progress_token, request_id=request_id, opencode_session_id=opencode_session_id,
+                kind=name, content_gate=gate, shared_note=note, edits_only=edits_only,
             )
 
         if name == "doctor":
@@ -1325,7 +1357,11 @@ class MCPServer:
             )
 
         if name == "delegate_start":
-            return self._execute_delegation_request(args, sync_convenience=False)
+            return self._execute_delegation_request(
+                args,
+                sync_convenience=False,
+                opencode_session_id=opencode_session_id,
+            )
 
         if name == "delegate_status":
             limit_val = _parse_positive_int(args.get("limit"), "limit", 20)
@@ -1423,6 +1459,7 @@ class MCPServer:
                 location=_optional_str(args.get("location"), "location"),
                 force_retry=force_b,
                 auto_apply=cont_auto_apply,
+                opencode_session_id=opencode_session_id,
             )
             if repair_meta.get("repaired") and isinstance(digest, dict):
                 digest["dictation_repaired"] = True
@@ -1469,7 +1506,11 @@ class MCPServer:
             )
 
         if name == "delegate_to_gemini":
-            return self._execute_delegation_request(args, sync_convenience=True)
+            return self._execute_delegation_request(
+                args,
+                sync_convenience=True,
+                opencode_session_id=opencode_session_id,
+            )
 
         raise InvalidParamsError(f"Unknown tool: {name!r}")
 
@@ -1478,6 +1519,7 @@ class MCPServer:
         args: dict[str, Any],
         *,
         sync_convenience: bool = False,
+        opencode_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Shared argument parser, dictation repair, QA audit, and auto-apply pipeline for `delegate_start` and `delegate_to_gemini`."""
         prompt_str = _require_str(args.get("prompt"), "prompt")
@@ -1550,6 +1592,7 @@ class MCPServer:
             spec_files=spec_f,
             context_files=context_f,
             checklist=checklist_items,
+            opencode_session_id=opencode_session_id,
             _skip_balanced_qa=will_run_qa,
         )
         if will_run_qa and qa_review_model:

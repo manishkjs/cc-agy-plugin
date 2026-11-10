@@ -6586,6 +6586,7 @@ class JobManager:
         agy_conversation_id: str | None = None,
         agy_prior_conversation_usage: dict[str, Any] | None = None,
         agy_prior_conversation_turns: int | None = None,
+        turn_instructions: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         token_keys = (
             "prompt_token_count",
@@ -6747,6 +6748,7 @@ class JobManager:
                 host_workspace_root=self.workspace_root,
                 nm_linked=bool(worker_nm_links),
                 isolated_worktree=(not in_place),
+                turn_instructions=turn_instructions,
             )
             if worker_out.get("agy_conversation_id"):
                 active_agy_conv_id = str(worker_out["agy_conversation_id"])
@@ -7453,6 +7455,15 @@ class JobManager:
                 if (vacuous_acceptance and acceptance_results)
                 else (all(r.get("passed") for r in acceptance_results) if acceptance_results else None)
             )
+            clipped_thoughts_tail = (
+                []
+                if scrub_receipt
+                else [
+                    str(t).strip()[-600:]
+                    for t in thoughts[-4:]
+                    if str(t).strip()
+                ]
+            )
             receipt_payload = {
                 "job_id": job_id,
                 "kind": "delegate",
@@ -7481,6 +7492,7 @@ class JobManager:
                 "tool_call_count": len(tool_calls),
                 "tool_calls": tool_calls,
                 "thoughts_count": len(thoughts),
+                "thoughts_tail": clipped_thoughts_tail,
                 "summary": clipped_text,
                 "summary_truncated": was_truncated,
                 "summary_tokens_estimated": orig_tokens,
@@ -7616,6 +7628,7 @@ class JobManager:
                 "skip_balanced_qa",
                 "qa_review",
                 "owner_instance_id",
+                "opencode_session_id",
             ):
                 if prior_disk_rec.get(ctx_key) and not receipt_payload.get(ctx_key):
                     if (
@@ -7981,6 +7994,7 @@ class JobManager:
         spec_files: list[str] | None = None,
         context_files: list[str] | None = None,
         checklist: list[str] | None = None,
+        opencode_session_id: str | None = None,
         _skip_balanced_qa: bool = False,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
@@ -8049,6 +8063,7 @@ class JobManager:
                         api_key=api_key,
                         scrub_receipt=scrub_receipt,
                         auto_apply=auto_apply,
+                        opencode_session_id=opencode_session_id,
                     )
         timeout_seconds = self._clamp_worker_timeout(timeout_seconds)
 
@@ -8351,6 +8366,7 @@ class JobManager:
             **({"context_files": ctx_rel_list} if ctx_rel_list else {}),
             **({"baseline_acceptance_probe": baseline_probe} if baseline_probe else {}),
             **({"acceptance_remapped": acceptance_remapped} if acceptance_remapped else {}),
+            **({"opencode_session_id": opencode_session_id} if opencode_session_id else {}),
             "error": None,
         }
         if sparse_init_count is not None:
@@ -8446,6 +8462,7 @@ class JobManager:
             "allowed_paths": validated_paths,
             "worktree_dir": str(wt_dir),
             "in_place": in_place,
+            **({"opencode_session_id": opencode_session_id} if opencode_session_id else {}),
         }
 
     def _wait_for_future_or_cancel(
@@ -10772,6 +10789,7 @@ class JobManager:
         force_retry: bool = False,
         scrub_receipt: bool | None = None,
         auto_apply: bool | None = None,
+        opencode_session_id: str | None = None,
         _wait_elapsed: float = 0.0,
         _wait_budget: float | None = None,
         _prompt_source: str = "lead",
@@ -11001,6 +11019,7 @@ class JobManager:
 
         # Attach a concise context note of the original task and latest turn so the fresh
         # Antigravity session retains task context without re-executing prior turns.
+        turn_reminders: dict[str, str] = {}
         if prior_prompts:
             orig_task = prior_prompts[0]
             last_turn = prior_prompts[-1] if len(prior_prompts) > 1 else None
@@ -11024,10 +11043,38 @@ class JobManager:
                         diffstat_note = f"\nWorktree diffstat from prior {escalated_from} attempt:\n{ds_res.stdout.strip()}"
                 except Exception:
                     diffstat_note = ""
+            # Note: `thoughts_tail` and `output_tail` originate from the prior worker run in the same
+            # isolated worktree (same trust class as `prior_summary`; API keys are redacted on receipt write).
+            from server.agy_runner import render_keyed_turn_instructions
+
+            _cont_thought_clip = 300
+            _acc_head_clip = 180
+            _acc_tail_clip = 215
+            raw_prior_thoughts = [
+                str(t).strip()[-_cont_thought_clip:]
+                for t in (receipt.get("thoughts_tail") or [])[-2:]
+                if str(t).strip()
+            ]
+            if raw_prior_thoughts:
+                joined_thoughts = " | ".join(raw_prior_thoughts)
+                turn_reminders["prior_worker_reasoning_tail"] = f"Prior worker reasoning tail: {joined_thoughts}"
+            for acc_r in (receipt.get("acceptance_results") or []):
+                if isinstance(acc_r, dict) and not acc_r.get("passed", True):
+                    cmd_s = str(acc_r.get("command") or "").strip()
+                    raw_tail = str(acc_r.get("output_tail") or "").strip()
+                    if len(raw_tail) > (_acc_head_clip + 5 + _acc_tail_clip):
+                        tail_s = raw_tail[:_acc_head_clip] + " ... " + raw_tail[-_acc_tail_clip:]
+                    else:
+                        tail_s = raw_tail
+                    if cmd_s:
+                        turn_reminders["prior_failed_acceptance"] = f"Prior failed acceptance `{cmd_s}`: {tail_s}"
+                        break
+            reminder_block = render_keyed_turn_instructions(turn_reminders)
+            reminder_suffix = f"\n{reminder_block}" if reminder_block else ""
             context_note = (
                 f"[Prior turn context (baseline {baseline_sha}, files_changed={receipt.get('files_changed', [])}, "
                 f"run `git diff {baseline_sha}` to inspect prior work): "
-                f"{prior_summary}]{no_edits_warning}{diffstat_note}\n{clean_followup}"
+                f"{prior_summary}]{no_edits_warning}{diffstat_note}{reminder_suffix}\n{clean_followup}"
             )
             worker_prompts = [context_note]
         else:
@@ -11381,6 +11428,7 @@ class JobManager:
                 "stop_reason": receipt.get("stop_reason"),
                 "acceptance_passed": receipt.get("acceptance_passed"),
                 "tool_call_count": len(prior_tool_calls_snapshot),
+                "thoughts_tail": list(receipt.get("thoughts_tail") or [])[-4:],
                 "summary": str(receipt.get("summary") or "")[:1500],
                 "acceptance_results": list(receipt.get("acceptance_results") or [])[:5],
             }
@@ -11411,6 +11459,9 @@ class JobManager:
         receipt["attempt"] = len(recorded_prompt_sources)
         receipt["attempt_started_at_epoch"] = round(time.time(), 3)
         receipt["owner_instance_id"] = self._instance_id
+        # Set-once session provenance: record the first OpenCode session ID seen on this job
+        if opencode_session_id and not receipt.get("opencode_session_id"):
+            receipt["opencode_session_id"] = opencode_session_id
         receipt["budget"] = {
             "max_tool_calls": budget_calls,
             "max_total_tokens": budget_tokens,
@@ -11489,6 +11540,7 @@ class JobManager:
                 agy_conversation_id=resumed_agy_conv_id,
                 agy_prior_conversation_usage=prior_agy_conv_usage,
                 agy_prior_conversation_turns=prior_agy_conv_turns,
+                turn_instructions=turn_reminders,
             )
             self._futures[safe_id] = fut
             self._owned_job_ids.add(safe_id)
@@ -11539,6 +11591,11 @@ class JobManager:
             "status": "running",
             "auth_mode": auth_mode,
             "prompts_count": len(recorded_prompts),
+            **(
+                {"opencode_session_id": str(receipt["opencode_session_id"])}
+                if receipt.get("opencode_session_id")
+                else {}
+            ),
         }
 
     def _verify_in_place_unchanged(self, receipt: dict[str, Any]) -> dict[str, str | None]:
@@ -12324,6 +12381,8 @@ class JobManager:
                 slim["stop_reason"] = receipt.get("stop_reason")
             if receipt.get("escalated_from_model"):
                 slim["escalated_from_model"] = receipt.get("escalated_from_model")
+            if receipt.get("opencode_session_id"):
+                slim["opencode_session_id"] = receipt.get("opencode_session_id")
             return slim
 
         digest_usage = dict(receipt.get("usage") or {})
@@ -12388,6 +12447,8 @@ class JobManager:
             digest["preloaded_files"] = list(receipt.get("preloaded_files") or [])
         if receipt.get("escalated_from_model"):
             digest["escalated_from_model"] = receipt.get("escalated_from_model")
+        if receipt.get("opencode_session_id"):
+            digest["opencode_session_id"] = receipt.get("opencode_session_id")
         if not is_running and receipt.get("vacuous_acceptance"):
             digest["vacuous_acceptance"] = True
         if not is_running and receipt.get("test_only_diff"):

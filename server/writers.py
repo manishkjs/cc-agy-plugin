@@ -598,7 +598,9 @@ def make_genai_writer(
         )
     from server.regions import (
         clamp_gemini_thinking_level,
+        clamp_output_tokens_to_headroom,
         estimate_cost_usd,
+        estimate_tokens,
         normalize_wire_model_name,
         resolve_effective_gateway_url,
     )
@@ -625,16 +627,23 @@ def make_genai_writer(
                 if is_zero
                 else gt.ThinkingConfig(thinking_level=clamped_tl or "LOW")
             )
+            sys_and_shared = req.system + ("\n\n" + req.shared_prefix if req.shared_prefix else "")
+            est_delta = estimate_tokens(sys_and_shared + "\n" + req.prompt)
+            clamped_max_out = clamp_output_tokens_to_headroom(
+                eff_model,
+                estimated_delta_tokens=est_delta,
+                requested_max_output_tokens=req.max_output_tokens,
+            )
             cfg: dict[str, Any] = {
                 "response_mime_type": "application/json",
                 "response_schema": ANSWER_SCHEMA,
-                "max_output_tokens": req.max_output_tokens,
+                "max_output_tokens": clamped_max_out,
                 "thinking_config": thinking_cfg,
             }
             if cached_content:
                 cfg["cached_content"] = cached_content
             else:
-                cfg["system_instruction"] = req.system + ("\n\n" + req.shared_prefix if req.shared_prefix else "")
+                cfg["system_instruction"] = sys_and_shared
             try:
                 resp = client.models.generate_content(model=wire_model, contents=req.prompt, config=gt.GenerateContentConfig(**cfg))
             except Exception as exc:  # noqa: BLE001 - classified below by status code / type

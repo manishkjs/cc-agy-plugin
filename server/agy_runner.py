@@ -200,6 +200,94 @@ def build_worker_system_prompt(
     )
 
 
+def render_keyed_turn_instructions(
+    instructions: Mapping[str, str] | None,
+) -> str:
+    """Render dynamic per-turn instructions as a deterministic `<system-reminder>` block for the user message.
+
+    Keeping dynamic instructions in the user turn payload rather than mutating `WORKER_SYSTEM_PROMPT`
+    preserves a byte-identical system prompt prefix across multi-turn conversations for 90% prompt-cache hits.
+    Tag markers and embedded newlines in keys/values are sanitized so callers cannot inject closing tags.
+    """
+    if not instructions:
+        return ""
+    import re as _re_mod
+    import unicodedata as _unicodedata
+
+    lines: list[str] = ["<system-reminder>"]
+    for key in sorted(instructions.keys()):
+        raw_key_clean = "".join(
+            ch for ch in str(key).strip() if _unicodedata.category(ch) != "Cf" and ch != "\u00ad"
+        )
+        clean_key = _re_mod.sub(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029\[\]<>]", "_", raw_key_clean)
+        scrubbed_raw = "".join(
+            ch
+            for ch in str(instructions[key] or "")
+            if _unicodedata.category(ch) != "Cf" and ch != "\u00ad"
+        )
+        raw_val = _re_mod.sub(
+            r"<\s*(/?)\s*system-reminder\s*>",
+            r"[\1system-reminder]",
+            scrubbed_raw,
+            flags=_re_mod.IGNORECASE,
+        )
+        val = _re_mod.sub(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+", " | ", raw_val).strip()
+        if clean_key and val:
+            lines.append(f"[{clean_key}] {val}")
+    if len(lines) == 1:
+        return ""
+    lines.append("</system-reminder>")
+    return "\n".join(lines)
+
+
+_BINARY_EXT_MODALITIES: dict[str, str] = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".bmp": "image",
+    ".ico": "image",
+    ".pdf": "pdf",
+    ".mp3": "audio",
+    ".wav": "audio",
+    ".ogg": "audio",
+    ".mp4": "video",
+    ".mov": "video",
+    ".avi": "video",
+    ".webm": "video",
+}
+
+
+def check_file_input_modality(
+    rel_path: str | Path,
+    model_name: str | None = None,
+    *,
+    env_override: str | None = None,
+) -> str | None:
+    """Return a clean modality guard message when `rel_path` requires an unsupported input modality, else `None`."""
+    p = Path(rel_path)
+    ext_modality = _BINARY_EXT_MODALITIES.get(p.suffix.lower())
+    if ext_modality is None:
+        return None
+    try:
+        from server.rate_card import resolve_model_input_modalities
+
+        eff_env = os.environ.get("CC_AGY_INPUT_MODALITIES") if env_override is None else env_override
+        allowed_mods = resolve_model_input_modalities(
+            model_name or os.environ.get("CC_AGY_MODEL"),
+            env_override=eff_env,
+        )
+    except Exception:
+        allowed_mods = frozenset({"text"})
+    if ext_modality not in allowed_mods:
+        return (
+            f"[Cannot read {ext_modality} file '{p.as_posix()}': active model supports "
+            f"{', '.join(sorted(allowed_mods))} input only; view_file is a text-only line reader]"
+        )
+    return None
+
+
 def is_read_only_tool_set(
     enabled_tools: list[str] | None,
     disabled_tools: list[str] | None,
@@ -600,6 +688,7 @@ def build_straitjacket_tools(
     live_state_path: str | Path | None = None,
     save_dir: str | Path | None = None,
     max_tool_calls: int | None = None,
+    model_name: str | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Build Straitjacket (ctx.sdk.ToolSession) async tools and return (tools, replaced_builtin_names).
 
@@ -1798,6 +1887,14 @@ def build_straitjacket_tools(
             if nm_cand is not None:
                 if not nm_cand.is_file():
                     return json.dumps({"error": f"FileNotFoundError: {nm_rel}", "path": str(path or "")})
+                nm_mod_err = check_file_input_modality(nm_rel, model_name)
+                if nm_mod_err is not None:
+                    return _maybe_append_turn_budget_note(nm_mod_err)
+                nm_ext_mod = _BINARY_EXT_MODALITIES.get(Path(nm_rel).suffix.lower())
+                if nm_ext_mod is not None:
+                    return _maybe_append_turn_budget_note(
+                        f"[Cannot read {nm_ext_mod} file '{nm_rel}': view_file is a text-only line reader]"
+                    )
                 try:
                     raw_lines = nm_cand.read_text(encoding="utf-8", errors="replace").splitlines()
                     total_l = len(raw_lines)
@@ -1814,9 +1911,18 @@ def build_straitjacket_tools(
                 except Exception as exc:
                     return json.dumps({"error": f"{type(exc).__name__}: {exc}", "path": str(path or "")})
             return json.dumps({"error": err, "path": str(path or "")})
+        target_f = ws_resolved / norm_rel
+        if target_f.is_file():
+            mod_err = check_file_input_modality(norm_rel, model_name)
+            if mod_err is not None:
+                return _maybe_append_turn_budget_note(mod_err)
+            ext_mod = _BINARY_EXT_MODALITIES.get(Path(norm_rel).suffix.lower())
+            if ext_mod is not None:
+                return _maybe_append_turn_budget_note(
+                    f"[Cannot read {ext_mod} file '{norm_rel}': view_file is a text-only line reader]"
+                )
         file_sha = ""
         try:
-            target_f = ws_resolved / norm_rel
             if target_f.is_file():
                 file_sha = _hashlib.sha256(target_f.read_bytes()).hexdigest()
         except Exception:
@@ -2033,23 +2139,65 @@ def resolve_worker_sdk_limits(
     *,
     env: dict[str, str] | None = None,
 ) -> tuple[int, int]:
-    """Return `(compaction_threshold_tokens, tool_output_max_tokens)` for `LocalAgentConfig` (`0` disables)."""
+    """Return `(compaction_threshold_tokens, tool_output_max_tokens)` for `LocalAgentConfig` (`0` disables).
+
+    Supports fixed integer token counts (`120000`), percentage thresholds (`'85%'` of the model context
+    window), or percentage/token compaction buffers via `compaction_buffer` / `CC_AGY_COMPACTION_BUFFER`
+    (such as `'15%'`, floored at `16,000` tokens of headroom).
+    """
     req = request or {}
     source_env = os.environ if env is None else env
-    raw_compaction = req.get("compaction_threshold")
-    if raw_compaction is None:
-        raw_compaction = source_env.get("CC_AGY_COMPACTION_THRESHOLD", "120000")
+    model_name = req.get("model") or source_env.get("CC_AGY_MODEL")
+    req_threshold = req.get("compaction_threshold")
+    req_buffer = req.get("compaction_buffer")
+    env_threshold = source_env.get("CC_AGY_COMPACTION_THRESHOLD")
+    env_buffer = source_env.get("CC_AGY_COMPACTION_BUFFER")
+
+    from server.rate_card import DEFAULT_WORKER_COMPACTION_THRESHOLD, compute_compaction_threshold
+
+    compaction_threshold = DEFAULT_WORKER_COMPACTION_THRESHOLD
     try:
-        compaction_threshold = max(0, int(float(str(raw_compaction).strip())))
-    except (TypeError, ValueError):
-        compaction_threshold = 120000
+        if req_threshold is not None and str(req_threshold).strip():
+            compaction_threshold = compute_compaction_threshold(
+                model_name,
+                threshold=req_threshold if isinstance(req_threshold, (int, float)) else str(req_threshold).strip(),
+            )
+        elif req_buffer is not None and str(req_buffer).strip():
+            compaction_threshold = compute_compaction_threshold(
+                model_name,
+                buffer=req_buffer if isinstance(req_buffer, (int, float)) else str(req_buffer).strip(),
+            )
+        elif env_threshold is not None and str(env_threshold).strip():
+            compaction_threshold = compute_compaction_threshold(
+                model_name,
+                threshold=str(env_threshold).strip(),
+            )
+        elif env_buffer is not None and str(env_buffer).strip():
+            compaction_threshold = compute_compaction_threshold(
+                model_name,
+                buffer=str(env_buffer).strip(),
+            )
+    except (TypeError, ValueError, OverflowError) as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Invalid worker compaction configuration (%s); falling back to %d tokens.",
+            exc,
+            DEFAULT_WORKER_COMPACTION_THRESHOLD,
+        )
+        compaction_threshold = DEFAULT_WORKER_COMPACTION_THRESHOLD
 
     raw_tool_max = req.get("tool_output_max_tokens")
     if raw_tool_max is None:
         raw_tool_max = source_env.get("CC_AGY_TOOL_OUTPUT_MAX_TOKENS", "4000")
     try:
-        tool_max_tokens = max(0, int(float(str(raw_tool_max).strip())))
-    except (TypeError, ValueError):
+        import math as _math
+
+        flt_tm = float(str(raw_tool_max).strip())
+        if not _math.isfinite(flt_tm):
+            raise ValueError("non-finite tool_output_max_tokens")
+        tool_max_tokens = max(0, int(flt_tm))
+    except (TypeError, ValueError, OverflowError):
         tool_max_tokens = 4000
 
     return compaction_threshold, tool_max_tokens
@@ -2300,6 +2448,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 live_state_path=live_state_file,
                 save_dir=save_dir,
                 max_tool_calls=int(request["max_tool_calls"]) if request.get("max_tool_calls") else None,
+                model_name=resolved_model,
             )
             for sj_fn in sj_tools:
                 if getattr(sj_fn, "__name__", "") == "run_command" and isinstance(getattr(sj_fn, "command_runs", None), list):
@@ -2427,11 +2576,23 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     try:
         agent_ref = await agent.__aenter__()
         entered = True
-        for idx, prompt_turn in enumerate(request["prompts"]):
+        turn_instr_map = request.get("turn_instructions")
+        turn_reminder_block = (
+            render_keyed_turn_instructions(turn_instr_map)
+            if isinstance(turn_instr_map, Mapping) and turn_instr_map
+            else ""
+        )
+        prompts_list = list(request["prompts"])
+        for idx, prompt_turn in enumerate(prompts_list):
+            eff_prompt_turn = (
+                f"{prompt_turn}\n\n{turn_reminder_block}"
+                if (turn_reminder_block and idx == len(prompts_list) - 1 and turn_reminder_block not in prompt_turn)
+                else prompt_turn
+            )
             if idx == 0 or not hasattr(agent_ref, "continue_session"):
-                resp = await maybe_await(agent_ref.chat(prompt_turn))
+                resp = await maybe_await(agent_ref.chat(eff_prompt_turn))
             else:
-                resp = await maybe_await(agent_ref.continue_session(prompt_turn))
+                resp = await maybe_await(agent_ref.continue_session(eff_prompt_turn))
             await asyncio.wait_for(
                 maybe_await(resp.resolve()),
                 timeout=timeout_sec,
@@ -3103,6 +3264,7 @@ def run_antigravity_worker(
     host_workspace_root: str | Path | None = None,
     nm_linked: bool = False,
     isolated_worktree: bool = False,
+    turn_instructions: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend."""
     resolved_auth = resolve_auth_config(
@@ -3169,6 +3331,11 @@ def run_antigravity_worker(
         **(
             {"agy_prior_conversation_turns": int(agy_prior_conversation_turns)}
             if agy_prior_conversation_turns is not None
+            else {}
+        ),
+        **(
+            {"turn_instructions": dict(turn_instructions)}
+            if isinstance(turn_instructions, Mapping) and turn_instructions
             else {}
         ),
     }

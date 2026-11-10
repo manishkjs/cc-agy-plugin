@@ -10,8 +10,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 import json
+import logging
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 RATE_CARD_PATH: Path = Path(__file__).resolve().with_name("rate_card.json")
@@ -122,6 +124,41 @@ def validate_rate_card(card: Mapping[str, Any]) -> list[str]:
             for pfx, lvls in prefixes.items():
                 if not isinstance(lvls, list) or not lvls or not all(lvl in _LEVEL_RANK for lvl in lvls):
                     errors.append(f"gemini_thinking_levels.prefixes[{pfx!r}] must be a non-empty list of valid thinking levels")
+
+    limits_cfg = card.get("model_limits")
+    if limits_cfg is not None:
+        if not isinstance(limits_cfg, Mapping):
+            errors.append("model_limits must be an object")
+        else:
+            def _check_limit_obj(obj: Any, label: str, *, require_all: bool = True) -> None:
+                if not isinstance(obj, Mapping):
+                    errors.append(f"{label} must be an object")
+                    return
+                if not require_all and not obj:
+                    errors.append(f"{label} must not be empty")
+                    return
+                for int_key in ("context_window", "max_output_tokens"):
+                    if not require_all and int_key not in obj:
+                        continue
+                    val = obj.get(int_key)
+                    if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                        errors.append(f"{label}.{int_key} must be a positive integer")
+                mods = obj.get("input_modalities")
+                if mods is not None and (
+                    not isinstance(mods, list)
+                    or not mods
+                    or not all(isinstance(m, str) and m.strip() for m in mods)
+                ):
+                    errors.append(f"{label}.input_modalities must be a non-empty list of strings")
+
+            _check_limit_obj(limits_cfg.get("default"), "model_limits.default", require_all=True)
+            pfx_limits = limits_cfg.get("prefixes")
+            if pfx_limits is not None:
+                if not isinstance(pfx_limits, Mapping):
+                    errors.append("model_limits.prefixes must be an object")
+                else:
+                    for pfx, l_obj in pfx_limits.items():
+                        _check_limit_obj(l_obj, f"model_limits.prefixes[{pfx!r}]", require_all=False)
 
     return errors
 
@@ -279,6 +316,198 @@ def clamp_gemini_thinking_level(
     if higher_or_equal:
         return min(higher_or_equal, key=lambda lvl: _LEVEL_RANK[lvl])
     return max(allowed, key=lambda lvl: _LEVEL_RANK[lvl])
+
+
+def resolve_model_token_limits(
+    model: str | None,
+    *,
+    card: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return `{"context_window": int, "max_output_tokens": int, "input_modalities": tuple[str, ...]}` for `model`."""
+    active_card = card if card is not None else _RATE_CARD
+    limits_cfg = active_card.get("model_limits") or {}
+    default_cfg = limits_cfg.get("default") or {}
+    prefixes = limits_cfg.get("prefixes") or {}
+    norm = _normalize_model_lookup(model)
+
+    matched: Mapping[str, Any] = default_cfg
+    if norm and isinstance(prefixes, Mapping):
+        for prefix, entry in sorted(prefixes.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if norm.startswith(prefix.lower()) and isinstance(entry, Mapping):
+                matched = entry
+                break
+
+    ctx_win = int(matched.get("context_window") or default_cfg.get("context_window") or 1_048_576)
+    max_out = int(matched.get("max_output_tokens") or default_cfg.get("max_output_tokens") or 65_536)
+    raw_mods = matched.get("input_modalities") or default_cfg.get("input_modalities") or ("text", "image", "pdf")
+    modalities = tuple(str(m).strip().lower() for m in raw_mods if str(m).strip()) or ("text",)
+    return {
+        "context_window": max(4_096, ctx_win),
+        "max_output_tokens": max(1_024, max_out),
+        "input_modalities": modalities,
+    }
+
+
+def resolve_model_input_modalities(
+    model: str | None,
+    *,
+    env_override: str | None = None,
+    card: Mapping[str, Any] | None = None,
+) -> frozenset[str]:
+    """Return allowed input modalities (`text`, `image`, `pdf`, `audio`, `video`) for `model`."""
+    if env_override is not None and str(env_override).strip():
+        parts = [
+            tok.strip().lower()
+            for tok in str(env_override).replace(";", ",").split(",")
+            if tok.strip()
+        ]
+        if parts:
+            return frozenset(parts)
+    limits = resolve_model_token_limits(model, card=card)
+    return frozenset(limits["input_modalities"])
+
+
+def compute_compaction_threshold(
+    model: str | None = None,
+    *,
+    buffer: str | float | int | None = "15%",
+    threshold: str | float | int | None = None,
+    min_buffer_tokens: int = 16_000,
+    context_window: int | None = None,
+    card: Mapping[str, Any] | None = None,
+) -> int:
+    """Compute a model-window-aware compaction threshold (`window - max(buffer_tokens, min_buffer_tokens)`).
+
+    `buffer` specifies the reserved headroom buffer below `context_window`:
+    - a percentage string in `(0%, 100%)` such as `'15%'` (default, reserving 15% of the window),
+    - a ratio float or string in `(0.0, 1.0)` such as `0.15` or `'0.15'`, or
+    - an integer token count `>= 2` (`120000`, `120000.0`, `'120000'`, `'120000.0'`) strictly smaller than `context_window`.
+
+    When `threshold` is passed instead, it specifies the compaction trigger point directly (`0`, `0.0`, `'0'`,
+    or `'0.0'` disables compaction; `'85%'`, `0.85`, or `'0.85'` triggers at 85% of the window; or an integer
+    token count `>= 2` such as `150000` or `150000.0`). Ambiguous `1` / `1.0` / `'1.0'`, non-integral values
+    `> 1.0` (`1.5`, `'1.5'`), scientific-notation / underscore strings (`'1e5'`, `'1_000'`), and non-ASCII digits
+    raise `ValueError` (in `resolve_worker_sdk_limits`, invalid values log a warning and fall back to
+    `DEFAULT_WORKER_COMPACTION_THRESHOLD = 120_000`).
+    """
+    window = (
+        int(context_window)
+        if (context_window is not None and int(context_window) > 0)
+        else int(resolve_model_token_limits(model, card=card)["context_window"])
+    )
+    floor_buf = min(max(1_024, int(min_buffer_tokens)), max(1, window // 2))
+    min_thresh = min(4_096, max(1, window - floor_buf))
+
+    if threshold is not None:
+        t_mode, t_val = _parse_compaction_spec(threshold, kind="threshold")
+        if t_mode == "off":
+            return 0
+        if t_mode == "ratio":
+            return max(min_thresh, min(int(round(window * float(t_val))), window - floor_buf))
+        return min(int(t_val), max(1, window - 1))
+
+    if buffer is None:
+        buf_tokens = max(int(round(window * 0.15)), floor_buf)
+        return max(min_thresh, window - buf_tokens)
+    b_mode, b_val = _parse_compaction_spec(buffer, kind="buffer")
+    if b_mode == "ratio":
+        buf_tokens = max(int(round(window * float(b_val))), floor_buf)
+        return max(min_thresh, window - buf_tokens)
+    int_buf = int(b_val)
+    if int_buf <= 0 or int_buf >= window:
+        raise ValueError(
+            f"Compaction token buffer must be in (0, {window}): {buffer!r}"
+        )
+    return max(min_thresh, window - max(int_buf, floor_buf))
+
+
+DEFAULT_WORKER_COMPACTION_THRESHOLD: int = 120_000
+_COMPACTION_ASCII_NUM_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$", re.ASCII)
+
+
+def _parse_compaction_spec(raw: Any, *, kind: str) -> tuple[str, float | int]:
+    """Parse a compaction `threshold` or `buffer` value with identical semantics across `str`, `float`, and `int`."""
+    if isinstance(raw, bool):
+        raise ValueError(f"Compaction {kind} must not be a boolean: {raw!r}")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            raise ValueError(f"Compaction {kind} must not be empty")
+        if s.endswith("%"):
+            pct_body = s[:-1].strip()
+            if not _COMPACTION_ASCII_NUM_RE.match(pct_body):
+                raise ValueError(f"Compaction percentage {kind} must be an ASCII decimal number: {raw!r}")
+            pct = float(pct_body) / 100.0
+            if not math.isfinite(pct) or not (0.0 < pct < 1.0):
+                raise ValueError(f"Compaction percentage {kind} must be in (0%, 100%): {raw!r}")
+            return ("ratio", pct)
+        if not _COMPACTION_ASCII_NUM_RE.match(s):
+            raise ValueError(f"Compaction {kind} string must be an ASCII decimal number or percentage: {raw!r}")
+        flt = float(s)
+    elif isinstance(raw, (int, float)):
+        flt = float(raw)
+    else:
+        raise TypeError(f"Unsupported compaction {kind} type {type(raw).__name__}: {raw!r}")
+
+    if not math.isfinite(flt) or flt < 0.0:
+        raise ValueError(f"Compaction {kind} must be finite and non-negative: {raw!r}")
+    if flt == 0.0:
+        if kind == "threshold":
+            return ("off", 0)
+        raise ValueError(f"Compaction token buffer must be > 0: {raw!r}")
+    if 0.0 < flt < 1.0:
+        return ("ratio", flt)
+    if flt == 1.0 or not flt.is_integer():
+        raise ValueError(
+            f"Compaction float {kind} ratio must be in (0.0, 1.0) or an integer token count >= 2: {raw!r}"
+        )
+    return ("tokens", int(flt))
+
+
+def clamp_output_tokens_to_headroom(
+    model: str | None = None,
+    *,
+    measured_input_tokens: int = 0,
+    estimated_delta_tokens: int = 0,
+    requested_max_output_tokens: int | None = None,
+    context_window: int | None = None,
+    card: Mapping[str, Any] | None = None,
+) -> int:
+    """Clamp `max_output_tokens` to remaining context-window headroom with a `1.15x` delta safety factor.
+
+    Implements OpenCode 2.2.6's dynamic output token clamping (`headroom = window - measured - ceil(delta * 1.15)`,
+    capped at `min(requested_or_model_max, model_max_out, 256_000, window)` and floored at `1` token) so
+    near-full context windows never exceed the model's declared output limit or remaining window capacity.
+    """
+    limits = resolve_model_token_limits(model, card=card)
+    window = (
+        int(context_window)
+        if (context_window is not None and int(context_window) > 0)
+        else int(limits["context_window"])
+    )
+    model_max_out = int(limits["max_output_tokens"])
+    base_out = (
+        int(requested_max_output_tokens)
+        if (requested_max_output_tokens is not None and int(requested_max_output_tokens) > 0)
+        else model_max_out
+    )
+    capped_base = min(max(1, base_out), model_max_out, 256_000, max(1, window))
+    used_in = max(0, int(measured_input_tokens))
+    est_delta = max(0, int(estimated_delta_tokens))
+    if used_in == 0 and est_delta == 0:
+        return capped_base
+    headroom = window - used_in - math.ceil(est_delta * 1.15)
+    if headroom <= 0:
+        logging.getLogger(__name__).warning(
+            "Context window headroom exhausted for model %s (window=%d, used_in=%d, est_delta=%d); "
+            "clamping max_output_tokens to 1.",
+            model or "default",
+            window,
+            used_in,
+            est_delta,
+        )
+        return 1
+    return max(1, min(capped_base, headroom))
 
 
 _RATE_CARD: dict[str, Any] = load_rate_card()

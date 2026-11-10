@@ -57,12 +57,12 @@ VALID_CURSOR_HOOK_EVENTS: frozenset[str] = frozenset(
 )
 
 VALID_OPENCODE_SKILL_KEYS: frozenset[str] = frozenset(
-    {"name", "description", "license", "compatibility", "metadata"}
+    {"name", "description", "license", "compatibility", "metadata", "disable-model-invocation"}
 )
 _OPENCODE_MAX_SAFE_INT = 9_007_199_254_740_991
 
 VALID_OPENCODE_COMMAND_KEYS: frozenset[str] = frozenset(
-    {"description", "agent", "model", "variant", "subtask"}
+    {"description", "agent", "model", "variant", "subtask", "subagent"}
 )
 
 VALID_OPENCODE_AGENT_KEYS: frozenset[str] = frozenset(
@@ -157,22 +157,27 @@ def _unquote_yaml_scalar(value: str) -> str:
     return value
 
 
-def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Extract simple YAML key: value frontmatter and return (metadata, body)."""
+def _extract_frontmatter_lines(text: str) -> tuple[list[str], int, list[str]] | None:
+    """Return `(all_lines, end_idx, frontmatter_body_lines)` when valid YAML `---` frontmatter is present."""
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        return {}, text
-    end_idx: int | None = None
+        return None
     for idx in range(1, len(lines)):
         if lines[idx].strip() == "---":
-            end_idx = idx
-            break
-    if end_idx is None:
+            return lines, idx, lines[1:idx]
+    return None
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Extract simple YAML key: value frontmatter and return (metadata, body)."""
+    extracted = _extract_frontmatter_lines(text)
+    if extracted is None:
         return {}, text
+    lines, end_idx, fm_lines = extracted
 
     meta: dict[str, str] = {}
     current_key: str | None = None
-    for raw in lines[1:end_idx]:
+    for raw in fm_lines:
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -192,30 +197,249 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return meta, body
 
 
-def _opencode_agent_effective_edit_permission(text: str) -> str | None:
-    """Evaluate sequential OpenCode `permission:` rules at the tool-map indent (last matching rule wins).
+def _parse_yaml_flow_rule_map(flow_str: str) -> dict[str, str] | None:
+    """Parse a flat YAML flow mapping `{action: edit, resource: '*', effect: deny}`; return `None` if nested/invalid."""
+    inner = flow_str.strip()
+    if not (inner.startswith("{") and inner.endswith("}")):
+        return None
+    body = inner[1:-1].strip()
+    if not body or any(ch in body for ch in ("{", "}", "[", "]")):
+        return None
+    rule: dict[str, str] = {}
+    for part in body.split(","):
+        seg = part.strip()
+        if not seg:
+            continue
+        if ":" not in seg:
+            return None
+        rk, rv = seg.split(":", 1)
+        clean_k = _unquote_yaml_scalar(rk.strip())
+        clean_v = _unquote_yaml_scalar(_strip_yaml_inline_comment(rv.strip()))
+        if not clean_k or not clean_v:
+            return None
+        rule[clean_k] = clean_v
+    return rule if rule else None
 
-    Direct children under `permission:` (`*`, `edit`, `bash`, ...) are evaluated in order, as well
-    as inline flow maps (`permission: {edit: deny}`). Nested pattern maps under non-`edit` tools
-    (such as `bash:\\n  "*": allow`) do not affect `edit`, while nested pattern maps under `edit:` or `*:`
-    must leave `edit` denied across all file patterns.
+
+def _parse_yaml_flow_rule_list(flow_list_str: str) -> list[dict[str, str]] | None:
+    """Parse an inline YAML flow list `[{...}, {...}]` of flat rule mappings; return `None` if invalid."""
+    outer = _strip_yaml_inline_comment(flow_list_str.strip())
+    if not (outer.startswith("[") and outer.endswith("]")):
+        return None
+    inner = outer[1:-1].strip()
+    if not inner:
+        return None
+    rules: list[dict[str, str]] = []
+    depth = 0
+    start: int | None = None
+    for idx, ch in enumerate(inner):
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return None
+            if depth == 0 and start is not None:
+                parsed = _parse_yaml_flow_rule_map(inner[start : idx + 1])
+                if parsed is None:
+                    return None
+                rules.append(parsed)
+                start = None
+        elif depth == 0 and ch not in (" ", "\t", ","):
+            return None
+    if depth != 0 or not rules:
+        return None
+    return rules
+
+
+def _has_opencode_v2_permissions_list(text: str) -> bool:
+    """Return True when frontmatter defines OpenCode V2 `permissions:` as a list of `{action, resource, effect}` rules."""
+    extracted = _extract_frontmatter_lines(text)
+    if extracted is None:
+        return False
+    _, _, fm_lines = extracted
+    in_permissions = False
+    for raw in fm_lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        expanded = raw.expandtabs(2)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if indent == 0:
+            if in_permissions and (stripped == "-" or stripped.startswith("- ")):
+                return True
+            if ":" in raw and raw.split(":", 1)[0].strip() == "permissions":
+                rhs = _strip_yaml_inline_comment(raw.split(":", 1)[1].strip())
+                if rhs.startswith("[") and rhs.endswith("]"):
+                    return True
+                in_permissions = rhs == ""
+            else:
+                in_permissions = False
+            continue
+        if in_permissions:
+            return stripped == "-" or stripped.startswith("- ")
+    return False
+
+
+def _is_global_permission_resource(resource: str) -> bool:
+    """Return True when `resource` covers all files (`*`, `**`, `**/*`, `/*`)."""
+    return resource.strip() in ("*", "**", "**/*", "/*")
+
+
+def _opencode_wildcard_matches(pattern: str, target: str) -> bool:
+    """Match whole-value OpenCode wildcard pattern (`*` any chars, `?` single char) against `target`."""
+    pat = pattern.strip()
+    if not pat:
+        return False
+    regex_parts: list[str] = ["^"]
+    for ch in pat:
+        if ch == "*":
+            regex_parts.append(".*")
+        elif ch == "?":
+            regex_parts.append(".")
+        else:
+            regex_parts.append(re.escape(ch))
+    regex_parts.append("$")
+    return bool(re.match("".join(regex_parts), target, flags=re.DOTALL))
+
+
+def _action_covers_edit(action: str) -> bool:
+    """Return True when whole-value wildcard `action` matches `'edit'` (`edit`, `*`, `e*`, `*dit`, `ed?t`)."""
+    return _opencode_wildcard_matches(action, "edit")
+
+
+def _action_touches_edit(action: str) -> bool:
+    """Return True when `action` matches `'edit'` or starts with `'edit'` (conservative fail-closed prefix check)."""
+    act = action.strip()
+    return _action_covers_edit(act) or act.startswith("edit")
+
+
+def _opencode_v2_permissions_list_edit_effect(text: str) -> str | None:
+    """Evaluate OpenCode V2 `permissions:` list rules (`{action, resource, effect}`) sequentially for `edit`.
+
+    Fails closed (`None`) when any rule is malformed, uses nested block lists/maps, or omits `action`/`effect`.
+    Processes rules in order ("last matching rule wins"): a trailing wildcard `deny` overrides earlier `allow`
+    rules, while any unoverridden narrow `allow`/`ask` causes effective `edit` permission to evaluate to `allow`.
     """
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    extracted = _extract_frontmatter_lines(text)
+    if extracted is None:
         return None
-    end_idx: int | None = None
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == "---":
-            end_idx = idx
-            break
-    if end_idx is None:
+    _, _, fm_lines = extracted
+    in_permissions = False
+    rules: list[dict[str, str]] = []
+    cur_rule: dict[str, str] | None = None
+    rule_dash_indent: int | None = None
+
+    for raw in fm_lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        expanded = raw.expandtabs(2)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if indent == 0 and not (in_permissions and (stripped == "-" or stripped.startswith("- "))):
+            if cur_rule is not None:
+                rules.append(cur_rule)
+                cur_rule = None
+                rule_dash_indent = None
+            if ":" in raw and raw.split(":", 1)[0].strip() == "permissions":
+                rhs = _strip_yaml_inline_comment(raw.split(":", 1)[1].strip())
+                if rhs.startswith("["):
+                    flow_rules = _parse_yaml_flow_rule_list(rhs)
+                    if flow_rules is None:
+                        return None
+                    rules.extend(flow_rules)
+                    in_permissions = False
+                elif rhs == "":
+                    in_permissions = True
+                else:
+                    return None
+            else:
+                in_permissions = False
+            continue
+        if not in_permissions:
+            continue
+        if stripped == "-" or stripped.startswith("- "):
+            if rule_dash_indent is not None and indent > rule_dash_indent:
+                return None
+            if cur_rule is not None:
+                rules.append(cur_rule)
+            rule_dash_indent = indent
+            rem = _strip_yaml_inline_comment(stripped[1:].strip())
+            if not rem:
+                cur_rule = {}
+                continue
+            if rem.startswith("{"):
+                flow_map = _parse_yaml_flow_rule_map(rem)
+                if flow_map is None:
+                    return None
+                rules.append(flow_map)
+                cur_rule = None
+                continue
+            if ":" not in rem:
+                return None
+            rk, rv = rem.split(":", 1)
+            clean_k = _unquote_yaml_scalar(rk.strip())
+            clean_v = _unquote_yaml_scalar(_strip_yaml_inline_comment(rv.strip()))
+            if not clean_k or not clean_v or any(ch in clean_v for ch in ("{", "}", "[", "]")):
+                return None
+            cur_rule = {clean_k: clean_v}
+        elif cur_rule is not None:
+            if ":" not in stripped:
+                return None
+            rk, rv = stripped.split(":", 1)
+            clean_k = _unquote_yaml_scalar(rk.strip())
+            clean_v = _unquote_yaml_scalar(_strip_yaml_inline_comment(rv.strip()))
+            if not clean_k or not clean_v or any(ch in clean_v for ch in ("{", "}", "[", "]")):
+                return None
+            cur_rule[clean_k] = clean_v
+        else:
+            return None
+
+    if cur_rule is not None:
+        rules.append(cur_rule)
+    if not rules:
         return None
+
+    global_edit_effect: str | None = None
+    narrow_non_deny_active = False
+    for rule in rules:
+        action = rule.get("action", "").strip()
+        resource = rule.get("resource", "*").strip()
+        effect = rule.get("effect", "").strip()
+        if not action or not resource or effect not in ("allow", "deny", "ask"):
+            return None
+        if not _action_touches_edit(action):
+            continue
+        if effect == "deny":
+            if _is_global_permission_resource(resource) and _action_covers_edit(action):
+                global_edit_effect = "deny"
+                narrow_non_deny_active = False
+        else:
+            if _is_global_permission_resource(resource) and _action_covers_edit(action):
+                global_edit_effect = effect
+                narrow_non_deny_active = False
+            else:
+                narrow_non_deny_active = True
+
+    if narrow_non_deny_active:
+        return "allow"
+    return global_edit_effect
+
+
+def _opencode_v1_permission_map_edit_effect(text: str) -> str | None:
+    """Evaluate sequential OpenCode V1 `permission:` map for `edit`."""
+    extracted = _extract_frontmatter_lines(text)
+    if extracted is None:
+        return None
+    _, _, fm_lines = extracted
 
     in_permission = False
     child_indent: int | None = None
     current_tool: str | None = None
     effective: str | None = None
-    for raw in lines[1:end_idx]:
+    for raw in fm_lines:
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -272,6 +496,41 @@ def _opencode_agent_effective_edit_permission(text: str) -> str | None:
                 elif rule_key == "*":
                     effective = "deny"
     return effective
+
+
+def _opencode_agent_effective_edit_permission(text: str) -> str | None:
+    """Evaluate sequential OpenCode `permission:` (V1 map) or `permissions:` (V2 rule list) for `edit`.
+
+    Direct children under `permission:` (`*`, `edit`, `bash`, ...) are evaluated in order, as well
+    as inline flow maps (`permission: {edit: deny}`) and V2 `{action, resource, effect}` rule lists.
+    If both `permission:` and `permissions:` are present in the same frontmatter, both must evaluate
+    to `'deny'` (fail closed on conflict).
+    """
+    extracted = _extract_frontmatter_lines(text)
+    if extracted is None:
+        return None
+    _, _, fm_lines = extracted
+    has_v1_key = any(
+        len(raw.expandtabs(2)) - len(raw.expandtabs(2).lstrip(" ")) == 0
+        and ":" in raw
+        and raw.split(":", 1)[0].strip() == "permission"
+        for raw in fm_lines
+        if raw.strip() and not raw.strip().startswith("#")
+    )
+    has_v2_key = any(
+        len(raw.expandtabs(2)) - len(raw.expandtabs(2).lstrip(" ")) == 0
+        and ":" in raw
+        and raw.split(":", 1)[0].strip() == "permissions"
+        for raw in fm_lines
+        if raw.strip() and not raw.strip().startswith("#")
+    )
+    if has_v1_key and has_v2_key:
+        v1_eff = _opencode_v1_permission_map_edit_effect(text)
+        v2_eff = _opencode_v2_permissions_list_edit_effect(text)
+        return "deny" if (v1_eff == "deny" and v2_eff == "deny") else None
+    if has_v2_key or _has_opencode_v2_permissions_list(text):
+        return _opencode_v2_permissions_list_edit_effect(text)
+    return _opencode_v1_permission_map_edit_effect(text)
 
 
 def check_always_on_budget(texts: Sequence[str], max_tokens: int = 1200) -> list[str]:
@@ -616,7 +875,7 @@ def validate_cursor_plugin(plugin_root: Path) -> list[str]:
 
 
 def validate_opencode_bundle(plugin_root: Path) -> list[str]:
-    """Validate `.opencode/` skill, commands, and subagent against OpenCode v1.x schemas."""
+    """Validate `.opencode/` skill, commands, and subagent against OpenCode v1.x and v2.x schemas."""
     root = Path(plugin_root).resolve()
     bundle_dir = root / ".opencode"
     if not bundle_dir.is_dir():
@@ -638,6 +897,13 @@ def validate_opencode_bundle(plugin_root: Path) -> list[str]:
                 f"{skill_md}: unsupported OpenCode skill frontmatter key(s) {unknown_skill_keys} "
                 f"(allowed: {sorted(VALID_OPENCODE_SKILL_KEYS)})"
             )
+        if "disable-model-invocation" in meta:
+            dmi_val = (meta.get("disable-model-invocation") or "").strip().lower()
+            if dmi_val not in ("true", "false"):
+                errors.append(
+                    f"{skill_md}: 'disable-model-invocation' must be a boolean ('true' or 'false'), "
+                    f"got {meta.get('disable-model-invocation')!r}"
+                )
         name = (meta.get("name") or "").strip()
         desc = (meta.get("description") or "").strip()
         if not name:
@@ -680,6 +946,14 @@ def validate_opencode_bundle(plugin_root: Path) -> list[str]:
                     f"{cmd_md}: unsupported OpenCode command frontmatter key(s) {unknown_keys} "
                     f"(allowed: {sorted(VALID_OPENCODE_COMMAND_KEYS)})"
                 )
+            for bool_cmd_key in ("subtask", "subagent"):
+                if bool_cmd_key in meta:
+                    bool_val = (meta.get(bool_cmd_key) or "").strip().lower()
+                    if bool_val not in ("true", "false"):
+                        errors.append(
+                            f"{cmd_md}: OpenCode command '{bool_cmd_key}' must be a boolean ('true' or 'false'), "
+                            f"got {meta.get(bool_cmd_key)!r}"
+                        )
             if "on the `vertex` MCP server" in body:
                 errors.append(
                     f"{cmd_md}: references Claude Code's 'vertex' MCP server instead of OpenCode's 'agy' server"
@@ -698,10 +972,16 @@ def validate_opencode_bundle(plugin_root: Path) -> list[str]:
         if (meta.get("mode") or "").strip() != "subagent":
             errors.append(f"{agent_path}: expected mode 'subagent', got {meta.get('mode')!r}")
         if "permissions" in meta:
-            errors.append(
-                f"{agent_path}: uses plural 'permissions'; OpenCode v1 agent schema requires singular 'permission'"
-            )
-        unknown_agent_keys = sorted(set(meta.keys()) - VALID_OPENCODE_AGENT_KEYS)
+            if not _has_opencode_v2_permissions_list(agent_content):
+                errors.append(
+                    f"{agent_path}: uses plural 'permissions'; OpenCode v1 agent schema requires singular 'permission'"
+                )
+        allowed_agent_keys = (
+            VALID_OPENCODE_AGENT_KEYS | {"permissions"}
+            if _has_opencode_v2_permissions_list(agent_content)
+            else VALID_OPENCODE_AGENT_KEYS
+        )
+        unknown_agent_keys = sorted(set(meta.keys()) - allowed_agent_keys)
         if unknown_agent_keys:
             errors.append(
                 f"{agent_path}: unsupported OpenCode agent frontmatter key(s) {unknown_agent_keys}"
@@ -709,7 +989,7 @@ def validate_opencode_bundle(plugin_root: Path) -> list[str]:
         if _opencode_agent_effective_edit_permission(agent_content) != "deny":
             errors.append(
                 f"{agent_path}: OpenCode subagent effective 'permission.edit' must evaluate to 'deny' "
-                "(ensure no trailing '\"*\": allow' overrides 'edit: deny')"
+                "(including V2 'permissions' rules; ensure no trailing '\"*\": allow', glob override, or conflicting V1/V2 permission keys)"
             )
         errors.extend(check_always_on_budget([WORKER_SYSTEM_PROMPT, agent_content], max_tokens=1200))
 

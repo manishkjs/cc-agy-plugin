@@ -65,7 +65,8 @@ Run one of the commands below in a normal terminal shell (or run `python3 -m ser
 python3 -m server.install --host claude --auth gemini-enterprise
 # Or install directly into Cursor (~/.cursor/mcp.json + ~/.cursor/skills/):
 python3 -m server.install --host cursor --auth gemini-enterprise
-# Or install directly into OpenCode (~/.config/opencode/opencode.json + skill, /commands, and @gemini-delegator):
+# Or install directly into OpenCode (~/.config/opencode/opencode.json + skill, /commands, and @gemini-delegator;
+# add --opencode-v2 for OpenCode 2.2.6+ mcp.servers.agy envelope, --[no-]opencode-codemode, --opencode-protocol auto, or --[no-]opencode-pool):
 python3 -m server.install --host opencode --auth gemini-enterprise
 # Or install directly into Antigravity CLI / IDE (~/.gemini/config/):
 python3 -m server.install --host agy --auth gemini-enterprise

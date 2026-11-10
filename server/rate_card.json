@@ -263,5 +263,29 @@
       "gemini-4-carbon": ["LOW", "MEDIUM", "HIGH"],
       "carbon": ["LOW", "MEDIUM", "HIGH"]
     }
+  },
+  "model_limits": {
+    "default": {
+      "context_window": 200000,
+      "max_output_tokens": 32768,
+      "input_modalities": ["text", "image", "pdf"]
+    },
+    "prefixes": {
+      "gemini-": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536,
+        "input_modalities": ["text", "image", "pdf", "audio", "video"]
+      },
+      "argon": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536,
+        "input_modalities": ["text", "image", "pdf", "audio", "video"]
+      },
+      "carbon": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536,
+        "input_modalities": ["text", "image", "pdf", "audio", "video"]
+      }
+    }
   }
 }
