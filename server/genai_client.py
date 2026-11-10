@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping
+import urllib.parse
 
 from server.regions import (
     resolve_effective_gateway_url,
@@ -17,6 +18,32 @@ USAGE_TOKEN_KEYS: tuple[str, ...] = (
     "thoughts_token_count",
     "total_token_count",
 )
+_GATEWAY_URL_API_VERSIONS: frozenset[str] = frozenset({"v1", "v1alpha", "v1beta", "v1beta1"})
+
+
+def _split_gateway_base_and_api_version(
+    base_url: str,
+    *,
+    default_api_version: str,
+) -> tuple[str, str]:
+    """Strip an explicit trailing `/v1`, `/v1alpha`, `/v1beta`, or `/v1beta1` segment into `api_version`.
+
+    `google-genai` 3.0+ changed its `vertexai=False` default `api_version` from `'v1beta'` to `'v1'`, and
+    always appends `/{api_version}/...` onto `HttpOptions.base_url`. Returning `(clean_base_url, api_version)`
+    keeps Gemini-wire calls on `'v1beta'` by default while honoring case-insensitive `/v1`, `/v1alpha`,
+    `/v1beta`, or `/v1beta1` gateway path suffixes without doubling the version segment (leaving `/v1internal` untouched).
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    if segments and segments[-1].lower() in _GATEWAY_URL_API_VERSIONS:
+        api_ver = segments[-1].lower()
+        prefix_segs = segments[:-1]
+        new_path = ("/" + "/".join(prefix_segs)) if prefix_segs else ""
+        clean_base = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, new_path, parsed.query, parsed.fragment)
+        )
+        return clean_base, api_ver
+    return base_url, default_api_version
 
 
 def build_genai_client(
@@ -32,7 +59,10 @@ def build_genai_client(
 
     base_url = resolve_effective_gateway_url(auth)
     if not base_url and auth.get("api_key"):
-        direct_opts: dict[str, Any] = {"base_url": "https://generativelanguage.googleapis.com/"}
+        direct_opts: dict[str, Any] = {
+            "base_url": "https://generativelanguage.googleapis.com/",
+            "api_version": "v1beta",
+        }
         if timeout_ms:
             direct_opts["timeout"] = timeout_ms
         return genai.Client(
@@ -49,11 +79,20 @@ def build_genai_client(
             wire=gw_wire,
             zero_thinking=zero_thinking,
         )
+        default_ver = "v1beta" if gw_wire == "gemini" else "v1beta1"
+        clean_base_url, api_ver = _split_gateway_base_and_api_version(
+            base_url,
+            default_api_version=default_ver,
+        )
         opt_kwargs: dict[str, Any] = {
-            "base_url": base_url,
+            "base_url": clean_base_url,
+            "api_version": api_ver,
             "headers": headers,
         }
-        is_custom_gateway = base_url.startswith("http://") or "googleapis.com" not in base_url
+        host_low = (urllib.parse.urlsplit(clean_base_url).hostname or "").lower()
+        is_custom_gateway = clean_base_url.startswith("http://") or not (
+            host_low == "googleapis.com" or host_low.endswith(".googleapis.com")
+        )
         if is_custom_gateway:
             opt_kwargs["client_args"] = {"follow_redirects": False}
         if timeout_ms:

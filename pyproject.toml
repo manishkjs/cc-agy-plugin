@@ -27,6 +27,7 @@ straitjacket = [
 ]
 dev = [
     "pytest>=8.0.0",
+    "jsonschema>=4.20.0",
 ]
 
 [tool.setuptools.packages.find]

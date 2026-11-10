@@ -215,7 +215,7 @@ def _parse_yaml_flow_rule_map(flow_str: str) -> dict[str, str] | None:
         rk, rv = seg.split(":", 1)
         clean_k = _unquote_yaml_scalar(rk.strip())
         clean_v = _unquote_yaml_scalar(_strip_yaml_inline_comment(rv.strip()))
-        if not clean_k or not clean_v:
+        if not clean_k or not clean_v or clean_k in rule:
             return None
         rule[clean_k] = clean_v
     return rule if rule else None
@@ -284,8 +284,8 @@ def _has_opencode_v2_permissions_list(text: str) -> bool:
 
 
 def _is_global_permission_resource(resource: str) -> bool:
-    """Return True when `resource` covers all files (`*`, `**`, `**/*`, `/*`)."""
-    return resource.strip() in ("*", "**", "**/*", "/*")
+    """Return True when `resource` unconditionally covers every resource string (`*` or `**`)."""
+    return resource.strip() in ("*", "**")
 
 
 def _opencode_wildcard_matches(pattern: str, target: str) -> bool:
@@ -361,7 +361,7 @@ def _opencode_v2_permissions_list_edit_effect(text: str) -> str | None:
         if not in_permissions:
             continue
         if stripped == "-" or stripped.startswith("- "):
-            if rule_dash_indent is not None and indent > rule_dash_indent:
+            if rule_dash_indent is not None and indent != rule_dash_indent:
                 return None
             if cur_rule is not None:
                 rules.append(cur_rule)
@@ -391,7 +391,7 @@ def _opencode_v2_permissions_list_edit_effect(text: str) -> str | None:
             rk, rv = stripped.split(":", 1)
             clean_k = _unquote_yaml_scalar(rk.strip())
             clean_v = _unquote_yaml_scalar(_strip_yaml_inline_comment(rv.strip()))
-            if not clean_k or not clean_v or any(ch in clean_v for ch in ("{", "}", "[", "]")):
+            if not clean_k or not clean_v or clean_k in cur_rule or any(ch in clean_v for ch in ("{", "}", "[", "]")):
                 return None
             cur_rule[clean_k] = clean_v
         else:
@@ -405,9 +405,11 @@ def _opencode_v2_permissions_list_edit_effect(text: str) -> str | None:
     global_edit_effect: str | None = None
     narrow_non_deny_active = False
     for rule in rules:
-        action = rule.get("action", "").strip()
-        resource = rule.get("resource", "*").strip()
-        effect = rule.get("effect", "").strip()
+        if set(rule.keys()) != {"action", "resource", "effect"}:
+            return None
+        action = rule["action"].strip()
+        resource = rule["resource"].strip()
+        effect = rule["effect"].strip()
         if not action or not resource or effect not in ("allow", "deny", "ask"):
             return None
         if not _action_touches_edit(action):
@@ -992,6 +994,14 @@ def validate_opencode_bundle(plugin_root: Path) -> list[str]:
                 "(including V2 'permissions' rules; ensure no trailing '\"*\": allow', glob override, or conflicting V1/V2 permission keys)"
             )
         errors.extend(check_always_on_budget([WORKER_SYSTEM_PROMPT, agent_content], max_tokens=1200))
+
+    for oc_md in sorted(bundle_dir.rglob("*.md")):
+        oc_text = oc_md.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"\bexperimental\.codemode\b", oc_text):
+            errors.append(
+                f"{oc_md}: references invalid OpenCode config key 'experimental.codemode' "
+                "(OpenCode's schema defines 'experimental.codemode_vm' and per-server 'codemode: true')"
+            )
 
     return errors
 

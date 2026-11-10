@@ -330,12 +330,23 @@ def resolve_model_token_limits(
     prefixes = limits_cfg.get("prefixes") or {}
     norm = _normalize_model_lookup(model)
 
-    matched: Mapping[str, Any] = default_cfg
+    matched: Mapping[str, Any] | None = None
     if norm and isinstance(prefixes, Mapping):
         for prefix, entry in sorted(prefixes.items(), key=lambda kv: len(kv[0]), reverse=True):
             if norm.startswith(prefix.lower()) and isinstance(entry, Mapping):
                 matched = entry
                 break
+        if matched is None:
+            gemini_models = active_card.get("gemini_models")
+            gemini_default = prefixes.get("gemini-")
+            if (
+                isinstance(gemini_models, Mapping)
+                and isinstance(gemini_default, Mapping)
+                and any(norm == _normalize_model_lookup(str(k)) for k in gemini_models)
+            ):
+                matched = gemini_default
+    if matched is None:
+        matched = default_cfg
 
     ctx_win = int(matched.get("context_window") or default_cfg.get("context_window") or 1_048_576)
     max_out = int(matched.get("max_output_tokens") or default_cfg.get("max_output_tokens") or 65_536)
@@ -404,7 +415,16 @@ def compute_compaction_threshold(
             return 0
         if t_mode == "ratio":
             return max(min_thresh, min(int(round(window * float(t_val))), window - floor_buf))
-        return min(int(t_val), max(1, window - 1))
+        clamped_tok = min(int(t_val), max(1, window - 1))
+        if window - clamped_tok < floor_buf:
+            logging.getLogger(__name__).warning(
+                "Compaction token threshold %d leaves only %d tokens below context_window=%d (< %d headroom floor).",
+                clamped_tok,
+                window - clamped_tok,
+                window,
+                floor_buf,
+            )
+        return clamped_tok
 
     if buffer is None:
         buf_tokens = max(int(round(window * 0.15)), floor_buf)

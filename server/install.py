@@ -32,7 +32,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -185,8 +185,24 @@ _SECRET_COMPOUND_KEYS: frozenset[str] = frozenset(
     }
 )
 _OPENCODE_MAX_SAFE_INT = 9_007_199_254_740_991
-_OPENCODE_V2_PROTOCOLS: frozenset[str] = frozenset({"legacy", "auto", "2026-07-28"})
+_OPENCODE_V2_PROTOCOLS: frozenset[str] = frozenset({"legacy", "auto"})
 _OPENCODE_V2_TIMEOUT_KEYS: tuple[str, ...] = ("startup", "catalog", "execution")
+_OPENCODE_V1_TO_V2_OAUTH_KEY_MAP: dict[str, str] = {
+    "clientId": "client_id",
+    "clientSecret": "client_secret",
+    "callbackPort": "callback_port",
+    "redirectUri": "redirect_uri",
+}
+_OPENCODE_V2_OAUTH_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "client_id",
+        "client_secret",
+        "scope",
+        "callback_port",
+        "redirect_uri",
+        "auth_server_metadata_url",
+    }
+)
 _OPENCODE_ASSET_MANIFEST_NAME = ".cc-agy-plugin-assets.json"
 _OPENCODE_SERVER_REF_RE = re.compile(
     r"(?P<backtick_srv>`agy` MCP server)"
@@ -1290,7 +1306,7 @@ def build_opencode_server_entry(
     no_auto_apply: bool = False,
     strict: bool = False,
     v2: bool = False,
-    pool: bool = False,
+    pool: bool | None = None,
     codemode: bool | None = None,
     protocol: str | None = None,
 ) -> dict[str, Any]:
@@ -1298,10 +1314,19 @@ def build_opencode_server_entry(
 
     Fresh configs default to OpenCode's legacy-compatible V1 `mcp.<name>` shape (`v2=False`, schema-valid
     across both OpenCode v1.x and v2, using a single `1800000` ms timeout so long `delegate_result` runs do
-    not time out). Passing `v2=True` (or calling `build_opencode_v2_server_entry`) builds an explicit OpenCode
-    V2 (`2.2.6`) `Mcp.LocalConfig` entry with split `{startup, execution}` timeouts and `pool: False` by default
-    (because the `agy` MCP server binds its workspace root at startup).
+    not time out). Passing `v2=True`, any explicit V2 option (`pool`, `codemode`, `protocol`), or calling
+    `build_opencode_v2_server_entry` builds an explicit OpenCode V2 (`2.2.6`) `Mcp.LocalConfig` entry with
+    split `{startup, execution}` timeouts and `pool: False` by default (because the `agy` MCP server binds
+    its workspace root at startup).
     """
+    if protocol is not None:
+        if not isinstance(protocol, str) or protocol not in _OPENCODE_V2_PROTOCOLS:
+            raise ValueError(
+                f"Unsupported OpenCode MCP protocol {protocol!r} for cc-agy-plugin; expected one of "
+                f"{sorted(_OPENCODE_V2_PROTOCOLS)} ('2026-07-28' requires MCP revision 2026-07-28 and fails "
+                "handshake against this stdio server's 2024-11-05 / 2025-03-26 protocol)"
+            )
+    eff_v2 = bool(v2 or pool is not None or codemode is not None or protocol is not None)
     agy_entry = build_agy_server_entry(
         python_bin=python_bin,
         profile=profile,
@@ -1319,7 +1344,7 @@ def build_opencode_server_entry(
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
-    if v2:
+    if eff_v2:
         v2_entry: dict[str, Any] = {
             "type": "local",
             "command": [agy_entry["command"], *agy_entry["args"]],
@@ -1329,15 +1354,11 @@ def build_opencode_server_entry(
                 "startup": OPENCODE_STARTUP_TIMEOUT_MS,
                 "execution": OPENCODE_TOOL_TIMEOUT_MS,
             },
-            "pool": bool(pool),
+            "pool": bool(pool) if pool is not None else False,
         }
         if isinstance(codemode, bool):
             v2_entry["codemode"] = codemode
         if protocol is not None:
-            if not isinstance(protocol, str) or protocol not in _OPENCODE_V2_PROTOCOLS:
-                raise ValueError(
-                    f"Unsupported OpenCode MCP protocol {protocol!r}; expected one of {sorted(_OPENCODE_V2_PROTOCOLS)}"
-                )
             v2_entry["protocol"] = protocol
         return v2_entry
     return {
@@ -1366,24 +1387,74 @@ def build_opencode_v2_server_entry(
     )
 
 
+def _is_v1_toggle_only_stub(val: Any) -> bool:
+    """Return True when `val` is a V1 disable/enable stub `{"enabled": bool}` allowed under `mcp.additionalProperties`."""
+    return isinstance(val, Mapping) and set(val.keys()) == {"enabled"} and isinstance(val.get("enabled"), bool)
+
+
+def _migrate_v1_remote_oauth_to_v2(oauth_val: Any) -> dict[str, Any] | Literal[False] | None:
+    """Convert a V1 `McpOAuthConfig` mapping (`clientId`, etc.) into a schema-valid V2 `Mcp.OAuthConfigEncoded`."""
+    if oauth_val is False:
+        return False
+    if not isinstance(oauth_val, Mapping):
+        return None
+    converted: dict[str, Any] = {}
+    for raw_k, raw_v in oauth_val.items():
+        if raw_k in _OPENCODE_V2_OAUTH_ALLOWED_KEYS:
+            target_k = raw_k
+        elif raw_k in _OPENCODE_V1_TO_V2_OAUTH_KEY_MAP:
+            target_k = _OPENCODE_V1_TO_V2_OAUTH_KEY_MAP[raw_k]
+            if target_k in oauth_val:
+                continue
+        else:
+            continue
+        if target_k == "callback_port":
+            if isinstance(raw_v, int) and not isinstance(raw_v, bool) and 1 <= raw_v <= 65535:
+                converted[target_k] = raw_v
+        elif isinstance(raw_v, str):
+            converted[target_k] = raw_v
+    return converted
+
+
+def _has_v1_mcp_entry_fields(obj: Mapping[str, Any]) -> bool:
+    """Return True when `obj` has scalar or list V1 `McpLocalConfig` / `McpRemoteConfig` fields (not nested server mappings)."""
+    return any(k in obj and not isinstance(obj[k], Mapping) for k in _OPENCODE_MCP_ENTRY_KEYS)
+
+
+def _clean_opencode_v2_top_timeout(raw_mcp_t: Any) -> dict[str, int] | None:
+    """Sanitize a top-level OpenCode V2 `mcp.timeout` mapping or integer into a schema-valid `Mcp.Timeout` object."""
+    if isinstance(raw_mcp_t, Mapping) and not _has_v1_mcp_entry_fields(raw_mcp_t):
+        cleaned = {
+            k: int(raw_mcp_t[k])
+            for k in _OPENCODE_V2_TIMEOUT_KEYS
+            if k in raw_mcp_t and _is_valid_opencode_timeout_int(raw_mcp_t[k])
+        }
+        return cleaned or None
+    if _is_valid_opencode_timeout_int(raw_mcp_t):
+        return {"execution": int(raw_mcp_t)}
+    return None
+
+
 def _is_opencode_v2_servers_envelope(mcp_obj: Mapping[str, Any]) -> bool:
-    """Return True when `mcp` uses OpenCode's V2 `{servers?: {...}, timeout?: ...}` envelope."""
+    """Return True when `mcp` uses OpenCode's V2 `{servers?: {...}, timeout?: {...}}` envelope (allowing toggle-only `{"enabled": bool}` siblings)."""
     if not mcp_obj:
         return False
-    mapping_keys = {k for k, v in mcp_obj.items() if isinstance(v, Mapping)}
-    if not ("servers" in mcp_obj or "timeout" in mcp_obj) or not (mapping_keys <= {"servers", "timeout"}):
+    if not ("servers" in mcp_obj or "timeout" in mcp_obj):
         return False
+    for k, v in mcp_obj.items():
+        if isinstance(v, Mapping) and k not in ("servers", "timeout") and not _is_v1_toggle_only_stub(v):
+            return False
     if "servers" in mcp_obj:
         servers = mcp_obj["servers"]
         if not isinstance(servers, dict):
             return False
-        if any(k in servers for k in _OPENCODE_MCP_ENTRY_KEYS):
+        if _has_v1_mcp_entry_fields(servers):
             return False
     if "timeout" in mcp_obj:
         timeout_val = mcp_obj["timeout"]
-        if isinstance(timeout_val, bool) or not isinstance(timeout_val, (int, float, dict)):
+        if not isinstance(timeout_val, dict):
             return False
-        if isinstance(timeout_val, dict) and any(k in timeout_val for k in _OPENCODE_MCP_ENTRY_KEYS):
+        if _has_v1_mcp_entry_fields(timeout_val):
             return False
     return True
 
@@ -1565,29 +1636,52 @@ def upsert_opencode_mcp_config(
         raise OpenCodeConfigError(f"existing {filename} 'mcp' field must be a JSON object")
     elif _is_opencode_v2_servers_envelope(mcp_val):
         mcp_map = dict(mcp_val)
+        if "timeout" in mcp_map:
+            cleaned_env_t = _clean_opencode_v2_top_timeout(mcp_map.get("timeout"))
+            if cleaned_env_t:
+                mcp_map["timeout"] = cleaned_env_t
+            else:
+                mcp_map.pop("timeout", None)
         servers_map = dict(mcp_val.get("servers") or {})
         servers_map[name] = _merge_opencode_v2_entry(servers_map.get(name), entry, pool_override=pool_override)
         mcp_map["servers"] = servers_map
         parsed["mcp"] = mcp_map
     elif use_v2_envelope:
+        for reserved_k in ("servers", "timeout"):
+            reserved_val = mcp_val.get(reserved_k)
+            if isinstance(reserved_val, Mapping) and _has_v1_mcp_entry_fields(reserved_val):
+                raise OpenCodeConfigError(
+                    f"existing {filename} defines a V1 MCP server under reserved V2 key 'mcp.{reserved_k}'; "
+                    "rename that server entry before migrating to OpenCode V2"
+                )
         nested_servers = mcp_val.get("servers")
-        servers_map = (
-            dict(nested_servers)
-            if isinstance(nested_servers, dict) and not any(k in nested_servers for k in _OPENCODE_MCP_ENTRY_KEYS)
-            else {}
-        )
+        servers_map = dict(nested_servers) if isinstance(nested_servers, dict) else {}
+        preserved_v1_stubs: dict[str, dict[str, Any]] = {}
         for srv_k, srv_v in mcp_val.items():
             if srv_k in ("servers", "timeout") or srv_k == name:
                 continue
-            if isinstance(srv_v, Mapping):
+            if _is_v1_toggle_only_stub(srv_v):
+                preserved_v1_stubs[srv_k] = {"enabled": srv_v["enabled"]}
+            elif isinstance(srv_v, Mapping):
+                if srv_v.get("type") not in ("local", "remote"):
+                    preserved_v1_stubs[srv_k] = dict(srv_v)
+                    continue
                 migrated = dict(srv_v)
-                if "enabled" in migrated and "disabled" not in migrated:
-                    migrated["disabled"] = not bool(migrated.pop("enabled"))
+                if isinstance(migrated.get("enabled"), bool):
+                    en_bool = migrated.pop("enabled")
+                    if "disabled" not in migrated:
+                        migrated["disabled"] = not en_bool
                 if _is_valid_opencode_timeout_int(migrated.get("timeout")):
                     migrated["timeout"] = {
                         "startup": OPENCODE_STARTUP_TIMEOUT_MS,
                         "execution": int(migrated["timeout"]),
                     }
+                if migrated.get("type") == "remote" and "oauth" in migrated:
+                    mig_oauth = _migrate_v1_remote_oauth_to_v2(migrated.get("oauth"))
+                    if mig_oauth is None:
+                        migrated.pop("oauth", None)
+                    else:
+                        migrated["oauth"] = mig_oauth
                 servers_map[srv_k] = migrated
         existing_self = mcp_val.get(name) if isinstance(mcp_val.get(name), Mapping) else servers_map.get(name)
         servers_map[name] = _merge_opencode_v2_entry(existing_self, entry, pool_override=pool_override)
@@ -1597,8 +1691,11 @@ def upsert_opencode_mcp_config(
                 continue
             if not isinstance(extra_v, Mapping):
                 new_mcp[extra_k] = extra_v
-        if "timeout" in mcp_val and isinstance(mcp_val["timeout"], (int, float, dict)) and not isinstance(mcp_val["timeout"], bool):
-            new_mcp["timeout"] = mcp_val["timeout"]
+        new_mcp.update(preserved_v1_stubs)
+        if "timeout" in mcp_val:
+            cleaned_mig_t = _clean_opencode_v2_top_timeout(mcp_val.get("timeout"))
+            if cleaned_mig_t:
+                new_mcp["timeout"] = cleaned_mig_t
         new_mcp["servers"] = servers_map
         parsed["mcp"] = new_mcp
     else:
@@ -1607,7 +1704,7 @@ def upsert_opencode_mcp_config(
         nested_servers = mcp_map.get("servers")
         if (
             isinstance(nested_servers, dict)
-            and not any(k in nested_servers for k in _OPENCODE_MCP_ENTRY_KEYS)
+            and not _has_v1_mcp_entry_fields(nested_servers)
             and name in nested_servers
         ):
             cleaned_nested = dict(nested_servers)
@@ -1661,7 +1758,7 @@ def _opencode_doc_defines_server(parsed_doc: Any, name: str) -> bool:
     nested = mcp_obj.get("servers")
     if (
         isinstance(nested, Mapping)
-        and not any(k in nested for k in _OPENCODE_MCP_ENTRY_KEYS)
+        and not _has_v1_mcp_entry_fields(nested)
         and name in nested
     ):
         return True
@@ -1894,6 +1991,7 @@ def install_opencode(
     mcp_cfg_path = resolve_opencode_config_path(cfg_dir, env=active_env)
     commands_dst_dir = cfg_dir / "commands"
 
+    eff_v2 = bool(v2 or pool is not None or codemode is not None or protocol is not None)
     command_sources = sorted(OPENCODE_COMMANDS_DIR.glob("*.md")) if OPENCODE_COMMANDS_DIR.is_dir() else []
     result: dict[str, Any] = {
         "host": "opencode",
@@ -1903,7 +2001,7 @@ def install_opencode(
         "command_paths": [str(commands_dst_dir / src.name) for src in command_sources],
         "agent_path": str(cfg_dir / "agents" / "gemini-delegator.md"),
         "server_name": name,
-        "mcp_key_path": f"mcp.servers.{name}" if v2 else f"mcp.{name}",
+        "mcp_key_path": f"mcp.servers.{name}" if eff_v2 else f"mcp.{name}",
     }
     try:
         entry = build_opencode_server_entry(
@@ -1922,8 +2020,8 @@ def install_opencode(
             blocked_projects=blocked_projects,
             no_auto_apply=no_auto_apply,
             strict=strict,
-            v2=v2,
-            pool=bool(pool),
+            v2=eff_v2,
+            pool=pool,
             codemode=codemode,
             protocol=protocol,
         )
@@ -1964,17 +2062,18 @@ def install_opencode(
     asset_backups: list[str] = []
     try:
         mcp_cfg_path, existing, existing_bytes, updated, preserved_jsonc = _resolve_opencode_target_config(
-            cfg_dir, mcp_cfg_path, entry, name=name, pool_override=pool if v2 else None
+            cfg_dir, mcp_cfg_path, entry, name=name, pool_override=pool if eff_v2 else None
         )
         if preserved_jsonc is not None:
             result["preserved_jsonc_path"] = preserved_jsonc
             result["config_path"] = str(mcp_cfg_path)
         updated_mcp = json.loads(updated).get("mcp") or {}
-        is_v2_env = _is_opencode_v2_servers_envelope(updated_mcp)
+        servers_sub = updated_mcp.get("servers")
+        wrote_v2_servers = isinstance(servers_sub, dict) and name in servers_sub
         result["mcp_key_path"] = (
-            f"mcp.servers.{name}" if is_v2_env else f"mcp.{name}"
+            f"mcp.servers.{name}" if wrote_v2_servers else f"mcp.{name}"
         )
-        merged_self = (updated_mcp.get("servers") or {}).get(name) if is_v2_env else updated_mcp.get(name)
+        merged_self = servers_sub.get(name) if wrote_v2_servers else updated_mcp.get(name)
         if isinstance(merged_self, dict):
             result["entry"] = merged_self
         if dry_run:
@@ -2363,7 +2462,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--opencode-codemode", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable or disable OpenCode 2.2.6+ Code Mode (codemode: true/false) on the MCP server entry.")
     parser.add_argument("--opencode-protocol", choices=sorted(_OPENCODE_V2_PROTOCOLS), default=None,
-                        help="Optional OpenCode 2.2.6+ MCP protocol version ('auto', '2026-07-28', or 'legacy').")
+                        help="Optional OpenCode 2.2.6+ MCP protocol negotiation mode ('auto' or 'legacy').")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
     parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics as JSON and exit.")
     parser.add_argument("--probe-oidc", action="store_true", help="With --doctor, mint a live OIDC token once to verify and display the resolved principal.")

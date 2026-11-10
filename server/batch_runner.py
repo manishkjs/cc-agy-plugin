@@ -843,6 +843,7 @@ class FileBatchRunner:
             for key, val in ledger.usage.items():
                 usage_total[key] = int(usage_total.get(key, 0)) + int(val)
             priced = ledger.pricing_known and bool(prior_cost.get("pricing_known", True))
+            prior_oc_sid = (prior or {}).get("opencode_session_id")
             receipt = {k: v for k, v in (prior or {}).items() if k not in ("receipt_hmac", "cost", "updated_at_epoch")}
             receipt.update({
                 "job_id": job_id, "kind": kind, "status": "error", "model": settings.model,
@@ -855,9 +856,24 @@ class FileBatchRunner:
                                      "pricing_known": priced},
                 "cost_by_utc_day": ledger.merged_days(prior),
             })
+            if extra_receipt:
+                receipt.update(extra_receipt)
+            if isinstance(prior_oc_sid, str) and prior_oc_sid.strip():
+                receipt["opencode_session_id"] = prior_oc_sid.strip()
+            raw_err_sid = receipt.get("opencode_session_id")
+            persisted_err_sid = (
+                raw_err_sid.strip()
+                if isinstance(raw_err_sid, str) and raw_err_sid.strip()
+                else None
+            )
             self.store.write_receipt(job_id, receipt, workspace_root=str(self.root), api_key=auth.get("api_key"))
-            return {"job_id": job_id, "status": "error", "error": error, "is_error": True,
-                    "totals": {"cost_cents": round(ledger.cents, 4), "job_cost_cents": round(total_cents, 4)}}
+            err_out: dict[str, Any] = {
+                "job_id": job_id, "status": "error", "error": error, "is_error": True,
+                "totals": {"cost_cents": round(ledger.cents, 4), "job_cost_cents": round(total_cents, 4)},
+            }
+            if persisted_err_sid:
+                err_out["opencode_session_id"] = persisted_err_sid
+            return err_out
 
     def _execute(self, plan, settings, auth, *, job_id, wt, baseline_sha, baseline_hashes, prior, started, ws_state,
                  allowed_paths, extra_acceptance, edits_only, kind, extra_receipt, content_gate, shared_note,
@@ -1374,17 +1390,28 @@ class FileBatchRunner:
                              "claude_writer": settings.claude_model if settings.claude_writer else None},
             "external_worktree_tamper": False, "tool_call_count": 0, "tool_calls": [],
         }
+        prior_oc_sid = (prior or {}).get("opencode_session_id")
         receipt.update(extra_receipt)
+        if isinstance(prior_oc_sid, str) and prior_oc_sid.strip():
+            receipt["opencode_session_id"] = prior_oc_sid.strip()
+        raw_persisted_sid = receipt.get("opencode_session_id")
+        persisted_oc_sid = (
+            raw_persisted_sid.strip()
+            if isinstance(raw_persisted_sid, str) and raw_persisted_sid.strip()
+            else None
+        )
         self.store.write_receipt(job_id, receipt, workspace_root=str(self.root), api_key=auth.get("api_key"))
         return self._digest(job_id, status, task_rows, counts, run_cents, total_cents, usage_run, acceptance_passed,
                             auth_error or stop_reason, files_changed, scope_violations, review,
-                            verification=verification, unverified_ids=unverified_ids, side_effects=side_effects)
+                            verification=verification, unverified_ids=unverified_ids, side_effects=side_effects,
+                            opencode_session_id=persisted_oc_sid)
 
     @staticmethod
     def _digest(job_id, status, rows, counts, run_cents, total_cents, usage, acceptance_passed, error, files_changed,
                 scope_violations, review, *, verification: str | None = None,
                 unverified_ids: list[str] | tuple[str, ...] = (),
-                side_effects: dict[str, list[str]] | None = None) -> dict[str, Any]:
+                side_effects: dict[str, list[str]] | None = None,
+                opencode_session_id: str | None = None) -> dict[str, Any]:
         tokens = sum(int(v) for k, v in usage.items() if k.endswith("_tokens") or k == "total_token_count")
         tasks: list[dict[str, Any]] = []
         tails_left = DIGEST_TAIL_TASKS
@@ -1400,6 +1427,8 @@ class FileBatchRunner:
                        "job_cost_cents": round(total_cents, 4), "tokens": tokens},
             "acceptance_passed": acceptance_passed, "tasks": tasks,
         }
+        if opencode_session_id:
+            digest["opencode_session_id"] = opencode_session_id
         if error:
             digest["error"] = error
         if scope_violations:

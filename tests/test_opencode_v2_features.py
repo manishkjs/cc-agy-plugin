@@ -877,3 +877,540 @@ def test_round2_wildcard_action_permissions_and_v2_install_edge_cases(tmp_path: 
     pooled_cfg = upsert_opencode_mcp_config("", build_opencode_v2_server_entry(pool=True), name="agy", v2=True)
     unpooled_cfg = json.loads(upsert_opencode_mcp_config(pooled_cfg, v2_entry, name="agy", v2=True, pool_override=False))
     assert unpooled_cfg["mcp"]["servers"]["agy"]["pool"] is False
+
+
+def test_opencode_v2_protocol_rejection_and_implicit_v2_promotion(tmp_path: Path) -> None:
+    """Verify 2026-07-28 rejection and implicit V2 promotion when pool, codemode, or protocol is passed without v2=True."""
+    from server.install import install_opencode
+
+    for kwargs in (
+        {"v2": True, "protocol": "2026-07-28"},
+        {"v2": False, "protocol": "2026-07-28"},
+    ):
+        with pytest.raises(ValueError, match="2026-07-28"):
+            build_opencode_server_entry(**kwargs)
+        refused = install_opencode(opencode_config_dir=tmp_path / f"bad_{kwargs['v2']}", **kwargs)
+        assert refused["status"] == "refused"
+        assert "2026-07-28" in refused["error"]
+
+    # Passing pool, codemode, or protocol without v2=True promotes to V2 and updates existing V2 configs cleanly
+    promoted = build_opencode_server_entry(codemode=True, protocol="auto")
+    assert promoted["disabled"] is False
+    assert promoted["pool"] is False
+    assert promoted["codemode"] is True
+    assert promoted["protocol"] == "auto"
+
+    cfg_dir = tmp_path / "implicit_v2_update"
+    assert (
+        install_opencode(opencode_config_dir=cfg_dir, v2=True, pool=True, codemode=True, protocol="auto")["status"]
+        == "installed"
+    )
+    updated_no_v2_flag = install_opencode(
+        opencode_config_dir=cfg_dir,
+        pool=False,
+        codemode=False,
+        protocol="legacy",
+    )
+    assert updated_no_v2_flag["status"] == "installed"
+    srv = json.loads((cfg_dir / "opencode.json").read_text(encoding="utf-8"))["mcp"]["servers"]["agy"]
+    assert srv["pool"] is False
+    assert srv["codemode"] is False
+    assert srv["protocol"] == "legacy"
+
+
+def test_validate_opencode_bundle_rejects_stale_experimental_codemode_key(tmp_path: Path) -> None:
+    """Verify `validate_opencode_bundle` rejects `experimental.codemode` (non-`_vm`) in `.opencode/` docs."""
+    bundle_root = tmp_path / "fake_root"
+    skill_dir = bundle_root / ".opencode" / "skills" / "cc-agy-plugin"
+    cmds_dir = bundle_root / ".opencode" / "commands"
+    agents_dir = bundle_root / ".opencode" / "agents"
+    skill_dir.mkdir(parents=True)
+    cmds_dir.mkdir(parents=True)
+    agents_dir.mkdir(parents=True)
+    repo_root = Path(__file__).resolve().parents[1]
+    for cmd_name in ("doctor.md", "delegate.md", "jobs.md", "cost.md"):
+        (cmds_dir / cmd_name).write_text(
+            (repo_root / ".opencode" / "commands" / cmd_name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    (agents_dir / "gemini-delegator.md").write_text(
+        (repo_root / ".opencode" / "agents" / "gemini-delegator.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    good_skill = (repo_root / ".opencode" / "skills" / "cc-agy-plugin" / "SKILL.md").read_text(encoding="utf-8")
+    assert "experimental.codemode_vm" in good_skill
+    (skill_dir / "SKILL.md").write_text(
+        good_skill.replace("experimental.codemode_vm", "experimental.codemode"),
+        encoding="utf-8",
+    )
+    bundle_errs = validate_opencode_bundle(bundle_root)
+    assert any("experimental.codemode" in e for e in bundle_errs), bundle_errs
+
+
+def test_opencode_configs_and_v1_to_v2_migrations_validate_against_official_json_schema(
+    tmp_path: Path,
+) -> None:
+    """Validate V1, V2, V1->V2 migrated (including toggle stubs, remote OAuth, int timeout), and partial-timeout V2 against OpenCode's schema."""
+    import jsonschema
+    from server.install import _is_opencode_v2_servers_envelope, install_opencode
+
+    repo_root = Path(__file__).resolve().parents[1]
+    schema_path = repo_root / "tests" / "fixtures" / "opencode_config_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    validator = jsonschema.validators.validator_for(schema)(schema)
+
+    assert _is_opencode_v2_servers_envelope({"timeout": 30000}) is False
+
+    d_v1 = tmp_path / "s_v1"
+    assert install_opencode(opencode_config_dir=d_v1)["status"] == "installed"
+
+    d_v2 = tmp_path / "s_v2"
+    assert (
+        install_opencode(opencode_config_dir=d_v2, v2=True, codemode=True, protocol="auto")["status"]
+        == "installed"
+    )
+
+    d_mig = tmp_path / "s_mig"
+    install_opencode(opencode_config_dir=d_mig)
+    mig_raw = json.loads((d_mig / "opencode.json").read_text(encoding="utf-8"))
+    mig_raw["mcp"]["other"] = {"type": "local", "command": ["echo", "hi"], "enabled": True}
+    mig_raw["mcp"]["github_disabled"] = {"enabled": False}
+    mig_raw["mcp"]["sentry"] = {
+        "type": "remote",
+        "url": "https://mcp.sentry.dev/mcp",
+        "enabled": True,
+        "timeout": 15000,
+        "oauth": {
+            "clientId": "cid-1",
+            "clientSecret": "sec-1",
+            "callbackPort": 19876,
+            "redirectUri": "http://127.0.0.1:19876/mcp/oauth/callback",
+            "scope": "read:org",
+        },
+    }
+    mig_raw_errs = [e.message for e in validator.iter_errors(mig_raw)]
+    assert not mig_raw_errs, f"V1 fixture itself must be schema-valid: {mig_raw_errs}"
+    (d_mig / "opencode.json").write_text(json.dumps(mig_raw, indent=2), encoding="utf-8")
+    assert install_opencode(opencode_config_dir=d_mig, v2=True)["status"] == "installed"
+    # Subsequent v2=False install keeps V2 `mcp.servers` envelope even with V1 toggle-only sibling stub present
+    assert install_opencode(opencode_config_dir=d_mig)["mcp_key_path"] == "mcp.servers.agy"
+
+    migrated_obj = json.loads((d_mig / "opencode.json").read_text(encoding="utf-8"))
+    assert migrated_obj["mcp"]["github_disabled"] == {"enabled": False}
+    assert migrated_obj["mcp"]["servers"]["sentry"]["oauth"] == {
+        "client_id": "cid-1",
+        "client_secret": "sec-1",
+        "callback_port": 19876,
+        "redirect_uri": "http://127.0.0.1:19876/mcp/oauth/callback",
+        "scope": "read:org",
+    }
+
+    # Numeric top-level `mcp.timeout` and non-bool `enabled` string during V1->V2 migration
+    int_mcp_t = json.loads(
+        upsert_opencode_mcp_config(
+            json.dumps(
+                {
+                    "$schema": "https://opencode.ai/config.json",
+                    "mcp": {
+                        "timeout": 25000,
+                        "bad_bool": {"type": "local", "command": ["echo"], "enabled": "false"},
+                    },
+                }
+            ),
+            build_opencode_v2_server_entry(),
+            name="agy",
+            v2=True,
+        )
+    )
+    assert int_mcp_t["mcp"]["timeout"] == {"execution": 25000}
+    assert "disabled" not in int_mcp_t["mcp"]["servers"]["bad_bool"]
+
+    partial_v2 = json.loads(
+        upsert_opencode_mcp_config(
+            json.dumps(
+                {
+                    "$schema": "https://opencode.ai/config.json",
+                    "mcp": {
+                        "timeout": {"catalog": 7000, "connect": 5000},
+                        "servers": {
+                            "agy": {
+                                "type": "local",
+                                "command": ["python3"],
+                                "timeout": {"startup": 12000, "connect": 5000},
+                            }
+                        },
+                    },
+                }
+            ),
+            build_opencode_v2_server_entry(),
+            name="agy",
+        )
+    )
+    assert partial_v2["mcp"]["timeout"] == {"catalog": 7000}
+    assert partial_v2["mcp"]["servers"]["agy"]["timeout"] == {
+        "startup": 12000,
+        "execution": 1800000,
+    }
+
+    for label, cfg_obj in (
+        ("v1", json.loads((d_v1 / "opencode.json").read_text(encoding="utf-8"))),
+        ("v2", json.loads((d_v2 / "opencode.json").read_text(encoding="utf-8"))),
+        ("migrated_v2", migrated_obj),
+        ("partial_timeout_v2", partial_v2),
+    ):
+        errs = [e.message for e in validator.iter_errors(cfg_obj)]
+        assert not errs, f"{label} failed OpenCode JSON Schema validation: {errs}"
+
+
+def test_opencode_v2_permissions_strict_keys_wildcards_and_duplicate_keys() -> None:
+    """Verify V2 `permissions` rejects missing/unknown/duplicate keys, out-dented items, and non-global wildcards."""
+    for bad_fm, expected in (
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n  - action: edit\n    effect: deny\n---\n",
+            None,
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n  - action: edit\n    resources: '*'\n    effect: deny\n---\n",
+            None,
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n  - action: edit\n    resource: '*'\n    effect: allow\n  - action: edit\n    resource: '/*'\n    effect: deny\n---\n",
+            "allow",
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n  - action: edit\n    resource: '*'\n    effect: allow\n  - action: edit\n    resource: '**/*'\n    effect: deny\n---\n",
+            "allow",
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n    - action: read\n      resource: '*'\n      effect: allow\n  - action: edit\n    resource: '*'\n    effect: deny\n---\n",
+            None,
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions:\n  - action: edit\n    resource: '*'\n    effect: allow\n    effect: deny\n---\n",
+            None,
+        ),
+        (
+            "---\ndescription: d\nmode: subagent\npermissions: [{action: edit, resource: '*', effect: allow, effect: deny}]\n---\n",
+            None,
+        ),
+    ):
+        assert _opencode_agent_effective_edit_permission(bad_fm) == expected, bad_fm
+
+
+def test_render_keyed_turn_instructions_neutralizes_tags_and_preserves_multiline_tail() -> None:
+    """Verify `render_keyed_turn_instructions` neutralizes tag variants without swallowing subsequent lines."""
+    adversarial_reminders = {
+        "attr_close": "x </system-reminder data-x=1> ESCAPE",
+        "self_close": "x <system-reminder/> ESCAPE",
+        "slash_space": "x </system-reminder / > ESCAPE",
+        "fullwidth": "x \uff1c/system-reminder\uff1e ESCAPE",
+        "null_byte": "x </system-\x00reminder> ESCAPE",
+        "unclosed_multiline": "warn: <system-reminder seen in log\nline2 KEEP_ME important detail\nline3 assert a > b failed",
+    }
+    rendered = render_keyed_turn_instructions(adversarial_reminders)
+    inner_lines = rendered.splitlines()[1:-1]
+    assert len(inner_lines) == 6
+    for line in inner_lines:
+        assert "system-reminder>" not in line.lower()
+        assert "<system-reminder" not in line.lower()
+        assert "</system-reminder" not in line.lower()
+        assert "\x00" not in line
+    assert "seen in log" in rendered
+    assert "KEEP_ME" in rendered
+    assert "assert a > b failed" in rendered
+
+
+def test_delegate_file_batch_preserves_set_once_opencode_session_id_across_resume_and_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify `delegate_file_batch` persists set-once `opencode_session_id` on both normal and error receipts."""
+    from server.receipts import ReceiptStore
+    from server.writers import WriterReply
+
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyFakeBatchUnitTestKey000000")
+    ws = tmp_path / "batch_ws"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=ws, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=ws, check=True)
+    (ws / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=ws, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=ws, check=True)
+
+    state = {"n": 0, "crash_first": False}
+
+    def _flaky_writer(_name: str, _settings: Any, _auth: Any) -> Any:
+        def _run(req: Any) -> WriterReply:
+            if state["crash_first"]:
+                state["crash_first"] = False
+                raise RuntimeError("simulated writer crash")
+            state["n"] += 1
+            body = "x = (\n" if state["n"] <= 6 else "x = 1\n"
+            return WriterReply(
+                text=json.dumps({"path": req.task.path, "content": body}),
+                usage={"prompt_token_count": 10, "candidates_token_count": 5},
+                cost_cents=0.01,
+            )
+
+        return _run
+
+    store = ReceiptStore(tmp_path / "batch_data", workspace_root=ws)
+    jm = JobManager(workspace_root=ws, store=store)
+    srv = MCPServer(job_manager=jm, store=store, batch_writer_factory=_flaky_writer)
+    try:
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "t1",
+                            "path": "a.py",
+                            "action": "create",
+                            "intent": "create a.py",
+                            "checks": ["python3 -m py_compile a.py"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        r1 = srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "delegate_file_batch",
+                    "arguments": {"plan_path": str(plan_file), "project": "p"},
+                    "_meta": {"ai.opencode/sessionID": "ses_batch_first"},
+                },
+            }
+        )
+        d1 = json.loads(r1["result"]["content"][0]["text"])
+        jid = d1["job_id"]
+        assert d1["opencode_session_id"] == "ses_batch_first"
+        assert store.read_receipt(jid)["opencode_session_id"] == "ses_batch_first"
+
+        # Resume without `_meta` keeps `ses_batch_first`
+        r2 = srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "delegate_file_batch",
+                    "arguments": {"plan_path": str(plan_file), "project": "p", "resume_job_id": jid},
+                },
+            }
+        )
+        d2 = json.loads(r2["result"]["content"][0]["text"])
+        assert d2["opencode_session_id"] == "ses_batch_first"
+        assert store.read_receipt(jid)["opencode_session_id"] == "ses_batch_first"
+
+        # Resume from a second session `ses_batch_second` preserves `ses_batch_first`
+        r3 = srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "delegate_file_batch",
+                    "arguments": {"plan_path": str(plan_file), "project": "p", "resume_job_id": jid},
+                    "_meta": {"ai.opencode/sessionID": "ses_batch_second"},
+                },
+            }
+        )
+        d3 = json.loads(r3["result"]["content"][0]["text"])
+        assert d3["status"] == "ok"
+        assert d3["opencode_session_id"] == "ses_batch_first"
+        assert store.read_receipt(jid)["opencode_session_id"] == "ses_batch_first"
+
+        # Error path on first run also persists set-once `opencode_session_id`
+        plan_err_file = tmp_path / "plan_err.json"
+        plan_err_file.write_text(
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "t_err",
+                            "path": "b.py",
+                            "action": "create",
+                            "intent": "create b.py",
+                            "checks": ["python3 -m py_compile b.py"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        from server.batch_runner import FileBatchRunner
+
+        monkeypatch.setattr(FileBatchRunner, "_execute", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        r_err = srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "delegate_file_batch",
+                    "arguments": {"plan_path": str(plan_err_file), "project": "p"},
+                    "_meta": {"ai.opencode/sessionID": "ses_err_origin"},
+                },
+            }
+        )
+        d_err = json.loads(r_err["result"]["content"][0]["text"])
+        err_jid = d_err["job_id"]
+        assert d_err["status"] == "error"
+        assert d_err["opencode_session_id"] == "ses_err_origin"
+        assert store.read_receipt(err_jid)["opencode_session_id"] == "ses_err_origin"
+
+        # Resuming the errored batch job from another session when `_execute` errors again still preserves `ses_err_origin`
+        r_err2 = srv.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "delegate_file_batch",
+                    "arguments": {"plan_path": str(plan_err_file), "project": "p", "resume_job_id": err_jid},
+                    "_meta": {"ai.opencode/sessionID": "ses_err_intruder"},
+                },
+            }
+        )
+        d_err2 = json.loads(r_err2["result"]["content"][0]["text"])
+        assert d_err2["status"] == "error"
+        assert d_err2["opencode_session_id"] == "ses_err_origin"
+        assert store.read_receipt(err_jid)["opencode_session_id"] == "ses_err_origin"
+    finally:
+        jm.shutdown()
+
+
+def test_opencode_v2_installer_reserved_names_timeout_cleanup_and_key_path(tmp_path: Path) -> None:
+    """Verify V2 migration refuses V1 servers named `timeout`/`servers`, drops invalid top-level timeouts, and reports exact `mcp_key_path`."""
+    from server.install import OpenCodeConfigError, install_opencode
+
+    for reserved_srv in ("timeout", "servers"):
+        with pytest.raises(OpenCodeConfigError, match=f"mcp\\.{reserved_srv}"):
+            upsert_opencode_mcp_config(
+                json.dumps({"mcp": {reserved_srv: {"type": "local", "command": ["my-server"]}}}),
+                build_opencode_v2_server_entry(),
+                name="agy",
+                v2=True,
+            )
+
+    cleaned_env = json.loads(
+        upsert_opencode_mcp_config(
+            json.dumps({"mcp": {"timeout": {"connect": 5000}, "servers": {}}}),
+            build_opencode_v2_server_entry(),
+            name="agy",
+            v2=True,
+        )
+    )
+    assert "timeout" not in cleaned_env["mcp"]
+    assert "agy" in cleaned_env["mcp"]["servers"]
+
+    cfg_dir = tmp_path / "oc_weird_sibling"
+    cfg_dir.mkdir()
+    (cfg_dir / "opencode.json").write_text(
+        json.dumps({"mcp": {"typeless_sibling": {"command": ["custom-bin"]}}}),
+        encoding="utf-8",
+    )
+    res = install_opencode(opencode_config_dir=cfg_dir, v2=True)
+    assert res["status"] == "installed"
+    assert res["mcp_key_path"] == "mcp.servers.agy"
+
+    # Servers named like V1 fields (`enabled`, `url`) inside V2 `mcp.servers` remain idempotent across re-runs,
+    # mixed V1->V2 migrations, V1 re-upserts, and sibling `opencode.jsonc` shadow checks
+    pass1 = upsert_opencode_mcp_config("{}", build_opencode_v2_server_entry(), name="enabled", v2=True)
+    pass2 = upsert_opencode_mcp_config(pass1, build_opencode_v2_server_entry(), name="agy", v2=True)
+    pass2_obj = json.loads(pass2)
+    assert set(pass2_obj["mcp"]["servers"].keys()) == {"enabled", "agy"}
+    assert upsert_opencode_mcp_config(pass2, build_opencode_v2_server_entry(), name="agy", v2=True) == pass2
+
+    mixed_v2 = json.loads(
+        upsert_opencode_mcp_config(
+            json.dumps(
+                {
+                    "mcp": {
+                        "v1_sib": {"type": "local", "command": ["echo"]},
+                        "servers": {"enabled": {"type": "local", "command": ["echo"]}},
+                    }
+                }
+            ),
+            build_opencode_v2_server_entry(),
+            name="agy",
+            v2=True,
+        )
+    )
+    assert set(mixed_v2["mcp"]["servers"].keys()) == {"v1_sib", "enabled", "agy"}
+
+    mixed_v1 = json.loads(
+        upsert_opencode_mcp_config(
+            json.dumps(
+                {
+                    "mcp": {
+                        "v1_sib": {"type": "local", "command": ["echo"]},
+                        "servers": {
+                            "enabled": {"type": "local", "command": ["echo"]},
+                            "agy": {"type": "local", "command": ["echo"]},
+                        },
+                    }
+                }
+            ),
+            build_opencode_server_entry(),
+            name="agy",
+            v2=False,
+        )
+    )
+    assert list(mixed_v1["mcp"]["servers"].keys()) == ["enabled"]
+    assert "agy" in mixed_v1["mcp"]
+
+    shadow_dir = tmp_path / "oc_jsonc_shadow_url"
+    shadow_dir.mkdir()
+    (shadow_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    (shadow_dir / "opencode.jsonc").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        "url": {"type": "remote", "url": "https://example.com/mcp"},
+                        "agy": {"type": "local", "command": ["python3"]},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    shadow_res = install_opencode(opencode_config_dir=shadow_dir, v2=True)
+    assert shadow_res["status"] == "refused"
+
+
+def test_model_limits_modality_checks_and_compaction_headroom_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify `gemini_models` limit fallback, binary media extension checks, and low-headroom compaction warnings."""
+    from server.rate_card import load_rate_card, resolve_model_token_limits
+
+    base_card = dict(load_rate_card())
+    custom_gemini_models = dict(base_card["gemini_models"])
+    custom_gemini_models["vendor/Custom-Declared-Route"] = {
+        "input": 2.0,
+        "cached_input": 0.2,
+        "output": 12.0,
+    }
+    custom_card = {**base_card, "gemini_models": custom_gemini_models}
+    route_limits = resolve_model_token_limits("custom-declared-route", card=custom_card)
+    assert route_limits["context_window"] == 1_048_576
+    assert route_limits["max_output_tokens"] == 65_536
+    assert "video" in route_limits["input_modalities"]
+
+    for media_ext in ("photo.heic", "scan.tiff", "song.flac", "clip.mkv", "clip.wmv"):
+        err_msg = check_file_input_modality(media_ext, "gemini-flash-next", env_override="text")
+        assert err_msg is not None and "Cannot read" in err_msg
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        near_full = compute_compaction_threshold("gemini-flash-next", threshold=1_047_000)
+    assert near_full == 1_047_000
+    assert any("headroom floor" in rec.message for rec in caplog.records)

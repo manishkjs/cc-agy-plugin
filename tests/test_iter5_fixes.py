@@ -850,19 +850,24 @@ def test_opus_r1_provenance_apostrophe_git_diff_and_skipped_acceptance_guards(tm
     import os
     from server.agy_runner import _direct_child_pids
 
-    lh_sym = tmp_path / "localharness"
-    lh_sym.symlink_to("/bin/sleep")
+    lh_bin = tmp_path / "localharness"
+    lh_bin.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n", encoding="utf-8")
+    lh_bin.chmod(0o755)
     save_a = tmp_path / "save_a"
     save_b = tmp_path / "save_b"
     save_a.mkdir()
     save_b.mkdir()
     pre_a = _direct_child_pids(os.getpid())
-    proc_b = subprocess.Popen([str(lh_sym), "60"], env={**os.environ, "CC_AGY_HARNESS_SAVE_DIR": str(save_b)})
+    proc_b = subprocess.Popen([str(lh_bin), "60"], env={**os.environ, "CC_AGY_HARNESS_SAVE_DIR": str(save_b)})
     try:
         time.sleep(0.1)
+        assert proc_b.poll() is None
         killed_cross = _force_terminate_agent_process(None, str(save_a), pre_child_pids=pre_a)
         assert killed_cross == 0
         assert proc_b.poll() is None
+        killed_match = _force_terminate_agent_process(None, str(save_b), pre_child_pids=pre_a)
+        assert killed_match >= 1
+        assert proc_b.wait(timeout=2.0) is not None
     finally:
         if proc_b.poll() is None:
             proc_b.kill()

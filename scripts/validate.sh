@@ -38,6 +38,7 @@ for rel in \
   server/genai_client.py \
   server/rate_card.json \
   server/rate_card.py \
+  tests/fixtures/opencode_config_schema.json \
   server/telemetry.py \
   server/verification_policy.py; do
   require_file "$root/$rel"
@@ -153,9 +154,16 @@ opencode_gw_json="$(
     python3 -m server.install --host opencode --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --no-bootstrap --non-interactive --json || true
 )"
 
-python3 - "$opencode_gw_json" "$tmp_home/opencode/opencode.json" <<'PY'
+opencode_v2_json="$(
+  cd "$root"
+  OPENCODE_CONFIG_DIR="$tmp_home/opencode_v2" GEMINI_API_KEY="test-key-not-written" \
+    python3 -m server.install --host opencode --opencode-v2 --opencode-codemode --opencode-protocol auto --profile balanced --base-url "https://gateway.example.internal" --max-daily-cents 500 --no-bootstrap --non-interactive --json || true
+)"
+
+python3 - "$opencode_gw_json" "$tmp_home/opencode/opencode.json" "$opencode_v2_json" "$tmp_home/opencode_v2/opencode.json" "$root/tests/fixtures/opencode_config_schema.json" <<'PY'
 from pathlib import Path
 import json
+import os
 import sys
 
 report = json.loads(sys.argv[1])
@@ -167,7 +175,44 @@ assert oc_cfg["$schema"] == "https://opencode.ai/config.json", oc_cfg
 assert oc_cfg["mcp"]["agy"]["type"] == "local", oc_cfg
 assert oc_cfg["mcp"]["agy"]["enabled"] is True, oc_cfg
 assert oc_cfg["mcp"]["agy"]["timeout"] == 1800000, oc_cfg
+
+report_v2 = json.loads(sys.argv[3])
+opencode_v2_host = next(h for h in report_v2["hosts"] if h["host"] == "opencode")
+assert opencode_v2_host["status"] == "installed", opencode_v2_host
+oc_v2_cfg = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+assert oc_v2_cfg["$schema"] == "https://opencode.ai/config.json", oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["type"] == "local", oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["disabled"] is False, oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["pool"] is False, oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["codemode"] is True, oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["protocol"] == "auto", oc_v2_cfg
+assert oc_v2_cfg["mcp"]["servers"]["agy"]["timeout"] == {"startup": 30000, "execution": 1800000}, oc_v2_cfg
+
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
+if jsonschema is None:
+    if os.environ.get("CI", "").strip().lower() in ("1", "true", "yes"):
+        raise SystemExit("jsonschema must be installed in CI for OpenCode JSON Schema validation")
+    print("jsonschema not installed; skipping OpenCode JSON Schema validation", file=sys.stderr)
+else:
+    schema = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
+    validator = jsonschema.validators.validator_for(schema)(schema)
+    for label, candidate in (("v1", oc_cfg), ("v2", oc_v2_cfg)):
+        errs = [e.message for e in validator.iter_errors(candidate)]
+        assert not errs, f"OpenCode {label} config failed schema validation: {errs}"
 PY
+
+bad_proto_rc=0
+bad_proto_out="$(
+  cd "$root" && OPENCODE_CONFIG_DIR="$tmp_home/opencode_bad_proto" \
+    python3 -m server.install --host opencode --opencode-v2 --opencode-protocol 2026-07-28 --no-bootstrap --non-interactive 2>&1
+)" || bad_proto_rc=$?
+if [[ "$bad_proto_rc" -ne 2 || "$bad_proto_out" != *"invalid choice"* ]]; then
+  printf 'Expected exit 2 + invalid choice for --opencode-protocol 2026-07-28, got rc=%d out=%s\n' "$bad_proto_rc" "$bad_proto_out" >&2
+  exit 1
+fi
 
 test -f "$tmp_home/opencode/opencode.json"
 test -f "$tmp_home/opencode/skills/cc-agy-plugin/SKILL.md"
@@ -176,7 +221,7 @@ test -f "$tmp_home/opencode/commands/delegate.md"
 test -f "$tmp_home/opencode/commands/jobs.md"
 test -f "$tmp_home/opencode/commands/cost.md"
 test -f "$tmp_home/opencode/agents/gemini-delegator.md"
-if grep -q "test-key-not-written" "$tmp_home/opencode/opencode.json"; then
+if grep -q "test-key-not-written" "$tmp_home/opencode/opencode.json" "$tmp_home/opencode_v2/opencode.json"; then
   printf 'API key leaked into OpenCode opencode.json!\n' >&2
   exit 1
 fi

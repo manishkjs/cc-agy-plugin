@@ -22,7 +22,7 @@ If the `agy` MCP tools are not registered yet, ask the user to run `python3 -m s
 | One new doc, tests from named cases, or one edit repeated across files | Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`. |
 <!-- SHARED:ROUTING_TABLE:END -->
 
-In OpenCode, call each MCP tool with its server prefix (for example `agy_doctor`, `agy_delegate_start`, `agy_delegate_result`, `agy_get_diff`, `agy_delegate_apply`, `agy_delegate_file_batch`, `agy_ask_gemini`, and `agy_cost_report`). When OpenCode V2 Code Mode (`experimental.codemode` / `codemode: true`) is active, invoke the same tools under `tools.agy.<tool>` (for example `await tools.agy.delegate_start({ prompt: "...", acceptance: ["pytest -q"], wait: true, auto_apply: true })`).
+In OpenCode, call each MCP tool with its server prefix (for example `agy_doctor`, `agy_delegate_start`, `agy_delegate_result`, `agy_get_diff`, `agy_delegate_apply`, `agy_delegate_file_batch`, `agy_ask_gemini`, and `agy_cost_report`). When OpenCode V2 Code Mode (`experimental.codemode_vm` / `codemode: true`) is active, invoke the same tools under `tools.agy.<tool>` (for example `await tools.agy.delegate_start({ prompt: "...", acceptance: ["pytest -q"], wait: true, auto_apply: true })`).
 
 ## Cost and safety rules
 

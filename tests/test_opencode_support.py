@@ -1044,7 +1044,7 @@ def test_opencode_v2_integer_timeout_coercion_protocol_filter_and_commented_json
     entry = build_opencode_server_entry(python_bin="/venv/bin/python")
 
     # Legacy integer `timeout` inside V2 `mcp.servers.<name>` coerces to V2 `{startup, execution}` object,
-    # valid `protocol` ("2026-07-28") is preserved, and unknown `protocol` ("stdio") / extra timeout keys are dropped
+    # supported `protocol` ("auto") is preserved on `agy`, while foreign `mcp.servers.other` keeps "2026-07-28" untouched
     v2_int_timeout_doc = json.dumps(
         {
             "$schema": OPENCODE_SCHEMA_URL,
@@ -1054,19 +1054,39 @@ def test_opencode_v2_integer_timeout_coercion_protocol_filter_and_commented_json
                         "type": "local",
                         "command": ["old"],
                         "timeout": 900000,
-                        "protocol": "2026-07-28",
+                        "protocol": "auto",
                     },
                     "other": {
                         "type": "local",
                         "command": ["other"],
+                        "protocol": "2026-07-28",
                     },
                 }
             },
         }
     )
-    coerced = json.loads(upsert_opencode_mcp_config(v2_int_timeout_doc, entry, name="agy"))["mcp"]["servers"]["agy"]
+    coerced_doc = json.loads(upsert_opencode_mcp_config(v2_int_timeout_doc, entry, name="agy"))
+    coerced = coerced_doc["mcp"]["servers"]["agy"]
     assert coerced["timeout"] == {"startup": OPENCODE_STARTUP_TIMEOUT_MS, "execution": 900000}
-    assert coerced["protocol"] == "2026-07-28"
+    assert coerced["protocol"] == "auto"
+    assert coerced_doc["mcp"]["servers"]["other"]["protocol"] == "2026-07-28"
+
+    # Pre-existing unsupported `"protocol": "2026-07-28"` on `agy` itself is stripped on re-upsert so startup does not fail
+    v2_unsupported_agy_proto = json.dumps(
+        {
+            "mcp": {
+                "servers": {
+                    "agy": {
+                        "type": "local",
+                        "command": ["old"],
+                        "protocol": "2026-07-28",
+                    }
+                }
+            }
+        }
+    )
+    healed = json.loads(upsert_opencode_mcp_config(v2_unsupported_agy_proto, entry, name="agy"))["mcp"]["servers"]["agy"]
+    assert "protocol" not in healed
 
     v2_bad_meta_doc = json.dumps(
         {

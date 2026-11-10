@@ -1587,3 +1587,97 @@ def test_powershell_bootstrap_gateway_secret_regex_matches_python_validator_on_c
     for ok_url in benign_urls:
         assert not ps1_rejects(ok_url), f"PowerShell regex false-positived on benign URL: {ok_url}"
         _validate_gateway_base_url_no_secrets(ok_url)
+
+
+def test_build_genai_client_pins_v1beta_and_deduplicates_versioned_gateway_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensure SDK 3.0+ keeps `/v1beta` on Gemini-wire and honors explicit `/v1` / `/v1beta` / `/v1beta1` suffixes without doubling."""
+    from server.genai_client import build_genai_client, close_genai_client
+
+    for clean_env in (
+        "CC_AGY_VERTEX_BASE_URL",
+        "CC_AGY_GEMINI_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+        "GOOGLE_GEMINI_BASE_URL",
+        "CC_AGY_BIFROST_VIRTUAL_KEY",
+    ):
+        monkeypatch.delenv(clean_env, raising=False)
+
+    # 1. Direct AI Studio API key pins `v1beta` across google-genai 2.x and 3.x
+    direct_client = build_genai_client({"api_key": "AIzaSyUnitTestKey0000000000000000"})
+    try:
+        req_direct = direct_client._api_client._build_request(
+            "post", "models/gemini-flash-next:generateContent", {}, None
+        )
+        assert req_direct.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-next:generateContent"
+    finally:
+        close_genai_client(direct_client)
+
+    # 2. Gemini-wire gateway URLs with and without trailing `/v1beta`, `/V1BETA`, `/v1alpha`, or `/v1` never double the version segment
+    for gw_url, expected_prefix in (
+        ("https://litellm.example.com/gemini", "https://litellm.example.com/gemini/v1beta/"),
+        ("https://litellm.example.com/gemini/v1beta", "https://litellm.example.com/gemini/v1beta/"),
+        ("https://litellm.example.com/gemini/V1BETA", "https://litellm.example.com/gemini/v1beta/"),
+        ("https://litellm.example.com/genai/v1alpha", "https://litellm.example.com/genai/v1alpha/"),
+        ("https://litellm.example.com/gemini/v1", "https://litellm.example.com/gemini/v1/"),
+        ("http://localhost:8080/genai/v1beta/", "http://localhost:8080/genai/v1beta/"),
+    ):
+        gw_client = build_genai_client(
+            {
+                "base_url": gw_url,
+                "gateway_wire": "gemini",
+                "base_url_token": "sk-litellm-test",
+            }
+        )
+        try:
+            req_gw = gw_client._api_client._build_request(
+                "post", "models/gemini-flash-next:generateContent", {}, None
+            )
+            assert req_gw.url == f"{expected_prefix}models/gemini-flash-next:generateContent"
+        finally:
+            close_genai_client(gw_client)
+
+    # 3. Custom gateways with spoofed `googleapis.com` path, suffix, prefix, or userinfo still set `follow_redirects=False`
+    for spoof_url in (
+        "https://gw.corp.internal/proxy/generativelanguage.googleapis.com/genai",
+        "https://googleapis.com.evil.example/v1beta",
+        "https://evilgoogleapis.com/v1beta",
+        "https://x.googleapis.com@evil.example/v1beta",
+    ):
+        spoof_client = build_genai_client(
+            {
+                "base_url": spoof_url,
+                "gateway_wire": "gemini",
+                "base_url_token": "sk-corp-proxy",
+            }
+        )
+        try:
+            client_args = spoof_client._api_client._http_options.client_args or {}
+            assert client_args.get("follow_redirects") is False, spoof_url
+        finally:
+            close_genai_client(spoof_client)
+
+    # 4. Vertex-wire gateway URLs default to `v1beta1`, honor explicit `/v1`, and preserve `/v1internal` untouched
+    for vx_url, expected_ver_segment in (
+        ("https://litellm.example.com/vertex_ai", "/vertex_ai/v1beta1/projects/"),
+        ("https://litellm.example.com/vertex_ai/v1", "/vertex_ai/v1/projects/"),
+        ("https://litellm.example.com/vertex_ai/v1beta1", "/vertex_ai/v1beta1/projects/"),
+        ("https://proxy.example.com/v1internal", "/v1internal/v1beta1/projects/"),
+    ):
+        vx_client = build_genai_client(
+            {
+                "base_url": vx_url,
+                "gateway_wire": "vertex",
+                "project": "acme-prod",
+                "location": "global",
+                "base_url_token": "sk-vertex-test",
+            }
+        )
+        try:
+            req_vx = vx_client._api_client._build_request(
+                "post", "publishers/google/models/gemini-flash-next:generateContent", {}, None
+            )
+            assert expected_ver_segment in req_vx.url
+        finally:
+            close_genai_client(vx_client)

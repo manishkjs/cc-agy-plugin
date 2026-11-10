@@ -8,8 +8,11 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import shutil
@@ -20,6 +23,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable, Mapping
+import unicodedata
 import urllib.parse
 
 from server.genai_client import extract_usage_metadata
@@ -200,6 +204,24 @@ def build_worker_system_prompt(
     )
 
 
+_REMINDER_KEY_SCRUB_RE = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029\[\]<>]")
+_REMINDER_TAG_RE = re.compile(
+    r"<\s*(/?)\s*system-reminder\b(?:[^>\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,256}>)?",
+    re.IGNORECASE,
+)
+_REMINDER_LINE_SEP_RE = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
+def _scrub_reminder_text(raw: str) -> str:
+    """NFKC-normalize and strip Unicode `Cf` / non-linebreak `Cc` controls."""
+    normalized = unicodedata.normalize("NFKC", raw)
+    return "".join(
+        ch
+        for ch in normalized
+        if unicodedata.category(ch) not in ("Cf", "Cc") or ch in "\t\n\r\v\f\x1c\x1d\x1e\x85"
+    )
+
+
 def render_keyed_turn_instructions(
     instructions: Mapping[str, str] | None,
 ) -> str:
@@ -207,31 +229,18 @@ def render_keyed_turn_instructions(
 
     Keeping dynamic instructions in the user turn payload rather than mutating `WORKER_SYSTEM_PROMPT`
     preserves a byte-identical system prompt prefix across multi-turn conversations for 90% prompt-cache hits.
-    Tag markers and embedded newlines in keys/values are sanitized so callers cannot inject closing tags.
+    Tag markers (including attributes, self-closing tags, full-width angle brackets, and control bytes) and
+    embedded newlines in keys/values are sanitized so callers cannot inject closing tags.
     """
     if not instructions:
         return ""
-    import re as _re_mod
-    import unicodedata as _unicodedata
-
     lines: list[str] = ["<system-reminder>"]
     for key in sorted(instructions.keys()):
-        raw_key_clean = "".join(
-            ch for ch in str(key).strip() if _unicodedata.category(ch) != "Cf" and ch != "\u00ad"
-        )
-        clean_key = _re_mod.sub(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029\[\]<>]", "_", raw_key_clean)
-        scrubbed_raw = "".join(
-            ch
-            for ch in str(instructions[key] or "")
-            if _unicodedata.category(ch) != "Cf" and ch != "\u00ad"
-        )
-        raw_val = _re_mod.sub(
-            r"<\s*(/?)\s*system-reminder\s*>",
-            r"[\1system-reminder]",
-            scrubbed_raw,
-            flags=_re_mod.IGNORECASE,
-        )
-        val = _re_mod.sub(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+", " | ", raw_val).strip()
+        raw_key_clean = _scrub_reminder_text(str(key).strip())
+        clean_key = _REMINDER_KEY_SCRUB_RE.sub("_", raw_key_clean)
+        scrubbed_raw = _scrub_reminder_text(str(instructions[key] or ""))
+        raw_val = _REMINDER_TAG_RE.sub(r"[\1system-reminder]", scrubbed_raw)
+        val = _REMINDER_LINE_SEP_RE.sub(" | ", raw_val).strip()
         if clean_key and val:
             lines.append(f"[{clean_key}] {val}")
     if len(lines) == 1:
@@ -248,14 +257,27 @@ _BINARY_EXT_MODALITIES: dict[str, str] = {
     ".webp": "image",
     ".bmp": "image",
     ".ico": "image",
+    ".heic": "image",
+    ".heif": "image",
+    ".tif": "image",
+    ".tiff": "image",
+    ".avif": "image",
     ".pdf": "pdf",
     ".mp3": "audio",
     ".wav": "audio",
     ".ogg": "audio",
+    ".flac": "audio",
+    ".m4a": "audio",
+    ".aac": "audio",
     ".mp4": "video",
     ".mov": "video",
     ".avi": "video",
     ".webm": "video",
+    ".mkv": "video",
+    ".mpeg": "video",
+    ".mpg": "video",
+    ".3gp": "video",
+    ".wmv": "video",
 }
 
 
@@ -2178,8 +2200,6 @@ def resolve_worker_sdk_limits(
                 buffer=str(env_buffer).strip(),
             )
     except (TypeError, ValueError, OverflowError) as exc:
-        import logging
-
         logging.getLogger(__name__).warning(
             "Invalid worker compaction configuration (%s); falling back to %d tokens.",
             exc,
@@ -2191,10 +2211,8 @@ def resolve_worker_sdk_limits(
     if raw_tool_max is None:
         raw_tool_max = source_env.get("CC_AGY_TOOL_OUTPUT_MAX_TOKENS", "4000")
     try:
-        import math as _math
-
         flt_tm = float(str(raw_tool_max).strip())
-        if not _math.isfinite(flt_tm):
+        if not math.isfinite(flt_tm):
             raise ValueError("non-finite tool_output_max_tokens")
         tool_max_tokens = max(0, int(flt_tm))
     except (TypeError, ValueError, OverflowError):
