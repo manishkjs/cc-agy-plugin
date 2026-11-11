@@ -293,8 +293,6 @@ Claude Opus 5.5 alone costs 87.6¢ per task on this suite. Against that baseline
 - **Need the most solves on Gemini?** Gemini Carbon with zero thinking solves **20 of 26** and passes 846 hidden tests (Opus: 806), at roughly Opus price (93.9¢, +7%).
 - **Opus still solves the most tasks** (22 of 26). Each setup ran each task once, so differences of 1 to 3 tasks are within normal run-to-run noise.
 
-Per-language numbers, failure analysis, and engineering lessons are in [`docs/design/lessons-learned.md`](docs/design/lessons-learned.md#benchmark-findings-detail) and the interactive dashboard ([`docs/brownfield_gemini_benchmark.html`](docs/brownfield_gemini_benchmark.html)).
-
 <details>
 <summary><b>Using <code>cc-agy-plugin</code> inside Antigravity: before vs. after</b></summary>
 

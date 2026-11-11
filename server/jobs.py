@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import fcntl
 import fnmatch
