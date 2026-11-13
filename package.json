@@ -1,0 +1,29 @@
+{
+  "name": "cc-agy-plugin",
+  "version": "0.3.0",
+  "description": "OpenCode entry point for cc-agy-plugin: registers the agy MCP server, commands, and subagent.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./opencode-plugin/index.ts",
+  "exports": {
+    ".": "./opencode-plugin/index.ts"
+  },
+  "files": [
+    "opencode-plugin",
+    ".opencode",
+    "server",
+    "scripts",
+    "skills",
+    "pyproject.toml"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "gemini",
+    "antigravity",
+    "mcp"
+  ],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.19.0"
+  }
+}

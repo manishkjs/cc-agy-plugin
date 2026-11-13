@@ -12,6 +12,7 @@ require_file() {
 
 for rel in \
   pyproject.toml \
+  package.json \
   LICENSE \
   README.md \
   .mcp.json \
@@ -20,6 +21,8 @@ for rel in \
   .cursor-plugin/plugin.json \
   .cursor-plugin/mcp.json \
   .cursor-plugin/hooks.json \
+  cursor/rules/cc-agy-coexistence.mdc \
+  opencode-plugin/index.ts \
   .opencode/skills/cc-agy-plugin/SKILL.md \
   .opencode/agents/gemini-delegator.md \
   .opencode/commands/delegate.md \
@@ -32,17 +35,39 @@ for rel in \
   plugins/cc-agy-plugin/skills/vertex/SKILL.md \
   skills/vertex/SKILL.md \
   scripts/install_agy_cli.sh \
+  scripts/quickstart.sh \
+  scripts/lint_ast.py \
+  scripts/run_tests_parallel.py \
   scripts/bootstrap-gateway.ps1 \
   scripts/sync_docs.py \
+  server/acceptance_runner.py \
   server/agy_cli.py \
+  server/agy_state.py \
+  server/ast_regression_guards.py \
+  server/bifrost_policy.py \
+  server/env_flags.py \
+  server/gateway.py \
   server/genai_client.py \
+  server/guard_bash.py \
+  server/guard_prompt_lint.py \
+  server/guard_session_state.py \
+  server/job_apply_mixin.py \
+  server/job_git_utils.py \
+  server/job_qa_mixin.py \
+  server/job_salvage_mixin.py \
   server/rate_card.json \
   server/rate_card.py \
+  server/settings_catalog.py \
+  server/test_discovery.py \
+  server/worker_prompt_builder.py \
+  server/worker_sandbox.py \
   tests/fixtures/opencode_config_schema.json \
   server/telemetry.py \
   server/verification_policy.py; do
   require_file "$root/$rel"
 done
+
+python3 "$root/scripts/lint_ast.py"
 
 if ! cmp -s "$root/LICENSE" "$root/plugins/cc-agy-plugin/LICENSE"; then
   printf 'Codex plugin LICENSE does not match root LICENSE byte-for-byte.\n' >&2
@@ -68,11 +93,13 @@ cursor_mcp = json.loads((root / ".cursor-plugin" / "mcp.json").read_text(encodin
 cursor_hooks = json.loads((root / ".cursor-plugin" / "hooks.json").read_text(encoding="utf-8"))
 codex_market = json.loads((root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
 codex_plugin = json.loads((root / "plugins" / "cc-agy-plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+package_json = json.loads((root / "package.json").read_text(encoding="utf-8"))
 json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
 
 assert claude_plugin["version"] == ver, (claude_plugin["version"], ver)
 assert claude_market["plugins"][0]["version"] == ver, (claude_market["plugins"][0]["version"], ver)
 assert cursor_plugin["version"] == ver, (cursor_plugin["version"], ver)
+assert package_json["version"] == ver, (package_json["version"], ver)
 assert cursor_plugin["name"] == "cc-agy-plugin", cursor_plugin
 assert "agy" in cursor_mcp.get("mcpServers", {}), cursor_mcp
 assert isinstance(cursor_hooks.get("hooks"), dict), cursor_hooks

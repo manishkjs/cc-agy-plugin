@@ -9,12 +9,14 @@ Use the `vertex` (Claude Code) or `agy` (Cursor, OpenCode, Codex, Antigravity) M
 
 1. **Single-Shot Review Tier (`ask_gemini`)**:
    - Calls Gemini directly via `google-genai` (or `agy --output-format json --mode plan` on Gemini Enterprise seats) without loading an agent workspace copy.
-   - Use for architecture reviews, root-cause hypotheses, and second opinions on diffs or specific `context_files`.
+   - Use for architecture reviews, root-cause hypotheses, and second opinions on diffs or specific `context_files` (files, directories, or globs, with automatic secret redaction and fair per-directory token budgeting).
+   - Supports `model="gemini-4-carbon"` (`carbon`) with sequential `continuationToken` multi-segment long-decode (up to 65,536 output tokens per segment, `MEDIUM` thinking by default), `media=[...]` for screenshots/videos/PDFs (`.png`, `.jpg`, `.jpeg`, `.webp`, `.heic`, `.heif`, `.mp4`, `.mov`, `.webm`, `.mpeg`, `.pdf`, `<=14 MB`), `spec_url="https://..."` for public RFC/spec compliance checks, and `google_search=true` / `check_dependencies=true` for live CVE and upgrade audits across repository manifests.
    - Default model: `gemini-flash-next` (`gemini-4-argon` when `cost_profile="quality"`, or override via `model=...` / `CC_AGY_DEFAULT_ASK_MODEL`).
 
 2. **Agentic Worker Tier (`delegate_start`, `delegate_result`, `get_diff`, `delegate_apply`, `delegate_revert`, `delegate_continue`, `delegate_cancel`, `delegate_to_gemini`, `cost_report`, `doctor`)**:
    - Routes automatically to the standalone Antigravity CLI (`agy --output-format stream-json`) on Gemini Enterprise subscriptions, or spawns `google.antigravity.Agent` (`GeminiAPIEndpoint` in API-key mode, `VertexEndpoint` in Vertex AI and AI Gateway modes).
    - Default model: `gemini-flash-next` under the default `balanced` cost profile, escalating automatically to `gemini-4-carbon-zero` on retries, failed checks, or overlapping follow-up fixes (`cost_profile="quality"` starts directly on `gemini-4-argon`; `cost_profile="economy"` stays on `gemini-flash-next`).
+   - When the user prompt references screenshots, screen recordings (`.mp4`, `.mov`, `.webm`, `.mpeg`), or PDF specs, delegate immediately on Turn 1 via `delegate_start(..., media_files=[...], wait=true)` (untracked media files are copied into the worker worktree and excluded from git diffs) or `ask_gemini(..., media=[...])`.
    - By default (`in_place=false`), runs inside a standalone git repository copy under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) initialized with `git init -b main`. When `CC_AGY_SPARSE_WORKTREE=1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>` is set on large monorepos, passing `allowed_paths` materializes a scoped sparse copy (including 2-hop local imports) so worktree setup stays fast without marking omitted files as deleted. Failed or timed-out runs leave your working tree untouched. Note: this provides git-level checkout isolation, not an OS container sandbox; worker commands execute with your user account's OS authority.
    - With `in_place=true`, edits your live working tree directly (requires a clean tracked tree, one `in_place` job at a time, and no `allowed_paths`), unwinds any worker commits or branch switches back to the baseline commit while keeping file edits on disk, and provides a shell-quoted `undo_hint`.
    - When `ctx-harness` (Straitjacket) is installed, replaces unbounded `RUN_COMMAND` with `run_command`, `ctx_get`, and `ctx_search` (capturing command outputs exceeding 400 lines or 6,000 tokens in a local evidence store).
@@ -70,6 +72,7 @@ Use the `vertex` (Claude Code) or `agy` (Cursor, OpenCode, Codex, Antigravity) M
 2. **Wait for completion**:
    - Call `delegate_result(job_id=...)` to inspect the compact digest (`status`, `acceptance_passed`, `acceptance_results`, `progress`, `files_changed`, `diff_tokens_estimated`, `usage`, `cost`).
    - If `status` is `"checkpoint"` (budget cap reached) or `"needs_input"` (`report_to_lead` question/blocker), call `delegate_continue(job_id=..., follow_up_prompt=...)` to resume or redirect.
+   - If the digest has `denied_actions`, the organization's Gemini Enterprise policy blocked those commands or file reads. Show them to the user, run only the approved ones inside the isolated worker copy named in `next_action` (never the live workspace), then call `delegate_continue` with the output so the same `agy` conversation resumes.
 3. **Inspect the diff**:
    - Call `get_diff(job_id=..., page=1, page_tokens=4000)` to review the worker's unified git diff within a 4,000-token page budget.
 4. **Verify and apply**:

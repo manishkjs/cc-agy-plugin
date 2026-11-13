@@ -300,7 +300,7 @@ def check_file_input_modality(
             model_name or os.environ.get("CC_AGY_MODEL"),
             env_override=eff_env,
         )
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError):
         allowed_mods = frozenset({"text"})
     if ext_modality not in allowed_mods:
         return (
@@ -534,13 +534,13 @@ def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, A
             rows = conn.execute(
                 "SELECT idx, step_type, metadata, step_payload FROM steps ORDER BY idx"
             ).fetchall()
-        except Exception:
+        except (sqlite3.Error, OSError, ValueError):
             continue
         finally:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
+                except (sqlite3.Error, OSError):
                     pass
         for _idx, step_type, meta, payload in rows:
             if step_type == 15 and isinstance(meta, (bytes, bytearray)) and meta:
@@ -601,10 +601,10 @@ def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, A
                             t_args_raw = tc_p.get(3).decode("utf-8", errors="ignore") if isinstance(tc_p.get(3), bytes) else "{}"
                             try:
                                 t_args = json.loads(t_args_raw)
-                            except Exception:
+                            except (ValueError, TypeError):
                                 t_args = {}
                             out["tool_calls"].append({"name": t_name, "args": t_args})
-                except Exception:
+                except (ValueError, TypeError, KeyError, AttributeError):
                     pass
     return out
 
@@ -751,7 +751,7 @@ def build_straitjacket_tools(
             cand_host = Path(host_workspace_root).resolve()
             if cand_host != ws_resolved:
                 host_ws_resolved = cand_host
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             host_ws_resolved = None
     extra_blocked_list = [
         p.strip()
@@ -937,7 +937,7 @@ def build_straitjacket_tools(
                 if toks_c[0] == "cd" and len(toks_c) >= 2 and not toks_c[1].startswith("-"):
                     try:
                         next_cwd = (eff_cwd / toks_c[1]).resolve()
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError):
                         if isolated_worktree:
                             return True
                         continue
@@ -953,7 +953,7 @@ def build_straitjacket_tools(
                             cand_tk = (eff_cwd / tk).resolve()
                             if (isolated_worktree and not cand_tk.is_relative_to(ws_resolved)) or _matches_abs_blocked(cand_tk):
                                 return True
-                        except Exception:
+                        except (OSError, RuntimeError, ValueError):
                             if isolated_worktree:
                                 return True
         return False
@@ -1073,7 +1073,7 @@ def build_straitjacket_tools(
                 encoding="utf-8",
             )
             os.replace(tmp_p, _live_state_p)
-        except Exception:
+        except (OSError, ValueError, TypeError):
             pass
 
     def _maybe_append_turn_budget_note(raw_output: str) -> str:
@@ -1112,7 +1112,7 @@ def build_straitjacket_tools(
                 )
                 if (gs.stdout or "").strip():
                     _straitjacket_state["has_edits"] = True
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 pass
         if not _straitjacket_state["has_edits"] and (calls >= 8 or elapsed >= session_timeout * 0.35 or near_tool_cap):
             return (
@@ -1168,7 +1168,7 @@ def build_straitjacket_tools(
                                 idx_z += 1
                                 if old_raw and xy[0] == "R":
                                     deleted_set.add(old_raw.decode("utf-8", errors="surrogateescape"))
-            except Exception:
+            except (OSError, ValueError, subprocess.SubprocessError):
                 used_git_status = False
         _ephemeral_hash_dirs = frozenset({
             ".git",
@@ -1240,7 +1240,7 @@ def build_straitjacket_tools(
     if post_acc_guard_enabled and not _is_git_ws:
         try:
             _, _, _baseline_non_git_hashes = _snapshot_run_hashes()
-        except Exception:
+        except (OSError, ValueError, subprocess.SubprocessError):
             _baseline_non_git_hashes = {}
     _no_tests_re = _re.compile(r"\bno tests ran\b|\bcollected 0 items\b|\bRan 0 tests\b", _re.I)
     _py_exe_re = _re.compile(r"^python(?:\d+(?:\.\d+)*)?$", _re.I)
@@ -1361,7 +1361,7 @@ def build_straitjacket_tools(
             if p_cand.is_absolute():
                 try:
                     rel_p = p_cand.resolve().relative_to(ws_resolved).as_posix()
-                except Exception:
+                except (OSError, ValueError):
                     rel_p = path_part.rstrip("/") or "."
             else:
                 rel_p = path_part.lstrip("./").rstrip("/") or "."
@@ -1572,7 +1572,7 @@ def build_straitjacket_tools(
         if post_del is None or post_h is None:
             try:
                 _, post_del, post_h = _snapshot_run_hashes()
-            except Exception:
+            except (OSError, ValueError, subprocess.SubprocessError):
                 return False, ((), ())
         if _is_git_ws:
             has_changes = bool(post_h or post_del)
@@ -1668,7 +1668,7 @@ def build_straitjacket_tools(
                             "PermissionDenied: working_directory must stay within the isolated workspace."
                         ),
                     })
-            except Exception:
+            except (OSError, ValueError, TypeError):
                 pass
         if nm_linked and _is_linked_node_modules_mutation(cmd_str):
             return json.dumps({
@@ -1694,7 +1694,7 @@ def build_straitjacket_tools(
         eff_timeout = min(max(1.0, raw_timeout if raw_timeout > 0 else default_cmd_timeout), session_timeout)
         try:
             _pre_files, pre_deleted, pre_hashes = _snapshot_run_hashes()
-        except Exception:
+        except (OSError, ValueError, subprocess.SubprocessError):
             pre_deleted, pre_hashes = set(), {}
         t0_mono = time.monotonic()
         result = await session.run(
@@ -1732,7 +1732,7 @@ def build_straitjacket_tools(
             command_runs.append(run_record)
             with open(reads_dir / "worker_runs.jsonl", "a", encoding="utf-8") as rfh:
                 rfh.write(json.dumps(run_record) + "\n")
-        except Exception:
+        except (OSError, ValueError, TypeError):
             pass
         if post_acc_guard_enabled:
             has_changes, post_state_key = _worktree_state_key(post_deleted, post_hashes)
@@ -1783,7 +1783,7 @@ def build_straitjacket_tools(
         try:
             cand = (ws_resolved / raw_rel).resolve()
             rel_obj = cand.relative_to(ws_resolved)
-        except Exception:
+        except (OSError, ValueError):
             return "", "PermissionDenied: Path must remain within the isolated workspace."
         if rel_obj.parts:
             bname = rel_obj.name.lower()
@@ -1876,7 +1876,7 @@ def build_straitjacket_tools(
         try:
             cand = (ws_resolved / clean).resolve()
             host_rel = cand.relative_to(host_ws_resolved)
-        except Exception:
+        except (OSError, ValueError):
             return None, ""
         if "node_modules" not in host_rel.parts:
             return None, ""
@@ -1947,7 +1947,7 @@ def build_straitjacket_tools(
         try:
             if target_f.is_file():
                 file_sha = _hashlib.sha256(target_f.read_bytes()).hexdigest()
-        except Exception:
+        except OSError:
             file_sha = ""
         try:
             min_span = max(0, int(os.environ.get("CC_AGY_MIN_VIEW_LINES", "250")))
@@ -2875,7 +2875,7 @@ def _ps_process_table(*, include_args: bool = False) -> dict[int, tuple[int, str
     except subprocess.TimeoutExpired:
         if include_args:
             return _ps_process_table(include_args=False)
-    except Exception:
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return table
 
@@ -2896,7 +2896,7 @@ def _ps_pid_matches_save_dir(pid: int, save_token: str, ps_args: str = "") -> bo
         )
         if res.returncode == 0 and save_token in (res.stdout or ""):
             return True
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass
     return False
 
@@ -3086,7 +3086,7 @@ def _force_terminate_agent_process(
             stdin = getattr(proc, "stdin", None)
             if stdin is not None:
                 stdin.close()
-        except Exception:
+        except OSError:
             pass
         pid = getattr(proc, "pid", None)
         if isinstance(pid, int) and pid != my_pid:
@@ -3162,7 +3162,7 @@ def _force_terminate_agent_process(
         for pid, proc in list(popen_by_pid.items()):
             try:
                 proc.poll()
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 pass
         if not any(_pid_is_alive_non_zombie(p) for p in ordered_pids):
             break
@@ -3182,7 +3182,7 @@ def _force_terminate_agent_process(
         if proc is not None:
             try:
                 proc.wait(timeout=0.3)
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 pass
 
     return len(killed_pids)
@@ -3435,4 +3435,7 @@ def run_antigravity_worker(
             else {}
         ),
         **({"usage_is_cumulative": True} if result.get("usage_is_cumulative") else {}),
+        **({"denied_actions": list(result["denied_actions"])} if result.get("denied_actions") else {}),
+        **({"worker_sandbox": dict(result["worker_sandbox"])} if result.get("worker_sandbox") else {}),
+        **({"usage_estimated": True} if result.get("usage_estimated") else {}),
     }

@@ -229,7 +229,36 @@ def run_doctor(
                 "companion_project": comp_proj,
                 "tier_id": ent_check.get("tier_id"),
                 "config_dir": ent_check.get("config_dir"),
+                "adc_seat_enabled": bool(ent_check.get("adc_seat_enabled")),
+                "enterprise_project": ent_check.get("enterprise_project"),
+                "enterprise_location": ent_check.get("enterprise_location"),
+                "baicode_user_tier": ent_check.get("baicode_user_tier"),
             }
+            if ent_check.get("adc_seat_error"):
+                agy_cli_info["adc_seat_error"] = ent_check["adc_seat_error"]
+            from server.worker_sandbox import inspect_worker_sandbox
+
+            agy_cli_info["worker_sandbox"] = inspect_worker_sandbox(active_env)
+            if agy_cli_info["worker_sandbox"]["error"]:
+                issues.append(str(agy_cli_info["worker_sandbox"]["error"]))
+            from server.bifrost_policy import inspect_bifrost_policy
+
+            bifrost_agy_policy = inspect_bifrost_policy(active_env, live=probe_oidc)
+            if bifrost_agy_policy["enabled"] or bifrost_agy_policy["error"]:
+                agy_cli_info["bifrost_agy_policy"] = bifrost_agy_policy
+            if bifrost_agy_policy["error"]:
+                issues.append(f"Bifrost /agy policy: {bifrost_agy_policy['error']}")
+            from server.agy_state import inspect_agy_model_catalog
+
+            model_catalog = inspect_agy_model_catalog(ent_check.get("agy_bin"), active_env, live=probe_oidc)
+            if model_catalog["model_count"] is not None or model_catalog["source"]:
+                agy_cli_info["model_catalog"] = model_catalog
+            if probe_oidc and model_catalog["models"] and bifrost_agy_policy["enabled"] and not bifrost_agy_policy["error"]:
+                from server.agy_cli import _filter_models_by_bifrost_policy
+
+                model_catalog["allowed_by_bifrost_count"] = len(
+                    _filter_models_by_bifrost_policy(list(model_catalog["models"]), active_env)
+                )
             if not ent_check.get("ok"):
                 auth_ok = False
                 issues.append(str(ent_check.get("error") or "Gemini Enterprise `agy` CLI sign-in is missing."))
@@ -555,6 +584,72 @@ def run_doctor(
     }
 
 
+def format_doctor_human(report: Mapping[str, Any]) -> str:
+    """Format a `run_doctor()` report as a concise human-readable terminal summary."""
+    status = str(report.get("status") or "error").upper()
+    healthy = bool(report.get("healthy"))
+    badge = "[OK]" if status == "OK" else ("[WARN]" if healthy else "[FAIL]")
+    auth = report.get("auth") if isinstance(report.get("auth"), Mapping) else {}
+    mcp = report.get("mcp") if isinstance(report.get("mcp"), Mapping) else {}
+    sdks = report.get("sdks") if isinstance(report.get("sdks"), Mapping) else {}
+    ws = report.get("workspace") if isinstance(report.get("workspace"), Mapping) else {}
+    store = report.get("receipt_store") if isinstance(report.get("receipt_store"), Mapping) else {}
+    budget = report.get("daily_budget") if isinstance(report.get("daily_budget"), Mapping) else {}
+
+    lines = [
+        f"{badge} cc-agy-plugin doctor ({status.lower()})",
+        f"  Auth mode:      {auth.get('auth_mode') or 'unconfigured'} (configured: {auth.get('configured_auth_mode') or 'auto'})",
+        f"  Cost profile:   {report.get('cost_profile')} (worker: {report.get('default_delegate_model')}, ask: {report.get('default_ask_model')})",
+        f"  MCP tools:      {'ok' if mcp.get('ok') else 'error'} ({mcp.get('active_tool_count', 0)} active)",
+        f"  Python runtime: {sdks.get('python_bin')} (genai={sdks.get('google_genai')}, agy={sdks.get('google_antigravity')}, ctx={sdks.get('ctx_straitjacket')})",
+        f"  Workspace:      {ws.get('workspace_root')} (git={ws.get('is_git_repo')}, runner={ws.get('detected_test_runner') or 'smoke_only'})",
+        f"  Receipt store:  {store.get('data_dir')} (writable={store.get('writable')})",
+    ]
+    agy_cli = auth.get("agy_cli") if isinstance(auth.get("agy_cli"), Mapping) else None
+    if agy_cli:
+        sbx = agy_cli.get("worker_sandbox") if isinstance(agy_cli.get("worker_sandbox"), Mapping) else {}
+        lines.append(
+            f"  AGY CLI:        bin={agy_cli.get('agy_bin') or 'missing'}, signed_in={agy_cli.get('auth_configured')}, "
+            f"sandbox={sbx.get('backend') or 'none'} (mode={sbx.get('mode') or 'auto'})"
+        )
+    if budget.get("max_daily_cents") is not None:
+        lines.append(
+            f"  Daily budget:   {float(budget.get('spent_today_cents') or 0.0):.2f}c / {float(budget['max_daily_cents']):.2f}c"
+        )
+    for issue in report.get("issues") or []:
+        lines.append(f"  [FAIL] {issue}")
+    for warn in report.get("warnings") or []:
+        lines.append(f"  [WARN] {warn}")
+    for rem in report.get("remediations") or []:
+        lines.append(f"  [FIX]  {rem}")
+    return "\n".join(lines)
+
+
+def _apply_doctor_fixes(env: Mapping[str, str]) -> list[str]:
+    """Run safe local bootstrap repairs when `doctor --fix` is requested."""
+    actions: list[str] = []
+    plugin_root = Path(__file__).resolve().parent.parent
+    try:
+        cfg_mode = resolve_configured_auth_mode(env=env)
+    except ValueError:
+        cfg_mode = None
+    if cfg_mode == "gemini_enterprise":
+        from server.agy_cli import ensure_agy_cli_installed, inspect_agy_cli_offline
+
+        status = inspect_agy_cli_offline(env)
+        if not status.get("binary_found"):
+            boot = ensure_agy_cli_installed(plugin_root, env=env, output_fn=None)
+            actions.append(f"ensure_agy_cli_installed: {'ok' if boot.get('ok') else boot.get('error')}")
+    else:
+        from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python
+
+        py_bin = resolve_sdk_python(plugin_root, env=env)
+        if not python_has_plugin_sdks(py_bin):
+            boot = ensure_sdk_venv(plugin_root, env=env, output_fn=None)
+            actions.append(f"ensure_sdk_venv: {'ok' if boot.get('ok') else boot.get('error')}")
+    return actions
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     import json
@@ -565,9 +660,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Mint a live OIDC identity token once when gateway OIDC is configured and display the principal claim.",
     )
+    parser.add_argument(
+        "--human",
+        action="store_true",
+        help="Print a concise human-readable diagnostic summary instead of JSON.",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Attempt safe local bootstrap repairs (managed SDK venv or standalone `agy` CLI) before checking.",
+    )
     args = parser.parse_args(argv)
+    fix_actions: list[str] = []
+    if args.fix:
+        fix_actions = _apply_doctor_fixes(os.environ)
     report = run_doctor(workspace_root=os.getcwd(), probe_oidc=bool(args.probe_oidc))
-    print(json.dumps(report, indent=2))
+    if fix_actions:
+        report["fix_actions"] = fix_actions
+    if args.human:
+        print(format_doctor_human(report))
+    else:
+        print(json.dumps(report, indent=2))
     return 0 if report.get("healthy") else 1
 
 

@@ -17,6 +17,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from server.env_flags import (
+    COST_PROFILE_ENV_KEYS as COST_PROFILE_ENV_KEYS,
+    STRICT_MODE_ENV_KEYS as STRICT_MODE_ENV_KEYS,
+    VALID_COST_PROFILES as VALID_COST_PROFILES,
+    env_flag as env_flag,
+    first_valid_env as first_valid_env,
+    is_strict_mode_enabled as is_strict_mode_enabled,
+    resolve_cost_profile as resolve_cost_profile,
+)
 from server.rate_card import (
     MODEL_PRICING_PER_1M_USD as MODEL_PRICING_PER_1M_USD,
     check_promotional_rate_expiry as check_promotional_rate_expiry,
@@ -50,6 +59,7 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
         "gemini-4-argon",
         "argon",
         "gemini-4-carbon",
+        "carbon",
         "gemini-4-carbon-high",
         "gemini-4-carbon-medium",
         "gemini-4-carbon-low",
@@ -69,6 +79,68 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
         "gemini-3-pro-preview",
     }
 )
+
+# Models that support multi-segment sequential continuationToken decode (up to 65,536
+# output tokens per streamed segment and 3x default output token budget).
+LONG_DECODE_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-4-carbon",
+        "carbon",
+        "gemini-4-carbon-high",
+        "gemini-4-carbon-medium",
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-zero",
+        "carbon-g",
+        "carbon-g-zero",
+    }
+)
+
+
+def is_long_decode_model(model: str | None) -> bool:
+    """Return True when `model` supports multi-segment `continuationToken` long-decode."""
+    if not model:
+        return False
+    cleaned = str(model).strip().lower()
+    if "/models/" in cleaned:
+        cleaned = cleaned[cleaned.rfind("/models/") + len("/models/") :]
+    elif cleaned.startswith("models/"):
+        cleaned = cleaned[len("models/") :]
+    return cleaned in LONG_DECODE_MODELS or cleaned.startswith("gemini-4-carbon")
+
+
+def resolve_ask_thinking_level(
+    thinking_level: str | None,
+    model: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve thinking level for `ask_gemini`, defaulting `gemini-4-carbon` to `MEDIUM`."""
+    if thinking_level and str(thinking_level).strip():
+        return str(thinking_level).strip().upper()
+    source_env = env if env is not None else os.environ
+    cleaned = str(model or "").strip().lower()
+    if "/models/" in cleaned:
+        cleaned = cleaned[cleaned.rfind("/models/") + len("/models/") :]
+    elif cleaned.startswith("models/"):
+        cleaned = cleaned[len("models/") :]
+    if cleaned.endswith("-zero"):
+        return "MINIMAL"
+    if cleaned.endswith("-low"):
+        return "LOW"
+    if cleaned.endswith("-medium"):
+        return "MEDIUM"
+    if cleaned.endswith("-high"):
+        return "HIGH"
+    if cleaned in LONG_DECODE_MODELS or "carbon" in cleaned:
+        env_lvl = (
+            source_env.get("CC_AGY_PRO_THINKING_LEVEL")
+            or source_env.get("GEMINI4_PRO_THINKING_LEVEL")
+            or "MEDIUM"
+        ).strip().upper()
+        if env_lvl in ("MINIMAL", "LOW", "MEDIUM", "HIGH", "EXTRA_HIGH"):
+            return env_lvl
+        return "MEDIUM"
+    return None
 
 # Default Flash worker model (cost_profile economy/balanced and single-shot asks).
 DEFAULT_FLASH_MODEL = "gemini-flash-next"
@@ -97,6 +169,7 @@ def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> st
         return cleaned
     low = cleaned.lower()
     if low in (
+        "carbon",
         "gemini-4-carbon-zero",
         "gemini-4-carbon-low",
         "gemini-4-carbon-medium",
@@ -105,6 +178,8 @@ def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> st
         "carbon-g",
     ):
         return "gemini-4-carbon"
+    if low == "argon":
+        return "gemini-4-argon"
     if low.endswith("-zero") and len(cleaned) > 5:
         return cleaned[:-5]
     return cleaned
@@ -211,17 +286,6 @@ def truncate_to_token_budget(
     return pages[0], True, orig_tokens
 
 
-def first_valid_env(source_env: Any, *keys: str, default: str = "") -> str:
-    """Return the first non-empty, non-placeholder (${...}) value from source_env for keys."""
-    for key in keys:
-        val = source_env.get(key)
-        if isinstance(val, str):
-            cleaned = val.strip()
-            if cleaned and not cleaned.startswith("${"):
-                return cleaned
-    return default
-
-
 def resolve_vertex_location(
     model: str,
     requested_location: str | None = None,
@@ -267,49 +331,6 @@ def resolve_vertex_location(
             f"Expected 'global' or a valid regional endpoint such as 'us-central1'."
         )
     return raw_loc, None
-
-
-_TRUTHY_FLAG_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
-_FALSY_FLAG_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
-
-
-def env_flag(name: str, env: Any = None) -> bool | None:
-    """Parse a boolean env flag: True for 1/true/yes/on, False for 0/false/no/off, None if unset or unrecognized."""
-    source = env if env is not None else os.environ
-    val = str(source.get(name) or "").strip().lower()
-    if val in _TRUTHY_FLAG_VALUES:
-        return True
-    if val in _FALSY_FLAG_VALUES:
-        return False
-    return None
-
-
-STRICT_MODE_ENV_KEYS: tuple[str, ...] = (
-    "CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE",
-    "CC_AGY_STRICT_MODE",
-    "CC_AGY_USERCFG_STRICT_MODE",
-)
-
-VALID_COST_PROFILES: tuple[str, ...] = ("economy", "balanced", "quality")
-
-COST_PROFILE_ENV_KEYS: tuple[str, ...] = (
-    "CC_AGY_COST_PROFILE",
-    "CLAUDE_PLUGIN_OPTION_COST_PROFILE",
-    "CC_AGY_USERCFG_COST_PROFILE",
-)
-
-
-def resolve_cost_profile(env: Any = None, *, strict: bool = False) -> str:
-    """Resolve the active cost/quality preset ('economy', 'balanced', or 'quality')."""
-    source = env if env is not None else os.environ
-    raw = first_valid_env(source, *COST_PROFILE_ENV_KEYS, default="balanced").lower()
-    if raw in VALID_COST_PROFILES:
-        return raw
-    if strict:
-        raise ValueError(
-            f"Unsupported cost_profile {raw!r}. Expected one of {list(VALID_COST_PROFILES)}."
-        )
-    return "balanced"
 
 
 def resolve_default_delegate_model(
@@ -364,17 +385,6 @@ def resolve_default_ask_model(
     if profile == "quality":
         return "gemini-4-argon"
     return DEFAULT_FLASH_MODEL
-
-
-def is_strict_mode_enabled(env: Any = None) -> bool:
-    """Return True when strict orchestrator mode is on via any supported route.
-
-    Strict mode can arrive as `CC_AGY_STRICT_MODE` (shell env), `CC_AGY_USERCFG_STRICT_MODE`
-    (`.mcp.json` userConfig passthrough), or `CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE`
-    (Claude Code plugin option). Every server and hook check goes through this one helper.
-    """
-    source = env if env is not None else os.environ
-    return any(env_flag(key, source) is True for key in STRICT_MODE_ENV_KEYS)
 
 
 def sanitize_placeholder_env() -> None:
@@ -458,6 +468,36 @@ def sanitize_placeholder_env() -> None:
         "CC_AGY_USERCFG_AUTO_APPLY_ON_PASS",
         "CC_AGY_ALLOW_IN_PLACE",
         "CC_AGY_DATA_DIR",
+        "CC_AGY_ENTERPRISE_ADC",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_ADC",
+        "CC_AGY_USERCFG_ENTERPRISE_ADC",
+        "CC_AGY_ENTERPRISE_PROJECT",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_PROJECT",
+        "CC_AGY_USERCFG_ENTERPRISE_PROJECT",
+        "CC_AGY_ENTERPRISE_LOCATION",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_LOCATION",
+        "CC_AGY_USERCFG_ENTERPRISE_LOCATION",
+        "CC_AGY_ENTERPRISE_USER_TIER",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_USER_TIER",
+        "CC_AGY_USERCFG_ENTERPRISE_USER_TIER",
+        "CC_AGY_BIFROST_POLICY_URL",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_POLICY_URL",
+        "CC_AGY_USERCFG_BIFROST_POLICY_URL",
+        "CC_AGY_BIFROST_AGY_VIRTUAL_KEY",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_AGY_VIRTUAL_KEY",
+        "CC_AGY_USERCFG_BIFROST_AGY_VIRTUAL_KEY",
+        "CC_AGY_BIFROST_POLICY_USER",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_POLICY_USER",
+        "CC_AGY_USERCFG_BIFROST_POLICY_USER",
+        "CC_AGY_BIFROST_POLICY_PASSWORD",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_POLICY_PASSWORD",
+        "CC_AGY_USERCFG_BIFROST_POLICY_PASSWORD",
+        "CC_AGY_BIFROST_AGY_POLICY_MODEL",
+        "CLAUDE_PLUGIN_OPTION_BIFROST_AGY_POLICY_MODEL",
+        "CC_AGY_USERCFG_BIFROST_AGY_POLICY_MODEL",
+        "CC_AGY_WORKER_SANDBOX",
+        "CLAUDE_PLUGIN_OPTION_WORKER_SANDBOX",
+        "CC_AGY_USERCFG_WORKER_SANDBOX",
     ):
         val = os.environ.get(var)
         if val is not None and (
@@ -1606,8 +1646,26 @@ def read_adc_quota_project(
     explicit_env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Read non-secret `quota_project_id` from Application Default Credentials JSON when present."""
+    return read_adc_metadata(
+        source_env, explicit_env=explicit_env, require_quota_project=True
+    ).get("quota_project_id")
+
+
+def read_adc_metadata(
+    source_env: Mapping[str, str],
+    *,
+    explicit_env: Mapping[str, str] | None = None,
+    require_quota_project: bool = False,
+) -> dict[str, str | None]:
+    """Read the non-secret `type`, `quota_project_id`, and path of the first readable ADC JSON file.
+
+    Never returns `client_secret`, `refresh_token`, or `private_key`. All three values are
+    `None` when no Application Default Credentials file is found. With
+    `require_quota_project`, files without a `quota_project_id` are skipped.
+    """
     import json
 
+    empty: dict[str, str | None] = {"type": None, "quota_project_id": None, "path": None}
     candidates: list[Path] = []
     explicit_adc = (source_env.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if explicit_adc and not explicit_adc.startswith("${"):
@@ -1629,11 +1687,18 @@ def read_adc_quota_project(
                 data = json.loads(cand.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     qp = data.get("quota_project_id")
-                    if isinstance(qp, str) and qp.strip():
-                        return qp.strip()
+                    has_qp = isinstance(qp, str) and bool(qp.strip())
+                    if require_quota_project and not has_qp:
+                        continue
+                    adc_type = data.get("type")
+                    return {
+                        "type": adc_type.strip() if isinstance(adc_type, str) and adc_type.strip() else None,
+                        "quota_project_id": qp.strip() if has_qp else None,
+                        "path": str(cand),
+                    }
         except (OSError, ValueError):
             continue
-    return None
+    return empty
 
 
 def enforce_project_controls(
@@ -1659,13 +1724,18 @@ def enforce_project_controls(
 
     companion_proj: str | None = None
     if auth_mode == "gemini_enterprise":
-        from server.agy_cli import inspect_agy_cli_offline
+        from server.agy_cli import inspect_agy_cli_offline, resolve_enterprise_adc_seat
 
         ent_info = inspect_agy_cli_offline(source_env)
         raw_comp = ent_info.get("companion_project")
         if isinstance(raw_comp, str) and raw_comp.strip():
             companion_proj = raw_comp.strip()
             candidates.append(("agy_cli.cloudaicompanionProject", companion_proj))
+        seat = resolve_enterprise_adc_seat(source_env)
+        if seat["requested"] and seat["project"]:
+            # Seat mode bills and reports against this project, so it is the one to check.
+            companion_proj = str(seat["project"])
+            candidates.append(("enterprise_adc.project", companion_proj))
     elif auth_mode == "vertex" and not resolve_gateway_base_url(env=source_env):
         adc_qp = read_adc_quota_project(source_env, explicit_env=explicit_env)
         if adc_qp:
@@ -2003,11 +2073,26 @@ def resolve_auth_config(
             }
         )
     if cfg_mode == "gemini_enterprise":
-        ent_proj = _resolve_explicit_project_only(requested_project, env=source_env)
+        from server.agy_cli import resolve_enterprise_adc_seat
+
+        seat = resolve_enterprise_adc_seat(source_env)
+        explicit_req_proj = (
+            requested_project.strip()
+            if isinstance(requested_project, str)
+            and requested_project.strip()
+            and not requested_project.strip().startswith("${")
+            and requested_project.strip() not in ("<paying-project>", "custom-endpoint")
+            else None
+        )
+        ent_proj = explicit_req_proj or (
+            str(seat["project"]) if (seat.get("requested") and seat.get("project")) else None
+        )
         req_loc_clean = (requested_location or "").strip().lower()
         if req_loc_clean.startswith("${"):
             req_loc_clean = ""
-        ent_loc = req_loc_clean or None
+        ent_loc = req_loc_clean or (
+            str(seat["location"]) if (seat.get("requested") and seat.get("location")) else None
+        )
         return _finish(
             {
                 "auth_mode": "gemini_enterprise",

@@ -1,0 +1,18 @@
+---
+description: When to use the cc-agy-plugin (agy / vertex) MCP tools for multi-file delegation, large codebase reads, security/dependency audits, spec checking, and multimodal debugging.
+alwaysApply: false
+---
+
+# Gemini & Antigravity MCP Tools (`cc-agy-plugin`)
+
+The `agy` (or `vertex`) MCP server executes repository-scale reads, multimodal visual/spec analysis, and isolated git worktree implementations on Gemini (`gemini-flash-next`, `gemini-4-argon`, `gemini-4-carbon`), returning compact structured digests so parent context stays lean:
+
+- **Multi-file implementation with a clear plan**: `delegate_file_batch(plan_path="/tmp/<task>-plan.json")`.
+- **Scoped implementation, test fixing, or open-ended repo investigation**: `delegate_start(prompt=..., allowed_paths=[...], acceptance=[...], wait=true)`.
+- **Multimodal UI / video / PDF debugging**: pass `media_files=["path/to/recording.mp4", "path/to/screen.png"]` to `delegate_start` (untracked media files are copied into the worker worktree and excluded from git diffs) or `media=[...]` to `ask_gemini`.
+- **Architecture & multi-file / directory analysis**: `ask_gemini(prompt=..., context_files=["src/", "tests/"])` (supports directories and globs with fair per-directory token budgeting and automatic secret redaction).
+- **Large single-shot synthesis & refactors (`gemini-4-carbon`)**: `ask_gemini(prompt=..., model="gemini-4-carbon")` (streams multi-segment `continuationToken` long-decode up to 65,536 tokens per segment).
+- **Public RFC / specification compliance check**: `ask_gemini(prompt=..., spec_url="https://...", context_files=[...])`.
+- **Live CVE & dependency upgrade audit (Google Search grounded)**: `ask_gemini(prompt="Audit declared dependencies for CVEs and upgrades", check_dependencies=true)`.
+
+Pass workspace-relative paths rather than pasting file contents into prompts. Switching the Composer model mid-conversation discards the prompt cache; delegate to these MCP tools instead of switching the parent model.

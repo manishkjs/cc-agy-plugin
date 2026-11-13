@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -545,14 +546,11 @@ def make_agy_cli_writer(
                 or "skipped internal" in low
             ):
                 raise WriterConfigError(msg) from exc
-            if any(
+            if is_agy_auth_error(msg):
+                raise WriterAuthError(401, msg) from exc
+            if re.search(r"\b(?:429|502|503|504|529)\b", low) or any(
                 tok in low
                 for tok in (
-                    "429",
-                    "503",
-                    "502",
-                    "504",
-                    "529",
                     "resource_exhausted",
                     "quota",
                     "rate limit",
@@ -561,8 +559,6 @@ def make_agy_cli_writer(
                 )
             ):
                 raise WriterTransportError(429, msg) from exc
-            if is_agy_auth_error(msg):
-                raise WriterAuthError(401, msg) from exc
             raise
 
         cost = estimate_cost_usd(model, usage, single_request=(read_budget <= 0))

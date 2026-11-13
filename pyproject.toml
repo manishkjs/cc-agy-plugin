@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 cc-agy-install = "server.install:main"
+cc-agy-plugin = "server.install:main"
 
 [project.optional-dependencies]
 antigravity = [
@@ -27,7 +28,9 @@ straitjacket = [
 ]
 dev = [
     "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",
     "jsonschema>=4.20.0",
+    "ruff>=0.8.0",
 ]
 
 [tool.setuptools.packages.find]

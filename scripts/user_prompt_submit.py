@@ -61,6 +61,55 @@ def record_user_prompt(payload: dict[str, Any], env: dict[str, str] | None = Non
     return target
 
 
+def evaluate_user_prompt_submit(
+    payload: dict[str, Any], env: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Emit immediate Turn-1 delegation guidance when multimodal files appear in the user prompt."""
+    if not isinstance(payload, dict):
+        return {}
+    source_env = env if env is not None else os.environ
+    raw_prompt = str(
+        payload.get("prompt")
+        or payload.get("user_prompt")
+        or payload.get("message")
+        or ""
+    ).strip()
+    if not raw_prompt:
+        return {}
+    cwd = payload.get("cwd") or source_env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    ws_root = resolve_workspace_root(cwd)
+    try:
+        from server.genai_ask import _PROMPT_MEDIA_PATH_RE, extract_workspace_media_paths
+
+        existing_media = extract_workspace_media_paths(ws_root, raw_prompt)
+        mentioned_media = list(
+            dict.fromkeys(
+                [
+                    *existing_media,
+                    *(m.group(1) for m in _PROMPT_MEDIA_PATH_RE.finditer(raw_prompt)),
+                ]
+            )
+        )
+    except Exception:
+        mentioned_media = []
+    if not mentioned_media:
+        return {}
+    media_csv = ", ".join(repr(p) for p in mentioned_media[:6])
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                f"Multimodal asset(s) detected in prompt ({media_csv}). "
+                "Do NOT inspect video or large visual/spec assets with multiple Lead Read turns: "
+                "for code changes or UI fixes, delegate immediately on Turn 1 via "
+                f"`delegate_start(prompt=..., media_files=[{media_csv}], wait=true)` "
+                "(untracked media files are copied into the worker worktree and excluded from git diffs); "
+                f"for read-only visual/spec analysis, call `ask_gemini(prompt=..., media=[{media_csv}])`."
+            ),
+        }
+    }
+
+
 def main() -> int:
     raw = sys.stdin.read().strip()
     if not raw:
@@ -72,6 +121,13 @@ def main() -> int:
     if isinstance(payload, dict):
         try:
             record_user_prompt(payload)
+        except Exception:
+            pass
+        try:
+            out = evaluate_user_prompt_submit(payload)
+            if out:
+                sys.stdout.write(json.dumps(out) + "\n")
+                sys.stdout.flush()
         except Exception:
             pass
     return 0

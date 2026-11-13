@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   validate:
-    name: Validate manifests, docs, and portability tests
+    name: Validate manifests, lint, docs, and parallel tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -22,13 +22,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install package and test runner
+      - name: Install package, linter, and parallel test runner
         run: |
           python -m pip install -e ".[antigravity,dev]"
           python -m pip install "git+https://github.com/vamsiramakrishnan/straitjacket.git@88b2af0511b426b9402010fc6568b20fbd9838c4"
 
-      - name: Validate plugin manifests and documentation sync
+      - name: Static lint check (ruff undefined names and syntax)
+        run: python -m ruff check server scripts --select E9,F63,F7,F82
+
+      - name: Validate plugin manifests, AST invariants, and documentation sync
         run: bash scripts/validate.sh
 
-      - name: Run full hermetic test suite
-        run: python -m pytest -q
+      - name: Run full hermetic test suite in parallel
+        run: python -m pytest -n auto -q

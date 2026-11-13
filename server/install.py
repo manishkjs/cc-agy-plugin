@@ -96,6 +96,16 @@ CODEX_FORWARDED_ENV_VARS = (
     "CC_AGY_BLOCKED_PROJECTS",
     "CC_AGY_AUTO_APPLY_ON_PASS",
     "CC_AGY_ALLOW_IN_PLACE",
+    "CC_AGY_ENTERPRISE_ADC",
+    "CC_AGY_ENTERPRISE_PROJECT",
+    "CC_AGY_ENTERPRISE_LOCATION",
+    "CC_AGY_ENTERPRISE_USER_TIER",
+    "CC_AGY_BIFROST_POLICY_URL",
+    "CC_AGY_BIFROST_AGY_VIRTUAL_KEY",
+    "CC_AGY_BIFROST_POLICY_USER",
+    "CC_AGY_BIFROST_POLICY_PASSWORD",
+    "CC_AGY_BIFROST_AGY_POLICY_MODEL",
+    "CC_AGY_WORKER_SANDBOX",
 )
 # Worker jobs run for minutes; Codex and OpenCode default MCP tool timeouts are far shorter.
 CODEX_TOOL_TIMEOUT_SEC = 1800
@@ -124,6 +134,13 @@ _PLUGIN_MANAGED_ENV_KEYS: frozenset[str] = frozenset(
         "CC_AGY_BLOCKED_PROJECTS",
         "CC_AGY_AUTO_APPLY_ON_PASS",
         "CC_AGY_STRICT_MODE",
+        "CC_AGY_ENTERPRISE_ADC",
+        "CC_AGY_ENTERPRISE_PROJECT",
+        "CC_AGY_ENTERPRISE_LOCATION",
+        "CC_AGY_ENTERPRISE_USER_TIER",
+        "CC_AGY_BIFROST_POLICY_URL",
+        "CC_AGY_BIFROST_AGY_POLICY_MODEL",
+        "CC_AGY_WORKER_SANDBOX",
     }
 )
 _SECRET_KEY_TOKENS: frozenset[str] = frozenset(
@@ -351,6 +368,77 @@ def _normalize_gateway_wire_choice(gateway_wire: str | None) -> str | None:
     return resolve_gateway_wire(cleaned, env={})
 
 
+_ENTERPRISE_ENV_TO_USER_CONFIG: dict[str, str] = {
+    "CC_AGY_ENTERPRISE_ADC": "enterprise_adc",
+    "CC_AGY_ENTERPRISE_PROJECT": "enterprise_project",
+    "CC_AGY_ENTERPRISE_LOCATION": "enterprise_location",
+    "CC_AGY_ENTERPRISE_USER_TIER": "enterprise_user_tier",
+    "CC_AGY_BIFROST_POLICY_URL": "bifrost_policy_url",
+    "CC_AGY_BIFROST_AGY_POLICY_MODEL": "bifrost_agy_policy_model",
+    "CC_AGY_WORKER_SANDBOX": "worker_sandbox",
+}
+
+
+def build_enterprise_env(
+    *,
+    enterprise_adc: bool | None = None,
+    enterprise_project: str | None = None,
+    enterprise_location: str | None = None,
+    enterprise_user_tier: str | None = None,
+    bifrost_policy_url: str | None = None,
+    bifrost_agy_policy_model: str | None = None,
+    worker_sandbox: str | None = None,
+) -> dict[str, str]:
+    """Validate the Gemini Enterprise seat and Bifrost `/agy` policy flags into non-secret env vars.
+
+    Secrets (the `/agy` Virtual Key and routing-rule password) are never accepted here; they
+    are read from the shell or the host's secret store at run time.
+
+    Raises:
+        ValueError: If the location, tier, or policy URL is not valid.
+    """
+    from server.agy_cli import ENTERPRISE_LOCATIONS, ENTERPRISE_USER_TIERS
+    from server.bifrost_policy import validate_policy_url
+
+    env: dict[str, str] = {}
+    if enterprise_adc is not None:
+        env["CC_AGY_ENTERPRISE_ADC"] = "true" if enterprise_adc else "false"
+    if enterprise_project and enterprise_project.strip():
+        env["CC_AGY_ENTERPRISE_PROJECT"] = enterprise_project.strip()
+    if enterprise_location and enterprise_location.strip():
+        location = enterprise_location.strip().lower()
+        if location not in ENTERPRISE_LOCATIONS:
+            raise ValueError(f"--enterprise-location must be one of: {', '.join(sorted(ENTERPRISE_LOCATIONS))}.")
+        env["CC_AGY_ENTERPRISE_LOCATION"] = location
+    if enterprise_user_tier and enterprise_user_tier.strip():
+        user_tier = enterprise_user_tier.strip().lower()
+        if user_tier not in ENTERPRISE_USER_TIERS:
+            raise ValueError(f"--enterprise-user-tier must be one of: {', '.join(sorted(ENTERPRISE_USER_TIERS))}.")
+        env["CC_AGY_ENTERPRISE_USER_TIER"] = user_tier
+    if bifrost_policy_url and bifrost_policy_url.strip():
+        env["CC_AGY_BIFROST_POLICY_URL"] = validate_policy_url(bifrost_policy_url)
+    if bifrost_agy_policy_model and bifrost_agy_policy_model.strip():
+        env["CC_AGY_BIFROST_AGY_POLICY_MODEL"] = bifrost_agy_policy_model.strip()
+    if worker_sandbox and worker_sandbox.strip():
+        from server.worker_sandbox import resolve_sandbox_mode
+
+        try:
+            mode = resolve_sandbox_mode({"CC_AGY_WORKER_SANDBOX": worker_sandbox})
+        except ValueError as exc:
+            raise ValueError(f"--worker-sandbox: {exc}") from exc
+        env["CC_AGY_WORKER_SANDBOX"] = mode
+    return env
+
+
+def enterprise_user_config(extra_env: Mapping[str, str] | None) -> dict[str, str]:
+    """Map enterprise env vars from `build_enterprise_env` to Claude Code `userConfig` keys."""
+    return {
+        _ENTERPRISE_ENV_TO_USER_CONFIG[key]: value
+        for key, value in (extra_env or {}).items()
+        if key in _ENTERPRISE_ENV_TO_USER_CONFIG
+    }
+
+
 def build_codex_server_block(
     *,
     name: str = DEFAULT_SERVER_NAME,
@@ -367,6 +455,7 @@ def build_codex_server_block(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
@@ -401,6 +490,7 @@ def build_codex_server_block(
         env["CC_AGY_ALLOWED_PROJECTS"] = allowed_projects.strip()
     if blocked_projects and blocked_projects.strip():
         env["CC_AGY_BLOCKED_PROJECTS"] = blocked_projects.strip()
+    env.update(extra_env or {})
     if no_auto_apply:
         env["CC_AGY_AUTO_APPLY_ON_PASS"] = "0"
     forwarded = [v for v in CODEX_FORWARDED_ENV_VARS if v not in env]
@@ -523,6 +613,7 @@ def install_codex(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     dry_run: bool,
     codex_home: Path | None = None,
@@ -543,6 +634,7 @@ def install_codex(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
     )
     existing = cfg.read_text(encoding="utf-8") if cfg.is_file() else ""
@@ -610,6 +702,7 @@ def build_claude_user_config(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -643,6 +736,7 @@ def build_claude_user_config(
         cfg["allowed_projects"] = allowed_projects.strip()
     if blocked_projects and blocked_projects.strip():
         cfg["blocked_projects"] = blocked_projects.strip()
+    cfg.update(enterprise_user_config(extra_env))
     if no_auto_apply:
         cfg["auto_apply_on_pass"] = False
     if strict:
@@ -664,6 +758,7 @@ def claude_install_commands(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
 ) -> list[list[str]]:
@@ -680,6 +775,7 @@ def claude_install_commands(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -708,6 +804,7 @@ def install_claude(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -724,6 +821,7 @@ def install_claude(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -740,6 +838,7 @@ def install_claude(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -830,6 +929,7 @@ def build_agy_server_entry(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -864,6 +964,7 @@ def build_agy_server_entry(
         env["CC_AGY_ALLOWED_PROJECTS"] = allowed_projects.strip()
     if blocked_projects and blocked_projects.strip():
         env["CC_AGY_BLOCKED_PROJECTS"] = blocked_projects.strip()
+    env.update(extra_env or {})
     if no_auto_apply:
         env["CC_AGY_AUTO_APPLY_ON_PASS"] = "0"
     if strict:
@@ -920,6 +1021,7 @@ def install_agy(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
     dry_run: bool = False,
@@ -951,6 +1053,7 @@ def install_agy(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -1035,6 +1138,7 @@ def build_cursor_server_entry(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -1053,6 +1157,7 @@ def build_cursor_server_entry(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -1103,6 +1208,7 @@ def install_cursor(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
     dry_run: bool = False,
@@ -1115,6 +1221,8 @@ def install_cursor(
     ).expanduser()
     mcp_cfg_path = cfg_dir / "mcp.json"
     skill_dst = cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"
+    rule_src = PLUGIN_ROOT / "cursor" / "rules" / "cc-agy-coexistence.mdc"
+    rule_dst = cfg_dir / "rules" / "cc-agy-coexistence.mdc"
 
     entry = build_cursor_server_entry(
         python_bin=python_bin,
@@ -1130,19 +1238,31 @@ def install_cursor(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
 
-    existing = mcp_cfg_path.read_text(encoding="utf-8") if mcp_cfg_path.is_file() else ""
     result: dict[str, Any] = {
         "host": "cursor",
         "config_path": str(mcp_cfg_path),
         "skill_path": str(skill_dst),
+        "rule_path": str(rule_dst),
         "server_name": name,
         "entry": entry,
     }
     try:
+        for cand_p in (
+            cfg_dir,
+            mcp_cfg_path,
+            skill_dst.parent,
+            skill_dst,
+            rule_dst.parent,
+            rule_dst,
+        ):
+            if cand_p.is_symlink():
+                raise CursorConfigError(f"refusing to write symlinked Cursor path: {cand_p}")
+        existing = mcp_cfg_path.read_text(encoding="utf-8") if mcp_cfg_path.is_file() else ""
         updated = upsert_cursor_mcp_config(existing, entry, name=name)
     except CursorConfigError as exc:
         result["status"] = "refused"
@@ -1168,7 +1288,19 @@ def install_cursor(
             skill_dst.write_text(skill_text, encoding="utf-8")
             skill_changed = True
 
-    result["status"] = "installed" if (existing != updated or skill_changed) else "unchanged"
+    rule_changed = False
+    rule_text = rule_src.read_text(encoding="utf-8") if rule_src.is_file() else ""
+    if rule_text:
+        rule_dst.parent.mkdir(parents=True, exist_ok=True)
+        existing_rule = rule_dst.read_text(encoding="utf-8") if rule_dst.is_file() else ""
+        if existing_rule != rule_text:
+            if existing_rule:
+                rule_backup = _write_unique_backup(rule_dst, existing_rule, 0o600)
+                result["rule_backup_path"] = str(rule_backup)
+            rule_dst.write_text(rule_text, encoding="utf-8")
+            rule_changed = True
+
+    result["status"] = "installed" if (existing != updated or skill_changed or rule_changed) else "unchanged"
     return result
 
 
@@ -1303,6 +1435,7 @@ def build_opencode_server_entry(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
     v2: bool = False,
@@ -1341,6 +1474,7 @@ def build_opencode_server_entry(
         max_daily_cents=max_daily_cents,
         allowed_projects=allowed_projects,
         blocked_projects=blocked_projects,
+        extra_env=extra_env,
         no_auto_apply=no_auto_apply,
         strict=strict,
     )
@@ -1975,6 +2109,7 @@ def install_opencode(
     max_daily_cents: float | None = None,
     allowed_projects: str | None = None,
     blocked_projects: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
     strict: bool = False,
     dry_run: bool = False,
@@ -2018,6 +2153,7 @@ def install_opencode(
             max_daily_cents=max_daily_cents,
             allowed_projects=allowed_projects,
             blocked_projects=blocked_projects,
+            extra_env=extra_env,
             no_auto_apply=no_auto_apply,
             strict=strict,
             v2=eff_v2,
@@ -2175,13 +2311,19 @@ def preflight(
     has_project = bool(resolved_proj or has_gateway)
 
     agy_cli_status: dict[str, Any] | None = None
+    next_steps: list[str] = []
     if norm_auth == "gemini_enterprise":
         auth = "gemini_enterprise"
         agy_cli_status = inspect_agy_cli_offline(source)
         if not agy_cli_status.get("ok"):
             err = str(agy_cli_status.get("error") or "Antigravity CLI (`agy`) sign-in is missing.")
             rem = str(agy_cli_status.get("remediation") or "")
-            issues.append(f"{err} {rem}".strip())
+            msg = f"{err} {rem}".strip()
+            if agy_cli_status.get("binary_found") and not agy_cli_status.get("adc_seat_error"):
+                warnings.append(msg)
+                next_steps.append(rem or f"Run `{agy_cli_status.get('agy_bin')}` once in a terminal to sign in.")
+            else:
+                issues.append(msg)
     elif norm_auth == "api_key":
         auth = "api_key" if has_key else "missing"
         if not has_key:
@@ -2233,6 +2375,7 @@ def preflight(
         "auth_mode": auth,
         "issues": issues,
         "warnings": warnings,
+        "next_steps": next_steps,
         "ready": not issues,
     }
     if agy_cli_status is not None:
@@ -2240,10 +2383,35 @@ def preflight(
             "binary_found": bool(agy_cli_status.get("binary_found")),
             "agy_bin": agy_cli_status.get("agy_bin"),
             "auth_configured": bool(agy_cli_status.get("auth_configured")),
+            "pending_login": bool(
+                agy_cli_status.get("binary_found")
+                and not agy_cli_status.get("auth_configured")
+                and not agy_cli_status.get("adc_seat_error")
+            ),
             "credential_source": agy_cli_status.get("credential_source"),
             "companion_project": agy_cli_status.get("companion_project"),
             "tier_id": agy_cli_status.get("tier_id"),
+            "adc_seat_enabled": bool(agy_cli_status.get("adc_seat_enabled")),
+            "enterprise_project": agy_cli_status.get("enterprise_project"),
+            "enterprise_location": agy_cli_status.get("enterprise_location"),
+            "baicode_user_tier": agy_cli_status.get("baicode_user_tier"),
         }
+        if agy_cli_status.get("adc_seat_error"):
+            out["agy_cli"]["adc_seat_error"] = agy_cli_status["adc_seat_error"]
+        from server.worker_sandbox import inspect_worker_sandbox
+
+        out["agy_cli"]["worker_sandbox"] = inspect_worker_sandbox(source)
+        if out["agy_cli"]["worker_sandbox"]["error"]:
+            issues.append(str(out["agy_cli"]["worker_sandbox"]["error"]))
+            out["ready"] = False
+        from server.bifrost_policy import inspect_bifrost_policy
+
+        bifrost_agy_policy = inspect_bifrost_policy(source)
+        if bifrost_agy_policy["enabled"] or bifrost_agy_policy["error"]:
+            out["agy_cli"]["bifrost_agy_policy"] = bifrost_agy_policy
+        if bifrost_agy_policy["error"]:
+            issues.append(f"Bifrost /agy policy: {bifrost_agy_policy['error']}")
+            out["ready"] = False
     return out
 
 
@@ -2444,6 +2612,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Optional comma-separated allowlist of GCP project IDs (sets CC_AGY_ALLOWED_PROJECTS).")
     parser.add_argument("--blocked-projects", default=None,
                         help="Optional comma-separated blocklist of GCP project IDs (sets CC_AGY_BLOCKED_PROJECTS).")
+    parser.add_argument("--enterprise-adc", action=argparse.BooleanOptionalAction, default=None,
+                        help="Gemini Enterprise seat via your own `gcloud auth application-default login` (sets CC_AGY_ENTERPRISE_ADC). Default: auto-detect.")
+    parser.add_argument("--enterprise-project", default=None,
+                        help="Google Cloud project that holds the Gemini Enterprise seats (default: the ADC quota project).")
+    parser.add_argument("--enterprise-location", default=None,
+                        help="Gemini Enterprise location for ADC seat mode: global (default), us, or eu.")
+    parser.add_argument("--enterprise-user-tier", default=None,
+                        help="Seat tier reported to Developer tools metrics: gcp-ge-plus-tier or gcp-ge-standard-tier.")
+    parser.add_argument("--bifrost-policy-url", default=None,
+                        help="Central Bifrost URL that decides which `agy` models a Virtual Key may run (https:// or loopback).")
+    parser.add_argument("--worker-sandbox", choices=("auto", "required", "off"), default=None,
+                        help="OS sandbox for `agy` write workers: auto (default), required, or off.")
+    parser.add_argument("--bifrost-agy-policy-model", default=None,
+                        help="`agy` model to run for `policy-routed` when Bifrost routing rules cannot be read.")
     parser.add_argument("--no-auto-apply", action="store_true",
                         help="Require manual diff review (`get_diff` then `delegate_apply`) before any worker change touches your repo.")
     parser.add_argument("--strict", action="store_true",
@@ -2464,18 +2646,74 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--opencode-protocol", choices=sorted(_OPENCODE_V2_PROTOCOLS), default=None,
                         help="Optional OpenCode 2.2.6+ MCP protocol negotiation mode ('auto' or 'legacy').")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
-    parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics as JSON and exit.")
+    parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics and exit.")
+    parser.add_argument("--list-settings", action="store_true", help="Print the grouped public CC_AGY_* runtime settings catalog and exit.")
+    parser.add_argument("--human", action="store_true", help="With --doctor, print a concise human-readable summary instead of JSON.")
+    parser.add_argument("--fix", action="store_true", help="With --doctor, attempt safe local bootstrap repairs before running diagnostics.")
     parser.add_argument("--probe-oidc", action="store_true", help="With --doctor, mint a live OIDC token once to verify and display the resolved principal.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing anything.")
     parser.add_argument("--json", action="store_true", help="Print the result as JSON.")
     args = parser.parse_args(raw_argv)
+    if args.list_settings:
+        from dataclasses import asdict
+        from server.settings_catalog import PUBLIC_SETTINGS, format_settings_text
+
+        if args.json:
+            print(json.dumps([asdict(s) for s in PUBLIC_SETTINGS], indent=2))
+        else:
+            print(format_settings_text())
+        return 0
+    if not (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").is_file() and not args.dry_run:
+        # Invoked from an ephemeral wheel (for example `uvx` or `pipx run`): materialize a
+        # persistent checkout under ~/.local/share/cc-agy-plugin/repo so host MCP configs stay valid.
+        repo_url = os.environ.get("CC_AGY_REPO_URL") or "https://github.com/manishkjs/cc-agy-plugin.git"
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        persistent_repo = Path(
+            os.environ.get("CC_AGY_INSTALL_REPO_DIR") or (data_home / "cc-agy-plugin" / "repo")
+        ).expanduser()
+        persistent_repo.parent.mkdir(parents=True, exist_ok=True)
+        from server.verify import run_git
+
+        if (persistent_repo / ".git").is_dir():
+            run_git(
+                ["fetch", "--quiet", "--depth=1", "origin", "main"],
+                cwd=persistent_repo,
+                check=False,
+            )
+            run_git(
+                ["merge", "--ff-only", "--quiet", "FETCH_HEAD"],
+                cwd=persistent_repo,
+                check=False,
+            )
+        else:
+            shutil.rmtree(persistent_repo, ignore_errors=True)
+            run_git(
+                ["clone", "--depth=1", repo_url, str(persistent_repo)],
+                cwd=persistent_repo.parent,
+                check=True,
+            )
+        forwarded = list(raw_argv) if raw_argv is not None else sys.argv[1:]
+        delegated = subprocess.run(
+            [sys.executable, "-m", "server.install", *forwarded],
+            cwd=str(persistent_repo),
+            check=False,
+        )
+        return delegated.returncode
     if args.probe_oidc and not args.doctor:
         parser.error("--probe-oidc requires --doctor")
     if args.doctor:
-        from server.doctor import run_doctor
+        from server.doctor import _apply_doctor_fixes, format_doctor_human, run_doctor
 
+        fix_actions: list[str] = []
+        if args.fix:
+            fix_actions = _apply_doctor_fixes(os.environ)
         report = run_doctor(workspace_root=os.getcwd(), probe_oidc=bool(args.probe_oidc))
-        print(json.dumps(report, indent=2))
+        if fix_actions:
+            report["fix_actions"] = fix_actions
+        if args.human and not args.json:
+            print(format_doctor_human(report))
+        else:
+            print(json.dumps(report, indent=2))
         return 0 if report.get("healthy") else 1
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
         parser.error("--name may only contain letters, digits, '-' and '_'")
@@ -2487,6 +2725,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _validate_gateway_base_url_no_secrets(args.base_url)
         norm_gateway_wire = _normalize_gateway_wire_choice(args.gateway_wire)
+        enterprise_env = build_enterprise_env(
+            enterprise_adc=args.enterprise_adc,
+            enterprise_project=args.enterprise_project,
+            enterprise_location=args.enterprise_location,
+            enterprise_user_tier=args.enterprise_user_tier,
+            bifrost_policy_url=args.bifrost_policy_url,
+            bifrost_agy_policy_model=args.bifrost_agy_policy_model,
+            worker_sandbox=args.worker_sandbox,
+        )
     except ValueError as exc:
         parser.error(str(exc))
     if args.gateway_audience:
@@ -2569,6 +2816,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
                 blocked_projects=args.blocked_projects,
+                extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
                 dry_run=args.dry_run,
             )
@@ -2589,6 +2837,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
                 blocked_projects=args.blocked_projects,
+                extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
             )
@@ -2609,6 +2858,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
                 blocked_projects=args.blocked_projects,
+                extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
                 dry_run=args.dry_run,
@@ -2630,6 +2880,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
                 blocked_projects=args.blocked_projects,
+                extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
                 dry_run=args.dry_run,
@@ -2660,6 +2911,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_daily_cents=args.max_daily_cents,
                 allowed_projects=args.allowed_projects,
                 blocked_projects=args.blocked_projects,
+                extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
                 strict=args.strict,
                 dry_run=args.dry_run,

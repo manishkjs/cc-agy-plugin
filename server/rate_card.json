@@ -164,6 +164,13 @@
       "long_context_input_multiplier": 2.0,
       "long_context_output_multiplier": 1.5
     },
+    "carbon": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 12.00,
+      "long_context_input_multiplier": 2.0,
+      "long_context_output_multiplier": 1.5
+    },
     "gemini-4-carbon-high": {
       "input": 2.00,
       "cached_input": 0.20,

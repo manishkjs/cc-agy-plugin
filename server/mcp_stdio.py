@@ -74,6 +74,14 @@ def _build_delegate_input_properties(
                 "Turn-1 prompt so the worker can edit immediately without calling view_file."
             ),
         },
+        "media_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional workspace-relative image, video, or PDF paths (.png, .jpg, .webp, .mp4, .mov, .webm, .pdf) "
+                "made available inside the isolated worker worktree (and excluded from code diffs)."
+            ),
+        },
         "checklist": {
             "type": "array",
             "items": {"type": "string"},
@@ -208,7 +216,37 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "context_files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of workspace-relative file paths to attach.",
+                    "description": "Optional list of workspace-relative file paths, directories, or globs to attach.",
+                },
+                "media": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional workspace-relative image (.png, .jpg, .webp, .heic), video (.mp4, .mov, .webm, .mpeg), "
+                        "or PDF (.pdf) paths to attach as multimodal inline data (up to 14 MB total)."
+                    ),
+                },
+                "spec_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional public https:// URL of an API specification, RFC, documentation page, or PDF to fetch "
+                        "server-side and verify against."
+                    ),
+                },
+                "google_search": {
+                    "type": "boolean",
+                    "description": "Enable live Google Search grounding to verify CVEs, package versions, and current APIs.",
+                },
+                "check_dependencies": {
+                    "type": "boolean",
+                    "description": (
+                        "Audit project manifests (requirements.txt, pyproject.toml, package.json, Cargo.toml, go.mod, etc.) "
+                        "in parallel batches of 12 with live Google Search for CVEs and latest stable versions."
+                    ),
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "description": "Optional maximum output token budget (automatically scaled 3x up to 98,304 on gemini-4-carbon).",
                 },
                 "system_instruction": {
                     "type": "string",
@@ -709,21 +747,22 @@ _CORE_OMIT_PROPERTIES: frozenset[str] = frozenset(
 )
 
 _CORE_CONCISE_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "delegate_start": "Run an isolated Gemini worker copy; auto-applies when wait=true and acceptance passes.",
-    "delegate_result": "Wait up to 240s for a running job_id and return its bounded digest.",
+    "delegate_start": "Run isolated Gemini worker; auto-applies when wait=true and acceptance passes.",
+    "delegate_result": "Wait up to 240s for job_id and return bounded digest.",
     "delegate_status": "Check status/cost for job_id or list recent jobs.",
-    "delegate_cancel": "Cancel a running job_id and clean up its worktree.",
-    "delegate_revert": "Restore files touched by an applied job_id to their pre-apply state.",
-    "get_diff": "Read paginated unified diff or file_stats for a job_id.",
-    "delegate_apply": "Apply a completed job_id's changes to the workspace.",
-    "delegate_continue": "Continue an existing job_id in its worktree with follow_up_prompt.",
-    "doctor": "Run local readiness diagnostics (auth, SDKs, git, test runner).",
+    "delegate_cancel": "Cancel running job_id and clean up worktree.",
+    "delegate_revert": "Restore files touched by applied job_id.",
+    "get_diff": "Read paginated diff or file_stats for job_id.",
+    "delegate_apply": "Apply completed job_id changes to workspace.",
+    "delegate_continue": "Continue job_id in its worktree with follow_up_prompt.",
+    "doctor": "Run readiness diagnostics (auth, SDKs, git, test runner).",
 }
 
 _CORE_CONCISE_PROP_DESCRIPTIONS: dict[tuple[str, str], str] = {
-    ("delegate_start", "prompt"): "Concise task brief (<500 words; no self-debate or >8-line code blocks).",
+    ("delegate_start", "prompt"): "Task brief (<500 words; no self-debate or >8-line code blocks).",
     ("delegate_start", "spec_files"): "Spec paths inlined verbatim.",
-    ("delegate_start", "context_files"): "Source paths inlined into worker prompt.",
+    ("delegate_start", "context_files"): "Source paths inlined into prompt.",
+    ("delegate_start", "media_files"): "Media paths (PNG/JPG/PDF/MP4/WAV).",
     ("delegate_start", "checklist"): "Requirement items to verify.",
     ("delegate_start", "model"): "Gemini model ID.",
     ("delegate_start", "allowed_paths"): "Relative paths worker may edit.",
@@ -770,11 +809,13 @@ def _compact_core_tool_def(tool_def: dict[str, Any]) -> dict[str, Any]:
     for prop_name, prop_val in raw_props.items():
         if prop_name in _CORE_OMIT_PROPERTIES or not isinstance(prop_val, dict):
             continue
+        entry = dict(prop_val)
+        if isinstance(entry.get("items"), dict) and "description" in entry["items"]:
+            entry["items"] = {k: v for k, v in entry["items"].items() if k != "description"}
         short_desc = _CORE_CONCISE_PROP_DESCRIPTIONS.get((name, prop_name))
         if short_desc is not None:
-            compact_props[prop_name] = {**prop_val, "description": short_desc}
-        else:
-            compact_props[prop_name] = dict(prop_val)
+            entry["description"] = short_desc
+        compact_props[prop_name] = entry
     compact_schema: dict[str, Any] = {
         "type": raw_schema.get("type", "object"),
         "properties": compact_props,
@@ -1335,18 +1376,32 @@ class MCPServer:
         if name == "ask_gemini":
             prompt_str = _require_str(args.get("prompt"), "prompt")
             ctx_files = _validate_optional_str_list(args.get("context_files"), "context_files")
+            media_list = _validate_optional_str_list(args.get("media") or args.get("media_files"), "media")
+            spec_url_str = _optional_str(args.get("spec_url"), "spec_url")
             temp_val = _parse_optional_finite_float(args.get("temperature"), "temperature")
+            max_out_val = (
+                _parse_positive_int(args.get("max_output_tokens"), "max_output_tokens", 32768)
+                if args.get("max_output_tokens") is not None
+                else None
+            )
             try:
                 scrub_b = parse_bool(args.get("scrub_receipt"), False)
+                gsearch_b = parse_bool(args.get("google_search"), False)
+                check_deps_b = parse_bool(args.get("check_dependencies"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             return ask_gemini(
                 prompt=prompt_str,
                 model=_optional_str(args.get("model"), "model"),
                 context_files=ctx_files,
+                media=media_list,
+                spec_url=spec_url_str,
+                google_search=gsearch_b,
+                check_dependencies=check_deps_b,
                 system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
                 temperature=temp_val,
                 thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
+                max_output_tokens=max_out_val,
                 api_key=_optional_str(args.get("api_key"), "api_key"),
                 project=_optional_str(args.get("project"), "project"),
                 location=_optional_str(args.get("location"), "location"),
@@ -1354,6 +1409,7 @@ class MCPServer:
                 store=self.store,
                 scrub_receipt=scrub_b,
                 backend=self.ask_backend,
+                session_id=opencode_session_id,
             )
 
         if name == "delegate_start":
@@ -1527,6 +1583,7 @@ class MCPServer:
         disabled_t = _validate_optional_str_list(args.get("disabled_tools"), "disabled_tools")
         spec_f = _validate_optional_str_list(args.get("spec_files"), "spec_files")
         context_f = _validate_optional_str_list(args.get("context_files"), "context_files")
+        media_f = _validate_optional_str_list(args.get("media_files") or args.get("media"), "media_files")
         checklist_items = _validate_optional_str_list(args.get("checklist"), "checklist")
         qa_review_model = _optional_str(args.get("qa_review_model"), "qa_review_model") or (
             os.environ.get("CC_AGY_QA_REVIEW_MODEL", "").strip() or None
@@ -1591,6 +1648,7 @@ class MCPServer:
             auto_apply=False if will_run_qa else auto_apply_arg,
             spec_files=spec_f,
             context_files=context_f,
+            media_files=media_f,
             checklist=checklist_items,
             opencode_session_id=opencode_session_id,
             _skip_balanced_qa=will_run_qa,

@@ -25,6 +25,16 @@
         "CC_AGY_USERCFG_MAX_DAILY_CENTS": "${user_config.max_daily_cents}",
         "CC_AGY_USERCFG_ALLOWED_PROJECTS": "${user_config.allowed_projects}",
         "CC_AGY_USERCFG_BLOCKED_PROJECTS": "${user_config.blocked_projects}",
+        "CC_AGY_USERCFG_ENTERPRISE_ADC": "${user_config.enterprise_adc}",
+        "CC_AGY_USERCFG_ENTERPRISE_PROJECT": "${user_config.enterprise_project}",
+        "CC_AGY_USERCFG_ENTERPRISE_LOCATION": "${user_config.enterprise_location}",
+        "CC_AGY_USERCFG_ENTERPRISE_USER_TIER": "${user_config.enterprise_user_tier}",
+        "CC_AGY_USERCFG_BIFROST_POLICY_URL": "${user_config.bifrost_policy_url}",
+        "CC_AGY_USERCFG_BIFROST_AGY_VIRTUAL_KEY": "${user_config.bifrost_agy_virtual_key}",
+        "CC_AGY_USERCFG_BIFROST_POLICY_USER": "${user_config.bifrost_policy_user}",
+        "CC_AGY_USERCFG_BIFROST_POLICY_PASSWORD": "${user_config.bifrost_policy_password}",
+        "CC_AGY_USERCFG_BIFROST_AGY_POLICY_MODEL": "${user_config.bifrost_agy_policy_model}",
+        "CC_AGY_USERCFG_WORKER_SANDBOX": "${user_config.worker_sandbox}",
         "CC_AGY_USERCFG_AUTO_APPLY_ON_PASS": "${user_config.auto_apply_on_pass}"
       },
       "timeout": 1800000

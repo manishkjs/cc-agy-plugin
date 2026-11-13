@@ -135,6 +135,66 @@
       "type": "string",
       "sensitive": false
     },
+    "enterprise_adc": {
+      "title": "Gemini Enterprise Seat via Your Own ADC",
+      "description": "Set to true to run `agy` on your Gemini Enterprise seat with your own `gcloud auth application-default login` credential (never a service account). Leave unset to auto-detect; set to false to turn it off.",
+      "type": "string",
+      "sensitive": false
+    },
+    "enterprise_project": {
+      "title": "Gemini Enterprise Project",
+      "description": "Optional Google Cloud project that holds your Gemini Enterprise seats. Defaults to the quota project in your ADC file. Checked against allowed_projects and blocked_projects before `agy` starts.",
+      "type": "string",
+      "sensitive": false
+    },
+    "enterprise_location": {
+      "title": "Gemini Enterprise Location",
+      "description": "Optional Gemini Enterprise location for ADC seat mode: global (default), us, or eu.",
+      "type": "string",
+      "sensitive": false
+    },
+    "enterprise_user_tier": {
+      "title": "Gemini Enterprise Seat Tier",
+      "description": "Optional seat tier (gcp-ge-plus-tier or gcp-ge-standard-tier) so usage appears in Google Cloud Console > Gemini Enterprise > Developer tools metrics. Must match the license you were assigned.",
+      "type": "string",
+      "sensitive": false
+    },
+    "bifrost_policy_url": {
+      "title": "Central Bifrost Policy URL for agy",
+      "description": "Optional https:// URL of your central Bifrost gateway. When set, the gateway decides which `agy` models your Virtual Key may run. Only small policy lookups are sent; prompts are not.",
+      "type": "string",
+      "sensitive": false
+    },
+    "bifrost_agy_virtual_key": {
+      "title": "Bifrost Virtual Key for agy",
+      "description": "Optional Bifrost Virtual Key allowed to use `agy-cli/*` models. Falls back to bifrost_virtual_key.",
+      "type": "string",
+      "sensitive": true
+    },
+    "bifrost_policy_user": {
+      "title": "Bifrost Routing Rules Reader (User)",
+      "description": "Optional read-only Bifrost user for looking up the `policy-routed` model.",
+      "type": "string",
+      "sensitive": false
+    },
+    "bifrost_policy_password": {
+      "title": "Bifrost Routing Rules Reader (Password)",
+      "description": "Optional password for bifrost_policy_user.",
+      "type": "string",
+      "sensitive": true
+    },
+    "bifrost_agy_policy_model": {
+      "title": "Fallback Model for policy-routed",
+      "description": "Optional `agy` model to run for `policy-routed` when routing rules cannot be read.",
+      "type": "string",
+      "sensitive": false
+    },
+    "worker_sandbox": {
+      "title": "OS Sandbox for agy Write Workers",
+      "description": "auto (default) confines Gemini Enterprise write workers with bubblewrap on Linux or sandbox-exec on macOS, and runs them with permission prompts when neither works. required refuses to run without a sandbox. off turns the sandbox off.",
+      "type": "string",
+      "sensitive": false
+    },
     "auto_apply_on_pass": {
       "title": "Auto-Apply Verified Worker Diffs",
       "description": "Set to false to require manual diff review (`get_diff` then `delegate_apply`) on every worker job and disable automatic shutdown salvage.",

@@ -496,9 +496,11 @@ def test_running_plugin_retry_clears_stale_fields_updates_budget_and_shows_live_
         )
         # Acceptance snapshots and checks the change set around every command; under heavy CPU load,
         # the initial 1.8 s wait slice can return while Attempt 1 is still finishing post-turn acceptance.
-        # Once Attempt 2 enters (and blocks on release_attempt2), fetch the live running view if needed.
+        # Calling delegate_result(wait=True) finishes Attempt 1 and triggers the wait-sliced Attempt 2 retry.
+        while mid.get("attempt", 1) < 2 and mid.get("status") == "running":
+            mid = jm.delegate_result(mid["job_id"], wait=True, timeout=5.0)
         assert attempt2_entered.wait(timeout=15.0)
-        if mid.get("attempt", 1) < 2:
+        if mid.get("tool_call_count", 0) < 54:
             mid = jm.delegate_result(mid["job_id"], wait=True, timeout=0.1)
         if mid["status"] != "running":
             pytest.fail(f"Expected wait-sliced Attempt 2 to still be running, got {mid}")

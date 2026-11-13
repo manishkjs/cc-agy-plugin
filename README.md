@@ -68,7 +68,17 @@ Setup takes about a minute in a normal terminal shell.
 
 The installer sets up either the standalone Antigravity CLI (`~/.local/share/cc-agy-plugin/bin/agy`) for Gemini Enterprise seats or an isolated Python environment (`~/.local/share/cc-agy-plugin/venv`) for AI Studio and Vertex AI. That keeps you clear of `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, and macOS Homebrew. Secrets are never written to config files.
 
-### 1. Clone the repository
+### 1. One-command quickstart (recommended)
+
+Run a single command to clone or update `~/.local/share/cc-agy-plugin/repo`, configure your host, and verify readiness with `--doctor`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
+# Or via uvx (materializes a persistent checkout under ~/.local/share/cc-agy-plugin/repo):
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin cc-agy-plugin --host claude --auth gemini-enterprise
+```
+
+Or clone manually if you prefer working from your own directory:
 
 ```bash
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
@@ -91,8 +101,14 @@ python3 -m server.install --host cursor --auth gemini-enterprise
 # Or install into OpenCode (~/.config/opencode/opencode.json + skill, /commands, and @gemini-delegator):
 python3 -m server.install --host opencode --auth gemini-enterprise
 
+# Or install into Codex (~/.codex/config.toml):
+python3 -m server.install --host codex --auth gemini-enterprise
+
 # Or install into Antigravity CLI / IDE (~/.gemini/config/):
 python3 -m server.install --host agy --auth gemini-enterprise
+
+# Or run with no flags for the 4-question interactive wizard:
+python3 -m server.install
 
 # Sign in once in a terminal with your work Google account (then type /exit or Ctrl+C):
 ~/.local/share/cc-agy-plugin/bin/agy
@@ -162,6 +178,7 @@ The plugin detects the wire format from the gateway path: Gemini `/v1beta/models
 - Installed asset hashes are tracked in `.cc-agy-plugin-assets.json`. Any pre-existing or user-edited file is backed up to `*.bak-*` before it is replaced.
 - Symlinked asset files are unlinked before writing, so the external dotfiles target is never modified. Symlinked directories are written through.
 - The same skill, commands, and subagent are bundled in this repository under `.opencode/`.
+- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login` and pick `cc-agy`. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
 
 **Cursor**
 
@@ -255,11 +272,43 @@ Every model call, file edit, and spend ceiling is governed by explicit settings 
 | **5. File scope & one-call undo** | `allowed_paths=[...]` + `delegate_revert` / `delegate_cancel` | Rejects out-of-scope file edits and restores every touched file from its HMAC-signed pre-apply backup in one call. |
 | **6. Zero-token preflight audit** | `/cc-agy-plugin:doctor` (or `"Run doctor"`) | Reports active auth mode, pinned status, active/companion GCP project, allow/block lists, spend cap, and manual-apply policy offline at **0 tokens**. |
 
+### Gemini Enterprise seats in a governed organization
+
+These three settings are optional and only apply to the Gemini Enterprise (`agy` CLI) connection. Leave them unset and nothing changes.
+
+**Sign in with your own Google Cloud credential.** If your organization onboards developers with `gcloud auth application-default login`, pass `--enterprise-adc` (or set `CC_AGY_ENTERPRISE_ADC=true`). The plugin then starts `agy` with `AGY_ADC_AUTH=true` and your seat project and location. It also turns on by itself when `agy` already has `userSettings.enableAdc` set and your credential file belongs to a person. A service account is refused, because it is not a licensed seat. The seat project is checked against `--allowed-projects` and `--blocked-projects` before `agy` starts. Add `--enterprise-user-tier gcp-ge-plus-tier` (or `gcp-ge-standard-tier`) so the usage shows up in Google Cloud Console under Gemini Enterprise, Developer tools metrics. Use the tier you were assigned; there is no default.
+
+```bash
+gcloud auth application-default login --project "$GE_PROJECT"
+python3 -m server.install --host all --auth gemini-enterprise \
+  --enterprise-adc --enterprise-project "$GE_PROJECT" --enterprise-user-tier gcp-ge-plus-tier
+```
+
+**Write workers run in an OS sandbox.** A Gemini Enterprise write worker runs `agy` without permission prompts, so the plugin confines it at the operating system level instead of trusting the prompt. On Linux it uses bubblewrap (`bwrap`): the whole disk is read-only except the job's own copy of the repo and `agy`'s state folder, `/tmp` and `~/.cache` are private and empty, and `~/.ssh`, `~/.gnupg`, cloud credential folders, `.netrc`, and `.git-credentials` are hidden. On macOS it uses `sandbox-exec` with the same rules. Other files in your home folder that are not on the hidden-credential list remain readable to the worker, so keep secrets in standard credential stores or `.env` files. The network stays on because `agy` must reach Google; instead, SSH agents, git credential helpers, and askpass programs are removed from the worker's environment, and inside the Linux `bwrap` sandbox `ssh`, `scp`, `sftp`, and git's remote HTTP/HTTPS/FTP helpers are masked with `/dev/null` alongside git config guards (outbound HTTPS from other tools remains open so `agy` can reach Google). If neither tool works on your machine, the worker runs with permission prompts and anything that needs approval comes back as `denied_actions`. Set `CC_AGY_WORKER_SANDBOX=required` to refuse to run without a sandbox, or `off` to go back to the old behavior. `--doctor` shows which one is active. Tools that need to write outside the repo copy, such as `npm install` into a global cache, will fail inside the sandbox.
+
+**When your organization blocks an action.** An admin can require review for terminal commands or for files outside the project. When `agy` hits one of those rules, the job pauses with `status: "needs_input"` and a `denied_actions` list that names each blocked command or file. Nothing is applied to your working tree. Your lead agent asks you what to do, runs the approved step inside the job's isolated copy of the repo, and resumes the same `agy` conversation with `delegate_continue`. This works the same way in Claude Code, Cursor, OpenCode, Codex, and Antigravity.
+
+**Let a central Bifrost gateway decide who can run `agy`.** Seat traffic goes from the `agy` CLI straight to Google, so it cannot pass through a gateway. A central Bifrost can still control it. Set the gateway URL and a Virtual Key that is allowed to use `agy-cli/*` models:
+
+```bash
+export CC_AGY_BIFROST_POLICY_URL="https://bifrost.internal.example.com"
+export CC_AGY_BIFROST_AGY_VIRTUAL_KEY="sk-bf-agy-..."          # falls back to CC_AGY_BIFROST_VIRTUAL_KEY
+export CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-3.8-flash-medium" # used for policy-routed when rules cannot be read
+```
+
+Before each `agy` run the plugin asks the gateway which `agy-cli/<model>` entries the key may use. A revoked key or a model that is not on the list stops the run at 0 tokens. Ask for the model `policy-routed` to run whatever model the gateway's routing rule currently selects. The laptop only makes outbound HTTPS calls, so no inbound port is needed. Two limits to know: the allowlist must contain the `agy` model names you actually run (or `policy-routed`), and Bifrost does not see the tokens these runs use. The check runs on the developer's machine, so treat it as a guard against mistakes and revoked keys, not a security boundary: someone with full control of the machine can skip it. Token counts stay in the plugin's receipts and in the Gemini Enterprise console.
+
+**Follow-up questions reuse the same conversation.** When you ask `ask_gemini` a second question about the same files in the same session, the plugin resumes the earlier `agy` conversation and sends only the new question. The files are not sent again, so Gemini can reuse what it already cached. A conversation is reused only for the same session, model, workspace, and files, and only for 15 minutes (`CC_AGY_CONVERSATION_TTL_SECONDS`, `0` turns this off). If the resume fails, the full prompt is sent in a new conversation. Only conversation IDs and token counts are stored on disk, never prompts.
+
+**Model names are checked before the first run.** The plugin caches the output of `agy models` for 60 seconds. If the model you asked for is not offered to your seat, it picks the closest offered one up front instead of failing a first turn. With a Bifrost policy URL set, it only picks models the gateway also allows.
+
+Run `python3 -m server.install --doctor` to see the seat mode, tier, location, and Bifrost policy status. Add `--probe-oidc` to also query the gateway once and print how many `agy` models the key may use.
+
 ### Installer flags and runtime configuration
 
 Pass `--host codex|claude|cursor|opencode|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--gateway-wire`, `--max-daily-cents`, or `--strict` to `python3 -m server.install`. For a single session without installing, run `claude --plugin-dir /path/to/cc-agy-plugin`.
 
-All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference).
+All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference), or print the grouped public catalog from your terminal with `python3 -m server.install --list-settings`.
 
 ## Benchmark results
 
@@ -339,7 +388,9 @@ No. All five hosts load the plugin's routing skill automatically, so you describ
 <details>
 <summary><b>Is the isolated copy a sandbox?</b></summary>
 
-No. Isolated copies provide git-level checkout isolation, not an OS container or VM sandbox. Worker commands execute under your local OS user account. The plugin scrubs credentials from the child environment and uses HMAC receipts to enforce provenance and secret hygiene.
+Two layers protect your machine:
+1. **Git worktree isolation (every backend):** Workers edit a standalone git copy of your repository so unverified edits never touch your working tree. Credential environment variables, SSH agent sockets, and git credential helpers are scrubbed from the child environment, and HMAC-SHA256 receipts protect provenance and pre-apply backups.
+2. **OS-level filesystem sandbox (`agy` CLI workers):** On Linux (`bwrap`) and macOS (`sandbox-exec`), `agy` workers run inside an OS filesystem sandbox where `/` is read-only, `/tmp` and `~/.cache` are private tmpfs mounts, `~/.ssh`, `~/.gnupg`, cloud credential folders, `.netrc`, `.git-credentials`, sibling worktrees, and the plugin receipt store (`.hmac_key`) are masked (including symlink targets), and `~/.gemini/antigravity-cli` config/MCP/plugin files are mounted read-only. Pass `--worker-sandbox required` (`CC_AGY_WORKER_SANDBOX=required`) to refuse execution when neither OS sandbox backend is available.
 
 </details>
 
@@ -589,6 +640,19 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 | `--max-daily-cents` / `userConfig.max_daily_cents` / `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | UTC daily workspace spend cap in US cents (for example `500` for 500¢/day). |
 | `--allowed-projects` / `userConfig.allowed_projects` / `CC_AGY_ALLOWED_PROJECTS` | unset | Comma-separated allowlist of GCP project IDs permitted for Vertex AI or Gemini Enterprise (`agy` CLI `cloudaicompanionProject`). Any other project is rejected at 0 tokens. |
 | `--blocked-projects` / `userConfig.blocked_projects` / `CC_AGY_BLOCKED_PROJECTS` | unset | Comma-separated blocklist of GCP project IDs that must never be used or billed (checked across Vertex AI, ADC `quota_project_id`, and `agy` CLI `onboarding.json`). |
+| `--enterprise-adc` / `userConfig.enterprise_adc` / `CC_AGY_ENTERPRISE_ADC` | auto-detect | Runs `agy` on your Gemini Enterprise seat with your own `gcloud` ADC login (`AGY_ADC_AUTH=true`). Auto-detected from `userSettings.enableAdc` plus an `authorized_user` ADC file; `false` turns it off. Service accounts are refused. |
+| `--enterprise-project` / `userConfig.enterprise_project` / `CC_AGY_ENTERPRISE_PROJECT` | ADC `quota_project_id` | Project that holds the Gemini Enterprise seats. Checked against the allowed and blocked project lists before `agy` starts. |
+| `--enterprise-location` / `userConfig.enterprise_location` / `CC_AGY_ENTERPRISE_LOCATION` | `global` | Gemini Enterprise location for ADC seat mode (`global`, `us`, or `eu`). |
+| `--enterprise-user-tier` / `userConfig.enterprise_user_tier` / `CC_AGY_ENTERPRISE_USER_TIER` | unset | Seat tier passed to `agy` as `BAICODE_USER_TIER` (`gcp-ge-plus-tier` or `gcp-ge-standard-tier`) so usage appears in Developer tools metrics. |
+| `--bifrost-policy-url` / `userConfig.bifrost_policy_url` / `CC_AGY_BIFROST_POLICY_URL` | unset | Central Bifrost URL (`https://`, or loopback) that decides which `agy-cli/<model>` entries a Virtual Key may run. Policy lookups only; no prompts are sent. |
+| `userConfig.bifrost_agy_virtual_key` / `CC_AGY_BIFROST_AGY_VIRTUAL_KEY` | `CC_AGY_BIFROST_VIRTUAL_KEY` | Bifrost Virtual Key used for the `agy` policy lookup. Never passed to the `agy` process. |
+| `userConfig.bifrost_policy_user`, `userConfig.bifrost_policy_password` / `CC_AGY_BIFROST_POLICY_USER`, `CC_AGY_BIFROST_POLICY_PASSWORD` | unset | Optional read-only Bifrost login used to read routing rules and resolve `policy-routed`. |
+| `--bifrost-agy-policy-model` / `userConfig.bifrost_agy_policy_model` / `CC_AGY_BIFROST_AGY_POLICY_MODEL` | unset | `agy` model to run for `policy-routed` when routing rules cannot be read. |
+| `--worker-sandbox` / `userConfig.worker_sandbox` / `CC_AGY_WORKER_SANDBOX` | `auto` | OS sandbox for Gemini Enterprise write workers (bubblewrap on Linux, `sandbox-exec` on macOS). `auto` falls back to permission prompts when no sandbox works, `required` refuses to run, `off` disables it. `CC_AGY_BWRAP_BIN` overrides the `bwrap` path. |
+| `CC_AGY_CONVERSATION_TTL_SECONDS` | `900` | How long an `ask_gemini` conversation on a Gemini Enterprise seat can be resumed for a follow-up question. `0` always sends the full prompt. |
+| `CC_AGY_MODEL_CATALOG` / `CC_AGY_MODEL_CATALOG_TTL_SECONDS` | on / `60` | Checks requested models against the cached `agy models` list before a run. Set `CC_AGY_MODEL_CATALOG=0` to turn the check off. |
+| `CC_AGY_STATE_DIR` | next to the managed `agy` binary | Where the model list and conversation IDs are cached (files are `0600`). |
+| `CC_AGY_BIFROST_POLICY_TTL_SECONDS` | `60` | How long a Bifrost policy answer is reused before it is fetched again. |
 | `--no-auto-apply` / `userConfig.auto_apply_on_pass=false` / `CC_AGY_AUTO_APPLY_ON_PASS=0` | `false` outside strict mode, `true` in strict mode | Enforces manual diff review (`get_diff` then `delegate_apply`) across all tools, disables shutdown salvage, and blocks `in_place=true` unless `CC_AGY_ALLOW_IN_PLACE=1`. |
 | `CC_AGY_ALLOW_IN_PLACE` | `true` (`false` when `--no-auto-apply` is set) | Set to `0` to forbid `in_place=true` direct working-tree edits so every worker runs inside a disposable git copy. |
 | `--no-bootstrap` / `CC_AGY_VENV_DIR` / `CC_AGY_PYTHON_BIN` | `~/.local/share/cc-agy-plugin/venv` | Per-user virtualenv directory or explicit Python interpreter path used on PEP 668 systems. |
@@ -606,6 +670,7 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 | `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`) | `2` (strict mode) | Caps direct Lead file/search reads before delegation (up to 6 review reads are added when a worker finishes without auto-apply; `0` allows none, `off` or `<0` removes the cap). |
 | `CC_AGY_FLASH_MAX_TOOL_CALLS` | `100` in economy, `55` otherwise | Per-turn tool-call cap for Flash workers (`55` in `balanced`, `100` in `economy`, matching Pro/Argon's `CC_AGY_MAX_TOOL_CALLS=100`). |
 | `CC_AGY_SAME_MODEL_RETRIES` | `1` in economy, `0` otherwise | Automatic same-model fix turns in bounded Lead sessions when a voluntary `status="ok"` turn edited files under 60% of its tool budget and failed checks. |
+| `--list-settings` | off | Prints the 6-category public `CC_AGY_*` settings catalog (`--json` outputs machine-readable JSON). Internal `CC_AGY_USERCFG_*` variables are `.mcp.json` passthroughs managed automatically by `server.install`. |
 
 </details>
 
@@ -668,13 +733,16 @@ cc-agy-plugin/
 ├── commands/                 # /cc-agy-plugin:{delegate,doctor,jobs,cost} slash commands
 ├── hooks/hooks.json          # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
 ├── scripts/
+│   ├── quickstart.sh         # 1-command persistent clone/update + install + --doctor bootstrap
 │   ├── install_agy_cli.sh    # SHA-512 verified standalone Antigravity CLI (`agy`) installer
 │   ├── bootstrap-gateway.ps1 # Windows PowerShell enterprise gateway + OIDC setup script
 │   ├── sync_docs.py          # Shared routing table & budget constant synchronizer
-│   ├── validate.sh           # Manifest, badge, doc-sync, and dry-run installer validator
+│   ├── lint_ast.py           # Zero-dependency AST static linter (syntax, bare except, mutable defaults)
+│   ├── run_tests_parallel.py # Multi-core parallel pytest runner across all test modules
+│   ├── validate.sh           # Manifest, AST lint, badge, doc-sync, and dry-run installer validator
 │   ├── session_start.py      # SessionStart hook: records the per-session baseline and --doctor CLI
 │   ├── user_prompt_submit.py # UserPromptSubmit hook: records prompt timestamp and resets read budgets
-│   ├── pre_tool_guard.py     # Strict mode PreToolUse guard + 9-line code dictation linter
+│   ├── pre_tool_guard.py     # Fast-path (<100ms) strict mode PreToolUse guard + prompt linter router
 │   ├── post_tool_ledger.py   # PostToolUse MCP audit logger
 │   └── provenance_check.py   # Stop-hook git diff vs HMAC-receipt provenance verifier
 ├── tests/                    # Pytest unit, integration, portability, and guardrail suite
@@ -684,8 +752,9 @@ cc-agy-plugin/
 ### Running tests and validation
 
 ```bash
-pytest tests/ -q          # run full test suite
-bash scripts/validate.sh  # checks manifests, doc sync, README badges, and hermetic Codex/Cursor/OpenCode/AGY installs
+python3 scripts/run_tests_parallel.py  # run full test suite in parallel across CPU cores (or pytest -n auto -q)
+python3 scripts/lint_ast.py            # static AST check across all server/ and scripts/ modules
+bash scripts/validate.sh               # checks manifests, AST lint, doc sync, badges, and hermetic host installs
 ```
 
 </details>
