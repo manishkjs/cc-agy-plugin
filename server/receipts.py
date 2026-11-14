@@ -5,7 +5,6 @@ from __future__ import annotations
 import atexit
 import copy
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import hmac
 import json
@@ -19,6 +18,7 @@ import time
 from typing import Any, Callable, Mapping
 import uuid
 
+from server import file_lock as fcntl
 from server.regions import estimate_cost_usd, resolve_max_daily_cents
 from server.verify import run_git
 
@@ -32,6 +32,7 @@ _RECEIPT_SUMMARY_KEYS = (
     "kind",
     "status",
     "applied",
+    "auth_mode",
     "model",
     "started_at_epoch",
     "finished_at_epoch",
@@ -556,11 +557,38 @@ def _utc_day(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+def _is_included_ge_seat_receipt(rec: Mapping[str, Any]) -> bool:
+    return str(rec.get("auth_mode") or "").strip().lower() == "gemini_enterprise"
+
+
+def _receipt_list_equivalent_cents(rec: Mapping[str, Any]) -> float:
+    cost = rec.get("cost") or rec.get("precomputed_cost") or {}
+    if isinstance(cost, Mapping):
+        if cost.get("list_equivalent_cents") is not None:
+            return _finite_positive(cost.get("list_equivalent_cents"))
+        if cost.get("total_cost_cents") is not None and not _is_included_ge_seat_receipt(rec):
+            return _finite_positive(cost.get("total_cost_cents"))
+    usage = rec.get("usage") or {}
+    est = estimate_cost_usd(
+        str(rec.get("model") or "gemini-flash-next"),
+        usage,
+        single_request=(rec.get("kind") == "ask"),
+    )
+    return _finite_positive(est.get("total_cost_cents"))
+
+
 def _receipt_cost_cents(rec: Mapping[str, Any]) -> float:
-    """Total cost of a receipt in cents, from its priced ``cost`` block (cents first, then USD)."""
+    """Billed PAYG cost of a receipt in cents (`0.0` for included Gemini Enterprise seat runs)."""
+    if _is_included_ge_seat_receipt(rec):
+        cost_ge = rec.get("cost") or {}
+        if isinstance(cost_ge, Mapping) and cost_ge.get("billed_cost_cents") is not None:
+            return _finite_positive(cost_ge.get("billed_cost_cents"))
+        return 0.0
     cost = rec.get("cost") or rec.get("precomputed_cost") or {}
     if not isinstance(cost, Mapping):
         return 0.0
+    if cost.get("billed_cost_cents") is not None:
+        return _finite_positive(cost.get("billed_cost_cents"))
     if cost.get("total_cost_cents") is not None:
         return _finite_positive(cost.get("total_cost_cents"))
     return _finite_positive(cost.get("total_cost_usd")) * 100.0
@@ -920,13 +948,32 @@ class ReceiptStore:
         precomputed = record.get("precomputed_cost")
         if isinstance(precomputed, dict) and "total_cost_cents" in precomputed:
             # Jobs that mix models (e.g. Gemini writers plus a Claude fallback) price each call themselves.
-            record["cost"] = dict(precomputed)
+            raw_cost = dict(precomputed)
         else:
-            record["cost"] = estimate_cost_usd(
+            raw_cost = estimate_cost_usd(
                 model,
                 usage,
                 single_request=(record.get("kind") == "ask"),
             )
+        if _is_included_ge_seat_receipt(record):
+            list_cents = _finite_positive(raw_cost.get("list_equivalent_cents", raw_cost.get("total_cost_cents")))
+            list_usd = round(list_cents / 100.0, 8)
+            billed_cents = _finite_positive(raw_cost.get("billed_cost_cents"))
+            billed_usd = round(billed_cents / 100.0, 8)
+            raw_cost["billing_model"] = "included_ge_seat"
+            raw_cost["billed_cost_cents"] = billed_cents
+            raw_cost["billed_cost_usd"] = billed_usd
+            raw_cost["list_equivalent_cents"] = list_cents
+            raw_cost["list_equivalent_usd"] = list_usd
+            raw_cost["total_cost_cents"] = billed_cents
+            raw_cost["total_cost_usd"] = billed_usd
+        else:
+            billed_cents = _finite_positive(raw_cost.get("total_cost_cents"))
+            billed_usd = _finite_positive(raw_cost.get("total_cost_usd"))
+            raw_cost.setdefault("billing_model", "pay_as_you_go")
+            raw_cost.setdefault("billed_cost_cents", billed_cents)
+            raw_cost.setdefault("billed_cost_usd", billed_usd)
+        record["cost"] = raw_cost
         record["cost_by_utc_day"] = self._cost_by_utc_day(safe_id, record, _prev=prev_rec)
         record["hmac_scope"] = 2
 
@@ -1140,8 +1187,11 @@ class ReceiptStore:
             "total_token_count": 0,
             "total_cost_usd": 0.0,
             "total_cost_cents": 0.0,
+            "included_ge_seat_equivalent_usd": 0.0,
+            "included_ge_seat_equivalent_cents": 0.0,
             "all_pricing_known": True,
             "by_model": {},
+            "by_auth_mode": {},
         }
         for r in receipts:
             status = str(r.get("status") or "")
@@ -1178,15 +1228,43 @@ class ReceiptStore:
             t_tok = int(usage.get("thoughts_token_count") or 0)
             tot_tok = int(usage.get("total_token_count") or (p_tok + o_tok + t_tok))
 
+            is_ge = _is_included_ge_seat_receipt(r)
+            billed_cents = _receipt_cost_cents(r)
+            billed_usd = billed_cents / 100.0
+            ge_equiv_cents = _receipt_list_equivalent_cents(r) if is_ge else 0.0
+
             totals["prompt_token_count"] += p_tok
             totals["cached_content_token_count"] += c_tok
             totals["candidates_token_count"] += o_tok
             totals["thoughts_token_count"] += t_tok
             totals["total_token_count"] += tot_tok
-            totals["total_cost_usd"] = round(
-                totals["total_cost_usd"] + float(cost.get("total_cost_usd") or 0.0), 8
-            )
+            totals["total_cost_usd"] = round(totals["total_cost_usd"] + billed_usd, 8)
             totals["total_cost_cents"] = round(totals["total_cost_usd"] * 100.0, 6)
+            if ge_equiv_cents > 0.0:
+                totals["included_ge_seat_equivalent_cents"] = round(
+                    totals["included_ge_seat_equivalent_cents"] + ge_equiv_cents, 6
+                )
+                totals["included_ge_seat_equivalent_usd"] = round(
+                    totals["included_ge_seat_equivalent_cents"] / 100.0, 8
+                )
+
+            auth_bucket = "gemini_enterprise" if is_ge else (str(r.get("auth_mode") or "pay_as_you_go"))
+            a_entry = totals["by_auth_mode"].setdefault(
+                auth_bucket,
+                {
+                    "jobs": 0,
+                    "billing_model": "included_ge_seat" if is_ge else "pay_as_you_go",
+                    "total_token_count": 0,
+                    "billed_cost_cents": 0.0,
+                    "list_equivalent_cents": 0.0,
+                },
+            )
+            a_entry["jobs"] += 1
+            a_entry["total_token_count"] += tot_tok
+            a_entry["billed_cost_cents"] = round(a_entry["billed_cost_cents"] + billed_cents, 6)
+            a_entry["list_equivalent_cents"] = round(
+                a_entry["list_equivalent_cents"] + (ge_equiv_cents if is_ge else billed_cents), 6
+            )
 
             model = str(r.get("model") or "unknown")
             m_entry = totals["by_model"].setdefault(
@@ -1200,6 +1278,7 @@ class ReceiptStore:
                     "total_token_count": 0,
                     "total_cost_usd": 0.0,
                     "total_cost_cents": 0.0,
+                    "list_equivalent_cents": 0.0,
                     "pricing_known": bool(cost.get("pricing_known", True)),
                 },
             )
@@ -1209,10 +1288,11 @@ class ReceiptStore:
             m_entry["candidates_token_count"] += o_tok
             m_entry["thoughts_token_count"] += t_tok
             m_entry["total_token_count"] += tot_tok
-            m_entry["total_cost_usd"] = round(
-                m_entry["total_cost_usd"] + float(cost.get("total_cost_usd") or 0.0), 8
-            )
+            m_entry["total_cost_usd"] = round(m_entry["total_cost_usd"] + billed_usd, 8)
             m_entry["total_cost_cents"] = round(m_entry["total_cost_usd"] * 100.0, 6)
+            m_entry["list_equivalent_cents"] = round(
+                m_entry["list_equivalent_cents"] + (ge_equiv_cents if is_ge else billed_cents), 6
+            )
 
         return totals
 
@@ -1287,6 +1367,13 @@ class ReceiptStore:
 
 def _receipt_cents_and_activity_on_utc_day(rec: Mapping[str, Any], utc_day: str) -> tuple[float, bool]:
     stamp = float(rec.get("finished_at_epoch") or rec.get("started_at_epoch") or 0.0)
+    if _is_included_ge_seat_receipt(rec):
+        cost_ge = rec.get("cost") or {}
+        billed_ge = _finite_positive(cost_ge.get("billed_cost_cents")) if isinstance(cost_ge, Mapping) else 0.0
+        if billed_ge <= 0.0:
+            if stamp > 0.0 and _utc_day(stamp) == utc_day:
+                return 0.0, True
+            return 0.0, False
     buckets = rec.get("cost_by_utc_day")
     if isinstance(buckets, Mapping) and buckets:
         cents_today = _finite_positive(buckets.get(utc_day))
@@ -1295,13 +1382,7 @@ def _receipt_cents_and_activity_on_utc_day(rec: Mapping[str, Any], utc_day: str)
         return cents_today, True
     if stamp <= 0.0 or _utc_day(stamp) != utc_day:
         return 0.0, False
-    usage = rec.get("usage") or {}
-    cost = rec.get("cost") or estimate_cost_usd(
-        str(rec.get("model") or "gemini-flash-next"),
-        usage,
-        single_request=(rec.get("kind") == "ask"),
-    )
-    cents = round(float(cost.get("total_cost_usd") or 0.0) * 100.0, 6)
+    cents = round(_receipt_cost_cents(rec), 6)
     return cents, True
 
 
@@ -1742,8 +1823,11 @@ def enforce_daily_budget(
     workspace_root: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     now_epoch: float | None = None,
+    auth_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """Check today's workspace spend against CC_AGY_MAX_DAILY_CENTS and raise BudgetExceededError if reached."""
+    if str(auth_mode or "").strip().lower() == "gemini_enterprise":
+        return None
     cap_cents = resolve_max_daily_cents(env)
     if cap_cents is None:
         return None

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -16,6 +15,8 @@ import threading
 import time
 from typing import Any
 
+from server import file_lock as fcntl
+
 from server.acceptance_runner import (
     _TEST_RUNNER_CMD_RE,
     _extract_failing_test_nodes_and_files,
@@ -26,6 +27,7 @@ from server.ast_regression_guards import (
     _is_test_file_path,
     _prompt_forbids_existing_test_updates,
 )
+from server.batch_plan import is_protected_path
 from server.job_git_utils import (
     _env_int,
     _explicitly_targets_runtime_artifact,
@@ -583,14 +585,13 @@ class JobApplyMixin:
                 conflicted_files.append(rel_path)
 
         # 2. If host files changed since baseline, attempt in-memory 3-way merge via `git merge-file -p`
-        # without ever touching the host repository's git index.
+        # without ever touching the host repository's git index, and re-verify combined host + worker state.
         merged_payloads: dict[str, bytes] = {}
+        merged_files: list[str] = []
+        post_merge_verified: bool | None = None
+        verification_stale_after_merge = False
         skipped_ignored_conflicts: list[str] = []
-        if conflicted_files:
-            if not wt_dir.exists():
-                raise ValueError(
-                    f"Conflict detected: host files {conflicted_files} were modified since job '{safe_id}' started."
-                )
+        if conflicted_files and wt_dir.exists():
             for rel_path in conflicted_files:
                 dst_raw = self.workspace_root / rel_path
                 src_raw = wt_dir / rel_path
@@ -606,8 +607,6 @@ class JobApplyMixin:
                 )
                 if base_show.returncode != 0:
                     if _is_gitignored_on_host(self.workspace_root, rel_path):
-                        # Generated output (gitignored) written by both sides, e.g. a test report:
-                        # keep the host copy rather than failing the whole apply.
                         skipped_ignored_conflicts.append(rel_path)
                         continue
                     raise ValueError(
@@ -633,6 +632,167 @@ class JobApplyMixin:
                         )
                     merged_payloads[rel_path] = merge_res.stdout
 
+        host_other_changed_files: list[str] = []
+        overlaid_host_files: list[str] = []
+        if wt_dir.exists() and baseline_sha:
+            changed_set = set(files_changed)
+            wt_git_dir = wt_dir / ".git"
+            diff_args = (
+                [
+                    "--git-dir",
+                    str(wt_git_dir),
+                    "--work-tree",
+                    str(self.workspace_root),
+                    "diff",
+                    "--name-only",
+                    baseline_sha,
+                ]
+                if wt_git_dir.exists()
+                else ["diff", "--name-only", baseline_sha]
+            )
+            diff_since_base = _git_raw(
+                diff_args,
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                check=False,
+            )
+            if diff_since_base.returncode == 0:
+                for raw_ln in diff_since_base.stdout.decode("utf-8", errors="replace").splitlines():
+                    hrel = raw_ln.strip()
+                    if hrel and hrel not in changed_set and not is_protected_path(hrel):
+                        host_other_changed_files.append(hrel)
+            untracked_since_base = _git_raw(
+                ["ls-files", "--others", "--exclude-standard"],
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                check=False,
+            )
+            if untracked_since_base.returncode == 0:
+                base_untracked = receipt.get("baseline_untracked_hashes") or {}
+                for raw_un in untracked_since_base.stdout.decode("utf-8", errors="replace").splitlines():
+                    urel = raw_un.strip()
+                    if (
+                        urel
+                        and urel not in changed_set
+                        and urel not in base_untracked
+                        and urel not in host_other_changed_files
+                        and not is_protected_path(urel)
+                    ):
+                        host_other_changed_files.append(urel)
+
+        if wt_dir.exists() and (merged_payloads or host_other_changed_files):
+            if merged_payloads:
+                merged_files = sorted(merged_payloads.keys())
+            from server.test_discovery import (
+                build_compile_smoke_commands,
+                build_import_smoke_command,
+                discover_related_test_commands,
+            )
+
+            orig_wt_bytes: dict[str, bytes] = {}
+            added_wt_overlays: list[Path] = []
+            for mrel, mbytes in merged_payloads.items():
+                wt_target = wt_dir / mrel
+                orig_wt_bytes[mrel] = wt_target.read_bytes()
+                wt_target.write_bytes(mbytes)
+            for hrel in host_other_changed_files:
+                h_src = self.workspace_root / hrel
+                wt_dst = wt_dir / hrel
+                try:
+                    wt_resolved = wt_dst.resolve(strict=False)
+                    if not wt_resolved.is_relative_to(wt_dir.resolve()):
+                        continue
+                    if h_src.is_file() and not h_src.is_symlink():
+                        if wt_dst.exists() and wt_dst.is_file():
+                            orig_wt_bytes.setdefault(hrel, wt_dst.read_bytes())
+                        else:
+                            wt_dst.parent.mkdir(parents=True, exist_ok=True)
+                            added_wt_overlays.append(wt_dst)
+                        wt_dst.write_bytes(h_src.read_bytes())
+                        overlaid_host_files.append(hrel)
+                    elif not h_src.exists() and not h_src.is_symlink() and wt_dst.exists() and wt_dst.is_file():
+                        orig_wt_bytes.setdefault(hrel, wt_dst.read_bytes())
+                        wt_dst.unlink()
+                        overlaid_host_files.append(hrel)
+                except OSError:
+                    continue
+            overlaid_host_files = sorted(set(overlaid_host_files))
+
+            scope_files = sorted(set(files_changed) | set(merged_files))
+            nm_merge_links = self._link_host_node_modules_for_checks(wt_dir)
+            merge_timeout = min(max(30.0, float(receipt.get("timeout_seconds") or 120.0)), 300.0)
+            try:
+                post_merge_cmds: list[str] = list(receipt.get("acceptance") or [])
+                if not post_merge_cmds and self._should_run_default_acceptance():
+                    post_merge_cmds.extend(discover_related_test_commands(wt_dir, scope_files, []))
+                for icmd in build_import_smoke_command(wt_dir, scope_files):
+                    if icmd not in post_merge_cmds:
+                        post_merge_cmds.append(icmd)
+                for ccmd in build_compile_smoke_commands(wt_dir, scope_files):
+                    if ccmd not in post_merge_cmds:
+                        post_merge_cmds.append(ccmd)
+                if post_merge_cmds:
+                    merge_acc_results = run_acceptance(
+                        post_merge_cmds,
+                        wt_dir,
+                        timeout=merge_timeout,
+                        restore_tracked=False,
+                    )
+                    merge_acc_passed = bool(merge_acc_results) and all(
+                        isinstance(r, dict) and bool(r.get("passed")) and not r.get("timed_out")
+                        for r in merge_acc_results
+                    )
+                    if not merge_acc_passed:
+                        failed_cmd = next(
+                            (
+                                str(r.get("command") or "")
+                                for r in merge_acc_results
+                                if isinstance(r, dict) and not r.get("passed")
+                            ),
+                            post_merge_cmds[0],
+                        )
+                        if merged_files:
+                            host_note = (
+                                f" (tested alongside concurrent host changes in {overlaid_host_files})"
+                                if overlaid_host_files
+                                else ""
+                            )
+                            raise ValueError(
+                                f"3-way merge of {merged_files}{host_note} failed post-merge verification "
+                                f"({failed_cmd!r}). Nothing was applied to the workspace; re-run or "
+                                "continue against current HEAD."
+                            )
+                        raise ValueError(
+                            f"Post-baseline verification of {files_changed} failed alongside concurrent host "
+                            f"changes in {overlaid_host_files} ({failed_cmd!r}). Nothing was applied to the "
+                            "workspace; commit/stash unrelated host edits or continue against current HEAD."
+                        )
+                    post_merge_verified = True
+                    receipt["acceptance_passed"] = True
+                    receipt["post_merge_acceptance_results"] = merge_acc_results
+                elif merged_payloads:
+                    post_merge_verified = False
+                    verification_stale_after_merge = True
+                    receipt["acceptance_passed"] = None
+            finally:
+                self._unlink_checks_node_modules(nm_merge_links)
+                for mrel, obytes in orig_wt_bytes.items():
+                    try:
+                        wt_restore = wt_dir / mrel
+                        wt_restore.parent.mkdir(parents=True, exist_ok=True)
+                        wt_restore.write_bytes(obytes)
+                    except OSError:
+                        pass
+                for added_p in added_wt_overlays:
+                    try:
+                        added_p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        elif conflicted_files and not diff_text.strip():
+            raise ValueError(
+                f"Conflict detected: host files {conflicted_files} were modified since job '{safe_id}' started."
+            )
+
         if skipped_ignored_conflicts:
             files_changed = [f for f in files_changed if f not in skipped_ignored_conflicts]
 
@@ -646,8 +806,6 @@ class JobApplyMixin:
             # All-or-nothing: if any write fails part way, every file already touched goes back to its
             # pre_apply backup before the error propagates, so the workspace is never half applied.
             from pathlib import PurePosixPath
-
-            from server.batch_plan import is_protected_path
             from server.writers import symlink_component
 
             in_progress: str | None = None
@@ -707,14 +865,31 @@ class JobApplyMixin:
                     )
                 raise
         elif diff_text.strip():
-            _git_raw(
-                ["apply", "--binary", "--whitespace=nowarn", "-"],
+            apply_cmd = ["apply", "--3way", "--binary", "--whitespace=nowarn", "-"] if conflicted_files else [
+                "apply", "--binary", "--whitespace=nowarn", "-"
+            ]
+            apply_res = _git_raw(
+                apply_cmd,
                 input=diff_text,
                 cwd=str(self.workspace_root),
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
+            if apply_res.returncode != 0:
+                self._rollback_partial_apply(safe_id, pre_apply, list(files_changed))
+                _git_raw(["reset", "-q", "--", *files_changed], cwd=str(self.workspace_root), capture_output=True, check=False)
+                raise ValueError(
+                    f"Conflict detected: host files {conflicted_files or files_changed} could not be cleanly merged "
+                    f"for job '{safe_id}': {(apply_res.stderr or apply_res.stdout or '').strip()[:300]}"
+                )
+            if conflicted_files:
+                # Clear any staged 3-way index entries while keeping the merged working tree bytes intact.
+                _git_raw(["reset", "-q", "--", *files_changed], cwd=str(self.workspace_root), capture_output=True, check=False)
+                merged_files = sorted(conflicted_files)
+                post_merge_verified = False
+                verification_stale_after_merge = True
+                receipt["acceptance_passed"] = None
             applied_files = list(files_changed)
 
         if cleanup_worktree and wt_dir.exists():
@@ -726,6 +901,7 @@ class JobApplyMixin:
             applied_prov["files_changed"] = [
                 f for f in applied_prov.get("files_changed", []) if f not in skipped_ignored_conflicts
             ]
+        applied_snap_dir = self.store.data_dir / "backups" / safe_id / ".applied"
         applied_file_hashes: dict[str, str | None] = {}
         for fpath in applied_files:
             if fpath not in applied_prov["files_changed"]:
@@ -736,6 +912,15 @@ class JobApplyMixin:
             elif dst_p.exists() and dst_p.is_file():
                 raw_applied_bytes = dst_p.read_bytes()
                 applied_file_hashes[fpath] = sha256_bytes(raw_applied_bytes)
+                try:
+                    snap_dst = (applied_snap_dir / fpath).resolve()
+                    applied_snap_root = applied_snap_dir.resolve()
+                    if snap_dst.is_relative_to(applied_snap_root):
+                        snap_dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        snap_dst.write_bytes(raw_applied_bytes)
+                        os.chmod(snap_dst, 0o600)
+                except OSError:
+                    pass
                 if (
                     baseline_hashes.get(fpath) is None
                     and fpath not in (applied_prov.get("per_file") or {})
@@ -764,6 +949,11 @@ class JobApplyMixin:
         receipt["baseline_file_hashes"] = baseline_hashes
         receipt["provenance"] = applied_prov
         receipt["pre_apply"] = {k: v for k, v in pre_apply.items() if k in applied_files}
+        if merged_files:
+            receipt["merged_files"] = merged_files
+            receipt["post_merge_verified"] = bool(post_merge_verified)
+            if verification_stale_after_merge:
+                receipt["verification_stale_after_merge"] = True
         if omitted_untracked_out_of_scope:
             receipt["omitted_untracked_out_of_scope"] = omitted_untracked_out_of_scope
         if omitted_unverified_new_tests:
@@ -825,6 +1015,23 @@ class JobApplyMixin:
             "job_id": safe_id,
             "applied": True,
             "applied_files": applied_files,
+            **(
+                {
+                    "merged_files": merged_files,
+                    "post_merge_verified": bool(post_merge_verified),
+                }
+                if merged_files
+                else {}
+            ),
+            **(
+                {
+                    "overlaid_host_files": overlaid_host_files,
+                    "post_merge_verified": bool(post_merge_verified),
+                }
+                if overlaid_host_files
+                else {}
+            ),
+            **({"verification_stale_after_merge": True} if verification_stale_after_merge else {}),
             **({"kept_host_copy": skipped_ignored_conflicts} if skipped_ignored_conflicts else {}),
             **(
                 {"omitted_untracked_out_of_scope": omitted_untracked_out_of_scope}
@@ -1065,7 +1272,7 @@ class JobApplyMixin:
             dst.write_bytes(data)
             if pre.get("mode") is not None:
                 os.chmod(dst, int(pre["mode"]))
-        elif state == "git_blob":
+        elif state == "git_blob" or state == "merged_bytes":
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_file():
                 dst.unlink()
@@ -1168,6 +1375,49 @@ class JobApplyMixin:
             expected = applied_hashes.get(rel)
             pre = pre_apply.get(rel) or (self._pre_state_for_in_place(receipt, rel) if in_place else {"state": "unknown"})
             if current != expected:
+                merged_revert_bytes: bytes | None = None
+                applied_snap_file = bdir / ".applied" / rel
+                pre_bytes: bytes | None = None
+                if pre.get("state") == "file" and pre.get("backup"):
+                    bak_f = bdir / str(pre["backup"])
+                    if bak_f.is_file():
+                        cand_pre = bak_f.read_bytes()
+                        if sha256_bytes(cand_pre) == pre.get("sha256"):
+                            pre_bytes = cand_pre
+                elif pre.get("state") == "git_blob" and isinstance(pre.get("data"), (bytes, bytearray)):
+                    pre_bytes = bytes(pre["data"])
+                if (
+                    dst.is_file()
+                    and not dst.is_symlink()
+                    and pre_bytes is not None
+                    and applied_snap_file.is_file()
+                ):
+                    app_bytes = applied_snap_file.read_bytes()
+                    if sha256_bytes(app_bytes) == expected:
+                        with tempfile.TemporaryDirectory(prefix="cc-agy-revmerge-") as rmdir:
+                            rmp = Path(rmdir)
+                            f_cur = rmp / "current"
+                            f_app = rmp / "applied"
+                            f_pre = rmp / "pre"
+                            f_cur.write_bytes(dst.read_bytes())
+                            f_app.write_bytes(app_bytes)
+                            f_pre.write_bytes(pre_bytes)
+                            rm_res = _git_raw(
+                                ["merge-file", "-p", str(f_cur), str(f_app), str(f_pre)],
+                                capture_output=True,
+                                check=False,
+                            )
+                            if rm_res.returncode == 0:
+                                merged_revert_bytes = rm_res.stdout
+                if merged_revert_bytes is not None:
+                    plan.append(
+                        {
+                            "file": rel,
+                            "restore_to": "3way_reverse_merge",
+                            "pre": {"state": "merged_bytes", "data": merged_revert_bytes, "mode": pre.get("mode")},
+                        }
+                    )
+                    continue
                 diff = ""
                 if dst.is_file() and not dst.is_symlink():
                     diff = f"current sha256={current}, applied sha256={expected}"

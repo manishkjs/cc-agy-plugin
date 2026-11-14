@@ -26,7 +26,7 @@ from server.jobs import (
     validate_plan,
 )
 from server.receipts import BudgetExceededError, ReceiptStore
-from server.regions import env_flag, is_strict_mode_enabled, truncate_to_token_budget
+from server.regions import env_flag, is_ge_mode_pinned, is_strict_mode_enabled, truncate_to_token_budget
 from server.true_cost import true_total_report
 from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_plan
 from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
@@ -42,7 +42,7 @@ from server.regions import resolve_auth_config
 from server.review_bundle import build_review_evidence_dir
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
-SUPPORTED_MCP_VERSIONS = frozenset({"2024-11-05", "2025-03-26"})
+SUPPORTED_MCP_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"})
 
 
 def _build_delegate_input_properties(
@@ -857,8 +857,41 @@ def server_instructions_for_host(env: dict[str, str] | None = None) -> str | Non
     return HOST_REVIEW_INSTRUCTIONS
 
 
+_GE_PINNED_OMIT_PROPERTIES: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "project",
+        "location",
+        "claude_writer",
+        "claude_model",
+        "max_claude_escalations",
+    }
+)
+
+
+def _strip_ge_locked_properties(tool_def: dict[str, Any], active_env: dict[str, str] | Any) -> dict[str, Any]:
+    raw_schema = tool_def.get("inputSchema")
+    if not isinstance(raw_schema, dict):
+        return tool_def
+    raw_props = raw_schema.get("properties")
+    if not isinstance(raw_props, dict):
+        return tool_def
+    allow_claude = str(active_env.get("CC_AGY_ALLOW_CLAUDE_IN_GE") or "").strip().lower() in ("1", "true", "yes")
+    omit = {"api_key", "project", "location"} if allow_claude else _GE_PINNED_OMIT_PROPERTIES
+    if not any(k in raw_props for k in omit):
+        return tool_def
+    filtered_props = {k: v for k, v in raw_props.items() if k not in omit}
+    updated_schema = dict(raw_schema)
+    updated_schema["properties"] = filtered_props
+    if "required" in updated_schema:
+        updated_schema["required"] = [r for r in updated_schema["required"] if r not in omit]
+    updated_def = dict(tool_def)
+    updated_def["inputSchema"] = updated_schema
+    return updated_def
+
+
 def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    """Return MCP tool definitions filtered by `CC_AGY_TOOL_PROFILE` (`core` default in strict mode, else `full`)."""
+    """Return MCP tool definitions filtered by `CC_AGY_TOOL_PROFILE` and GE fail-closed policy."""
     active_env = os.environ if env is None else env
     raw_profile = (active_env.get("CC_AGY_TOOL_PROFILE") or "").strip().lower()
     if not raw_profile:
@@ -867,8 +900,12 @@ def get_tool_definitions(env: dict[str, str] | None = None) -> list[dict[str, An
         profile = raw_profile
     if profile in ("core", "compact"):
         core_set = set(CORE_TOOL_NAMES)
-        return [_compact_core_tool_def(t) for t in TOOL_DEFINITIONS if t["name"] in core_set]
-    return TOOL_DEFINITIONS
+        defs = [_compact_core_tool_def(t) for t in TOOL_DEFINITIONS if t["name"] in core_set]
+    else:
+        defs = list(TOOL_DEFINITIONS)
+    if is_ge_mode_pinned(active_env):
+        defs = [_strip_ge_locked_properties(t, active_env) for t in defs]
+    return defs
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -995,9 +1032,52 @@ class MCPServer:
         self.batch_writer_factory = batch_writer_factory
         # Set by serve_stdio: writes a JSON-RPC notification (e.g. notifications/progress) to the client.
         self.notify: Any = None
-        # notifications/cancelled flips the stop event of the matching in-flight batch request.
+        # notifications/cancelled flips the stop event and runs registered cancel hooks for in-flight requests.
         self._active_stops: dict[Any, threading.Event] = {}
+        self._active_cancels: dict[Any, list[Any]] = {}
         self._cancel_lock = threading.Lock()
+
+    def _register_request_guard(
+        self,
+        request_id: Any,
+        progress_token: Any,
+        *,
+        heartbeat_seconds: float = 15.0,
+    ) -> tuple[Any, Any, threading.Event, Any]:
+        """Bind a `threading.Event` and `on_job_allocated` cancel hook to `request_id`."""
+        report, stop_beat = self._progress_reporter(progress_token, heartbeat_seconds=heartbeat_seconds)
+        stop = threading.Event()
+        if request_id is not None:
+            with self._cancel_lock:
+                self._active_stops[request_id] = stop
+                self._active_cancels.setdefault(request_id, [])
+
+        def _register_cancel_cb(fn: Any) -> None:
+            if not callable(fn):
+                return
+            fire_now = False
+            if request_id is not None:
+                with self._cancel_lock:
+                    if stop.is_set():
+                        fire_now = True
+                    else:
+                        self._active_cancels.setdefault(request_id, []).append(fn)
+            elif stop.is_set():
+                fire_now = True
+            if fire_now:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        def _cleanup() -> None:
+            stop_beat()
+            if request_id is not None:
+                with self._cancel_lock:
+                    self._active_stops.pop(request_id, None)
+                    self._active_cancels.pop(request_id, None)
+
+        return report, _cleanup, stop, _register_cancel_cb
 
     def _progress_reporter(self, progress_token: Any, heartbeat_seconds: float = 30.0):
         """Return (report, stop) for MCP progress: report(done, total, msg) plus a heartbeat thread."""
@@ -1092,10 +1172,17 @@ class MCPServer:
         # Notifications have no id and expect no response
         if not has_id:
             if method == "notifications/cancelled":
+                req_target = params.get("requestId")
                 with self._cancel_lock:
-                    stop = self._active_stops.get(params.get("requestId"))
+                    stop = self._active_stops.get(req_target)
+                    cancel_fns = list(self._active_cancels.get(req_target) or ())
                 if stop is not None:
                     stop.set()
+                for cfn in cancel_fns:
+                    try:
+                        cfn()
+                    except Exception:
+                        pass
             return None
 
         try:
@@ -1196,7 +1283,10 @@ class MCPServer:
                                 "text": json.dumps(payload, indent=2, sort_keys=True),
                             }
                         ],
-                        "isError": bool(payload.get("is_error", False)),
+                        "isError": bool(
+                            payload.get("is_error", False)
+                            or (tool_name != "doctor" and payload.get("status") == "error")
+                        ),
                     },
                 }
 
@@ -1262,16 +1352,15 @@ class MCPServer:
 
     def _run_file_batch(self, plan: Any, args: dict[str, Any], progress_token: Any, *, request_id: Any = None,
                         opencode_session_id: str | None = None, **runner_kwargs: Any) -> dict[str, Any]:
+        raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or "gemini-flash-next")
+        auth = self._batch_auth(args, raw_model_hint)
         try:
-            settings = resolve_batch_settings(args)
+            settings = resolve_batch_settings(args, auth_mode=str(auth.get("auth_mode") or ""))
         except ValueError as exc:
             raise InvalidParamsError(str(exc)) from exc
-        auth = self._batch_auth(args, settings.model)
-        report, stop_beat = self._progress_reporter(progress_token)
-        stop = threading.Event()
-        if request_id is not None:
-            with self._cancel_lock:
-                self._active_stops[request_id] = stop
+        if settings.model != raw_model_hint:
+            auth = self._batch_auth(args, settings.model)
+        report, cleanup_guard, stop, _ = self._register_request_guard(request_id, progress_token, heartbeat_seconds=30.0)
         if opencode_session_id:
             extra_rec = dict(runner_kwargs.get("extra_receipt") or {})
             extra_rec.setdefault("opencode_session_id", opencode_session_id)
@@ -1280,10 +1369,7 @@ class MCPServer:
             runner = FileBatchRunner(self.job_manager, writer_factory=self.batch_writer_factory, progress=report, stop=stop)
             return runner.run(plan, settings, auth, **runner_kwargs)
         finally:
-            stop_beat()
-            if request_id is not None:
-                with self._cancel_lock:
-                    self._active_stops.pop(request_id, None)
+            cleanup_guard()
 
     def _dispatch_tool(self, name: str, args: dict[str, Any], *, progress_token: Any = None,
                        request_id: Any = None, opencode_session_id: str | None = None) -> dict[str, Any]:
@@ -1357,14 +1443,15 @@ class MCPServer:
             )
 
         if name == "probe_writers":
+            raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or "gemini-flash-next")
             try:
-                settings = resolve_batch_settings(args)
-            except ValueError as exc:
-                raise InvalidParamsError(str(exc)) from exc
-            try:
-                auth = self._batch_auth(args, settings.model)
+                auth = self._batch_auth(args, raw_model_hint)
             except ValueError as exc:
                 return {"status": "error", "is_error": True, "writers": [], "error": str(exc)}
+            try:
+                settings = resolve_batch_settings(args, auth_mode=str(auth.get("auth_mode") or ""))
+            except ValueError as exc:
+                raise InvalidParamsError(str(exc)) from exc
             return probe_writers(
                 settings,
                 auth,
@@ -1390,33 +1477,44 @@ class MCPServer:
                 check_deps_b = parse_bool(args.get("check_dependencies"), False)
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
-            return ask_gemini(
-                prompt=prompt_str,
-                model=_optional_str(args.get("model"), "model"),
-                context_files=ctx_files,
-                media=media_list,
-                spec_url=spec_url_str,
-                google_search=gsearch_b,
-                check_dependencies=check_deps_b,
-                system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
-                temperature=temp_val,
-                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-                max_output_tokens=max_out_val,
-                api_key=_optional_str(args.get("api_key"), "api_key"),
-                project=_optional_str(args.get("project"), "project"),
-                location=_optional_str(args.get("location"), "location"),
-                workspace_root=self.job_manager.workspace_root,
-                store=self.store,
-                scrub_receipt=scrub_b,
-                backend=self.ask_backend,
-                session_id=opencode_session_id,
+            report_ask, cleanup_ask, stop_ask, _ = self._register_request_guard(
+                request_id, progress_token, heartbeat_seconds=15.0
             )
+            try:
+                if report_ask is not None:
+                    report_ask(0, None, "Querying Gemini...")
+                return ask_gemini(
+                    prompt=prompt_str,
+                    model=_optional_str(args.get("model"), "model"),
+                    context_files=ctx_files,
+                    media=media_list,
+                    spec_url=spec_url_str,
+                    google_search=gsearch_b,
+                    check_dependencies=check_deps_b,
+                    system_instruction=_optional_str(args.get("system_instruction"), "system_instruction"),
+                    temperature=temp_val,
+                    thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
+                    max_output_tokens=max_out_val,
+                    api_key=_optional_str(args.get("api_key"), "api_key"),
+                    project=_optional_str(args.get("project"), "project"),
+                    location=_optional_str(args.get("location"), "location"),
+                    workspace_root=self.job_manager.workspace_root,
+                    store=self.store,
+                    scrub_receipt=scrub_b,
+                    backend=self.ask_backend,
+                    session_id=opencode_session_id,
+                    stop_event=stop_ask,
+                )
+            finally:
+                cleanup_ask()
 
         if name == "delegate_start":
             return self._execute_delegation_request(
                 args,
                 sync_convenience=False,
                 opencode_session_id=opencode_session_id,
+                progress_token=progress_token,
+                request_id=request_id,
             )
 
         if name == "delegate_status":
@@ -1433,11 +1531,20 @@ class MCPServer:
             except ValueError as exc:
                 raise InvalidParamsError(str(exc)) from exc
             timeout_val = _parse_positive_float(args.get("timeout"), "timeout", 240.0)
-            return self.job_manager.delegate_result(
-                job_id=job_id_str,
-                wait=wait_b,
-                timeout=timeout_val,
+            report_res, cleanup_res, stop_res, reg_cancel_res = self._register_request_guard(
+                request_id, progress_token, heartbeat_seconds=15.0
             )
+            try:
+                return self.job_manager.delegate_result(
+                    job_id=job_id_str,
+                    wait=wait_b,
+                    timeout=timeout_val,
+                    on_job_allocated=lambda jid: reg_cancel_res(lambda: self.job_manager.delegate_cancel(jid)),
+                    progress_callback=report_res,
+                    stop_event=stop_res,
+                )
+            finally:
+                cleanup_res()
 
         if name == "get_diff":
             job_id_str = _require_str(args.get("job_id"), "job_id")
@@ -1503,20 +1610,29 @@ class MCPServer:
                 raise InvalidParamsError(str(exc)) from exc
             followup_str, _, repair_meta = self._maybe_repair_dictation(followup_str, None, None)
             timeout_sec = _parse_positive_float(args.get("timeout_seconds"), "timeout_seconds", 600.0)
-            digest = self.job_manager.delegate_continue(
-                job_id=job_id_str,
-                follow_up_prompt=followup_str,
-                allowed_paths=cont_allowed,
-                acceptance=cont_acceptance,
-                timeout_seconds=timeout_sec,
-                wait=wait_b,
-                api_key=_optional_str(args.get("api_key"), "api_key"),
-                project=_optional_str(args.get("project"), "project"),
-                location=_optional_str(args.get("location"), "location"),
-                force_retry=force_b,
-                auto_apply=cont_auto_apply,
-                opencode_session_id=opencode_session_id,
+            report_cont, cleanup_cont, stop_cont, reg_cancel_cont = self._register_request_guard(
+                request_id, progress_token, heartbeat_seconds=15.0
             )
+            try:
+                digest = self.job_manager.delegate_continue(
+                    job_id=job_id_str,
+                    follow_up_prompt=followup_str,
+                    allowed_paths=cont_allowed,
+                    acceptance=cont_acceptance,
+                    timeout_seconds=timeout_sec,
+                    wait=wait_b,
+                    api_key=_optional_str(args.get("api_key"), "api_key"),
+                    project=_optional_str(args.get("project"), "project"),
+                    location=_optional_str(args.get("location"), "location"),
+                    force_retry=force_b,
+                    auto_apply=cont_auto_apply,
+                    opencode_session_id=opencode_session_id,
+                    on_job_allocated=lambda jid: reg_cancel_cont(lambda: self.job_manager.delegate_cancel(jid)),
+                    progress_callback=report_cont,
+                    stop_event=stop_cont,
+                )
+            finally:
+                cleanup_cont()
             if repair_meta.get("repaired") and isinstance(digest, dict):
                 digest["dictation_repaired"] = True
                 if repair_meta.get("snippet_paths"):
@@ -1566,6 +1682,8 @@ class MCPServer:
                 args,
                 sync_convenience=True,
                 opencode_session_id=opencode_session_id,
+                progress_token=progress_token,
+                request_id=request_id,
             )
 
         raise InvalidParamsError(f"Unknown tool: {name!r}")
@@ -1576,6 +1694,8 @@ class MCPServer:
         *,
         sync_convenience: bool = False,
         opencode_session_id: str | None = None,
+        progress_token: Any = None,
+        request_id: Any = None,
     ) -> dict[str, Any]:
         """Shared argument parser, dictation repair, QA audit, and auto-apply pipeline for `delegate_start` and `delegate_to_gemini`."""
         prompt_str = _require_str(args.get("prompt"), "prompt")
@@ -1625,34 +1745,43 @@ class MCPServer:
         req_project = _optional_str(args.get("project"), "project")
         req_location = _optional_str(args.get("location"), "location")
         will_run_qa = bool(wait_b and qa_review_model and qa_review_model.strip())
-        digest = self.job_manager.delegate_start(
-            prompt=prompt_str,
-            model=_optional_str(args.get("model"), "model"),
-            allowed_paths=allowed,
-            enabled_tools=enabled_t,
-            disabled_tools=disabled_t,
-            enable_subagents=enable_sub,
-            scrub_receipt=scrub_b,
-            timeout_seconds=timeout_sec,
-            wait=wait_b,
-            in_place=in_place_b,
-            api_key=req_api_key,
-            project=req_project,
-            location=req_location,
-            thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
-            plan=plan_steps,
-            acceptance=acceptance_cmds,
-            max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
-            max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
-            preload_files=preload_b,
-            auto_apply=False if will_run_qa else auto_apply_arg,
-            spec_files=spec_f,
-            context_files=context_f,
-            media_files=media_f,
-            checklist=checklist_items,
-            opencode_session_id=opencode_session_id,
-            _skip_balanced_qa=will_run_qa,
+        report_del, cleanup_del, stop_del, reg_cancel_del = self._register_request_guard(
+            request_id, progress_token, heartbeat_seconds=15.0
         )
+        try:
+            digest = self.job_manager.delegate_start(
+                prompt=prompt_str,
+                model=_optional_str(args.get("model"), "model"),
+                allowed_paths=allowed,
+                enabled_tools=enabled_t,
+                disabled_tools=disabled_t,
+                enable_subagents=enable_sub,
+                scrub_receipt=scrub_b,
+                timeout_seconds=timeout_sec,
+                wait=wait_b,
+                in_place=in_place_b,
+                api_key=req_api_key,
+                project=req_project,
+                location=req_location,
+                thinking_level=_optional_str(args.get("thinking_level"), "thinking_level"),
+                plan=plan_steps,
+                acceptance=acceptance_cmds,
+                max_tool_calls=_parse_optional_nonneg_int(args.get("max_tool_calls"), "max_tool_calls"),
+                max_total_tokens=_parse_optional_nonneg_int(args.get("max_total_tokens"), "max_total_tokens"),
+                preload_files=preload_b,
+                auto_apply=False if will_run_qa else auto_apply_arg,
+                spec_files=spec_f,
+                context_files=context_f,
+                media_files=media_f,
+                checklist=checklist_items,
+                opencode_session_id=opencode_session_id,
+                on_job_allocated=lambda jid: reg_cancel_del(lambda: self.job_manager.delegate_cancel(jid)),
+                progress_callback=report_del if wait_b else None,
+                stop_event=stop_del if wait_b else None,
+                _skip_balanced_qa=will_run_qa,
+            )
+        finally:
+            cleanup_del()
         if will_run_qa and qa_review_model:
             digest = self._maybe_run_qa_review(
                 digest,
@@ -2137,6 +2266,32 @@ def serve_stdio(
                     _process_and_write(msg, use_content_length)
 
         if is_live_process_stdin:
+            # Give just-submitted fast validation/preflight RPCs up to 300ms to finish writing their
+            # response when no worker job is running yet, while immediately interrupting active workers.
+            has_running_worker = False
+            try:
+                with active_server.job_manager._lock:
+                    has_running_worker = any(not f.done() for f in active_server.job_manager._futures.values())
+            except Exception:
+                has_running_worker = False
+            if not has_running_worker and in_flight_futures:
+                drain_deadline = __import__("time").monotonic() + 0.35
+                for fut in list(in_flight_futures):
+                    if fut.done():
+                        continue
+                    try:
+                        with active_server.job_manager._lock:
+                            if any(not f.done() for f in active_server.job_manager._futures.values()):
+                                break
+                    except Exception:
+                        break
+                    rem_drain = drain_deadline - __import__("time").monotonic()
+                    if rem_drain <= 0:
+                        break
+                    try:
+                        fut.result(timeout=min(0.05, rem_drain))
+                    except Exception:
+                        pass
             # Host CLI closed stdin (e.g. session exit or cohort timeout): immediately interrupt
             # and cancel active workers instead of blocking up to 240s in pool.shutdown(wait=True).
             try:

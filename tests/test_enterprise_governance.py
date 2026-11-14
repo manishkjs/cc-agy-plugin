@@ -827,7 +827,7 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
         "CC_AGY_BIFROST_POLICY_URL": POLICY_URL,
         "CC_AGY_BIFROST_AGY_VIRTUAL_KEY": AGY_VIRTUAL_KEY,
     }
-    assert set(out["cfg"]["command"]) == {"cost", "delegate", "doctor", "jobs"}
+    assert set(out["cfg"]["command"]) == {"agy", "cost", "delegate", "doctor", "jobs"}
     assert out["cfg"]["command"]["cost"] == {"template": "user-defined"}
     assert out["cfg"]["agent"]["gemini-delegator"]["permission"] == {"edit": "deny"}
     assert "agy" not in {k for k in out["kept"]["mcp"] if k != "servers"}

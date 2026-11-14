@@ -40,7 +40,7 @@ def test_opencode_bundle_contracts_and_zero_em_dashes() -> None:
 
     assert skill_path.is_file()
     assert agent_path.is_file()
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         cmd_path = commands_dir / f"{stem}.md"
         assert cmd_path.is_file()
         meta, body = parse_frontmatter(cmd_path.read_text(encoding="utf-8"))
@@ -103,7 +103,7 @@ def test_validate_opencode_bundle_rejects_known_schema_traps(tmp_path: Path) -> 
         encoding="utf-8",
     )
     # Trap 2: command using Claude-only frontmatter keys (`name`, `argument-hint`) and `vertex` server
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         (bundle / "commands" / f"{stem}.md").write_text(
             f"---\nname: {stem}\ndescription: Desc\nargument-hint: <arg>\n---\nCall `doctor` on the `vertex` MCP server.\n",
             encoding="utf-8",
@@ -128,7 +128,7 @@ def test_validate_opencode_bundle_rejects_known_schema_traps(tmp_path: Path) -> 
         "---\nname: cc-agy-plugin\ndescription: Use when delegating tasks from OpenCode to Gemini.\n---\nBody\n",
         encoding="utf-8",
     )
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         (bundle / "commands" / f"{stem}.md").write_text(
             f"---\ndescription: Run {stem}\n---\nCall `agy_{stem}` on the `agy` MCP server.\n",
             encoding="utf-8",
@@ -339,7 +339,7 @@ def test_install_opencode_lifecycle_idempotence_backups_jsonc_and_secret_hygiene
     # Global skill, 4 commands, and subagent are all installed
     assert (oc_dir / "skills" / "cc-agy-plugin" / "SKILL.md").is_file()
     assert (oc_dir / "agents" / "gemini-delegator.md").is_file()
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         assert (oc_dir / "commands" / f"{stem}.md").is_file()
 
     # 2nd run is idempotent (`unchanged`)
@@ -836,7 +836,7 @@ def test_validate_opencode_bundle_catches_wildcard_permission_override_extra_age
         "---\nname: cc-agy-plugin # inline comment\ndescription: >-\n  Use when delegating coding tasks from OpenCode to Gemini.\n---\nBody\n",
         encoding="utf-8",
     )
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         (bundle / "commands" / f"{stem}.md").write_text(
             f"---\ndescription: Run {stem} # comment\n---\nCall `agy_{stem}`.\n",
             encoding="utf-8",
@@ -920,7 +920,7 @@ def _init_minimal_opencode_bundle(root: Path) -> Path:
         "---\nname: cc-agy-plugin\ndescription: Use when delegating tasks.\n---\nBody\n",
         encoding="utf-8",
     )
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         (bundle / "commands" / f"{stem}.md").write_text(
             f"---\ndescription: Run {stem}\n---\nCall `agy_{stem}`.\n",
             encoding="utf-8",

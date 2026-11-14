@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = []
+build-backend = "_build_backend"
+backend-path = ["."]
 
 [project]
 name = "cc-agy-plugin"
@@ -39,7 +40,7 @@ include = ["server*", "scripts*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-server = ["*.json"]
+server = ["*.json", "_bundled_assets/**/*", "_bundled_assets/.*/*", "_bundled_assets/.*"]
 scripts = ["*.sh", "*.ps1"]
 
 [tool.pytest.ini_options]

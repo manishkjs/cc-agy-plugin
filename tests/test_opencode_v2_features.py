@@ -129,7 +129,7 @@ def test_opencode_v2_validator_permissions_precedence_flow_and_fail_closed(tmp_p
         "Body\n",
         encoding="utf-8",
     )
-    for stem in ("delegate", "doctor", "jobs", "cost"):
+    for stem in ("agy", "delegate", "doctor", "jobs", "cost"):
         (bundle / "commands" / f"{stem}.md").write_text(
             f"---\ndescription: Run {stem}\nsubagent: true\n---\nCall `agy_{stem}`.\n",
             encoding="utf-8",

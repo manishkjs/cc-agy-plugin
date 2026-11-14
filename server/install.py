@@ -116,7 +116,7 @@ OPENCODE_STARTUP_TIMEOUT_MS = CODEX_STARTUP_TIMEOUT_SEC * 1000
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _OPENCODE_RESERVED_SERVER_NAMES: frozenset[str] = frozenset({"servers", "timeout"})
 _OPENCODE_MCP_ENTRY_KEYS: tuple[str, ...] = ("type", "command", "url", "enabled", "disabled")
-_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost")
+_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost", "agy")
 _PLUGIN_MANAGED_ENV_KEYS: frozenset[str] = frozenset(
     {
         "CC_AGY_COST_PROFILE",
@@ -674,17 +674,31 @@ def install_codex(
     result["status"] = "installed" if existing != updated else "unchanged"
     codex_bin = shutil.which("codex")
     if codex_bin:
-        probe = subprocess.run(
-            [codex_bin, "mcp", "get", name, "--json"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, "CODEX_HOME": str(home)},
-            timeout=30,
-        )
-        result["codex_verify_exit_code"] = probe.returncode
-        if probe.returncode != 0:
-            result["codex_verify_error"] = (probe.stderr or probe.stdout).strip()[-600:]
+        is_openai_codex = False
+        try:
+            help_probe = subprocess.run(
+                [codex_bin, "--help"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            help_text = f"{help_probe.stdout or ''}\n{help_probe.stderr or ''}".lower()
+            is_openai_codex = "mcp" in help_text and ("codex" in help_text or "exec" in help_text)
+        except (OSError, subprocess.SubprocessError):
+            is_openai_codex = False
+        if is_openai_codex:
+            probe = subprocess.run(
+                [codex_bin, "mcp", "get", name, "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "CODEX_HOME": str(home)},
+                timeout=30,
+            )
+            result["codex_verify_exit_code"] = probe.returncode
+            if probe.returncode != 0:
+                result["codex_verify_error"] = (probe.stderr or probe.stdout).strip()[-600:]
     return result
 
 
@@ -2257,12 +2271,13 @@ def install_opencode(
 
 
 def preflight(
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
     *,
     auth_mode: str | None = None,
     project: str | None = None,
     base_url: str | None = None,
     agy_cli_path: str | None = None,
+    no_bootstrap: bool = False,
 ) -> dict[str, Any]:
     """Zero-network readiness: Python, SDKs / `agy` CLI, git and credentials."""
     from server.agy_cli import inspect_agy_cli_offline
@@ -2318,6 +2333,11 @@ def preflight(
         if not agy_cli_status.get("ok"):
             err = str(agy_cli_status.get("error") or "Antigravity CLI (`agy`) sign-in is missing.")
             rem = str(agy_cli_status.get("remediation") or "")
+            if no_bootstrap and not agy_cli_status.get("binary_found"):
+                rem = (
+                    "Re-run without `--no-bootstrap` (or run `python3 -m server.install --install-agy-cli`) "
+                    "to download `agy`, then run it once in a terminal to sign in."
+                )
             msg = f"{err} {rem}".strip()
             if agy_cli_status.get("binary_found") and not agy_cli_status.get("adc_seat_error"):
                 warnings.append(msg)
@@ -2427,9 +2447,6 @@ def run_interactive_wizard(
     source = env if env is not None else os.environ
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
-    host_raw = str(
-        input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor, 6=OpenCode] (1): ") or ""
-    ).strip().lower()
     host_map = {
         "": "all",
         "1": "all",
@@ -2439,6 +2456,7 @@ def run_interactive_wizard(
         "codex": "codex",
         "3": "claude",
         "claude": "claude",
+        "claude-code": "claude",
         "4": "agy",
         "agy": "agy",
         "antigravity": "agy",
@@ -2449,7 +2467,20 @@ def run_interactive_wizard(
         "opencode": "opencode",
         "open-code": "opencode",
     }
-    host = host_map.get(host_raw, "all")
+    host: str | None = None
+    for _attempt in range(3):
+        host_raw = str(
+            input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor, 6=OpenCode] (1): ")
+            or ""
+        ).strip().lower()
+        if host_raw in host_map:
+            host = host_map[host_raw]
+            break
+        output_fn(
+            f"   Unrecognized host {host_raw!r}. Enter 1-6 or one of: all, codex, claude, agy, cursor, opencode."
+        )
+    if host is None:
+        raise ValueError("Invalid host selection in interactive setup wizard.")
 
     from server.regions import (
         _clean_base_url_candidate,
@@ -2564,14 +2595,181 @@ def run_interactive_wizard(
     return built
 
 
+def _is_cc_agy_plugin_checkout(path: Path) -> bool:
+    """Return True only if `path` carries our `.cc-agy-managed-repo` marker or plugin manifest."""
+    if (path / ".cc-agy-managed-repo").is_file():
+        return True
+    manifest = path / ".claude-plugin" / "plugin.json"
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            return isinstance(data, dict) and data.get("name") == "cc-agy-plugin"
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def _materialize_persistent_checkout(persistent_repo: Path) -> None:
+    """Populate `persistent_repo` from wheel `_bundled_assets` (offline-safe) or a git clone."""
+    marker_name = ".cc-agy-managed-repo"
+    bundled_root = PLUGIN_ROOT / "server" / "_bundled_assets"
+    has_bundled = (bundled_root / ".claude-plugin" / "plugin.json").is_file()
+
+    if persistent_repo.exists():
+        is_managed = _is_cc_agy_plugin_checkout(persistent_repo)
+        is_empty = persistent_repo.is_dir() and not any(persistent_repo.iterdir())
+        if not is_managed and not is_empty:
+            raise RuntimeError(
+                f"Refusing to overwrite non-empty directory {persistent_repo} because it is not a managed "
+                "cc-agy-plugin checkout. Unset CC_AGY_INSTALL_REPO_DIR or choose an empty path."
+            )
+
+    persistent_repo.parent.mkdir(parents=True, exist_ok=True)
+    if has_bundled:
+        persistent_repo.mkdir(parents=True, exist_ok=True)
+        for item in bundled_root.iterdir():
+            dst = persistent_repo / item.name
+            if item.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(item, dst)
+            elif item.is_file():
+                shutil.copy2(item, dst)
+        for pkg_name in ("server", "scripts"):
+            pkg_src = PLUGIN_ROOT / pkg_name
+            pkg_dst = persistent_repo / pkg_name
+            if pkg_src.is_dir():
+                if pkg_dst.exists():
+                    shutil.rmtree(pkg_dst)
+                shutil.copytree(
+                    pkg_src,
+                    pkg_dst,
+                    ignore=shutil.ignore_patterns("_bundled_assets", "__pycache__", "*.pyc"),
+                )
+        (persistent_repo / marker_name).write_text("managed-by-cc-agy-plugin\n", encoding="utf-8")
+        return
+
+    repo_url = os.environ.get("CC_AGY_REPO_URL") or "https://github.com/manishkjs/cc-agy-plugin.git"
+    explicit_ref = (os.environ.get("CC_AGY_REPO_REF") or "").strip()
+    repo_ref = explicit_ref or "main"
+    _GIT_SAFE_ARGS = (
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.file.allow=always",
+    )
+    git_clone_env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    if (persistent_repo / ".git").is_dir():
+        fetch_res = subprocess.run(
+            ["git", *_GIT_SAFE_ARGS, "fetch", "--quiet", "--depth=1", "origin", repo_ref],
+            cwd=str(persistent_repo),
+            env=git_clone_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fetch_res.returncode == 0:
+            co_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "checkout", "--quiet", "FETCH_HEAD"],
+                cwd=str(persistent_repo),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if co_res.returncode != 0 and explicit_ref:
+                detail = (co_res.stderr or co_res.stdout or "").strip()
+                raise RuntimeError(f"git checkout of pinned ref {repo_ref!r} failed: {detail}")
+        elif explicit_ref:
+            detail = (fetch_res.stderr or fetch_res.stdout or "").strip()
+            raise RuntimeError(f"git fetch of pinned ref {repo_ref!r} from {repo_url!r} failed: {detail}")
+    else:
+        if persistent_repo.exists():
+            shutil.rmtree(persistent_repo)
+        if re.fullmatch(r"[0-9a-fA-F]{40}", repo_ref):
+            persistent_repo.mkdir(parents=True, exist_ok=True)
+            init_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "init", "--quiet"],
+                cwd=str(persistent_repo),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            rem_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "remote", "add", "origin", repo_url],
+                cwd=str(persistent_repo),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            fetch_sha_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "fetch", "--quiet", "--depth=1", "origin", repo_ref],
+                cwd=str(persistent_repo),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            co_sha_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "checkout", "--quiet", "FETCH_HEAD"],
+                cwd=str(persistent_repo),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if any(r.returncode != 0 for r in (init_res, rem_res, fetch_sha_res, co_sha_res)):
+                shutil.rmtree(persistent_repo, ignore_errors=True)
+                detail = (fetch_sha_res.stderr or co_sha_res.stderr or fetch_sha_res.stdout or "").strip()
+                raise RuntimeError(f"git fetch of pinned commit {repo_ref!r} from {repo_url!r} failed: {detail}")
+        elif re.fullmatch(r"[0-9a-fA-F]{7,39}", repo_ref):
+            raise RuntimeError(
+                f"Abbreviated commit SHA {repo_ref!r} cannot be fetched directly; pass the full 40-character SHA or a tag/branch name."
+            )
+        else:
+            clone_res = subprocess.run(
+                ["git", *_GIT_SAFE_ARGS, "clone", "--depth=1", "--branch", repo_ref, repo_url, str(persistent_repo)],
+                cwd=str(persistent_repo.parent),
+                env=git_clone_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if clone_res.returncode != 0:
+                detail = (clone_res.stderr or clone_res.stdout or "").strip()
+                raise RuntimeError(f"git clone from {repo_url!r} (ref {repo_ref!r}) failed: {detail}")
+        (persistent_repo / marker_name).write_text("managed-by-cc-agy-plugin\n", encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if not raw_argv and argv is None and sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            raw_argv = run_interactive_wizard()
-        except (EOFError, KeyboardInterrupt):
-            print("\nSetup cancelled.")
-            return 1
+    if not raw_argv and argv is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                raw_argv = run_interactive_wizard()
+            except (EOFError, KeyboardInterrupt, ValueError) as exc:
+                msg = f"\nSetup cancelled: {exc}" if isinstance(exc, ValueError) else "\nSetup cancelled."
+                print(msg)
+                return 1
+        else:
+            print(
+                "Error: cc-agy-install was invoked with no flags in a non-interactive shell.\n"
+                "Pass explicit flags, for example:\n"
+                "  python3 -m server.install --host opencode --auth gemini-enterprise\n"
+                "  python3 -m server.install --non-interactive   # configure all hosts with auto-detected defaults",
+                file=sys.stderr,
+            )
+            return 2
 
     parser = argparse.ArgumentParser(
         prog="cc-agy-install",
@@ -2581,12 +2779,13 @@ def main(argv: list[str] | None = None) -> int:
         "--host",
         choices=("codex", "claude", "cursor", "opencode", "agy", "antigravity", "jetski", "all"),
         default="all",
+        help="Target host CLI/IDE to configure (default: all).",
     )
     parser.add_argument(
         "--auth",
         choices=AUTH_CHOICES,
-        default="auto",
-        help="Connection mode: 'gemini-enterprise' / 'agy-cli' (included seat quota via standalone `agy` CLI), 'api-key', 'vertex', 'gateway', or 'auto'.",
+        default=None,
+        help="Connection mode: 'gemini-enterprise' / 'agy-cli' (included seat quota via standalone `agy` CLI), 'api-key', 'vertex', 'gateway', or 'auto' (default: auto).",
     )
     parser.add_argument("--profile", choices=COST_PROFILES, default="balanced",
                         help="economy: Flash only; balanced: Flash, escalating to Carbon Zero-Think on failure; quality: Argon first.")
@@ -2651,6 +2850,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--human", action="store_true", help="With --doctor, print a concise human-readable summary instead of JSON.")
     parser.add_argument("--fix", action="store_true", help="With --doctor, attempt safe local bootstrap repairs before running diagnostics.")
     parser.add_argument("--probe-oidc", action="store_true", help="With --doctor, mint a live OIDC token once to verify and display the resolved principal.")
+    parser.add_argument("--allow-pending-login", action="store_true", help="With --doctor, treat pending first-time `agy` sign-in as a warning instead of an error.")
+    parser.add_argument("--workspace", default=None, help="With --doctor, target workspace root directory to inspect (default: current directory).")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing anything.")
     parser.add_argument("--json", action="store_true", help="Print the result as JSON.")
     args = parser.parse_args(raw_argv)
@@ -2663,51 +2864,41 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_settings_text())
         return 0
-    if not (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").is_file() and not args.dry_run:
-        # Invoked from an ephemeral wheel (for example `uvx` or `pipx run`): materialize a
-        # persistent checkout under ~/.local/share/cc-agy-plugin/repo so host MCP configs stay valid.
-        repo_url = os.environ.get("CC_AGY_REPO_URL") or "https://github.com/manishkjs/cc-agy-plugin.git"
-        data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
-        persistent_repo = Path(
-            os.environ.get("CC_AGY_INSTALL_REPO_DIR") or (data_home / "cc-agy-plugin" / "repo")
-        ).expanduser()
-        persistent_repo.parent.mkdir(parents=True, exist_ok=True)
-        from server.verify import run_git
-
-        if (persistent_repo / ".git").is_dir():
-            run_git(
-                ["fetch", "--quiet", "--depth=1", "origin", "main"],
-                cwd=persistent_repo,
-                check=False,
-            )
-            run_git(
-                ["merge", "--ff-only", "--quiet", "FETCH_HEAD"],
-                cwd=persistent_repo,
-                check=False,
-            )
-        else:
-            shutil.rmtree(persistent_repo, ignore_errors=True)
-            run_git(
-                ["clone", "--depth=1", repo_url, str(persistent_repo)],
-                cwd=persistent_repo.parent,
-                check=True,
-            )
-        forwarded = list(raw_argv) if raw_argv is not None else sys.argv[1:]
-        delegated = subprocess.run(
-            [sys.executable, "-m", "server.install", *forwarded],
-            cwd=str(persistent_repo),
-            check=False,
-        )
-        return delegated.returncode
     if args.probe_oidc and not args.doctor:
         parser.error("--probe-oidc requires --doctor")
+    if args.fix and not args.doctor:
+        parser.error("--fix requires --doctor")
+    if args.allow_pending_login and not args.doctor:
+        parser.error("--allow-pending-login requires --doctor")
+    if args.human and not args.doctor:
+        parser.error("--human requires --doctor")
+    if args.workspace is not None and not args.doctor:
+        parser.error("--workspace requires --doctor")
     if args.doctor:
         from server.doctor import _apply_doctor_fixes, format_doctor_human, run_doctor
 
+        doc_env: dict[str, str] | None = None
+        explicit_doc_auth = _normalize_auth_choice(args.auth) if args.auth is not None else None
+        if explicit_doc_auth is not None or args.project or args.base_url or args.agy_cli_path:
+            doc_env = dict(os.environ)
+            if explicit_doc_auth is not None:
+                doc_env["CC_AGY_AUTH_MODE"] = explicit_doc_auth
+            if args.project:
+                doc_env["GOOGLE_CLOUD_PROJECT"] = args.project
+            if args.base_url:
+                doc_env["CC_AGY_VERTEX_BASE_URL"] = args.base_url
+            if args.agy_cli_path:
+                doc_env["CC_AGY_CLI_BIN"] = args.agy_cli_path
         fix_actions: list[str] = []
         if args.fix:
-            fix_actions = _apply_doctor_fixes(os.environ)
-        report = run_doctor(workspace_root=os.getcwd(), probe_oidc=bool(args.probe_oidc))
+            fix_actions = _apply_doctor_fixes(doc_env if doc_env is not None else os.environ)
+        target_ws = args.workspace or os.getcwd()
+        report = run_doctor(
+            workspace_root=target_ws,
+            env=doc_env,
+            probe_oidc=bool(args.probe_oidc),
+            allow_pending_login=bool(args.allow_pending_login),
+        )
         if fix_actions:
             report["fix_actions"] = fix_actions
         if args.human and not args.json:
@@ -2715,6 +2906,28 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(json.dumps(report, indent=2))
         return 0 if report.get("healthy") else 1
+    args.auth = args.auth or "auto"
+    if not (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").is_file() and not args.dry_run:
+        # Invoked from an ephemeral wheel (for example `uvx` or `pipx run`): materialize a
+        # persistent checkout under ~/.local/share/cc-agy-plugin/repo so host MCP configs stay valid.
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        persistent_repo = Path(
+            os.environ.get("CC_AGY_INSTALL_REPO_DIR") or (data_home / "cc-agy-plugin" / "repo")
+        ).expanduser()
+        orig_cwd = os.getcwd()
+        try:
+            _materialize_persistent_checkout(persistent_repo)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        forwarded = list(raw_argv) if raw_argv is not None else sys.argv[1:]
+        delegated = subprocess.run(
+            [sys.executable, "-m", "server.install", *forwarded],
+            cwd=str(persistent_repo),
+            env={**os.environ, "CC_AGY_CALLER_CWD": orig_cwd},
+            check=False,
+        )
+        return delegated.returncode
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
         parser.error("--name may only contain letters, digits, '-' and '_'")
     if args.max_daily_cents is not None:
@@ -2784,6 +2997,7 @@ def main(argv: list[str] | None = None) -> int:
         project=args.project,
         base_url=args.base_url,
         agy_cli_path=args.agy_cli_path,
+        no_bootstrap=bool(args.no_bootstrap),
     )
     if bootstrap_info and not bootstrap_info.get("ok") and bootstrap_info.get("error") and pre.get("auth_mode") != "gemini_enterprise":
         pre["issues"].append(str(bootstrap_info["error"]))
@@ -2960,10 +3174,10 @@ def main(argv: list[str] | None = None) -> int:
             for asset_bak in host.get("asset_backups") or []:
                 print(f"  asset backup: {asset_bak}")
             print(f"  skill: {host['skill_path']}")
-            print(f"  commands: {host['commands_dir']} (/delegate, /doctor, /jobs, /cost)")
+            print(f"  commands: {host['commands_dir']} (/delegate, /doctor, /jobs, /cost, /agy)")
             print(f"  subagent: {host['agent_path']}")
             print(
-                '  Next: run `opencode` in your repository and type `/doctor` '
+                '  Next: run `opencode` in your repository and type `/doctor` or `/agy hello` '
                 '(or ask: "Run doctor to verify my Gemini setup.").'
             )
         elif host["host"] == "agy":
@@ -2981,6 +3195,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  $ {cmd}")
             print(f"  or for one session: {host['fallback']}")
             print(f"  {host['note']}")
+    if pre.get("next_steps"):
+        print("\n[NEXT STEP]")
+        for step_msg in pre["next_steps"]:
+            print(f"  -> {step_msg}")
+    if not _report_ok(report):
+        print("\n[ACTION NEEDED] Setup wrote configuration files, but readiness checks reported issues:")
+        for issue in pre.get("issues") or []:
+            print(f"  ! {issue}")
+        for host in report["hosts"]:
+            if host.get("status") in ("refused", "failed") and host.get("error"):
+                print(f"  ! {host['host']}: {host['error']}")
     return 0 if _report_ok(report) else 1
 
 

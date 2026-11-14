@@ -10,6 +10,8 @@ DOWNLOAD_BASE_URL="${CC_AGY_UPDATER_BASE_URL:-https://antigravity-cli-auto-updat
 DEFAULT_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 TARGET_DIR="${CC_AGY_CLI_INSTALL_DIR:-$DEFAULT_DATA_HOME/cc-agy-plugin/bin}"
 MANIFEST_URL=""
+PINNED_VERSION="${CC_AGY_CLI_VERSION:-}"
+PINNED_SHA512="${CC_AGY_CLI_SHA512:-}"
 CONFIGURE_SHELL=0
 JSON_OUTPUT=0
 
@@ -20,6 +22,8 @@ Usage: install_agy_cli.sh [options]
 Options:
   --target-dir <dir>     Install directory for `agy` (default: ~/.local/share/cc-agy-plugin/bin)
   --manifest-url <url>   Override release manifest URL (default: official auto-updater)
+  --version <ver>        Require exact manifest version (or set CC_AGY_CLI_VERSION)
+  --sha512 <hex128>      Require exact SHA-512 archive digest (or set CC_AGY_CLI_SHA512)
   --configure-shell      Run `agy install` after placement to update shell PATH/aliases
   --json                 Print machine-readable JSON summary to stdout
   -h, --help             Show this help message
@@ -44,6 +48,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --manifest-url=*)
       MANIFEST_URL="${1#*=}"
+      shift
+      ;;
+    --version)
+      [[ $# -ge 2 ]] || { echo "error: --version requires a value" >&2; exit 2; }
+      PINNED_VERSION="$2"
+      shift 2
+      ;;
+    --version=*)
+      PINNED_VERSION="${1#*=}"
+      shift
+      ;;
+    --sha512)
+      [[ $# -ge 2 ]] || { echo "error: --sha512 requires a value" >&2; exit 2; }
+      PINNED_SHA512="$2"
+      shift 2
+      ;;
+    --sha512=*)
+      PINNED_SHA512="${1#*=}"
       shift
       ;;
     --configure-shell)
@@ -174,13 +196,15 @@ fetch_url() {
 fetch_url "$MANIFEST_URL" "$TMP_DIR/manifest.json"
 
 PARSED_MANIFEST="$(
-  "$PYTHON_BIN" - "$TMP_DIR/manifest.json" "${CC_AGY_ALLOW_HTTP_MANIFEST:-0}" <<'PY'
+  "$PYTHON_BIN" - "$TMP_DIR/manifest.json" "${CC_AGY_ALLOW_HTTP_MANIFEST:-0}" "$PINNED_VERSION" "$PINNED_SHA512" <<'PY'
 import json
 import re
 import sys
 
 manifest_path = sys.argv[1]
 allow_http = sys.argv[2] == "1"
+pinned_version = sys.argv[3].strip()
+pinned_sha512 = sys.argv[4].strip().lower()
 
 try:
     with open(manifest_path, "r", encoding="utf-8") as fh:
@@ -197,11 +221,19 @@ sha512 = str(data.get("sha512") or "").strip().lower()
 
 if not version or any(ord(ch) < 32 for ch in version):
     raise SystemExit("error: manifest missing valid 'version'")
+if pinned_version and version != pinned_version:
+    raise SystemExit(f"error: manifest version {version!r} does not match pinned version {pinned_version!r}")
 if not url or any(ord(ch) <= 32 for ch in url):
     raise SystemExit("error: manifest 'url' contains invalid empty or control/whitespace characters")
 allowed_schemes = ("https://", "file://") + (("http://",) if allow_http else ())
 if not url.startswith(allowed_schemes):
     raise SystemExit(f"error: manifest URL {url!r} must use https://")
+if pinned_sha512:
+    if not re.fullmatch(r"[0-9a-f]{128}", pinned_sha512):
+        raise SystemExit("error: pinned --sha512 / CC_AGY_CLI_SHA512 must be a 128-character hex digest")
+    if sha512 and sha512 != pinned_sha512:
+        raise SystemExit("error: manifest 'sha512' does not match pinned --sha512 / CC_AGY_CLI_SHA512")
+    sha512 = pinned_sha512
 if not re.fullmatch(r"[0-9a-f]{128}", sha512):
     raise SystemExit("error: manifest 'sha512' must be a 128-character hex digest")
 
@@ -319,6 +351,16 @@ fi
 
 mv -f "$STAGE_PATH" "$DEST_BIN"
 STAGE_PATH=""
+"$PYTHON_BIN" - "${TARGET_DIR%/}/agy.manifest.json" "$VERSION" "$EXPECTED_SHA512" "$PLATFORM" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(
+    json.dumps({"version": sys.argv[2], "sha512": sys.argv[3], "platform": sys.argv[4]}, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
 
 if [[ "$CONFIGURE_SHELL" -eq 1 ]]; then
   "$DEST_BIN" install --dir "$TARGET_DIR" >/dev/null 2>&1 || true

@@ -6,7 +6,6 @@ import ast
 import asyncio
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-import fcntl
 import fnmatch
 import json
 import os
@@ -66,6 +65,7 @@ from server.regions import (
     estimate_cost_usd,
     estimate_tokens,
     env_flag,
+    is_ge_mode_pinned,
     is_strict_mode_enabled,
     paginate_text_by_tokens,
     resolve_api_key,
@@ -2597,11 +2597,23 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             # Delegate workers run as multi-turn CLI/SDK sessions: enforce the shared daily cap
             # right before each worker phase (initial, continuation, or model escalation) without
             # holding a multi-minute reservation that would stall concurrent unpriced batch/ask calls.
-            enforce_daily_budget(self.store, workspace_root=self.workspace_root)
+            enforce_daily_budget(self.store, workspace_root=self.workspace_root, auth_mode=auth_mode)
 
             if not in_place:
+                os_sandbox_active = False
+                if auth_mode == "gemini_enterprise":
+                    from server.worker_sandbox import detect_sandbox_backend, resolve_sandbox_mode
+
+                    try:
+                        os_sandbox_active = (
+                            resolve_sandbox_mode(os.environ) != "off"
+                            and detect_sandbox_backend(os.environ)[0] is not None
+                        )
+                    except ValueError:
+                        os_sandbox_active = False
                 allow_shallow = not (
                     auth_mode == "gemini_enterprise"
+                    and not os_sandbox_active
                     and not is_read_only_tool_set(enabled_tools, disabled_tools)
                     and env_flag("CC_AGY_CLI_LINK_NODE_MODULES") is not True
                 )
@@ -2680,7 +2692,11 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 + usage["thoughts_token_count"],
             )
             self._append_phase_usage_requests(usage, new_usage, model)
-            if budget_guard is not None and any(int(new_usage.get(k) or 0) > 0 for k in token_keys):
+            if (
+                budget_guard is not None
+                and auth_mode != "gemini_enterprise"
+                and any(int(new_usage.get(k) or 0) > 0 for k in token_keys)
+            ):
                 phase_cost = estimate_cost_usd(model, new_usage, single_request=False)
                 phase_cents = float(phase_cost.get("total_cost_cents") or 0.0)
                 if phase_cents > 0.0:
@@ -3897,6 +3913,9 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         media_files: list[str] | None = None,
         checklist: list[str] | None = None,
         opencode_session_id: str | None = None,
+        on_job_allocated: Callable[[str], None] | None = None,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+        stop_event: threading.Event | None = None,
         _skip_balanced_qa: bool = False,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
@@ -3912,7 +3931,6 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("MCP server is shutting down; refusing to start new worker job.")
-        enforce_daily_budget(self.store, workspace_root=self.workspace_root)
         if wait and not in_place and self._is_bounded_lead_session():
             delegate_receipts = [
                 r
@@ -3966,6 +3984,9 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                         scrub_receipt=scrub_receipt,
                         auto_apply=auto_apply,
                         opencode_session_id=opencode_session_id,
+                        on_job_allocated=on_job_allocated,
+                        progress_callback=progress_callback,
+                        stop_event=stop_event,
                     )
         timeout_seconds = self._clamp_worker_timeout(timeout_seconds)
 
@@ -4143,6 +4164,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             model=chosen_model,
         )
         auth_mode = auth["auth_mode"]
+        enforce_daily_budget(self.store, workspace_root=self.workspace_root, auth_mode=auth_mode)
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
         resolved_location = auth.get("location")
@@ -4367,13 +4389,31 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             self._futures[job_id] = fut
             self._owned_job_ids.add(job_id)
 
+        if callable(on_job_allocated):
+            try:
+                on_job_allocated(job_id)
+            except Exception:
+                pass
+        if stop_event is not None and stop_event.is_set():
+            self.delegate_cancel(job_id)
+
         if wait:
             setup_elapsed = max(0.0, time.monotonic() - rpc_started_mono)
             wait_slice = self._resolve_wait_slice_seconds(
                 timeout_seconds,
                 elapsed_seconds=setup_elapsed,
             )
-            self._wait_for_future_or_cancel(job_id, fut, timeout=wait_slice)
+            if progress_callback is None and stop_event is None:
+                self._wait_for_future_or_cancel(job_id, fut, timeout=wait_slice)
+            else:
+                self._wait_for_future_or_cancel(
+                    job_id,
+                    fut,
+                    timeout=wait_slice,
+                    progress_callback=progress_callback,
+                    stop_event=stop_event,
+                    max_tool_calls=budget_calls,
+                )
             receipt = self.store.read_receipt(job_id)
             if not fut.done() or receipt.get("status") == "running":
                 with self._lock:
@@ -4409,13 +4449,84 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         fut: Future[dict[str, Any]],
         *,
         timeout: float,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+        stop_event: threading.Event | None = None,
+        max_tool_calls: int | None = None,
     ) -> None:
-        """Wait for `fut` to complete or for `job_id` to be added to `self._cancelled`."""
-        deadline = time.monotonic() + max(0.01, float(timeout))
+        """Wait for `fut` to complete or for `job_id` to be cancelled, streaming live progress when requested."""
+        started_mono = time.monotonic()
+        deadline = started_mono + max(0.01, float(timeout))
+        last_reported_calls = -1
+        last_reported_sig_count = 0
+        last_heartbeat_mono = started_mono
+        prog_path = self.store.progress_path(job_id)
+        live_path = Path(f"{prog_path}.live")
+        if callable(progress_callback):
+            try:
+                progress_callback(0, max_tool_calls, f"Job {job_id}: worker started")
+            except Exception:
+                pass
         while not fut.done():
+            if stop_event is not None and stop_event.is_set():
+                try:
+                    self.delegate_cancel(job_id)
+                except Exception:
+                    pass
+                return
             with self._lock:
                 if job_id in self._cancelled:
                     return
+            if callable(progress_callback):
+                now_m = time.monotonic()
+                live_calls = 0
+                last_tool_desc = ""
+                try:
+                    if live_path.is_file():
+                        ldata = json.loads(live_path.read_text(encoding="utf-8"))
+                        if isinstance(ldata, dict):
+                            live_calls = int(ldata.get("straitjacket_calls") or 0)
+                            lt = str(ldata.get("last_tool") or "").strip()
+                            ltarg = str(ldata.get("last_target") or "").strip()
+                            if lt:
+                                last_tool_desc = f"{lt} {ltarg}".strip()
+                except (OSError, ValueError, TypeError):
+                    pass
+                sigs = read_progress(prog_path, limit=16)
+                if len(sigs) > last_reported_sig_count:
+                    last_reported_sig_count = len(sigs)
+                    latest_sig = sigs[-1]
+                    sig_msg = str(latest_sig.get("message") or "").strip()[:140]
+                    try:
+                        progress_callback(
+                            max(0, live_calls),
+                            max_tool_calls,
+                            f"Job {job_id} [{latest_sig.get('kind', 'progress')}]: {sig_msg}",
+                        )
+                        last_heartbeat_mono = now_m
+                    except Exception:
+                        pass
+                elif live_calls > last_reported_calls and live_calls > 0:
+                    last_reported_calls = live_calls
+                    step_note = f": {last_tool_desc}" if last_tool_desc else ""
+                    try:
+                        progress_callback(
+                            live_calls,
+                            max_tool_calls,
+                            f"Job {job_id}: step {live_calls}{step_note} ({int(now_m - started_mono)}s)",
+                        )
+                        last_heartbeat_mono = now_m
+                    except Exception:
+                        pass
+                elif now_m - last_heartbeat_mono >= 5.0:
+                    last_heartbeat_mono = now_m
+                    try:
+                        progress_callback(
+                            max(0, live_calls),
+                            max_tool_calls,
+                            f"Job {job_id}: working ({max(0, live_calls)} tool calls, {int(now_m - started_mono)}s)",
+                        )
+                    except Exception:
+                        pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -4709,9 +4820,19 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         *,
         wait: bool = True,
         timeout: float = 240.0,
+        on_job_allocated: Callable[[str], None] | None = None,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Return the compact completion digest for job_id, optionally waiting if still running."""
         safe_id = validate_job_id(job_id)
+        if callable(on_job_allocated):
+            try:
+                on_job_allocated(safe_id)
+            except Exception:
+                pass
+        if stop_event is not None and stop_event.is_set():
+            self.delegate_cancel(safe_id)
         wait_started_mono = time.monotonic()
         with self._lock:
             fut = self._futures.get(safe_id)
@@ -4720,7 +4841,16 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         if capped_timeout < 1.0 and float(timeout) <= 30.0 and has_sliced_state:
             capped_timeout = max(capped_timeout, float(timeout))
         if fut is not None and wait and not fut.done():
-            self._wait_for_future_or_cancel(safe_id, fut, timeout=capped_timeout)
+            if progress_callback is None and stop_event is None:
+                self._wait_for_future_or_cancel(safe_id, fut, timeout=capped_timeout)
+            else:
+                self._wait_for_future_or_cancel(
+                    safe_id,
+                    fut,
+                    timeout=capped_timeout,
+                    progress_callback=progress_callback,
+                    stop_event=stop_event,
+                )
         receipt = self.store.read_receipt(safe_id)
         if (fut is not None and not fut.done()) or receipt.get("status") == "running":
             return self._digest_with_progress(receipt)
@@ -4755,6 +4885,9 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         scrub_receipt: bool | None = None,
         auto_apply: bool | None = None,
         opencode_session_id: str | None = None,
+        on_job_allocated: Callable[[str], None] | None = None,
+        progress_callback: Callable[[int, int | None, str], None] | None = None,
+        stop_event: threading.Event | None = None,
         _wait_elapsed: float = 0.0,
         _wait_budget: float | None = None,
         _prompt_source: str = "lead",
@@ -4769,9 +4902,12 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 raise RuntimeError("MCP server is shutting down; refusing to continue worker job.")
         timeout_seconds = self._clamp_worker_timeout(timeout_seconds)
         try:
-            kind_probe = self.store.read_receipt(safe_id).get("kind")
+            prior_rec_init = self.store.read_receipt(safe_id)
+            kind_probe = prior_rec_init.get("kind")
+            prior_auth_probe = str(prior_rec_init.get("auth_mode") or "")
         except FileNotFoundError:
             kind_probe = None
+            prior_auth_probe = ""
         if kind_probe in ("file_batch", "draft_document", "write_tests_from_cases", "replicate_edit"):
             raise ValueError(
                 f"Job '{safe_id}' is a batch job; re-send it with delegate_file_batch(resume_job_id={safe_id!r}) "
@@ -4792,7 +4928,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 digest["continued"] = False
                 return digest
 
-        enforce_daily_budget(self.store, workspace_root=self.workspace_root)
+        enforce_daily_budget(self.store, workspace_root=self.workspace_root, auth_mode=prior_auth_probe)
 
         with self._lock:
             fut = self._futures.get(safe_id)
@@ -5237,11 +5373,24 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             if rec_proj == "<paying-project>":
                 rec_proj = None
             inherited_project = raw_proj or rec_proj
-        inherited_auth_mode = (
-            str(prior_auth_mode)
-            if prior_auth_mode in ("gemini_enterprise", "api_key", "vertex") and not project and not api_key
-            else None
-        )
+        if prior_auth_mode == "gemini_enterprise" or is_ge_mode_pinned():
+            if prior_auth_mode in ("api_key", "vertex") and is_ge_mode_pinned():
+                raise ValueError(
+                    f"Gemini Enterprise mode is now pinned, so pre-pin {prior_auth_mode!r} job '{safe_id}' "
+                    "cannot be continued on a pay-as-you-go backend; start a new Gemini Enterprise job instead."
+                )
+            if api_key and str(api_key).strip():
+                raise ValueError(
+                    "Gemini Enterprise job cannot be continued with a per-call api_key override "
+                    "to prevent out-of-pool billing."
+                )
+            inherited_auth_mode: str | None = "gemini_enterprise"
+        else:
+            inherited_auth_mode = (
+                str(prior_auth_mode)
+                if prior_auth_mode in ("api_key", "vertex") and not project and not api_key
+                else None
+            )
         auth = resolve_auth_config(
             requested_project=inherited_project,
             requested_location=location or receipt.get("vertex_location"),
@@ -5250,6 +5399,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             model=model,
         )
         auth_mode = auth["auth_mode"]
+        enforce_daily_budget(self.store, workspace_root=self.workspace_root, auth_mode=auth_mode)
         resolved_key = auth.get("api_key")
         resolved_project = auth.get("project")
         resolved_location = auth.get("location")
@@ -5511,6 +5661,14 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             self._futures[safe_id] = fut
             self._owned_job_ids.add(safe_id)
 
+        if callable(on_job_allocated):
+            try:
+                on_job_allocated(safe_id)
+            except Exception:
+                pass
+        if stop_event is not None and stop_event.is_set():
+            self.delegate_cancel(safe_id)
+
         if wait:
             slice_target = float(_wait_budget) if _wait_budget is not None else float(timeout_seconds)
             total_elapsed = max(0.0, float(_wait_elapsed) + max(0.0, time.monotonic() - cont_started_mono))
@@ -5521,7 +5679,17 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             )
             if _wait_budget is not None and wait_slice < 1.0 and float(_wait_budget) <= 30.0:
                 wait_slice = max(wait_slice, float(_wait_budget) - float(_wait_elapsed))
-            self._wait_for_future_or_cancel(safe_id, fut, timeout=wait_slice)
+            if progress_callback is None and stop_event is None:
+                self._wait_for_future_or_cancel(safe_id, fut, timeout=wait_slice)
+            else:
+                self._wait_for_future_or_cancel(
+                    safe_id,
+                    fut,
+                    timeout=wait_slice,
+                    progress_callback=progress_callback,
+                    stop_event=stop_event,
+                    max_tool_calls=phase_budget_calls,
+                )
             updated = self.store.read_receipt(safe_id)
             if not fut.done() or updated.get("status") == "running":
                 with self._lock:

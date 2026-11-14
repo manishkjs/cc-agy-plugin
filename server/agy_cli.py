@@ -320,6 +320,90 @@ def is_external_agy_binary(
     return verdict
 
 
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], str | None] = {}
+
+
+def _read_installed_agy_version_offline(
+    agy_bin: str | Path | None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read installed `agy` version from adjacent manifest metadata or memory cache without spawning `agy`."""
+    source = env if env is not None else os.environ
+    candidates: list[Path] = []
+    if agy_bin:
+        cand_bin = Path(agy_bin).expanduser()
+        try:
+            resolved = cand_bin.resolve()
+            st = resolved.stat()
+            cache_key = (str(resolved), st.st_mtime_ns, st.st_size)
+            with _BINARY_PROBE_LOCK:
+                cached_ver = _VERSION_PROBE_CACHE.get(cache_key)
+            if cached_ver:
+                return cached_ver
+        except OSError:
+            pass
+        candidates.append(cand_bin.parent / "agy.manifest.json")
+    candidates.append(managed_agy_bin_dir(source) / "agy.manifest.json")
+    candidates.append(agy_cli_config_dir(source) / "cache" / "install_manifest.json")
+    for cand in candidates:
+        try:
+            if cand.is_file() and cand.stat().st_size > 2:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    raw_ver = data.get("version")
+                    if isinstance(raw_ver, str) and raw_ver.strip():
+                        return raw_ver.strip()
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def probe_agy_cli_version(
+    agy_bin: str | Path | None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return the version string reported by `agy --version`, cached by file stat."""
+    offline_ver = _read_installed_agy_version_offline(agy_bin, env=env)
+    if offline_ver:
+        return offline_ver
+    if not agy_bin:
+        return None
+    cand = Path(agy_bin).expanduser()
+    if not (cand.is_file() and os.access(cand, os.X_OK)):
+        return None
+    try:
+        resolved = cand.resolve()
+        st = resolved.stat()
+    except OSError:
+        return None
+    cache_key = (str(resolved), st.st_mtime_ns, st.st_size)
+    with _BINARY_PROBE_LOCK:
+        if cache_key in _VERSION_PROBE_CACHE:
+            return _VERSION_PROBE_CACHE[cache_key]
+    ver: str | None = None
+    try:
+        proc = subprocess.run(
+            [str(cand), "--version"],
+            cwd=tempfile.gettempdir(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+            env=build_agy_subprocess_env(env),
+        )
+        if proc.returncode == 0:
+            raw = (proc.stdout or proc.stderr or "").strip().splitlines()
+            if raw:
+                m = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9A-Za-z._-]+)?)", raw[0].strip())
+                ver = m.group(1) if m else raw[0].strip()[:64]
+    except (OSError, subprocess.SubprocessError):
+        ver = None
+    with _BINARY_PROBE_LOCK:
+        _VERSION_PROBE_CACHE[cache_key] = ver
+    return ver
+
+
 def _explicit_cli_bin_override(source: Mapping[str, str]) -> str:
     return _clean_env_str(
         source,
@@ -372,8 +456,8 @@ def resolve_agy_cli_binary(
     return None, skipped_internal
 
 
-def _read_onboarding_metadata(config_dir: Path) -> tuple[bool, str | None, str | None]:
-    """Read non-secret onboarding flags, `cloudaicompanionProject`, and `tierId` from `cache/onboarding.json`."""
+def _read_onboarding_metadata_ext(config_dir: Path) -> tuple[bool, str | None, str | None, bool]:
+    """Return `(complete, companion_project, tier_id, consumer_only)` from `cache/onboarding.json`."""
     onboarding_file = config_dir / "cache" / "onboarding.json"
     try:
         if onboarding_file.is_file() and onboarding_file.stat().st_size > 2:
@@ -383,6 +467,8 @@ def _read_onboarding_metadata(config_dir: Path) -> tuple[bool, str | None, str |
                 comp_proj = str(raw_proj).strip() if isinstance(raw_proj, str) and str(raw_proj).strip() else None
                 raw_tier = data.get("tierId")
                 tier_id = str(raw_tier).strip() if isinstance(raw_tier, str) and str(raw_tier).strip() else None
+                ent_flag = bool(data.get("enterpriseOnboardingComplete"))
+                cons_flag = bool(data.get("consumerOnboardingComplete"))
                 complete = any(
                     bool(data.get(flag_key))
                     for flag_key in (
@@ -391,10 +477,33 @@ def _read_onboarding_metadata(config_dir: Path) -> tuple[bool, str | None, str |
                         "consumerOnboardingComplete",
                     )
                 ) or bool(tier_id or comp_proj)
-                return complete, comp_proj, tier_id
+                tier_l = (tier_id or "").lower()
+                is_ge_tier = bool(
+                    tier_l in ENTERPRISE_USER_TIERS
+                    or tier_l.startswith("gcp-ge-")
+                    or "enterprise" in tier_l
+                )
+                is_known_consumer_tier = bool(
+                    tier_l in ("free-tier", "standard-tier", "legacy-tier", "consumer", "personal", "individual", "trial")
+                )
+                consumer_only = bool(
+                    not ent_flag
+                    and not is_ge_tier
+                    and (
+                        (cons_flag and not comp_proj)
+                        or is_known_consumer_tier
+                    )
+                )
+                return complete, comp_proj, tier_id, consumer_only
     except (OSError, ValueError):
         pass
-    return False, None, None
+    return False, None, None, False
+
+
+def _read_onboarding_metadata(config_dir: Path) -> tuple[bool, str | None, str | None]:
+    """Read non-secret onboarding flags, `cloudaicompanionProject`, and `tierId` from `cache/onboarding.json`."""
+    complete, comp_proj, tier_id, _ = _read_onboarding_metadata_ext(config_dir)
+    return complete, comp_proj, tier_id
 
 
 def _plugin_option(source: Mapping[str, str], suffix: str) -> str:
@@ -577,13 +686,47 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     cfg_dir = agy_cli_config_dir(source)
     auth_ok, cred_source = _inspect_auth_files(cfg_dir, source)
     seat = resolve_enterprise_adc_seat(source)
-    _onboarding_ok, companion_project, tier_id = _read_onboarding_metadata(cfg_dir)
+    _onboarding_ok, companion_project, tier_id, consumer_only = _read_onboarding_metadata_ext(cfg_dir)
     managed_bin = managed_agy_bin_dir(source) / MANAGED_CLI_BIN_NAME
+    pinned_version = _clean_env_str(source, "CC_AGY_CLI_VERSION") or None
+    detected_version = _read_installed_agy_version_offline(agy_bin, env=source) if agy_bin else None
 
     explicit_bin = _explicit_cli_bin_override(source)
     binary_found = agy_bin is not None
     seat_failure = enterprise_seat_failure(source)
-    ok = binary_found and auth_ok and seat_failure is None
+    tier_l = (tier_id or "").lower()
+    tier_verified_enterprise = bool(
+        seat["active"]
+        or tier_l in ENTERPRISE_USER_TIERS
+        or tier_l.startswith("gcp-ge-")
+        or "enterprise" in tier_l
+        or bool(companion_project)
+    )
+    unverified_tier_blocked = bool(
+        auth_ok
+        and not tier_verified_enterprise
+        and _env_flag("CC_AGY_REQUIRE_GE_TIER", source) is True
+    )
+    consumer_blocked = bool(
+        auth_ok
+        and consumer_only
+        and not seat["active"]
+        and _env_flag("CC_AGY_ALLOW_CONSUMER_AGY", source) is not True
+    )
+    version_mismatch = bool(
+        binary_found
+        and pinned_version
+        and detected_version
+        and detected_version != pinned_version
+    )
+    ok = (
+        binary_found
+        and auth_ok
+        and seat_failure is None
+        and not consumer_blocked
+        and not unverified_tier_blocked
+        and not version_mismatch
+    )
 
     error: str | None = None
     remediation: str | None = None
@@ -603,8 +746,17 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         else:
             error = "External Antigravity CLI (`agy`) is not installed yet."
         remediation = (
-            "Run `python3 -m server.install --auth gemini-enterprise` (or `bash scripts/install_agy_cli.sh`) "
+            "Run `python3 -m server.install --auth gemini-enterprise` (or `cc-agy-install --install-agy-cli`) "
             f"to install `agy` to `{managed_bin}`, then run `{managed_bin}` once in a terminal to sign in."
+        )
+    elif version_mismatch:
+        error = (
+            f"Installed Antigravity CLI (`{agy_bin}`) has version {detected_version!r}, "
+            f"which does not match pinned CC_AGY_CLI_VERSION={pinned_version!r}."
+        )
+        remediation = (
+            f"Run `CC_AGY_CLI_VERSION={pinned_version} python3 -m server.install --install-agy-cli` "
+            "or update `CC_AGY_CLI_VERSION`."
         )
     elif not auth_ok:
         error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
@@ -614,6 +766,24 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         )
         if seat["requested"] and seat["error"]:
             error = f"{error} {seat['error']}"
+    elif consumer_blocked:
+        error = (
+            f"Antigravity CLI at `{agy_bin}` is signed in with a personal/consumer Google account "
+            f"(tier={tier_id or 'consumer'}) rather than a licensed Gemini Enterprise seat."
+        )
+        remediation = (
+            f"Sign out of the consumer account and run `{agy_bin}` (or `{agy_bin} acp --login`) to sign in "
+            "with your licensed Gemini Enterprise work account."
+        )
+    elif unverified_tier_blocked:
+        error = (
+            f"Antigravity CLI at `{agy_bin}` does not report a verified Gemini Enterprise seat tier "
+            f"(tier={tier_id or 'unknown'}) while CC_AGY_REQUIRE_GE_TIER=1 is set."
+        )
+        remediation = (
+            f"Run `{agy_bin}` once with your licensed Gemini Enterprise work account so `cache/onboarding.json` "
+            "records your `gcp-ge-*` tier, or unset `CC_AGY_REQUIRE_GE_TIER`."
+        )
     elif seat_failure:
         error = seat_failure
         remediation = (
@@ -626,8 +796,12 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         "ok": ok,
         "binary_found": binary_found,
         "agy_bin": agy_bin,
+        "version": detected_version,
+        "pinned_version": pinned_version,
         "managed_bin_path": str(managed_bin),
         "auth_configured": auth_ok,
+        "consumer_account_detected": consumer_blocked,
+        "tier_verified_enterprise": tier_verified_enterprise,
         "credential_source": cred_source,
         "companion_project": companion_project,
         "tier_id": tier_id,
@@ -643,6 +817,139 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     }
 
 
+def _detect_cli_platform_python(source: Mapping[str, str]) -> str:
+    import platform
+
+    explicit = _clean_env_str(source, "CC_AGY_CLI_PLATFORM")
+    if explicit:
+        return explicit
+    machine = platform.machine().strip().lower()
+    if machine in ("x86_64", "amd64"):
+        norm_arch = "amd64"
+    elif machine in ("arm64", "aarch64"):
+        norm_arch = "arm64"
+    else:
+        raise ValueError(f"Unsupported CPU architecture for Antigravity CLI: {machine!r}")
+    sys_name = platform.system().strip().lower()
+    if sys_name == "darwin":
+        return f"darwin_{norm_arch}"
+    if sys_name == "windows":
+        return f"windows_{norm_arch}"
+    if sys_name == "linux":
+        if source.get("TERMUX_VERSION"):
+            return "android_arm64"
+        return f"linux_{norm_arch}"
+    raise ValueError(f"Unsupported operating system for Antigravity CLI: {sys_name!r}")
+
+
+def _install_agy_cli_pure_python(
+    *,
+    target_dir: Path,
+    source: Mapping[str, str],
+    manifest_url: str | None = None,
+) -> dict[str, Any]:
+    """Cross-platform pure-Python installer supporting Linux, macOS, and Windows + version/SHA-512 pinning."""
+    import hashlib
+    import stat
+    import tarfile
+    import urllib.request
+    import zipfile
+
+    updater_base = (
+        _clean_env_str(source, "CC_AGY_UPDATER_BASE_URL")
+        or "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app"
+    ).rstrip("/")
+    plat = _detect_cli_platform_python(source)
+    eff_manifest = (manifest_url or _clean_env_str(source, "CC_AGY_CLI_MANIFEST_URL") or f"{updater_base}/manifests/{plat}.json").strip()
+    allow_http = _env_flag("CC_AGY_ALLOW_HTTP_MANIFEST", source) is True
+    allowed_schemes = ("https://", "file://") + (("http://",) if allow_http else ())
+    if not eff_manifest.startswith(allowed_schemes) or any(ord(c) <= 32 for c in eff_manifest):
+        raise ValueError(f"Manifest URL {eff_manifest!r} must use https://")
+
+    pinned_ver = _clean_env_str(source, "CC_AGY_CLI_VERSION")
+    pinned_sha = _clean_env_str(source, "CC_AGY_CLI_SHA512").lower()
+    if pinned_sha and not re.fullmatch(r"[0-9a-f]{128}", pinned_sha):
+        raise ValueError("CC_AGY_CLI_SHA512 must be a 128-character hex SHA-512 digest.")
+
+    with urllib.request.urlopen(eff_manifest, timeout=30) as resp:  # noqa: S310 - scheme validated above
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Manifest root must be a JSON object.")
+    version = str(data.get("version") or "").strip()
+    archive_url = str(data.get("url") or "").strip()
+    expected_sha = str(data.get("sha512") or "").strip().lower()
+    if pinned_ver and version != pinned_ver:
+        raise ValueError(
+            f"Manifest version {version!r} does not match pinned CC_AGY_CLI_VERSION={pinned_ver!r} "
+            "(point CC_AGY_CLI_MANIFEST_URL at your pinned release manifest)."
+        )
+    if pinned_sha:
+        if expected_sha and expected_sha != pinned_sha:
+            raise ValueError("Manifest sha512 does not match pinned CC_AGY_CLI_SHA512.")
+        expected_sha = pinned_sha
+    if not archive_url.startswith(allowed_schemes) or not re.fullmatch(r"[0-9a-f]{128}", expected_sha):
+        raise ValueError("Manifest contains invalid archive URL or SHA-512 digest.")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cc-agy-cli-py-") as tmp_str:
+        tmp_dir = Path(tmp_str)
+        archive_file = tmp_dir / ("agy.zip" if archive_url.lower().endswith(".zip") else "agy.tar.gz")
+        hasher = hashlib.sha512()
+        with urllib.request.urlopen(archive_url, timeout=180) as aresp, archive_file.open("wb") as out_fh:  # noqa: S310
+            while True:
+                chunk = aresp.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                out_fh.write(chunk)
+        actual_sha = hasher.hexdigest().lower()
+        if actual_sha != expected_sha:
+            raise ValueError(
+                f"SHA-512 mismatch for Antigravity CLI archive (expected {expected_sha[:16]}..., got {actual_sha[:16]}...)"
+            )
+        extract_dir = tmp_dir / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        extract_resolved = extract_dir.resolve()
+        if archive_file.suffix == ".zip":
+            with zipfile.ZipFile(archive_file, "r") as zf:
+                for zinfo in zf.infolist():
+                    dest = (extract_resolved / zinfo.filename).resolve()
+                    if not dest.is_relative_to(extract_resolved):
+                        raise ValueError(f"Archive path traversal blocked: {zinfo.filename!r}")
+                zf.extractall(extract_resolved)
+        else:
+            with tarfile.open(archive_file, mode="r:gz") as tf:
+                for member in tf.getmembers():
+                    if not (member.isfile() or member.isdir()):
+                        raise ValueError(f"Archive contains unsupported non-regular entry: {member.name!r}")
+                    dest = (extract_resolved / member.name).resolve()
+                    if not dest.is_relative_to(extract_resolved):
+                        raise ValueError(f"Archive path traversal blocked: {member.name!r}")
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(extract_resolved, filter="data")
+                else:
+                    tf.extractall(extract_resolved)
+        bin_candidates = [
+            p
+            for p in extract_resolved.rglob("*")
+            if p.is_file() and p.name.lower() in ("agy", "agy.exe")
+        ]
+        if not bin_candidates:
+            raise ValueError("Extracted archive did not contain an `agy` or `agy.exe` executable.")
+        extracted_bin = bin_candidates[0]
+        final_bin = target_dir / MANAGED_CLI_BIN_NAME
+        stage_bin = target_dir / f".{MANAGED_CLI_BIN_NAME}.stage-{secrets.token_hex(6)}"
+        shutil.copy2(extracted_bin, stage_bin)
+        if os.name != "nt":
+            os.chmod(stage_bin, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        os.replace(stage_bin, final_bin)
+        (target_dir / "agy.manifest.json").write_text(
+            json.dumps({"version": version, "sha512": expected_sha}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return {"version": version, "agy_bin": str(final_bin)}
+
+
 def ensure_agy_cli_installed(
     plugin_root: Path | None = None,
     *,
@@ -653,14 +960,18 @@ def ensure_agy_cli_installed(
 ) -> dict[str, Any]:
     """Ensure the external `agy` binary is installed in `managed_agy_bin_dir`."""
     source = env if env is not None else os.environ
+    pinned_ver = _clean_env_str(source, "CC_AGY_CLI_VERSION")
     existing_bin, skipped_internal = resolve_agy_cli_binary(source)
     if existing_bin is not None:
-        return {
-            "ok": True,
-            "bootstrapped": False,
-            "agy_bin": existing_bin,
-            "skipped_internal_binaries": skipped_internal,
-        }
+        existing_ver = probe_agy_cli_version(existing_bin, env=source)
+        if not pinned_ver or existing_ver == pinned_ver:
+            return {
+                "ok": True,
+                "bootstrapped": False,
+                "agy_bin": existing_bin,
+                "version": existing_ver,
+                "skipped_internal_binaries": skipped_internal,
+            }
 
     explicit_override = _explicit_cli_bin_override(source)
     if explicit_override:
@@ -670,7 +981,7 @@ def ensure_agy_cli_installed(
             "agy_bin": None,
             "skipped_internal_binaries": skipped_internal,
             "error": (
-                f"Explicit CC_AGY_CLI_BIN ({explicit_override}) is invalid or missing; "
+                f"Explicit CC_AGY_CLI_BIN ({explicit_override}) is invalid or does not match pinned version; "
                 "unset CC_AGY_CLI_BIN to allow automatic installation."
             ),
         }
@@ -678,22 +989,60 @@ def ensure_agy_cli_installed(
     root = Path(plugin_root).resolve() if plugin_root is not None else DEFAULT_PLUGIN_ROOT.resolve()
     installer = root / "scripts" / "install_agy_cli.sh"
     target_dir = managed_agy_bin_dir(source)
-    if not installer.is_file():
-        return {
-            "ok": False,
-            "bootstrapped": False,
-            "agy_bin": None,
-            "skipped_internal_binaries": skipped_internal,
-            "error": f"Installer script missing at {installer}",
-        }
 
     if output_fn is not None:
         output_fn(f"  Installing standalone Antigravity CLI (`agy`) to {target_dir / MANAGED_CLI_BIN_NAME} ...")
+
+    use_python_installer = bool(
+        os.name == "nt"
+        or not installer.is_file()
+        or not shutil.which("bash")
+        or not shutil.which("curl")
+    )
+    if use_python_installer:
+        try:
+            py_res = _install_agy_cli_pure_python(
+                target_dir=target_dir,
+                source=source,
+                manifest_url=manifest_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "bootstrapped": False,
+                "agy_bin": None,
+                "skipped_internal_binaries": skipped_internal,
+                "error": f"Pure-Python Antigravity CLI installer failed: {exc}",
+            }
+        with _BINARY_PROBE_LOCK:
+            _BINARY_PROBE_CACHE.clear()
+            _VERSION_PROBE_CACHE.clear()
+        resolved_py, skipped_py = resolve_agy_cli_binary(source)
+        if resolved_py is None:
+            return {
+                "ok": False,
+                "bootstrapped": False,
+                "agy_bin": None,
+                "skipped_internal_binaries": skipped_py,
+                "error": f"Installed binary under {target_dir} did not pass external `agy` verification.",
+            }
+        return {
+            "ok": True,
+            "bootstrapped": True,
+            "agy_bin": resolved_py,
+            "version": py_res.get("version"),
+            "skipped_internal_binaries": skipped_py,
+        }
 
     cmd = ["bash", str(installer), "--target-dir", str(target_dir), "--json"]
     effective_manifest = manifest_url or _clean_env_str(source, "CC_AGY_CLI_MANIFEST_URL")
     if effective_manifest:
         cmd.extend(["--manifest-url", effective_manifest])
+    if pinned_ver:
+        cmd.extend(["--version", pinned_ver])
+    pinned_sha = _clean_env_str(source, "CC_AGY_CLI_SHA512")
+    if pinned_sha:
+        cmd.extend(["--sha512", pinned_sha])
     if configure_shell:
         cmd.append("--configure-shell")
 
@@ -764,22 +1113,29 @@ def ensure_agy_cli_installed(
 
 
 def _should_auto_install_on_call(env: Mapping[str, str] | None, source: Mapping[str, str]) -> bool:
+    """Only download the 265 MB `agy` archive inside an MCP tool call when `CC_AGY_AUTO_INSTALL_CLI=1`."""
     flag = _env_flag("CC_AGY_AUTO_INSTALL_CLI", source)
     if flag is True:
-        return True
-    if flag is False:
-        return False
-    if _explicit_cli_bin_override(source):
-        return False
-    if env is not None or "PYTEST_CURRENT_TEST" in os.environ:
-        return False
-    return True
+        return not bool(_explicit_cli_bin_override(source))
+    return False
 
 
 def _resolve_or_bootstrap_agy_bin(env: Mapping[str, str] | None = None) -> str:
     source = env if env is not None else os.environ
+    pinned_ver = _clean_env_str(source, "CC_AGY_CLI_VERSION")
     agy_bin, skipped_internal = resolve_agy_cli_binary(source)
     if agy_bin is not None:
+        if pinned_ver:
+            det_ver = probe_agy_cli_version(agy_bin, env=source)
+            if det_ver and det_ver != pinned_ver:
+                raise RuntimeError(
+                    f"Installed Antigravity CLI (`{agy_bin}`) has version {det_ver!r}, "
+                    f"which does not match pinned CC_AGY_CLI_VERSION={pinned_ver!r}. "
+                    f"Run `CC_AGY_CLI_VERSION={pinned_ver} python3 -m server.install --install-agy-cli`."
+                )
+        status_check = inspect_agy_cli_offline(source)
+        if status_check.get("consumer_account_detected"):
+            raise RuntimeError(f"{status_check['error']} {status_check['remediation']}")
         return agy_bin
 
     if _should_auto_install_on_call(env, source):
@@ -895,6 +1251,7 @@ def build_agy_subprocess_env(
     *,
     workspace_dir: str | Path | None = None,
     cwd: str | Path | None = None,
+    host_workspace_root: str | Path | None = None,
 ) -> dict[str, str]:
     """Build a scrubbed subprocess environment for `agy` preserving OAuth, keyring, and proxies.
 
@@ -944,6 +1301,10 @@ def build_agy_subprocess_env(
         venv_bin = ws_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
         if venv_bin.is_dir():
             path_prefixes.append(str(venv_bin))
+        elif host_workspace_root is not None:
+            host_venv_bin = Path(host_workspace_root) / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+            if host_venv_bin.is_dir():
+                path_prefixes.append(str(host_venv_bin.resolve()))
         if path_prefixes:
             cur_path = out.get("PATH") or ""
             prefix_joined = os.pathsep.join(path_prefixes)
@@ -1582,6 +1943,9 @@ def _run_stream_json_turn(
     prior_tokens_count: int = 0,
     env: Mapping[str, str] | None = None,
     sandbox_prefix: Sequence[str] = (),
+    use_agy_sandbox: bool = False,
+    progress_path: str | Path | None = None,
+    host_workspace_root: str | Path | None = None,
 ) -> dict[str, Any]:
     if not prompt_text or not prompt_text.strip():
         raise ValueError("Worker prompt cannot be empty.")
@@ -1600,6 +1964,8 @@ def _run_stream_json_turn(
         "--print-timeout",
         f"{print_timeout_sec}s",
     ]
+    if use_agy_sandbox:
+        cmd.append("--sandbox")
     if skip_permissions:
         cmd.append("--dangerously-skip-permissions")
     if model:
@@ -1610,7 +1976,7 @@ def _run_stream_json_turn(
         cmd.extend(["--conversation", conversation_id])
 
     spawn_cookie = secrets.token_hex(16)
-    sub_env = build_agy_subprocess_env(env, workspace_dir=cwd)
+    sub_env = build_agy_subprocess_env(env, workspace_dir=cwd, host_workspace_root=host_workspace_root)
     sub_env["_AGY_SPAWN_COOKIE"] = spawn_cookie
 
     proc = subprocess.Popen(
@@ -1743,6 +2109,22 @@ def _run_stream_json_turn(
                         step_tool_indexes.append(s_idx)
                         if s_idx > 0:
                             seen_step_tools[(s_idx, t_name)] = len(step_tool_calls) - 1
+                        if progress_path:
+                            from server.agy_acp import _write_live_step_progress
+
+                            target_hint = str(
+                                parsed_args.get("Path")
+                                or parsed_args.get("path")
+                                or parsed_args.get("CommandLine")
+                                or parsed_args.get("command")
+                                or ""
+                            )
+                            _write_live_step_progress(
+                                progress_path,
+                                tool_calls_count=prior_tool_calls_count + len(step_tool_calls),
+                                last_tool=t_name,
+                                last_target=target_hint,
+                            )
                 if allow_result and _check_live_budgets():
                     return "budget"
         elif evt_kind == "assistant":
@@ -2088,6 +2470,12 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
     )
     skip_permissions = bool(not read_only and sandbox and sandbox.skip_permissions)
     sandbox_prefix = sandbox.command_prefix if sandbox else ()
+    use_agy_sandbox = bool(not sandbox_prefix and sandbox is not None and sandbox.mode != "off")
+    progress_path = request.get("progress_path")
+    host_ws_root = request.get("host_workspace_root")
+    from server.agy_acp import resolve_cli_protocol, run_agy_acp_turn
+
+    cli_protocol = resolve_cli_protocol(env)
 
     prompts: list[str] = list(request.get("prompts") or [])
     if not prompts and request.get("prompt"):
@@ -2135,6 +2523,30 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                 f"Antigravity CLI worker used its whole {timeout_seconds:.0f}s timeout across attempts"
             )
         attempts_started[0] += 1
+        if cli_protocol == "acp":
+            from server.bifrost_policy import resolve_bifrost_policy_config
+
+            bifrost_strict = resolve_bifrost_policy_config(env) is not None
+            return run_agy_acp_turn(
+                agy_bin=agy_bin,
+                prompt_text=prompt_text,
+                cwd=workspace_dir,
+                model=active_model,
+                effort=active_effort,
+                strict_model_selection=bifrost_strict,
+                read_only=read_only,
+                skip_permissions=skip_permissions,
+                use_agy_sandbox=use_agy_sandbox,
+                conversation_id=conversation,
+                timeout_seconds=remaining,
+                register_cancel=register_cancel if callable(register_cancel) else None,
+                max_tool_calls=max_tool_calls,
+                prior_tool_calls_count=len(all_tool_calls),
+                env=env,
+                sandbox_prefix=sandbox_prefix,
+                progress_path=progress_path,
+                host_workspace_root=host_ws_root,
+            )
         return _run_stream_json_turn(
             agy_bin=agy_bin,
             prompt_text=prompt_text,
@@ -2152,6 +2564,9 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
             prior_tokens_count=agg_usage["total_token_count"],
             env=env,
             sandbox_prefix=sandbox_prefix,
+            use_agy_sandbox=use_agy_sandbox,
+            progress_path=progress_path,
+            host_workspace_root=host_ws_root,
         )
 
     def _count_failed_attempt(failed: Mapping[str, Any], resumed: bool) -> None:
@@ -2345,6 +2760,7 @@ def _run_json_envelope_once(
     timeout_seconds: float,
     env: Mapping[str, str] | None = None,
     conversation_id: str | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     if not prompt_text or not prompt_text.strip():
         raise ValueError("Worker prompt cannot be empty.")
@@ -2411,15 +2827,34 @@ def _run_json_envelope_once(
     t_err = _start_pipe_chunk_drainer(proc.stderr, stderr_chunks)
 
     try:
-        proc.wait(timeout=timeout_sec)
+        if stop_event is None:
+            proc.wait(timeout=timeout_sec)
+        else:
+            wait_end = time.monotonic() + timeout_sec
+            while proc.poll() is None:
+                if stop_event.is_set():
+                    timed_out_flag.set()
+                    break
+                rem_w = wait_end - time.monotonic()
+                if rem_w <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout_sec)
+                try:
+                    proc.wait(timeout=min(0.05, rem_w))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
     except subprocess.TimeoutExpired:
         timed_out_flag.set()
-        _terminate_process_tree(proc, spawn_cookie=spawn_cookie, pipe_inodes=pipe_inodes)
     finally:
-        _terminate_process_tree(proc, spawn_cookie=spawn_cookie, pipe_inodes=pipe_inodes)
-        t_in.join(timeout=0.3)
-        t_out.join(timeout=0.3)
-        t_err.join(timeout=0.3)
+        if not timed_out_flag.is_set() and proc.poll() is not None:
+            t_in.join(timeout=0.08)
+            t_out.join(timeout=0.08)
+            t_err.join(timeout=0.08)
+        if timed_out_flag.is_set() or proc.poll() is None or t_out.is_alive() or t_err.is_alive():
+            _terminate_process_tree(proc, spawn_cookie=spawn_cookie, pipe_inodes=pipe_inodes)
+            t_in.join(timeout=0.25)
+            t_out.join(timeout=0.25)
+            t_err.join(timeout=0.25)
         _close_proc_pipes_safely(proc, stdout_thread=t_out, stderr_thread=t_err)
 
     stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
@@ -2668,6 +3103,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
     resumed = lookup_conversation(lookup_key, env) if lookup_key else None
     lease_held = resumed is not None and bool(lookup_key)
     failed_attempts_usage = convert_agy_usage_to_vertex(None)
+    stop_evt = request.get("stop_event") if isinstance(request.get("stop_event"), threading.Event) else None
 
     try:
         with tempfile.TemporaryDirectory(prefix="cc-agy-ask-") as temp_cwd:
@@ -2692,6 +3128,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
                             timeout_seconds=resume_budget,
                             env=env,
                             conversation_id=resumed["conversation_id"],
+                            stop_event=stop_evt,
                         )
                     except TimeoutError as exc:
                         forget_conversation(lookup_key, env)
@@ -2735,6 +3172,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
                         json_schema=None,
                         timeout_seconds=_next_attempt_timeout(),
                         env=env,
+                        stop_event=stop_evt,
                     )
                 seen_ask_states: set[tuple[str, str | None]] = {(active_model, active_effort)}
                 for _retry_idx in range(2):
@@ -2766,6 +3204,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
                         json_schema=None,
                         timeout_seconds=_next_attempt_timeout(),
                         env=env,
+                        stop_event=stop_evt,
                     )
             finally:
                 if media_note:

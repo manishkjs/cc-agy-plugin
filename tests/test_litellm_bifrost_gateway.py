@@ -1332,6 +1332,7 @@ def test_installer_gateway_wire_all_five_hosts_doctor_and_secret_scrubbing(
     assert "CC_AGY_VERTEX_BASE_URL_AUDIENCE" not in ak_agy["env"]
 
     # 3. Doctor reports `gateway_wire` + boolean `bifrost_virtual_key_configured` (never raw key) and flags invalid wire
+    monkeypatch.setattr("server.doctor._module_available", lambda _name: True)
     doc_ok = run_doctor(
         workspace_root=REPO_ROOT,
         env={

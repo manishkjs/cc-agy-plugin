@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import math
@@ -29,6 +28,8 @@ import threading
 import time
 from typing import Any, Callable
 import uuid
+
+from server import file_lock as fcntl
 
 from server.batch_journal import BatchJournal
 from server.batch_plan import BatchPlan, FileTask, needs_review
@@ -70,6 +71,12 @@ _PLAN_LOCKS: dict[str, threading.Lock] = {}
 _PLAN_LOCKS_GUARD = threading.Lock()
 
 
+def _claude_allowed_for_auth(auth: dict[str, Any]) -> bool:
+    if auth.get("auth_mode") == "gemini_enterprise":
+        return os.environ.get("CC_AGY_ALLOW_CLAUDE_IN_GE", "").strip().lower() in ("1", "true", "yes")
+    return True
+
+
 def default_writer_factory(name: str, settings: BatchSettings, auth: dict[str, Any]) -> Writer | None:
     if name == "genai":
         return make_genai_writer(auth, settings.model, thinking_level=settings.thinking_level,
@@ -83,7 +90,9 @@ def default_writer_factory(name: str, settings: BatchSettings, auth: dict[str, A
             workspace_dir=auth.get("_workspace_dir"),
         )
     if name == "claude":
-        return make_claude_writer(settings.claude_model) if settings.claude_writer else None
+        if not settings.claude_writer or not _claude_allowed_for_auth(auth):
+            return None
+        return make_claude_writer(settings.claude_model)
     return None
 
 
@@ -792,7 +801,11 @@ class FileBatchRunner:
         content_gate: ContentGate | None = None,
         shared_note: str = "",
     ) -> dict[str, Any]:
-        enforce_daily_budget(self.store, workspace_root=self.root)
+        enforce_daily_budget(
+            self.store,
+            workspace_root=self.root,
+            auth_mode=str(auth.get("auth_mode") or ""),
+        )
         lock, lock_file = self._plan_lock(plan)
         with lock, open(lock_file, "w", encoding="utf-8") as handle:
             # One run per plan at a time (threads and processes); a concurrent identical call waits,
@@ -949,12 +962,17 @@ class FileBatchRunner:
         writer_auth["_workspace_dir"] = wt
         cache_name = None
         if settings.writer == "genai" and shared_text and len(plan.tasks) > 1 and self.cache_factory:
-            enforce_daily_budget(self.store, workspace_root=self.root)
+            enforce_daily_budget(
+            self.store,
+            workspace_root=self.root,
+            auth_mode=str(auth.get("auth_mode") or ""),
+        )
             cache_name = self.cache_factory(auth, settings.model, WRITER_SYSTEM_PROMPT, shared_text)
             writer_auth["_shared_cache"] = cache_name
+        use_claude = bool(settings.claude_writer and _claude_allowed_for_auth(auth))
         writers = _LadderWriters({
             settings.writer: self.writer_factory(settings.writer, settings, writer_auth),
-            "claude": self.writer_factory("claude", settings, auth) if settings.claude_writer else None,
+            "claude": self.writer_factory("claude", settings, auth) if use_claude else None,
         }, controls)
 
         def dependency_context(task: FileTask) -> tuple[str, ...]:
@@ -1518,10 +1536,15 @@ def probe_writers(
     from server.writers import WriterConfigError, WriterTransportError
 
     if store is not None:
-        enforce_daily_budget(store, workspace_root=workspace_root)
+        enforce_daily_budget(
+            store,
+            workspace_root=workspace_root,
+            auth_mode=str(auth.get("auth_mode") or ""),
+        )
     factory = writer_factory or default_writer_factory
     probe_settings = replace(settings, read_budget=0)
-    names = [probe_settings.writer] + (["claude"] if probe_settings.claude_writer else [])
+    use_claude = bool(probe_settings.claude_writer and _claude_allowed_for_auth(auth))
+    names = [probe_settings.writer] + (["claude"] if use_claude else [])
     rows: list[dict[str, Any]] = []
     budget_guard = getattr(store, "budget", None) if store is not None else None
     for name in names:

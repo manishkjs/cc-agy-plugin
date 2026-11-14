@@ -582,7 +582,10 @@ class TestGauntletRound1Bugs:
         ws = tmp_path / "docrepo"
         ws.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
-        with patch("server.doctor.check_promotional_rate_expiry", return_value=["Promo expired notice"]):
+        with (
+            patch("server.doctor.check_promotional_rate_expiry", return_value=["Promo expired notice"]),
+            patch("server.doctor._module_available", return_value=True),
+        ):
             doc = run_doctor(ws, env={"GEMINI_API_KEY": "AIzaSyTestKey12345678901234567890"})
         assert doc["status"] == "ok"
         assert "Promo expired notice" in doc.get("rate_card_notices", [])
@@ -1310,9 +1313,16 @@ class TestGauntletRound3Bugs:
         import sys
 
         repo_root = Path(__file__).resolve().parents[1]
+        for sub_mod in ("antigravity", "genai"):
+            stub_pkg = tmp_path / "stub_site" / "google" / sub_mod
+            stub_pkg.mkdir(parents=True, exist_ok=True)
+            (stub_pkg / "__init__.py").write_text("", encoding="utf-8")
+        prev_py_path = os.environ.get("PYTHONPATH", "")
+        stub_py_path = str(tmp_path / "stub_site") + (os.pathsep + prev_py_path if prev_py_path else "")
         base_env = {
             **os.environ,
             "HOME": str(tmp_path),
+            "PYTHONPATH": stub_py_path,
             "CC_AGY_DATA_DIR": str(tmp_path / "data"),
             "CC_AGY_VERTEX_BASE_URL": "https://gw.example.com",
             "CC_AGY_VERTEX_BASE_URL_TOKEN": "static-vkey-ok",

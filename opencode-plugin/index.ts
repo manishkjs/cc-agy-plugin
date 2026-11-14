@@ -7,7 +7,7 @@
  * - stores what you enter in OpenCode's own `auth.json` (mode 0600), never in a config file;
  * - registers the `agy` MCP server, which launches this repository's existing stdio server
  *   (`server/main.py`). No HTTP listener is opened;
- * - registers the `/delegate`, `/doctor`, `/jobs`, and `/cost` commands and the
+ * - registers the `/agy`, `/delegate`, `/doctor`, `/jobs`, and `/cost` commands and the
  *   `@gemini-delegator` subagent from the bundled `.opencode/` files.
  *
  * Anything you already defined in `opencode.json` (for example an entry written by
@@ -73,7 +73,7 @@ export function buildServerEnvironment(auth: StoredAuth): Record<string, string>
   return environment;
 }
 
-/** Pick the Python interpreter: `CC_AGY_PYTHON_BIN`/`CC_AGY_PYTHON`, managed user venv, plugin `.venv`, then `python3`. */
+/** Picks the Python interpreter: `CC_AGY_PYTHON_BIN`/`CC_AGY_PYTHON`, managed user venv, plugin `.venv`, then `python3`. */
 export function resolvePython(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = (env.CC_AGY_PYTHON_BIN || env.CC_AGY_PYTHON || "").trim();
   if (explicit) return explicit;
@@ -81,10 +81,15 @@ export function resolvePython(env: NodeJS.ProcessEnv = process.env): string {
   const dataHome = (env.XDG_DATA_HOME || "").trim() || join(env.HOME || homedir(), ".local", "share");
   const managedVenv = customVenv || join(dataHome, "cc-agy-plugin", "venv");
   for (const venv of [managedVenv, join(PLUGIN_ROOT, ".venv")]) {
-    const candidate = join(venv, "bin", "python");
-    if (existsSync(candidate)) return candidate;
+    const candidates =
+      process.platform === "win32"
+        ? [join(venv, "Scripts", "python.exe"), join(venv, "bin", "python")]
+        : [join(venv, "bin", "python")];
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate;
+    }
   }
-  return "python3";
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 /** Split a Markdown file into simple `key: value` frontmatter (one nested level) and its body. */

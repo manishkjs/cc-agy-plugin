@@ -142,6 +142,73 @@ def _transcript_files(tdir: Path) -> list[Path]:
     return files
 
 
+def _iter_opencode_assistant_usage(workspace_root: str | Path) -> Iterable[dict[str, Any]]:
+    """Yield assistant message usage from OpenCode's XDG storage (`storage/session` + `storage/message`)."""
+    data_home = Path((os.environ.get("XDG_DATA_HOME") or "").strip() or (Path.home() / ".local" / "share")).expanduser()
+    storage_dir = data_home / "opencode" / "storage"
+    session_root = storage_dir / "session"
+    message_root = storage_dir / "message"
+    if not session_root.is_dir() or not message_root.is_dir():
+        return
+    target_ws = str(Path(workspace_root).resolve())
+    matching_sessions: set[str] = set()
+    for sfile in session_root.rglob("*.json"):
+        try:
+            sdata = json.loads(sfile.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(sdata, dict):
+            continue
+        s_dir = str(sdata.get("directory") or sdata.get("cwd") or "").strip()
+        if s_dir:
+            try:
+                if str(Path(s_dir).resolve()) != target_ws:
+                    continue
+            except OSError:
+                if s_dir != target_ws:
+                    continue
+        sid = str(sdata.get("id") or sfile.stem).strip()
+        if sid:
+            matching_sessions.add(sid)
+    for sid in sorted(matching_sessions):
+        msg_dir = message_root / sid
+        if not msg_dir.is_dir():
+            continue
+        for mfile in sorted(msg_dir.glob("*.json")):
+            try:
+                mdata = json.loads(mfile.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(mdata, dict) or mdata.get("role") != "assistant":
+                continue
+            tokens = mdata.get("tokens")
+            if not isinstance(tokens, dict):
+                continue
+            time_obj = mdata.get("time") if isinstance(mdata.get("time"), dict) else {}
+            created_ms = time_obj.get("created") or time_obj.get("completed")
+            iso_ts: str | None = None
+            if isinstance(created_ms, (int, float)) and created_ms > 0:
+                from datetime import datetime, timezone
+
+                sec = float(created_ms) / 1000.0 if created_ms > 1e11 else float(created_ms)
+                iso_ts = datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
+            elif isinstance(created_ms, str):
+                iso_ts = created_ms
+            cache_obj = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+            yield {
+                "file": str(mfile),
+                "timestamp": iso_ts,
+                "message_id": str(mdata.get("id") or mfile.stem),
+                "model": str(mdata.get("modelID") or (mdata.get("model") or {}).get("modelID") or ""),
+                "usage": {
+                    "input_tokens": int(tokens.get("input") or 0),
+                    "output_tokens": int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0),
+                    "cache_read_input_tokens": int(cache_obj.get("read") or 0),
+                    "cache_creation_input_tokens": int(cache_obj.get("write") or 0),
+                },
+            }
+
+
 def _iter_assistant_usage(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
     for p in paths:
         try:
@@ -203,7 +270,9 @@ def collect_lead_usage(
     unpriced_models: list[str] = []
     notes: list[str] = []
     messages = 0
-    for rec in _iter_assistant_usage(files):
+    opencode_records = list(_iter_opencode_assistant_usage(workspace_root)) if transcripts_dir is None else []
+    combined_records = list(_iter_assistant_usage(files)) + opencode_records
+    for rec in combined_records:
         raw_ts = str(rec.get("timestamp") or "")
         ts = _iso_to_epoch(raw_ts)
         if ts is None:
@@ -273,11 +342,11 @@ def collect_lead_usage(
         usd = per_model_usd.get(model, 0.0)
         row["cost_cents"] = round(usd * 100.0, 4)
         total_cents += usd * 100.0
-    if not files:
-        notes.append(f"No Claude Code transcripts found under {tdir}.")
+    if not files and not opencode_records:
+        notes.append(f"No Claude Code or OpenCode transcripts found under {tdir}.")
     return {
         "transcripts_dir": str(tdir),
-        "transcript_files": len(files),
+        "transcript_files": len(files) + len({r["file"] for r in opencode_records}),
         "messages": messages,
         "per_model": per_model,
         "lead_cost_cents": round(total_cents, 4),
@@ -300,6 +369,12 @@ def true_total_report(
     first delegated job and until_epoch (planning turns before the first delegation included), and
     the dispatched side counts every receipt up to until_epoch.
     """
+    from server.receipts import (
+        _is_included_ge_seat_receipt,
+        _receipt_cost_cents,
+        _receipt_list_equivalent_cents,
+    )
+
     receipts = store.list_receipts(workspace_root=workspace_root)
     anchor: float | None = None
     if since_epoch is None:
@@ -312,10 +387,45 @@ def true_total_report(
         and float(r.get("started_at_epoch") or 0.0) <= until
     ]
     dispatched_cents = 0.0
+    ge_equiv_cents = 0.0
     dispatched_known = True
+    by_auth_mode: dict[str, dict[str, Any]] = {
+        "gemini_enterprise_seat": {
+            "jobs": 0,
+            "billing_model": "included_ge_seat",
+            "total_tokens": 0,
+            "billed_cost_cents": 0.0,
+            "list_equivalent_cents": 0.0,
+        },
+        "pay_as_you_go": {
+            "jobs": 0,
+            "billing_model": "pay_as_you_go",
+            "total_tokens": 0,
+            "billed_cost_cents": 0.0,
+            "list_equivalent_cents": 0.0,
+        },
+    }
     for r in in_window:
         cost = r.get("cost") or {}
-        dispatched_cents += float(cost.get("total_cost_cents") or 0.0)
+        usage = r.get("usage") or {}
+        tot_tok = int(usage.get("total_token_count") or 0)
+        is_ge = _is_included_ge_seat_receipt(r)
+        billed_c = _receipt_cost_cents(r)
+        equiv_c = _receipt_list_equivalent_cents(r)
+        dispatched_cents += billed_c
+        if is_ge:
+            ge_equiv_cents += equiv_c
+            ge_bucket = by_auth_mode["gemini_enterprise_seat"]
+            ge_bucket["jobs"] += 1
+            ge_bucket["total_tokens"] += tot_tok
+            ge_bucket["billed_cost_cents"] = round(ge_bucket["billed_cost_cents"] + billed_c, 4)
+            ge_bucket["list_equivalent_cents"] = round(ge_bucket["list_equivalent_cents"] + equiv_c, 4)
+        else:
+            payg_bucket = by_auth_mode["pay_as_you_go"]
+            payg_bucket["jobs"] += 1
+            payg_bucket["total_tokens"] += tot_tok
+            payg_bucket["billed_cost_cents"] = round(payg_bucket["billed_cost_cents"] + billed_c, 4)
+            payg_bucket["list_equivalent_cents"] = round(payg_bucket["list_equivalent_cents"] + equiv_c, 4)
         if cost.get("pricing_known") is False:
             dispatched_known = False
     lead = collect_lead_usage(
@@ -333,6 +443,8 @@ def true_total_report(
         "dispatched": {
             "jobs": len(in_window),
             "cost_cents": round(dispatched_cents, 4),
+            "included_ge_seat_equivalent_cents": round(ge_equiv_cents, 4),
+            "by_auth_mode": by_auth_mode,
             "pricing_known": dispatched_known,
             "source": "plugin receipts (Gemini worker turns and ask_gemini calls)",
         },
@@ -340,8 +452,9 @@ def true_total_report(
         "true_total_cost_cents": round(true_total, 4),
         "lead_share_of_true_total": round(float(lead["lead_cost_cents"]) / true_total, 4) if true_total > 0 else None,
         "note": (
-            "Dispatched is what the plugin sent to Gemini. True total adds the Claude Code lead session "
-            "rebuilt from its transcripts. Compare architectures on true total, not dispatched."
+            "Dispatched cost_cents counts pay-as-you-go Gemini spend only; included Gemini Enterprise seat runs "
+            "bill $0.00 and report their token volume and list-rate value under dispatched.by_auth_mode. "
+            "True total adds the Lead session rebuilt from Claude Code / OpenCode transcripts."
         ),
     }
 

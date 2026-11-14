@@ -32,6 +32,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from typing import Any, Callable
 import urllib.error
@@ -1999,6 +2000,7 @@ def ask_gemini(
     record_receipt: bool = True,
     budget_job_id: str | None = None,
     session_id: str | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run a single-shot or multi-segment long-decode Gemini query and record a signed receipt.
 
@@ -2017,7 +2019,6 @@ def ask_gemini(
 
     ws_root = resolve_workspace_root(workspace_root)
     receipt_store = store or ReceiptStore(workspace_root=ws_root)
-    enforce_daily_budget(receipt_store, workspace_root=ws_root)
 
     chosen_model = resolve_default_ask_model(model, env=os.environ)
     effective_thinking = thinking_level
@@ -2031,6 +2032,7 @@ def ask_gemini(
         model=chosen_model,
     )
     auth_mode = auth["auth_mode"]
+    enforce_daily_budget(receipt_store, workspace_root=ws_root, auth_mode=auth_mode)
     resolved_key = auth.get("api_key")
     resolved_project = auth.get("project")
     resolved_location = auth.get("location")
@@ -2093,7 +2095,7 @@ def ask_gemini(
         ).get("total_cost_cents")
         or 0.0
     )
-    budget_guard = getattr(receipt_store, "budget", None)
+    budget_guard = getattr(receipt_store, "budget", None) if auth_mode != "gemini_enterprise" else None
     res_id: str | None = None
     if budget_guard is not None:
         res_id = budget_guard.reserve(
@@ -2148,6 +2150,10 @@ def ask_gemini(
             req_payload["media_parts"] = media_parts
         if effective_google_search:
             req_payload["google_search"] = True
+        if stop_event is not None:
+            req_payload["stop_event"] = stop_event
+            if stop_event.is_set():
+                raise TimeoutError("Query cancelled by caller.")
         if stable_prefix and not check_dependencies:
             from server.agy_state import PROCESS_SESSION_ID
 

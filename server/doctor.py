@@ -70,15 +70,139 @@ def _default_adc_candidates(env: Mapping[str, str]) -> list[Path]:
     return candidates
 
 
+def _discover_installed_host_mcp_env(base_env: Mapping[str, str]) -> dict[str, str]:
+    """Extract non-secret `CC_AGY_*` / project settings from installed host MCP configs when shell env is unset."""
+    import json
+    from server.install import _loads_jsonc, _parse_toml
+
+    home_dir = resolve_home_dir(base_env)
+    opencode_cfg = resolve_opencode_config_path(resolve_opencode_config_dir(base_env), env=base_env)
+    cursor_cfg = expand_path_with_env(base_env.get("CURSOR_CONFIG_DIR") or (home_dir / ".cursor"), base_env) / "mcp.json"
+    agy_cfg = expand_path_with_env(base_env.get("AGY_CONFIG_DIR") or (home_dir / ".gemini" / "config"), base_env) / "mcp_config.json"
+    codex_cfg = expand_path_with_env(base_env.get("CODEX_HOME") or (home_dir / ".codex"), base_env) / "config.toml"
+
+    candidates: list[dict[str, Any]] = []
+    if opencode_cfg.is_file():
+        try:
+            oc_data = _loads_jsonc(opencode_cfg.read_text(encoding="utf-8"))
+            if isinstance(oc_data, dict):
+                mcp_sec = oc_data.get("mcp")
+                if isinstance(mcp_sec, dict):
+                    servers_map = mcp_sec.get("servers") if isinstance(mcp_sec.get("servers"), dict) else mcp_sec
+                    for srv in servers_map.values():
+                        if isinstance(srv, dict) and isinstance(srv.get("environment"), dict):
+                            cmd_str = " ".join(str(x) for x in (srv.get("command") or []) if x)
+                            if "server/main.py" in cmd_str or "cc-agy-plugin" in cmd_str or "CC_AGY_" in str(srv["environment"]):
+                                candidates.append(srv["environment"])
+        except Exception:
+            pass
+    for json_cfg in (cursor_cfg, agy_cfg):
+        if json_cfg.is_file():
+            try:
+                j_data = json.loads(json_cfg.read_text(encoding="utf-8"))
+                mcp_srvs = j_data.get("mcpServers") if isinstance(j_data, dict) else None
+                if isinstance(mcp_srvs, dict):
+                    for srv in mcp_srvs.values():
+                        if isinstance(srv, dict) and isinstance(srv.get("env"), dict):
+                            args_str = " ".join(str(x) for x in (srv.get("args") or []) if x)
+                            if "server/main.py" in args_str or "cc-agy-plugin" in args_str or "CC_AGY_" in str(srv["env"]):
+                                candidates.append(srv["env"])
+            except Exception:
+                pass
+    if codex_cfg.is_file():
+        try:
+            t_data = _parse_toml(codex_cfg.read_text(encoding="utf-8"))
+            mcp_srvs = t_data.get("mcp_servers") if isinstance(t_data, dict) else None
+            if isinstance(mcp_srvs, dict):
+                for srv in mcp_srvs.values():
+                    if isinstance(srv, dict) and isinstance(srv.get("env"), dict):
+                        args_str = " ".join(str(x) for x in (srv.get("args") or []) if x)
+                        if "server/main.py" in args_str or "cc-agy-plugin" in args_str or "CC_AGY_" in str(srv["env"]):
+                            candidates.append(srv["env"])
+        except Exception:
+            pass
+
+    allowed_prefixes = ("CC_AGY_",)
+    allowed_exact = {"GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"}
+    secret_substrings = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    merged: dict[str, str] = {}
+    for env_dict in candidates:
+        for k, v in env_dict.items():
+            if not isinstance(k, str) or not isinstance(v, (str, int, float, bool)):
+                continue
+            val_s = str(v).strip()
+            if not val_s or val_s.startswith("${"):
+                continue
+            if any(sec in k.upper() for sec in secret_substrings):
+                continue
+            if k.startswith(allowed_prefixes) or k in allowed_exact:
+                merged.setdefault(k, val_s)
+        if merged.get("CC_AGY_AUTH_MODE"):
+            break
+    return merged
+
+
 def run_doctor(
     workspace_root: str | Path | None = None,
     *,
     env: Mapping[str, str] | None = None,
     store: ReceiptStore | None = None,
     probe_oidc: bool = False,
+    allow_pending_login: bool = False,
 ) -> dict[str, Any]:
     """Run local zero-network readiness checks and return a structured report."""
-    active_env: Mapping[str, str] = os.environ if env is None else env
+    raw_env: Mapping[str, str] = os.environ if env is None else env
+    used_host_cfg_env = False
+    has_isolated_cfg_override = bool(
+        env is not None
+        and any(
+            k in env
+            for k in (
+                "HOME",
+                "USERPROFILE",
+                "XDG_CONFIG_HOME",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_CONFIG",
+                "CURSOR_CONFIG_DIR",
+                "AGY_CONFIG_DIR",
+                "CODEX_HOME",
+            )
+        )
+    )
+    has_explicit_non_ge_creds = any(
+        (raw_env.get(k) or "").strip()
+        for k in (
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "CC_AGY_VERTEX_BASE_URL",
+            "CC_AGY_GEMINI_BASE_URL",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        )
+    )
+    in_unisolated_pytest = bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and not has_isolated_cfg_override
+        and not allow_pending_login
+    )
+    raw_auth_val = (raw_env.get("CC_AGY_AUTH_MODE") or "").strip().lower()
+    if (
+        (env is None or has_isolated_cfg_override or allow_pending_login)
+        and raw_auth_val in ("", "auto")
+        and not in_unisolated_pytest
+        and (allow_pending_login or not has_explicit_non_ge_creds)
+    ):
+        discovered_cfg_env = _discover_installed_host_mcp_env(raw_env)
+        if discovered_cfg_env:
+            combined = dict(discovered_cfg_env)
+            combined.update({k: v for k, v in raw_env.items() if v is not None})
+            if discovered_cfg_env.get("CC_AGY_AUTH_MODE") and raw_auth_val in ("", "auto"):
+                combined["CC_AGY_AUTH_MODE"] = discovered_cfg_env["CC_AGY_AUTH_MODE"]
+            active_env: Mapping[str, str] = combined
+            used_host_cfg_env = True
+        else:
+            active_env = raw_env
+    else:
+        active_env = raw_env
     issues: list[str] = []
     warnings: list[str] = []
     remediations: list[str] = []
@@ -178,7 +302,7 @@ def run_doctor(
     try:
         resolved_auth = resolve_auth_config(
             model=default_delegate_model,
-            env=dict(env) if env is not None else None,
+            env=dict(active_env) if (env is not None or used_host_cfg_env) else None,
         )
         auth_mode = str(resolved_auth.get("auth_mode") or "")
         active_auth_mode = auth_mode
@@ -216,15 +340,36 @@ def run_doctor(
             from server.agy_cli import inspect_agy_cli_offline
 
             ent_check = inspect_agy_cli_offline(active_env)
+            detected_agy_ver = ent_check.get("version")
+            if (
+                detected_agy_ver is None
+                and ent_check.get("agy_bin")
+                and (probe_oidc or allow_pending_login or not os.environ.get("PYTEST_CURRENT_TEST"))
+            ):
+                from server.agy_cli import probe_agy_cli_version
+
+                detected_agy_ver = probe_agy_cli_version(ent_check.get("agy_bin"), env=active_env)
             ent_cred_source = str(ent_check.get("credential_source") or "") or None
             comp_proj = ent_check.get("companion_project")
             if isinstance(comp_proj, str) and comp_proj.strip() and not active_project_id:
                 active_project_id = comp_proj.strip()
+            from server.regions import is_ge_mode_pinned
+
+            ge_pinned = is_ge_mode_pinned(active_env)
+            claude_esc_off = str(active_env.get("CC_AGY_ALLOW_CLAUDE_IN_GE") or "").strip().lower() not in (
+                "1",
+                "true",
+                "yes",
+            )
             agy_cli_info = {
                 "binary_found": bool(ent_check.get("binary_found")),
                 "agy_bin": ent_check.get("agy_bin"),
+                "version": detected_agy_ver,
+                "pinned_version": ent_check.get("pinned_version"),
                 "managed_bin_path": ent_check.get("managed_bin_path"),
                 "auth_configured": bool(ent_check.get("auth_configured")),
+                "consumer_account_detected": bool(ent_check.get("consumer_account_detected")),
+                "tier_verified_enterprise": bool(ent_check.get("tier_verified_enterprise")),
                 "credential_source": ent_cred_source,
                 "companion_project": comp_proj,
                 "tier_id": ent_check.get("tier_id"),
@@ -233,6 +378,11 @@ def run_doctor(
                 "enterprise_project": ent_check.get("enterprise_project"),
                 "enterprise_location": ent_check.get("enterprise_location"),
                 "baicode_user_tier": ent_check.get("baicode_user_tier"),
+                "ge_billing_lock": {
+                    "pinned": ge_pinned,
+                    "api_key_override_blocked": ge_pinned,
+                    "claude_escalation_disabled": claude_esc_off,
+                },
             }
             if ent_check.get("adc_seat_error"):
                 agy_cli_info["adc_seat_error"] = ent_check["adc_seat_error"]
@@ -260,10 +410,29 @@ def run_doctor(
                     _filter_models_by_bifrost_policy(list(model_catalog["models"]), active_env)
                 )
             if not ent_check.get("ok"):
-                auth_ok = False
-                issues.append(str(ent_check.get("error") or "Gemini Enterprise `agy` CLI sign-in is missing."))
+                only_pending_signin = bool(
+                    allow_pending_login
+                    and ent_check.get("binary_found")
+                    and not ent_check.get("auth_configured")
+                    and not ent_check.get("consumer_account_detected")
+                    and not ent_check.get("adc_seat_error")
+                )
+                if only_pending_signin:
+                    agy_cli_info["pending_login"] = True
+                    warnings.append(
+                        str(ent_check.get("error") or "One-time Antigravity CLI sign-in is still pending.")
+                    )
+                else:
+                    auth_ok = False
+                    issues.append(str(ent_check.get("error") or "Gemini Enterprise `agy` CLI sign-in is missing."))
                 if ent_check.get("remediation"):
                     remediations.append(str(ent_check["remediation"]))
+            elif not ent_check.get("tier_verified_enterprise"):
+                warnings.append(
+                    "Antigravity CLI sign-in is present, but `cache/onboarding.json` does not yet record an explicit "
+                    "`gcp-ge-*` enterprise tier. Verify you signed in with your licensed Gemini Enterprise work account "
+                    "(or set `CC_AGY_REQUIRE_GE_TIER=1` to enforce strict tier verification)."
+                )
         elif auth_mode == "vertex":
             adc_found = any(p.is_file() for p in _default_adc_candidates(active_env))
             adc_quota_project = read_adc_quota_project(active_env, explicit_env=env)
@@ -596,21 +765,37 @@ def format_doctor_human(report: Mapping[str, Any]) -> str:
     store = report.get("receipt_store") if isinstance(report.get("receipt_store"), Mapping) else {}
     budget = report.get("daily_budget") if isinstance(report.get("daily_budget"), Mapping) else {}
 
+    raw_runner = ws.get("detected_test_runner")
+    if isinstance(raw_runner, Mapping):
+        runner_display = str(raw_runner.get("primary_command") or raw_runner.get("command") or "smoke_only")
+    else:
+        runner_display = str(raw_runner or "smoke_only")
+
     lines = [
         f"{badge} cc-agy-plugin doctor ({status.lower()})",
         f"  Auth mode:      {auth.get('auth_mode') or 'unconfigured'} (configured: {auth.get('configured_auth_mode') or 'auto'})",
         f"  Cost profile:   {report.get('cost_profile')} (worker: {report.get('default_delegate_model')}, ask: {report.get('default_ask_model')})",
         f"  MCP tools:      {'ok' if mcp.get('ok') else 'error'} ({mcp.get('active_tool_count', 0)} active)",
         f"  Python runtime: {sdks.get('python_bin')} (genai={sdks.get('google_genai')}, agy={sdks.get('google_antigravity')}, ctx={sdks.get('ctx_straitjacket')})",
-        f"  Workspace:      {ws.get('workspace_root')} (git={ws.get('is_git_repo')}, runner={ws.get('detected_test_runner') or 'smoke_only'})",
+        f"  Workspace:      {ws.get('workspace_root')} (git={ws.get('is_git_repo')}, runner={runner_display})",
         f"  Receipt store:  {store.get('data_dir')} (writable={store.get('writable')})",
     ]
     agy_cli = auth.get("agy_cli") if isinstance(auth.get("agy_cli"), Mapping) else None
     if agy_cli:
         sbx = agy_cli.get("worker_sandbox") if isinstance(agy_cli.get("worker_sandbox"), Mapping) else {}
+        ge_lock = agy_cli.get("ge_billing_lock") if isinstance(agy_cli.get("ge_billing_lock"), Mapping) else {}
+        ver_str = agy_cli.get("version") or "unknown"
+        if agy_cli.get("pinned_version"):
+            ver_str = f"{ver_str} (pinned={agy_cli['pinned_version']})"
+        tier_str = f", tier={agy_cli['tier_id']}" if agy_cli.get("tier_id") else ""
         lines.append(
-            f"  AGY CLI:        bin={agy_cli.get('agy_bin') or 'missing'}, signed_in={agy_cli.get('auth_configured')}, "
-            f"sandbox={sbx.get('backend') or 'none'} (mode={sbx.get('mode') or 'auto'})"
+            f"  AGY CLI:        bin={agy_cli.get('agy_bin') or 'missing'}, version={ver_str}, "
+            f"signed_in={agy_cli.get('auth_configured')}{tier_str}, "
+            f"sandbox={sbx.get('backend') or 'agy --sandbox'} (mode={sbx.get('mode') or 'auto'})"
+        )
+        lines.append(
+            f"  GE billing:     fail_closed={bool(ge_lock.get('api_key_override_blocked'))}, "
+            f"claude_escalation={'disabled' if ge_lock.get('claude_escalation_disabled') else 'enabled'}"
         )
     if budget.get("max_daily_cents") is not None:
         lines.append(

@@ -43,6 +43,48 @@ PUBLIC_SETTINGS: tuple[SettingSpec, ...] = (
         "Explicit path to the standalone Antigravity CLI (`agy`) binary.",
     ),
     SettingSpec(
+        "CC_AGY_CLI_VERSION",
+        "Connection & Auth",
+        "unset (latest verified)",
+        "Optional exact `agy` version pin enforced during install, `doctor`, and tool execution.",
+    ),
+    SettingSpec(
+        "CC_AGY_CLI_SHA512",
+        "Connection & Auth",
+        "unset (manifest SHA-512)",
+        "Optional 128-hex SHA-512 archive checksum pin enforced when downloading `agy`.",
+    ),
+    SettingSpec(
+        "CC_AGY_AUTO_INSTALL_CLI",
+        "Connection & Auth",
+        "0",
+        "Set to `1` to allow downloading `agy` inside an MCP tool call if missing (default: explicit install only).",
+    ),
+    SettingSpec(
+        "CC_AGY_CLI_PROTOCOL",
+        "Connection & Auth",
+        "stream-json",
+        "Wire protocol for `agy` workers: `stream-json` (default) or experimental `acp` (`agy acp --stdio`).",
+    ),
+    SettingSpec(
+        "CC_AGY_CLI_MANIFEST_URL",
+        "Connection & Auth",
+        "(Google CDN manifest)",
+        "Optional enterprise HTTPS mirror URL for the pinned `agy` platform manifest JSON.",
+    ),
+    SettingSpec(
+        "CC_AGY_REQUIRE_GE_TIER",
+        "Connection & Auth",
+        "0",
+        "Set to `1` to require an explicit `gcp-ge-*` enterprise tier in `cache/onboarding.json` for GE OAuth sign-ins.",
+    ),
+    SettingSpec(
+        "CC_AGY_REPO_REF",
+        "Connection & Auth",
+        "main",
+        "Git tag, branch, or commit ref pinned by `quickstart.sh` and `cc-agy-install` checkout bootstrap.",
+    ),
+    SettingSpec(
         "CC_AGY_CLI_CONFIG_DIR",
         "Connection & Auth",
         "~/.gemini/antigravity-cli",

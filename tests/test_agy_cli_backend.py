@@ -2230,6 +2230,7 @@ class TestUserControlGuarantees:
             assert (repo / "app.py").read_text(encoding="utf-8") == "x = 1\n"
 
             # 5) doctor exposes full user_controls summary and warns on unpinned ambient Vertex
+            monkeypatch.setattr("server.doctor._module_available", lambda _name: True)
             doc_manual = run_doctor(
                 workspace_root=repo,
                 env={

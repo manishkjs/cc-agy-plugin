@@ -999,12 +999,28 @@ def _vertex_enabled() -> bool:
     )
 
 
+def _is_gateway_blocked_by_ge_pin() -> bool:
+    from server.regions import is_ge_mode_pinned
+
+    if os.environ.get("CC_AGY_ALLOW_GATEWAY_IN_GE", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    return is_ge_mode_pinned(os.environ)
+
+
 def gemini_credentials_available() -> bool:
+    if _is_gateway_blocked_by_ge_pin():
+        return False
     return bool(_gemini_api_key()) or _vertex_enabled()
 
 
 def gemini_endpoint(model: str, *, stream_sse: bool = False) -> tuple[str, dict[str, str]]:
     """Return `(url, headers)` for `generateContent` or `streamGenerateContent?alt=sse`."""
+    if _is_gateway_blocked_by_ge_pin():
+        raise GatewayRequestError(
+            403,
+            "permission_error",
+            "cc-agy-gateway is disabled when CC_AGY_AUTH_MODE=gemini_enterprise is pinned to prevent out-of-pool billing.",
+        )
     if not is_valid_model_id(model):
         raise GatewayRequestError(400, "invalid_request_error", "Invalid model identifier.")
     quoted = urllib.parse.quote(model, safe="")
@@ -1556,6 +1572,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         model: str,
         est_input: int,
     ) -> None:
+        if _is_gateway_blocked_by_ge_pin():
+            raise GatewayRequestError(
+                403,
+                "permission_error",
+                "Anthropic passthrough is disabled when CC_AGY_AUTH_MODE=gemini_enterprise is pinned to prevent out-of-pool billing.",
+            )
         key = (os.environ.get("ANTHROPIC_UPSTREAM_KEY") or "").strip()
         if not key:
             raise GatewayRequestError(
@@ -1706,6 +1728,11 @@ class ReusableGatewayHTTPServer(ThreadingHTTPServer):
 
 
 def run_server(port: int = GATEWAY_PORT) -> None:
+    if _is_gateway_blocked_by_ge_pin():
+        raise RuntimeError(
+            "Refusing to start cc-agy-gateway while CC_AGY_AUTH_MODE=gemini_enterprise is pinned "
+            "(set CC_AGY_ALLOW_GATEWAY_IN_GE=1 to override)."
+        )
     token, path, created = load_or_create_token()
     if path is None:
         print("[cc-agy-gateway] Using token from environment.", file=sys.stderr, flush=True)

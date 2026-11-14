@@ -1882,6 +1882,14 @@ def resolve_configured_auth_mode(
     return None
 
 
+def is_ge_mode_pinned(env: Mapping[str, str] | None = None) -> bool:
+    """Return True when Gemini Enterprise mode is explicitly pinned in environment or plugin config."""
+    try:
+        return resolve_configured_auth_mode(None, env=env) == "gemini_enterprise"
+    except ValueError:
+        return False
+
+
 def _resolve_explicit_project_only(
     requested_project: str | None = None,
     *,
@@ -1981,8 +1989,15 @@ def resolve_auth_config(
         if cleaned_req_proj and not cleaned_req_proj.startswith("${") and cleaned_req_proj != "<paying-project>":
             explicit_project = cleaned_req_proj
 
-    cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
     env_cfg_mode = resolve_configured_auth_mode(None, env=source_env)
+    if env_cfg_mode == "gemini_enterprise" and requested_auth_mode is not None:
+        req_mode_norm = resolve_configured_auth_mode(requested_auth_mode, env={})
+        if req_mode_norm not in (None, "gemini_enterprise"):
+            raise ValueError(
+                "Gemini Enterprise mode is pinned (CC_AGY_AUTH_MODE=gemini_enterprise); "
+                f"requested_auth_mode override {requested_auth_mode!r} is forbidden to prevent out-of-pool billing."
+            )
+    cfg_mode = resolve_configured_auth_mode(requested_auth_mode, env=source_env)
     # A requested `api_key` mode that merely echoes pass-1 output (same ambient key + Gemini gateway)
     # keeps the gateway so two-pass worker resolution is idempotent; env `CC_AGY_AUTH_MODE=api_key`
     # or a different per-call key still forces direct AI Studio.
@@ -2062,17 +2077,12 @@ def resolve_auth_config(
         )
         return result
 
-    if resolved_key and is_per_call_key_override:
-        return _finish(
-            {
-                "auth_mode": "api_key",
-                "api_key": resolved_key,
-                "project": None,
-                "location": None,
-                "reroute_note": None,
-            }
-        )
     if cfg_mode == "gemini_enterprise":
+        if is_per_call_key_override:
+            raise ValueError(
+                "Gemini Enterprise mode is pinned (CC_AGY_AUTH_MODE=gemini_enterprise); "
+                "per-call api_key overrides are forbidden to prevent out-of-pool billing."
+            )
         from server.agy_cli import resolve_enterprise_adc_seat
 
         seat = resolve_enterprise_adc_seat(source_env)
@@ -2084,9 +2094,21 @@ def resolve_auth_config(
             and requested_project.strip() not in ("<paying-project>", "custom-endpoint")
             else None
         )
-        ent_proj = explicit_req_proj or (
-            str(seat["project"]) if (seat.get("requested") and seat.get("project")) else None
+        configured_seat_proj = (
+            str(seat["project"]).strip() if (seat.get("requested") and seat.get("project")) else None
         )
+        if explicit_req_proj and cfg_mode == "gemini_enterprise":
+            allowed_projs = {p.lower() for p in resolve_allowed_projects(source_env)}
+            if (
+                (not configured_seat_proj or explicit_req_proj.lower() != configured_seat_proj.lower())
+                and explicit_req_proj.lower() not in allowed_projs
+            ):
+                raise ValueError(
+                    "Gemini Enterprise mode does not allow arbitrary project overrides: "
+                    f"per-call project override {explicit_req_proj!r} is forbidden unless it matches "
+                    "the configured enterprise seat project or is listed in CC_AGY_ALLOWED_PROJECTS."
+                )
+        ent_proj = explicit_req_proj or configured_seat_proj
         req_loc_clean = (requested_location or "").strip().lower()
         if req_loc_clean.startswith("${"):
             req_loc_clean = ""
@@ -2099,6 +2121,17 @@ def resolve_auth_config(
                 "api_key": None,
                 "project": ent_proj,
                 "location": ent_loc,
+                "reroute_note": None,
+            }
+        )
+
+    if resolved_key and is_per_call_key_override:
+        return _finish(
+            {
+                "auth_mode": "api_key",
+                "api_key": resolved_key,
+                "project": None,
+                "location": None,
                 "reroute_note": None,
             }
         )

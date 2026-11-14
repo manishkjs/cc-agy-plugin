@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,6 +12,8 @@ import subprocess
 import threading
 import time
 from typing import Any
+
+from server import file_lock as fcntl
 
 from server.acceptance_runner import (
     _TEST_RUNNER_CMD_RE,

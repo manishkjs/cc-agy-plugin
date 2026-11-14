@@ -86,7 +86,7 @@ VALID_OPENCODE_AGENT_KEYS: frozenset[str] = frozenset(
 )
 
 _OPENCODE_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost")
+_REQUIRED_OPENCODE_COMMANDS: tuple[str, ...] = ("delegate", "doctor", "jobs", "cost", "agy")
 
 _TRIGGER_PHRASES: tuple[str, ...] = (
     "use when",

@@ -82,10 +82,9 @@ def candidate_sdk_pythons(
     root = Path(plugin_root).resolve() if plugin_root is not None else DEFAULT_PLUGIN_ROOT.resolve()
     managed_py = venv_python_path(managed_venv_dir(source))
     local_venv_py = venv_python_path(root / ".venv")
-    parent_venv_py = venv_python_path(root.parent / ".venv")
     seen: set[str] = set()
     ordered: list[Path] = []
-    for cand in (managed_py, local_venv_py, parent_venv_py):
+    for cand in (managed_py, local_venv_py):
         key = str(cand)
         if key not in seen:
             seen.add(key)
@@ -104,8 +103,8 @@ def resolve_sdk_python(
     1. Explicit `CC_AGY_PYTHON_BIN` when set and executable.
     2. Current `sys.executable` when it already has `google-antigravity` and `google-genai`.
     3. Managed per-user venv (`~/.local/share/cc-agy-plugin/venv/bin/python`) when ready.
-    4. Plugin-local `.venv` or parent `.venv` when ready (`python_has_plugin_sdks`).
-    5. First existing non-parent candidate venv interpreter, else `sys.executable` / `python3`.
+    4. Plugin-local `.venv` when ready (`python_has_plugin_sdks`).
+    5. First existing candidate venv interpreter, else `sys.executable` / `python3`.
     """
     source = env if env is not None else os.environ
     explicit = str(source.get("CC_AGY_PYTHON_BIN") or "").strip()
@@ -118,16 +117,15 @@ def resolve_sdk_python(
         return sys.executable
 
     root = Path(plugin_root).resolve() if plugin_root is not None else DEFAULT_PLUGIN_ROOT.resolve()
-    parent_venv_py = venv_python_path(root.parent / ".venv")
     candidates = candidate_sdk_pythons(root, env=source)
     usable = [c for c in candidates if c.is_file() and os.access(c, os.X_OK)]
     for cand in usable:
         if python_has_plugin_sdks(cand):
             return str(cand)
-    non_parent = [c for c in usable if c != parent_venv_py]
-    if non_parent:
-        return str(non_parent[0])
-    return sys.executable or "python3"
+    for cand in usable:
+        if (cand.parent.parent / ".cc-agy-venv-ready").is_file():
+            return str(cand)
+    return sys.executable or ("python" if os.name == "nt" else "python3")
 
 
 def ensure_sdk_venv(
@@ -157,7 +155,10 @@ def ensure_sdk_venv(
     target_venv = managed_venv_dir(source)
     target_py = venv_python_path(target_venv)
     if output_fn is not None:
-        output_fn(f"  Setting up isolated Python environment at {target_venv} ...")
+        try:
+            output_fn(f"  Setting up isolated Python environment at {target_venv} ...", flush=True)  # type: ignore[call-arg]
+        except TypeError:
+            output_fn(f"  Setting up isolated Python environment at {target_venv} ...")
 
     target_venv.parent.mkdir(parents=True, exist_ok=True)
     used_uv = False
@@ -243,6 +244,10 @@ def ensure_sdk_venv(
             "venv_dir": str(target_venv),
             "error": f"Failed to install plugin dependencies into {target_venv}: {tail}",
         }
+    try:
+        (target_venv / ".cc-agy-venv-ready").write_text("ready\n", encoding="utf-8")
+    except OSError:
+        pass
     return {
         "ok": True,
         "bootstrapped": True,

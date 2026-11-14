@@ -538,6 +538,7 @@ def test_doctor_diagnostics_redacts_secrets_and_works_via_mcp_and_cli(
     store = ReceiptStore(tmp_path / "data", workspace_root=repo)
 
     secret_key = "AIzaSuperSecretNeverLeak999999"
+    monkeypatch.setattr("server.doctor._module_available", lambda _name: True)
     report = run_doctor(
         workspace_root=repo,
         env={"GEMINI_API_KEY": secret_key, "CC_AGY_COST_PROFILE": "quality"},

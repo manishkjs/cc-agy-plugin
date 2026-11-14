@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: Delegate a coding task to a Google AI Studio or Vertex AI Gemini worker via the Antigravity SDK
+description: Delegate a coding task to an isolated Gemini worker (Gemini Enterprise agy CLI, Google AI Studio, or Vertex AI)
 argument-hint: <task description>
 ---
 

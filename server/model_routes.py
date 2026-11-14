@@ -85,17 +85,33 @@ class BatchSettings:
     read_budget: int = 0
 
 
-def resolve_batch_settings(args: dict[str, Any] | None = None) -> BatchSettings:
+def resolve_batch_settings(
+    args: dict[str, Any] | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    auth_mode: str | None = None,
+) -> BatchSettings:
     """Per-call arguments win over env (CC_AGY_BATCH_*) and userConfig, which win over defaults."""
+    from server.regions import is_ge_mode_pinned
+
     args = args or {}
+    active_env = os.environ if env is None else env
     has_arg_read_budget = args.get("read_budget") is not None
-    raw_read_budget = args.get("read_budget") if has_arg_read_budget else (_env_first("CC_AGY_BATCH_READ_BUDGET") or 0)
+    raw_read_budget = (
+        args.get("read_budget")
+        if has_arg_read_budget
+        else ((active_env.get("CC_AGY_BATCH_READ_BUDGET") or "").strip() or 0)
+    )
     try:
         read_budget = max(0, min(MAX_READ_BUDGET, int(raw_read_budget)))
     except (TypeError, ValueError) as exc:
         raise ValueError("read_budget must be an integer") from exc
     arg_writer = str(args.get("writer") or "").strip().lower()
     env_writer = _env_first("CC_AGY_BATCH_WRITER", "CLAUDE_PLUGIN_OPTION_BATCH_WRITER").strip().lower()
+    if env is not None:
+        env_writer = (
+            (env.get("CC_AGY_BATCH_WRITER") or env.get("CLAUDE_PLUGIN_OPTION_BATCH_WRITER") or "").strip().lower()
+        )
     if arg_writer == "genai" and not has_arg_read_budget:
         read_budget = 0
     if read_budget > 0:
@@ -112,9 +128,29 @@ def resolve_batch_settings(args: dict[str, Any] | None = None) -> BatchSettings:
     if thinking not in ("MINIMAL", "LOW", "MEDIUM", "HIGH"):
         raise ValueError(f"thinking_level must be MINIMAL, LOW, MEDIUM or HIGH, got {thinking!r}")
     claude_model = str(args.get("claude_model") or _env_first("CC_AGY_BATCH_CLAUDE_MODEL") or DEFAULT_CLAUDE_WRITER_MODEL)
-    claude_writer = args.get("claude_writer")
-    if claude_writer is None:
-        claude_writer = _env_first("CC_AGY_BATCH_CLAUDE_WRITER").lower() not in ("0", "false", "no")
+    ge_locked = (
+        (auth_mode == "gemini_enterprise" or is_ge_mode_pinned(active_env))
+        and str(active_env.get("CC_AGY_ALLOW_CLAUDE_IN_GE") or "").strip().lower() not in ("1", "true", "yes")
+    )
+    raw_claude_writer = args.get("claude_writer")
+    if ge_locked:
+        if raw_claude_writer is True or (
+            isinstance(raw_claude_writer, str) and raw_claude_writer.strip().lower() in ("1", "true", "yes", "on")
+        ):
+            raise ValueError(
+                "Gemini Enterprise mode disables Claude writer escalation (claude_writer=true) to prevent "
+                "out-of-pool billing. Omit claude_writer, pass claude_writer=false, or set CC_AGY_ALLOW_CLAUDE_IN_GE=1."
+            )
+        claude_writer: Any = False
+    else:
+        claude_writer = raw_claude_writer
+        if claude_writer is None:
+            env_cw = (
+                (env.get("CC_AGY_BATCH_CLAUDE_WRITER") or "").strip()
+                if env is not None
+                else _env_first("CC_AGY_BATCH_CLAUDE_WRITER")
+            )
+            claude_writer = env_cw.lower() not in ("0", "false", "no")
     try:
         max_parallel = int(args.get("max_parallel") or _env_first("CC_AGY_BATCH_MAX_PARALLEL") or DEFAULT_MAX_PARALLEL)
     except ValueError as exc:
@@ -125,8 +161,15 @@ def resolve_batch_settings(args: dict[str, Any] | None = None) -> BatchSettings:
         check_timeout = float(raw_timeout) if raw_timeout not in (None, "") else 300.0
         max_cost = args.get("max_cost_cents")
         max_cost_cents = float(max_cost) if max_cost not in (None, "") else None
-        max_claude = int(args.get("max_claude_escalations") if args.get("max_claude_escalations") is not None
-                         else _env_first("CC_AGY_BATCH_MAX_CLAUDE") or DEFAULT_MAX_CLAUDE_ESCALATIONS)
+        max_claude = (
+            0
+            if ge_locked
+            else int(
+                args.get("max_claude_escalations")
+                if args.get("max_claude_escalations") is not None
+                else _env_first("CC_AGY_BATCH_MAX_CLAUDE") or DEFAULT_MAX_CLAUDE_ESCALATIONS
+            )
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid numeric batch setting: {exc}") from exc
     # NaN compares False against everything, so "nan <= 0" passes and a NaN budget never trips.
