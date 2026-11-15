@@ -180,9 +180,9 @@ class TestRegionsAndCostAccounting(unittest.TestCase):
         self.assertTrue(cost["pricing_known"])
         self.assertAlmostEqual(cost["total_cost_usd"], 0.0388, places=6)
 
-        flash38_cost = estimate_cost_usd("gemini-3.8-flash", usage)
-        self.assertTrue(flash38_cost["pricing_known"])
-        self.assertAlmostEqual(flash38_cost["total_cost_usd"], 0.0530, places=6)
+        hydrogen_cost = estimate_cost_usd("gemini-4-hydrogen", usage)
+        self.assertTrue(hydrogen_cost["pricing_known"])
+        self.assertAlmostEqual(hydrogen_cost["total_cost_usd"], 0.1395, places=6)
 
         unknown_cost = estimate_cost_usd("custom-experimental-model-v9", usage)
         self.assertFalse(unknown_cost["pricing_known"])
@@ -195,7 +195,7 @@ class TestRegionsAndCostAccounting(unittest.TestCase):
 
         # Aggregated multi-turn worker usage (e.g. 1M input + 100k output across 25 turns) uses standard tier
         multi_turn_usage = {"prompt_token_count": 1_000_000, "candidates_token_count": 100_000}
-        argon_multi_cost = estimate_cost_usd("gemini-4-argon", multi_turn_usage)
+        argon_multi_cost = estimate_cost_usd("gemini-4-carbon", multi_turn_usage)
         self.assertAlmostEqual(argon_multi_cost["total_cost_usd"], 3.20, places=6)
 
 
@@ -1125,7 +1125,7 @@ class TestCostControls(unittest.TestCase):
             self.assertEqual((seen[0]["max_tool_calls"], seen[0]["max_total_tokens"]), (55, 5_000_000))
             self.assertTrue(jm.delegate_apply(res["job_id"])["applied"])
 
-            argon_res = jm.delegate_start("edit greet argon", model="gemini-4-argon", project="p", wait=True)
+            argon_res = jm.delegate_start("edit greet argon", model="gemini-4-carbon", project="p", wait=True)
             self.assertEqual(argon_res["budget"], {"max_tool_calls": 100, "max_total_tokens": 5_000_000})
 
             no_cap = jm.delegate_start("x", project="p", wait=True, max_tool_calls=0, max_total_tokens=0)
@@ -1807,7 +1807,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 detect_bash_workspace_mutation(f"cp /tmp/x {wt_file}", repo, str(data_dir), cwd=repo)["blocked"]
             )
 
-            # 2. One worker turn with 1M accumulated input tokens + 100k output tokens on Argon costs $3.20
+            # 2. One worker turn with 1M accumulated input tokens + 100k output tokens on Carbon costs $3.20
             turn_u = {
                 "prompt_token_count": 1_000_000,
                 "cached_content_token_count": 0,
@@ -1823,7 +1823,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                     {"text": "ok", "usage": {**turn_u, "max_request_prompt_tokens": 1_000_000, "requests": [dict(turn_u)]}},
                 )[1],
             )
-            res_cost = jm_cost.delegate_start("argon turn", model="gemini-4-argon", project="p", wait=True)
+            res_cost = jm_cost.delegate_start("argon turn", model="gemini-4-carbon", project="p", wait=True)
             self.assertAlmostEqual(res_cost["cost"]["total_cost_usd"], 3.20, places=4)
             jm_cost.shutdown()
 
@@ -1834,7 +1834,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 "turns": [{"prompt_token_count": 1_000_000, "candidates_token_count": 100_000}],
                 "requests": [{"prompt_token_count": 50_000, "candidates_token_count": 1_000, "per_call": True}],
             }
-            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", partial_u)["total_cost_usd"], 3.20, places=4)
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-carbon", partial_u)["total_cost_usd"], 3.20, places=4)
             over_u1 = {
                 "prompt_token_count": 1_000_000,
                 "candidates_token_count": 100_000,
@@ -1843,13 +1843,13 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                     {"prompt_token_count": 1_000_000, "candidates_token_count": 100_000, "per_call": True},
                 ],
             }
-            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", over_u1)["total_cost_usd"], 5.80, places=4)
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-carbon", over_u1)["total_cost_usd"], 5.80, places=4)
             over_u2 = {
                 "prompt_token_count": 1_000_000,
                 "candidates_token_count": 100_000,
                 "requests": [{"prompt_token_count": 150_000, "candidates_token_count": 10_000, "per_call": True}] * 10,
             }
-            self.assertAlmostEqual(estimate_cost_usd("gemini-4-argon", over_u2)["total_cost_usd"], 3.20, places=4)
+            self.assertAlmostEqual(estimate_cost_usd("gemini-4-carbon", over_u2)["total_cost_usd"], 3.20, places=4)
 
             # 3. AST inline Python check blocks obfuscated mutations and allows benign inline prints
             for bad_inline in (
@@ -1994,7 +1994,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             old_env = dict(os.environ)
             try:
                 os.environ.update(mcp_env)
-                os.environ["CC_AGY_DEFAULT_DELEGATE_MODEL"] = "gemini-4-argon"
+                os.environ["CC_AGY_DEFAULT_DELEGATE_MODEL"] = "gemini-4-carbon"
                 os.environ["GOOGLE_CLOUD_PROJECT"] = "test-proj-argon"
                 jm = JobManager(workspace_root=repo, store=store, worker_backend=edit_pkg_worker)
                 res = jm.delegate_start(
@@ -2003,7 +2003,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                     acceptance=["python3 -m unittest test_pkg.py"],
                 )
                 self.assertEqual(res["status"], "ok")
-                self.assertEqual(res["model"], "gemini-4-argon")
+                self.assertEqual(res["model"], "gemini-4-carbon")
                 self.assertEqual(res["files_changed"], ["pkg.py"])
                 self.assertTrue(res["acceptance_passed"])
                 jm.delegate_apply(res["job_id"])
@@ -2178,7 +2178,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             jm = JobManager(workspace_root=repo, store=store, worker_backend=worker_with_tls_and_many_reqs)
             digest = jm.delegate_start(
                 "update pkg",
-                model="gemini-4-argon",
+                model="gemini-4-carbon",
                 project="p",
                 allowed_paths=["pkg.py"],
                 wait=True,
@@ -2275,7 +2275,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 stores = list(pool.map(lambda _: ReceiptStore(race_dir, workspace_root=repo), range(8)))
             keys = {s._active_hmac_key() for s in stores}
             self.assertEqual(len(keys), 1)
-            rcpt_a = stores[0].write_receipt("job-race-1", {"kind": "delegate", "status": "ok", "model": "gemini-4-argon"})
+            rcpt_a = stores[0].write_receipt("job-race-1", {"kind": "delegate", "status": "ok", "model": "gemini-4-carbon"})
             self.assertTrue(stores[-1].verify_receipt_signature(rcpt_a))
 
     def test_disable_web_tools_and_timeout_containment_preservation(self) -> None:
@@ -2376,7 +2376,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                 raise exc
 
             jm = JobManager(workspace_root=repo, store=store, worker_backend=timeout_worker)
-            digest = jm.delegate_start("test timeout", model="gemini-4-argon", project="p", wait=True)
+            digest = jm.delegate_start("test timeout", model="gemini-4-carbon", project="p", wait=True)
             self.assertEqual(digest["status"], "timeout")
             rcpt = store.read_receipt(digest["job_id"])
             self.assertEqual(rcpt["containment"], "straitjacket")
@@ -2450,7 +2450,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                             "model": "gemini-3.8-flash",
                             "project": "test-proj",
                             "preload_files": True,
-                            "qa_review_model": "gemini-4-argon",
+                            "qa_review_model": "gemini-4-carbon",
                             "auto_apply": True,
                         },
                     },
@@ -2519,7 +2519,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
                             "prompt": "Finish greet in app.py",
                             "model": "gemini-3.8-flash",
                             "project": "test-proj",
-                            "qa_review_model": "gemini-4-argon",
+                            "qa_review_model": "gemini-4-carbon",
                             "auto_apply": True,
                         },
                     },
@@ -2564,7 +2564,7 @@ class TestGauntletRound1Regressions(unittest.TestCase):
             resp = srv.handle_Message({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
                 "name": "delegate_to_gemini",
                 "arguments": {"prompt": "Add big.py", "model": "gemini-3.8-flash", "project": "test-proj",
-                              "qa_review_model": "gemini-4-argon", "auto_apply": False}}})
+                              "qa_review_model": "gemini-4-carbon", "auto_apply": False}}})
             payload = json.loads(resp["result"]["content"][0]["text"])
             self.assertEqual(len(ask_calls), 1)
             self.assertEqual(ask_calls[0].get("thinking_level"), "HIGH")
@@ -2823,11 +2823,11 @@ class TestEscalationRevertAndTrueCost(unittest.TestCase):
         from server.repo_map import build_repo_map
         from server.verify import is_behavioral_check
 
-        self.assertEqual(resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False), "LOW")
-        self.assertEqual(resolve_thinking_level(None, model="gemini-3.8-flash", read_only=True), "HIGH")
-        self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=False), "LOW")
-        self.assertEqual(resolve_thinking_level(None, model="gemini-4-argon", read_only=True), "HIGH")
-        self.assertEqual(resolve_batch_settings({"model": "mechanical"}).model, "gemini-flash-next")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False), "LOW")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=True), "HIGH")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-carbon", read_only=False), "LOW")
+        self.assertEqual(resolve_thinking_level(None, model="gemini-4-carbon", read_only=True), "HIGH")
+        self.assertEqual(resolve_batch_settings({"model": "mechanical"}).model, "gemini-4-hydrogen")
         self.assertEqual(resolve_batch_settings({"read_budget": 6}).writer, "agent")
         self.assertFalse(is_behavioral_check("python3 -m py_compile pkg/a.py"))
         self.assertTrue(is_behavioral_check("python3 -m pytest -q tests/test_a.py"))

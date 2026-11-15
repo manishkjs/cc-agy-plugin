@@ -214,7 +214,7 @@ def test_flash_to_argon_escalation_on_followup_delegate_start_and_continue(tmp_p
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
     subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
 
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
 
     seen_models: list[str] = []
@@ -231,30 +231,30 @@ def test_flash_to_argon_escalation_on_followup_delegate_start_and_continue(tmp_p
     store = ReceiptStore(tmp_path / "data_esc", workspace_root=repo)
     jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
     try:
-        # Job 1 runs on gemini-3.8-flash and auto-applies when its initial acceptance command passes.
+        # Job 1 runs on gemini-4-hydrogen and auto-applies when its initial acceptance command passes.
         d1 = jm.delegate_start(
             "Initial implementation",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["grep -q def app.py"],
             wait=True,
         )
-        assert d1["model"] == "gemini-3.8-flash"
+        assert d1["model"] == "gemini-4-hydrogen"
         assert d1["applied"] is True
         assert "escalated_from_model" not in d1
 
         # Job 2 is a follow-up delegate_start after post-apply review found an edge case:
-        # it must automatically escalate from gemini-3.8-flash to gemini-4-argon.
+        # it must automatically escalate from gemini-4-hydrogen to gemini-4-carbon.
         d2 = jm.delegate_start(
             "Fix edge case found during post-apply review",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["grep -q def app.py"],
             wait=True,
         )
-        assert d2["model"] == "gemini-4-argon"
-        assert d2["escalated_from_model"] == "gemini-3.8-flash"
-        assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
+        assert d2["model"] == "gemini-4-carbon"
+        assert d2["escalated_from_model"] == "gemini-4-hydrogen"
+        assert seen_models == ["gemini-4-hydrogen", "gemini-4-carbon"]
     finally:
         jm.shutdown()
 
@@ -270,7 +270,7 @@ def test_bounded_lead_delegate_start_auto_escalates_in_place_on_turn1_failure(
     subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
 
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
 
     seen_models: list[str] = []
@@ -279,7 +279,7 @@ def test_bounded_lead_delegate_start_auto_escalates_in_place_on_turn1_failure(
         model = str(req["model"])
         seen_models.append(model)
         wt = Path(str(req["workspace_dir"]))
-        if model == "gemini-3.8-flash":
+        if model == "gemini-4-hydrogen":
             # Turn 1 on Flash hits the 100-tool-call checkpoint even though the initial acceptance command passes
             (wt / "app.py").write_text("def partial():\n    return 1\n", encoding="utf-8")
             return {
@@ -299,20 +299,20 @@ def test_bounded_lead_delegate_start_auto_escalates_in_place_on_turn1_failure(
     try:
         d1 = jm.delegate_start(
             "Implement feature with Turn 1 failure on flash",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["grep -q def app.py"],
             wait=True,
         )
-        assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
-        assert d1["model"] == "gemini-4-argon"
-        assert d1["escalated_from_model"] == "gemini-3.8-flash"
+        assert seen_models == ["gemini-4-hydrogen", "gemini-4-carbon"]
+        assert d1["model"] == "gemini-4-carbon"
+        assert d1["escalated_from_model"] == "gemini-4-hydrogen"
         assert d1["acceptance_passed"] is True
         assert d1["applied"] is True
         raw_rec = store.read_receipt(d1["job_id"])
         assert len(raw_rec.get("prompts") or []) == 2
-        assert raw_rec["model"] == "gemini-4-argon"
-        assert raw_rec["escalated_from_model"] == "gemini-3.8-flash"
+        assert raw_rec["model"] == "gemini-4-carbon"
+        assert raw_rec["escalated_from_model"] == "gemini-4-hydrogen"
     finally:
         jm.shutdown()
 
@@ -347,7 +347,7 @@ def test_prepare_worktree_commits_tracked_gitignored_files_and_avoids_false_scop
     try:
         d = jm.delegate_start(
             "Update x in src/mypkg/__init__.py",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             allowed_paths=["src/mypkg/__init__.py"],
             wait=True,
@@ -461,7 +461,7 @@ def test_delegate_start_inlines_spec_files_context_files_lead_reads_and_checklis
     try:
         d = jm.delegate_start(
             "Implement task in target.py.",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             spec_files=["PROMPT.md"],
             context_files=["target.py"],
@@ -561,7 +561,7 @@ def test_worker_acceptance_reuse_and_orphaned_job_scope_check(tmp_path: Path) ->
     try:
         d = jm.delegate_start(
             "Update greet in app.py",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             acceptance=["pytest -q"],
             wait=True,
@@ -626,7 +626,7 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
     subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
     subprocess.run(["git", "commit", "-qm", "add app"], cwd=str(repo), check=True)
 
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     data_dir = tmp_path / "data_session_esc"
     store = ReceiptStore(data_dir, workspace_root=repo)
@@ -637,7 +637,7 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
             "job_id": "job-old-session",
             "kind": "delegate",
             "status": "ok",
-            "model": "gemini-3.8-flash",
+            "model": "gemini-4-hydrogen",
             "started_at_epoch": time.time() - 3600,
         },
         workspace_root=str(repo),
@@ -681,12 +681,12 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
         # Turn 1 of new session must NOT escalate despite job-old-session on disk, and uses 55 max_tool_calls for Flash
         d1 = jm.delegate_start(
             "Phase 1: update compute",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             wait=True,
             auto_apply=False,
         )
-        assert d1["model"] == "gemini-3.8-flash"
+        assert d1["model"] == "gemini-4-hydrogen"
         assert "escalated_from_model" not in d1
         assert seen_reqs[0]["max_tool_calls"] == 55
 
@@ -698,10 +698,10 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
             wait=True,
             auto_apply=False,
         )
-        assert d2["model"] == "gemini-3.8-flash"
+        assert d2["model"] == "gemini-4-hydrogen"
         assert d2["status"] == "checkpoint"
 
-        # Turn 3 via delegate_continue after Turn 2 hit "checkpoint" escalates to gemini-4-argon,
+        # Turn 3 via delegate_continue after Turn 2 hit "checkpoint" escalates to gemini-4-carbon,
         # upgrades max_tool_calls to 100, and includes worktree diffstat in the continuation prompt!
         d3 = jm.delegate_continue(
             d1["job_id"],
@@ -710,16 +710,16 @@ def test_stale_prior_session_receipt_does_not_escalate_turn1_and_multimodel_cost
             wait=True,
             auto_apply=False,
         )
-        assert d3["model"] == "gemini-4-argon"
-        assert d3["escalated_from_model"] == "gemini-3.8-flash"
+        assert d3["model"] == "gemini-4-carbon"
+        assert d3["escalated_from_model"] == "gemini-4-hydrogen"
         assert seen_reqs[2]["max_tool_calls"] == 100
-        assert "Worktree diffstat from prior gemini-3.8-flash attempt:" in str(seen_reqs[2]["prompts"][0])
+        assert "Worktree diffstat from prior gemini-4-hydrogen attempt:" in str(seen_reqs[2]["prompts"][0])
 
         # Verify multi-model pricing:
-        # Turns 1 & 2 ran on gemini-3.8-flash (200k input @ $0.50/1M = $0.10, 20k output @ $3.00/1M = $0.06 -> $0.16)
-        # Turn 3 ran on gemini-4-argon (100k input @ $2.00/1M = $0.20, 10k output @ $12.00/1M = $0.12 -> $0.32)
-        # Combined cost must be $0.48 (48.0 cents), NOT $0.96 (all-Argon rate)!
-        assert abs(float(d3["cost"]["total_cost_usd"]) - 0.48) < 1e-6
+        # Turns 1 & 2 ran on gemini-4-hydrogen (200k input @ $1.50/1M = $0.30, 20k output @ $7.50/1M = $0.15 -> $0.45)
+        # Turn 3 ran on gemini-4-carbon (100k input @ $2.00/1M = $0.20, 10k output @ $12.00/1M = $0.12 -> $0.32)
+        # Combined cost must be $0.77, NOT $0.96 (all-Carbon rate)!
+        assert abs(float(d3["cost"]["total_cost_usd"]) - 0.77) < 1e-6
     finally:
         jm.shutdown()
 
@@ -751,7 +751,7 @@ def test_wait_slice_clamping_and_auto_apply_on_delegate_result(tmp_path: Path, m
     try:
         d_slice = jm.delegate_start(
             "Update x to 42",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_app.py"],
             wait=True,
@@ -840,7 +840,7 @@ def test_bash_workspace_reads_counted_and_clean_apply_skips_review_bonus_and_use
         # AND mod.py in Pre-Read Context Files (captured from the Bash `sed` read above!)
         d = jm.delegate_start(
             "Update Blueprint.register in mod.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=[f"{shlex.quote(sys.executable)} -m pytest -q test_mod.py"],
             wait=True,
@@ -888,7 +888,7 @@ def test_wait_slice_preserves_in_place_flash_to_argon_escalation_and_skip_worktr
 
     # 2. B1: Wait-sliced Flash -> Argon escalation
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
     monkeypatch.setenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", "0.08")
 
@@ -900,7 +900,7 @@ def test_wait_slice_preserves_in_place_flash_to_argon_escalation_and_skip_worktr
         seen_models.append(m)
         seen_timeouts.append(float(req.get("timeout_seconds") or 0.0))
         wt = Path(str(req["workspace_dir"]))
-        if m == "gemini-3.8-flash":
+        if m == "gemini-4-hydrogen":
             time.sleep(0.25)
             (wt / "app.py").write_text("def partial():\n    return 1\n", encoding="utf-8")
             return {
@@ -919,7 +919,7 @@ def test_wait_slice_preserves_in_place_flash_to_argon_escalation_and_skip_worktr
     try:
         d1 = jm.delegate_start(
             "Implement fixed in app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             allowed_paths=["app.py"],
             acceptance=["grep -q fixed app.py"],
@@ -929,11 +929,11 @@ def test_wait_slice_preserves_in_place_flash_to_argon_escalation_and_skip_worktr
         assert d1["status"] == "running"
         d2 = jm.delegate_result(d1["job_id"], wait=True, timeout=5.0)
         assert d2["status"] == "ok"
-        assert d2["model"] == "gemini-4-argon"
+        assert d2["model"] == "gemini-4-carbon"
         assert d2["applied"] is True
         assert d2["files_changed"] == ["app.py"]
         assert d2.get("scope_violations", []) == []
-        assert seen_models == ["gemini-3.8-flash", "gemini-4-argon"]
+        assert seen_models == ["gemini-4-hydrogen", "gemini-4-carbon"]
         assert seen_timeouts == [900.0, 900.0]
         assert "LOCAL_SECRET" not in str(d2.get("diff_preview") or "")
 
@@ -941,7 +941,7 @@ def test_wait_slice_preserves_in_place_flash_to_argon_escalation_and_skip_worktr
         monkeypatch.setenv("CC_AGY_DEFAULT_ACCEPTANCE", "0")
         d3 = jm.delegate_start(
             "Touch notes.txt",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             wait=True,
         )
@@ -1238,7 +1238,7 @@ def test_round7_post_tool_use_autostop_and_slim_applied_digest(tmp_path: Path, m
     try:
         slim_digest = jm.delegate_start(
             "Double x in calc",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -1325,7 +1325,7 @@ def test_round7_post_tool_use_autostop_and_slim_applied_digest(tmp_path: Path, m
         jm.worker_backend = caveat_worker
         caveat_digest = jm.delegate_start(
             "Double x in calc and clarify negatives",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -1441,7 +1441,7 @@ def test_round7_post_tool_use_autostop_and_slim_applied_digest(tmp_path: Path, m
         (repo / "app.py").write_text("def calc(x: int) -> int:\n    return x\n", encoding="utf-8")
         verbose_digest = jm.delegate_start(
             "Double x again",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -1511,7 +1511,7 @@ def test_round7_verified_timeout_promotion_and_dedup_prompt_and_compact_core_sch
 
     data_dir = tmp_path / "data_timeout_promo"
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_INLINE_CANDIDATE_FILES", "1")
 
     record_user_prompt(
@@ -1542,14 +1542,14 @@ def test_round7_verified_timeout_promotion_and_dedup_prompt_and_compact_core_sch
     try:
         d_ok = jm.delegate_start(
             "Implement compute_total in billing.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             context_files=[".docs/instructions.md", "billing.py"],
             acceptance=["python3 -m pytest -q test_billing.py"],
             wait=True,
         )
         # Promoted from timeout -> ok on Flash without escalating to Argon!
-        assert seen_models == ["gemini-3.8-flash"]
+        assert seen_models == ["gemini-4-hydrogen"]
         assert d_ok["status"] == "ok"
         assert d_ok["applied"] is True
         assert d_ok.get("recovered_from_timeout") is True
@@ -1590,7 +1590,7 @@ def test_round7_verified_timeout_promotion_and_dedup_prompt_and_compact_core_sch
         jm.worker_backend = half_finished_timeout_worker
         d_autodisc = jm.delegate_start(
             "Implement compute_total without explicit acceptance",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             wait=True,
         )
@@ -1608,7 +1608,7 @@ def test_round7_verified_timeout_promotion_and_dedup_prompt_and_compact_core_sch
         jm.worker_backend = timed_out_failing_worker
         d_fail = jm.delegate_start(
             "Break compute_total",
-            model="gemini-4-argon",
+            model="gemini-4-carbon",
             project="p",
             acceptance=["python3 -c 'import sys; sys.exit(1)'"],
             wait=True,
@@ -1637,7 +1637,7 @@ def test_balanced_inplace_escalation_uses_40_flash_calls_and_passes_flash_summar
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.delenv("CC_AGY_FLASH_MAX_TOOL_CALLS", raising=False)
     monkeypatch.delenv("CC_AGY_MAX_TOOL_CALLS", raising=False)
 
@@ -1666,23 +1666,23 @@ def test_balanced_inplace_escalation_uses_40_flash_calls_and_passes_flash_summar
     try:
         d = jm.delegate_start(
             "Implement add(a, b) in calc.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_calc.py"],
             wait=True,
             auto_apply=True,
         )
         assert len(seen_reqs) == 2
-        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
+        assert seen_reqs[0]["model"] == "gemini-4-hydrogen"
         assert seen_reqs[0]["max_tool_calls"] == 55
-        assert seen_reqs[1]["model"] == "gemini-4-argon"
+        assert seen_reqs[1]["model"] == "gemini-4-carbon"
         assert seen_reqs[1]["max_tool_calls"] == 60
         argon_prompt = "\n".join(str(p) for p in (seen_reqs[1].get("prompts") or []))
         assert "Prior Flash diagnostic summary:" in argon_prompt
         assert "sign edge case still failing" in argon_prompt
         assert "rather than weakening test inputs or altering pre-existing test expectations" in argon_prompt
-        assert d["model"] == "gemini-4-argon"
-        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["model"] == "gemini-4-carbon"
+        assert d["escalated_from_model"] == "gemini-4-hydrogen"
         assert d["acceptance_passed"] is True
         assert d.get("applied") is True
     finally:
@@ -1704,7 +1704,7 @@ def test_balanced_inplace_escalation_skips_compiler_cli_config_error_when_test_r
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_models: list[str] = []
 
@@ -1722,7 +1722,7 @@ def test_balanced_inplace_escalation_skips_compiler_cli_config_error_when_test_r
     try:
         d = jm.delegate_start(
             "Set VALUE = 42 in mod.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=[
                 "python3 -m pytest -q test_mod.py",
@@ -1731,8 +1731,8 @@ def test_balanced_inplace_escalation_skips_compiler_cli_config_error_when_test_r
             wait=True,
             auto_apply=False,
         )
-        assert seen_models == ["gemini-3.8-flash"]
-        assert d["model"] == "gemini-3.8-flash"
+        assert seen_models == ["gemini-4-hydrogen"]
+        assert d["model"] == "gemini-4-hydrogen"
         assert "escalated_from_model" not in d
     finally:
         jm.shutdown()
@@ -1755,7 +1755,7 @@ def test_balanced_inplace_escalation_respects_session_deadline_budget(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     # 200s deadline - 120s default reserve = 80s remaining worker budget (< 120s threshold)
     monkeypatch.setenv("CC_AGY_SESSION_DEADLINE_SECONDS", "200")
 
@@ -1775,14 +1775,14 @@ def test_balanced_inplace_escalation_respects_session_deadline_budget(
     try:
         d = jm.delegate_start(
             "Implement mul(a, b) in calc.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_calc.py"],
             wait=True,
             auto_apply=False,
         )
-        assert seen_models == ["gemini-3.8-flash"]
-        assert d["model"] == "gemini-3.8-flash"
+        assert seen_models == ["gemini-4-hydrogen"]
+        assert d["model"] == "gemini-4-hydrogen"
         assert "escalated_from_model" not in d
     finally:
         jm.shutdown()
@@ -1797,7 +1797,7 @@ def test_turn3_delegate_continue_honors_cumulative_max_tool_calls_after_75_to_60
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_FLASH_MAX_TOOL_CALLS", "75")
     monkeypatch.delenv("CC_AGY_MAX_TOOL_CALLS", raising=False)
 
@@ -1844,7 +1844,7 @@ def test_turn3_delegate_continue_honors_cumulative_max_tool_calls_after_75_to_60
         try:
             d12 = jm.delegate_start(
                 "Implement sub(a, b) in calc.py",
-                model="gemini-3.8-flash",
+                model="gemini-4-hydrogen",
                 project="p",
                 acceptance=["python3 -m pytest -q test_calc.py"],
                 wait=True,
@@ -1885,7 +1885,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_reqs: list[dict[str, object]] = []
 
@@ -1906,7 +1906,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
     try:
         d_exp = jm1.delegate_start(
             "Set VALUE = 7",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             max_tool_calls=75,
             acceptance=["python3 -m pytest -q test_mod.py"],
@@ -1934,7 +1934,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
     try:
         d_leg = jm2.delegate_start(
             "Set VALUE = 7 legacy",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             max_tool_calls=40,
             acceptance=["python3 -m pytest -q test_mod.py"],
@@ -1967,7 +1967,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
             auto_apply=False,
         )
         assert len(leg_reqs) == 1
-        assert leg_reqs[0]["model"] == "gemini-4-argon"
+        assert leg_reqs[0]["model"] == "gemini-4-carbon"
         assert leg_reqs[0]["max_tool_calls"] == 60
         assert d_leg2["budget"]["max_tool_calls"] == 100
         assert d_leg2["acceptance_passed"] is True
@@ -1993,7 +1993,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
     try:
         d_cli = jm3.delegate_start(
             "Set VALUE = 7 cleanly",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=[
                 "python3 -m pytest -q test_mod.py",
@@ -2002,7 +2002,7 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
             wait=True,
             auto_apply=False,
         )
-        assert cli_models == ["gemini-3.8-flash"]
+        assert cli_models == ["gemini-4-hydrogen"]
         assert d_cli["acceptance_passed"] is False
 
         d_cli2 = jm3.delegate_continue(
@@ -2013,8 +2013,8 @@ def test_explicit_max_tool_calls_75_honored_while_legacy_40_upgrades_and_cli_cfg
             wait=True,
             auto_apply=False,
         )
-        assert cli_models == ["gemini-3.8-flash", "gemini-3.8-flash"]
-        assert d_cli2["model"] == "gemini-3.8-flash"
+        assert cli_models == ["gemini-4-hydrogen", "gemini-4-hydrogen"]
+        assert d_cli2["model"] == "gemini-4-hydrogen"
         assert "escalated_from_model" not in d_cli2
         assert d_cli2["acceptance_passed"] is True
     finally:
@@ -2043,7 +2043,7 @@ def test_b7_1_flash_max_total_tokens_exceeded_escalates_cleanly_while_explicit_t
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_reqs: list[dict[str, object]] = []
 
@@ -2078,19 +2078,19 @@ def test_b7_1_flash_max_total_tokens_exceeded_escalates_cleanly_while_explicit_t
     try:
         d = jm1.delegate_start(
             "Make inc(x) return x + 1",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_calc.py"],
             wait=True,
             auto_apply=False,
         )
         assert len(seen_reqs) == 2
-        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
-        assert seen_reqs[1]["model"] == "gemini-4-argon"
+        assert seen_reqs[0]["model"] == "gemini-4-hydrogen"
+        assert seen_reqs[1]["model"] == "gemini-4-carbon"
         assert seen_reqs[1]["max_tool_calls"] == 65
         assert seen_reqs[1]["max_total_tokens"] == 2_500_000
-        assert d["model"] == "gemini-4-argon"
-        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["model"] == "gemini-4-carbon"
+        assert d["escalated_from_model"] == "gemini-4-hydrogen"
         assert d["acceptance_passed"] is True
         raw_rec = store1.read_receipt(d["job_id"])
         assert raw_rec is not None
@@ -2116,7 +2116,7 @@ def test_b7_1_flash_max_total_tokens_exceeded_escalates_cleanly_while_explicit_t
     try:
         d_exp = jm2.delegate_start(
             "Make inc(x) return x + 1 explicit",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             max_total_tokens=1000,
             acceptance=["python3 -m pytest -q test_calc.py"],
@@ -2138,7 +2138,7 @@ def test_r7_1_balanced_pre_apply_qa_pass_and_needs_fixes_escalation_with_blended
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
 
     # 1. VERDICT: PASS
@@ -2181,15 +2181,15 @@ def test_r7_1_balanced_pre_apply_qa_pass_and_needs_fixes_escalation_with_blended
     try:
         d1 = jm1.delegate_start(
             "Implement greet(name) returning 'Hello, <name>!'",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_fmt.py"],
             wait=True,
             auto_apply=True,
         )
         assert len(qa_calls_1) == 1
-        assert qa_calls_1[0]["model"] == "gemini-4-argon"
-        assert d1["model"] == "gemini-3.8-flash"
+        assert qa_calls_1[0]["model"] == "gemini-4-carbon"
+        assert d1["model"] == "gemini-4-hydrogen"
         assert d1["applied"] is True
         assert d1["qa_review"]["verdict"] == "PASS"
         assert d1["qa_review"]["resumed"] is False
@@ -2255,7 +2255,7 @@ def test_r7_1_balanced_pre_apply_qa_pass_and_needs_fixes_escalation_with_blended
     try:
         d2 = jm2.delegate_start(
             "Implement greet(name) returning exact string 'Hello, <name>!' with trailing exclamation mark.",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_fmt.py"],
             wait=True,
@@ -2263,10 +2263,10 @@ def test_r7_1_balanced_pre_apply_qa_pass_and_needs_fixes_escalation_with_blended
         )
         assert len(qa_calls_2) == 1
         assert len(worker_reqs_2) == 2
-        assert worker_reqs_2[0]["model"] == "gemini-3.8-flash"
-        assert worker_reqs_2[1]["model"] == "gemini-4-argon"
-        assert d2["model"] == "gemini-4-argon"
-        assert d2["escalated_from_model"] == "gemini-3.8-flash"
+        assert worker_reqs_2[0]["model"] == "gemini-4-hydrogen"
+        assert worker_reqs_2[1]["model"] == "gemini-4-carbon"
+        assert d2["model"] == "gemini-4-carbon"
+        assert d2["escalated_from_model"] == "gemini-4-hydrogen"
         assert d2["applied"] is True
         assert (repo2 / "fmt.py").read_text(encoding="utf-8").strip().endswith("return f'Hello, {name}!'")
         raw2 = store2.read_receipt(d2["job_id"])
@@ -2330,15 +2330,15 @@ def test_carbon_g_high_pricing_thinking_level_and_escalation_upgrade_from_flash_
     from server.regions import estimate_cost_usd
 
     monkeypatch.setenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "LOW")
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
-    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-low", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-high", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-medium", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="bon-experiment-arm-226", read_only=False) == "LOW"
 
     monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-low", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-high", read_only=False) == "HIGH"
     assert resolve_thinking_level(None, model="gemini-4-carbon-medium", read_only=False) == "MEDIUM"
@@ -2386,19 +2386,19 @@ def test_carbon_g_high_pricing_thinking_level_and_escalation_upgrade_from_flash_
     try:
         d = jm.delegate_start(
             "Set VAL = 9 in app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
             auto_apply=True,
         )
         assert len(seen_reqs) == 2
-        assert seen_reqs[0]["model"] == "gemini-3.8-flash"
+        assert seen_reqs[0]["model"] == "gemini-4-hydrogen"
         assert seen_reqs[0]["thinking_level"] == "LOW"
         assert seen_reqs[1]["model"] == "gemini-4-carbon-high"
         assert seen_reqs[1]["thinking_level"] == "HIGH"
         assert d["model"] == "gemini-4-carbon-high"
-        assert d["escalated_from_model"] == "gemini-3.8-flash"
+        assert d["escalated_from_model"] == "gemini-4-hydrogen"
         assert d["applied"] is True
     finally:
         jm.shutdown()
@@ -2439,7 +2439,7 @@ def test_carbon_g_high_pricing_thinking_level_and_escalation_upgrade_from_flash_
     try:
         d_low = jm_low.delegate_start(
             "Set VAL = 9 in app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -2473,7 +2473,7 @@ def test_r7_r2_explicit_max_tool_calls_still_escalates_on_default_token_cap(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen: list[dict[str, object]] = []
 
@@ -2500,7 +2500,7 @@ def test_r7_r2_explicit_max_tool_calls_still_escalates_on_default_token_cap(
     try:
         d = jm.delegate_start(
             "Make inc(x) return x + 1",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             max_tool_calls=60,
             acceptance=["python3 -m pytest -q test_calc.py"],
@@ -2508,7 +2508,7 @@ def test_r7_r2_explicit_max_tool_calls_still_escalates_on_default_token_cap(
             auto_apply=True,
         )
         assert len(seen) == 2
-        assert seen[1]["model"] == "gemini-4-argon"
+        assert seen[1]["model"] == "gemini-4-carbon"
         assert seen[1]["max_tool_calls"] == 25  # 60 explicit cap - 35 used
         assert seen[1]["max_total_tokens"] == 2_500_000
         assert d["applied"] is True
@@ -2532,7 +2532,7 @@ def test_r7_r2_qa_review_wall_time_counted_in_wait_slice_and_marks_resolved(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
     monkeypatch.setenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", "2.0")
     # This test pins the first-round QA timing; the post-escalation audit has its own test below.
@@ -2559,7 +2559,7 @@ def test_r7_r2_qa_review_wall_time_counted_in_wait_slice_and_marks_resolved(
         t0 = time.monotonic()
         d0 = jm.delegate_start(
             "Make f() return 2",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -2599,7 +2599,7 @@ def test_post_escalation_qa_audits_escalated_diff_once_and_fixes_on_same_model(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
     monkeypatch.setenv("CC_AGY_POST_ESCALATION_QA", "1")
     monkeypatch.delenv("CC_AGY_MAX_WAIT_SLICE_SECONDS", raising=False)
@@ -2622,7 +2622,7 @@ def test_post_escalation_qa_audits_escalated_diff_once_and_fixes_on_same_model(
     try:
         fin = jm.delegate_start(
             "Make f() return 3",
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -2633,8 +2633,8 @@ def test_post_escalation_qa_audits_escalated_diff_once_and_fixes_on_same_model(
                 break
             fin = jm.delegate_result(fin["job_id"], wait=True, timeout=10.0)
         assert fin["status"] == "ok"
-        assert seen == ["gemini-flash-next", "gemini-4-argon", "gemini-4-argon"]
-        assert qa_calls == ["gemini-4-argon", "gemini-4-argon"]
+        assert seen == ["gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-carbon"]
+        assert qa_calls == ["gemini-4-carbon", "gemini-4-carbon"]
         rec = store.read_receipt(fin["job_id"])
         assert rec["qa_review"]["post_escalation"] is True
     finally:
@@ -2688,7 +2688,7 @@ def test_autonomous_solo_flash_checkpoint_retry_and_self_qa(tmp_path: Path, monk
     try:
         fin = jm.delegate_start(
             "Make f() return 3",
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -2696,8 +2696,8 @@ def test_autonomous_solo_flash_checkpoint_retry_and_self_qa(tmp_path: Path, monk
         )
         assert fin["status"] == "ok"
         assert fin["applied"] is True
-        assert seen == ["gemini-flash-next", "gemini-flash-next", "gemini-flash-next"]
-        assert qa_calls == ["gemini-flash-next"]
+        assert seen == ["gemini-4-hydrogen", "gemini-4-hydrogen", "gemini-4-hydrogen"]
+        assert qa_calls == ["gemini-4-hydrogen"]
         assert "return 3" in (repo / "app.py").read_text(encoding="utf-8")
     finally:
         jm.shutdown()
@@ -2741,7 +2741,7 @@ def test_autonomous_solo_cross_model_review_runs_even_without_warnings(
     try:
         fin = jm.delegate_start(
             "Make f() return 3",
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_app.py"],
             wait=True,
@@ -2813,7 +2813,7 @@ def test_r7_r2_expectation_warnings_count_functions_ignore_pure_adds_exempt_spec
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "0")
 
     models_explicit: list[str] = []
@@ -2852,13 +2852,13 @@ def test_r7_r2_expectation_warnings_count_functions_ignore_pure_adds_exempt_spec
     try:
         d_exp = jm_exp.delegate_start(
             "Change tag(x) in fmt.py from v1: to v2: and update the existing tests to expect v2:.",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q tests/test_fmt.py"],
             wait=True,
             auto_apply=True,
         )
-        assert models_explicit == ["gemini-3.8-flash"]
+        assert models_explicit == ["gemini-4-hydrogen"]
         assert d_exp["applied"] is True
         assert d_exp.get("auto_apply_skipped") is None
     finally:
@@ -2888,13 +2888,13 @@ def test_r7_r2_expectation_warnings_count_functions_ignore_pure_adds_exempt_spec
     try:
         d_imp = jm_imp.delegate_start(
             "Change tag(x) in fmt.py from v1: to v2: so the suite passes. Do NOT modify the existing tests.",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q tests/test_fmt.py"],
             wait=True,
             auto_apply=True,
         )
-        assert models_imp == ["gemini-3.8-flash", "gemini-4-argon"]
+        assert models_imp == ["gemini-4-hydrogen", "gemini-4-carbon"]
         assert d_imp.get("applied") is not True
         assert "altered pre-existing test expectations across >=2 test functions" in str(
             d_imp.get("auto_apply_skipped") or ""
@@ -2918,7 +2918,7 @@ def test_v9_qa_audited_checkpoint_promotion_and_needs_fixes_escalation(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "true")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_BALANCED_QA_REVIEW", "1")
 
     # Case A: QA PASS on verified Flash checkpoint -> no Turn-2 worker escalation
@@ -2966,7 +2966,7 @@ def test_v9_qa_audited_checkpoint_promotion_and_needs_fixes_escalation(
     try:
         da = jm_a.delegate_start(
             "Implement mul(a, b) in calc.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_calc.py"],
             wait=True,
@@ -2978,7 +2978,7 @@ def test_v9_qa_audited_checkpoint_promotion_and_needs_fixes_escalation(
         assert "Summary: Original User Specification Takes Precedence" in str(qa_a_reqs[0]["prompt"])
         assert qa_a_reqs[0]["thinking_level"] == "LOW"
         assert da["status"] == "ok"
-        assert da["model"] == "gemini-3.8-flash"
+        assert da["model"] == "gemini-4-hydrogen"
         assert da["applied"] is True
         raw_a = store_a.read_receipt(da["job_id"])
         assert raw_a is not None and raw_a.get("recovered_from_checkpoint") is True
@@ -3026,17 +3026,17 @@ def test_v9_qa_audited_checkpoint_promotion_and_needs_fixes_escalation(
     try:
         db = jm_b.delegate_start(
             "Implement mul(a, b) returning a * b in calc.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_calc.py"],
             wait=True,
             auto_apply=True,
         )
         assert len(worker_b_reqs) == 2
-        assert worker_b_reqs[0]["model"] == "gemini-3.8-flash"
-        assert worker_b_reqs[1]["model"] == "gemini-4-argon"
+        assert worker_b_reqs[0]["model"] == "gemini-4-hydrogen"
+        assert worker_b_reqs[1]["model"] == "gemini-4-carbon"
         assert worker_b_reqs[1]["max_tool_calls"] == 60
-        assert db["model"] == "gemini-4-argon"
+        assert db["model"] == "gemini-4-carbon"
         assert db["applied"] is True
     finally:
         jm_b.shutdown()
@@ -3052,18 +3052,18 @@ def test_v9_carbon_zero_thinking_budget_and_qa_retry_error_escalation(
 
     monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
     monkeypatch.setenv("CC_AGY_ESCALATION_THINKING_LEVEL", "0")
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
-    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "ZERO"
+    assert resolve_thinking_level(None, model="gemini-4-carbon", read_only=False) == "ZERO"
     monkeypatch.setenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", "LOW")
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "LOW"
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     monkeypatch.delenv("CC_AGY_ESCALATION_THINKING_LEVEL", raising=False)
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     monkeypatch.delenv("CC_AGY_FORCE_WORKER_THINKING_LEVEL", raising=False)
     assert resolve_thinking_level(None, model="gemini-4-carbon-zero", read_only=False) == "ZERO"
     assert resolve_thinking_level(None, model="my-model-v2-0", read_only=False) == "LOW"
-    assert resolve_thinking_level(None, model="gemini-4-argon", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-carbon", read_only=False) == "LOW"
 
     cost = estimate_cost_usd(
         "gemini-4-carbon-zero",
@@ -3107,7 +3107,7 @@ def test_v9_carbon_zero_thinking_budget_and_qa_retry_error_escalation(
     try:
         d = jm.delegate_start(
             "Set X = 2 in mod.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 -m pytest -q test_mod.py"],
             wait=True,

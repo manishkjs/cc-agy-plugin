@@ -7,7 +7,7 @@ compatibility: opencode
 
 # Gemini & Antigravity Delegation (`cc-agy-plugin`)
 
-Use the `agy` MCP server tools in OpenCode (exposed as `agy_<tool>`, such as `agy_delegate_start`, `agy_delegate_file_batch`, `agy_ask_gemini`, and `agy_doctor`) to run implementation and test loops on Gemini (`gemini-flash-next` with automatic step-up to `gemini-4-carbon-zero` under `balanced`, or `gemini-4-argon` under `quality`) inside an isolated git copy of the repository.
+Use the `agy` MCP server tools in OpenCode (exposed as `agy_<tool>`, such as `agy_delegate_start`, `agy_delegate_file_batch`, `agy_ask_gemini`, and `agy_doctor`) to run implementation and test loops on Gemini (`gemini-4-hydrogen` with automatic step-up to `gemini-4-carbon-zero` under `balanced`, or `gemini-4-carbon` under `quality`) inside an isolated git copy of the repository.
 
 If the `agy` MCP tools are not registered yet, ask the user to run `python3 -m server.install --host opencode` once from the plugin checkout (add `--auth gemini-enterprise` to install the standalone `agy` CLI and use an included Gemini Enterprise seat via Google sign-in).
 
@@ -26,7 +26,7 @@ In OpenCode, call each MCP tool with its server prefix (for example `agy_doctor`
 
 ## Cost and safety rules
 
-1. **Delegate early, do not read the repo twice.** Dispatch on Turn 1 or Turn 2. The plugin automatically injects a cached Repository Map and line-numbered file outlines into the Gemini worker's first turn (default worker tool-call cap: `55` on Flash in `balanced`, `100` in `economy` and on Argon).
+1. **Delegate early, do not read the repo twice.** Dispatch on Turn 1 or Turn 2. The plugin automatically injects a cached Repository Map and line-numbered file outlines into the Gemini worker's first turn (default worker tool-call cap: `55` on Hydrogen/Flash in `balanced`, `100` in `economy` and on Carbon).
 2. **State outcomes, not implementation lines.** Never paste more than 8 consecutive lines of code into `prompt` or `plan`. Pass concrete requirements in `checklist` and targeted read-only test commands in `acceptance` (such as `["pytest -q tests/test_api.py"]`).
 3. **Check `verification` before applying.**
    - `verification="acceptance_tests"` with `scope_violations=[]`: explicit behavioral tests passed in the isolated copy. Call `agy_delegate_apply(job_id=...)` directly without re-running the same tests.

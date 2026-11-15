@@ -350,9 +350,9 @@ class TestUsageAndModelMapping:
             "thoughts_token_count": 500,
             "total_token_count": 5700,
         }
-        # Verify pricing math uses exact 1000 uncached + 4000 cached + 700 total output on Flash
-        cost = estimate_cost_usd("gemini-3.8-flash", vertex)["total_cost_usd"]
-        expected = (1000 * 0.50 + 4000 * 0.05 + 700 * 3.00) / 1_000_000.0
+        # Verify pricing math uses exact 1000 uncached + 4000 cached + 700 total output on Hydrogen
+        cost = estimate_cost_usd("gemini-4-hydrogen", vertex)["total_cost_usd"]
+        expected = (1000 * 1.50 + 4000 * 0.075 + 700 * 7.50) / 1_000_000.0
         assert abs(cost - expected) < 1e-12
 
     def test_effort_mapping_and_model_fallback_catalog(self):

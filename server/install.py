@@ -2566,7 +2566,7 @@ def run_interactive_wizard(
         output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
     prof_raw = str(
-        input_fn("3. Model preset [1=balanced (Flash then Carbon), 2=economy (Flash only), 3=quality (Argon first)] (1): ")
+        input_fn("3. Model preset [1=balanced (Hydrogen then Carbon), 2=economy (Hydrogen only), 3=quality (Carbon first)] (1): ")
         or ""
     ).strip().lower()
     prof_map = {
@@ -2788,7 +2788,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Connection mode: 'gemini-enterprise' / 'agy-cli' (included seat quota via standalone `agy` CLI), 'api-key', 'vertex', 'gateway', or 'auto' (default: auto).",
     )
     parser.add_argument("--profile", choices=COST_PROFILES, default="balanced",
-                        help="economy: Flash only; balanced: Flash, escalating to Carbon Zero-Think on failure; quality: Argon first.")
+                        help="economy: Hydrogen only; balanced: Hydrogen, escalating to Carbon Zero-Think on failure; quality: Carbon first.")
     parser.add_argument("--project", default=None, help="Google Cloud project ID (required for pay-as-you-go Vertex AI).")
     parser.add_argument("--location", default=None, help="Vertex AI region (for example 'global' or 'us-central1').")
     parser.add_argument("--base-url", default=None, help="Optional AI gateway base URL (sets CC_AGY_VERTEX_BASE_URL).")

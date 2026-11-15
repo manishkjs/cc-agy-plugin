@@ -4,7 +4,7 @@
 Listens on `127.0.0.1:3456` (override with `CC_AGY_GATEWAY_PORT`, `GEMINI4_GATEWAY_PORT`, or `--port`)
 for opt-in `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` setups:
   - Implements `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`, and `GET /health`.
-  - Routes requests across `gemini-3.8-flash` (`gemini-flash-next`), `gemini-4-argon`, and `gemini-4-carbon`
+  - Routes requests across `gemini-4-hydrogen` and `gemini-4-carbon`
     (never `gemini-3.5-flash-lite` by default) or passes through to `api.anthropic.com` when `ANTHROPIC_UPSTREAM_KEY`
     is set.
   - Translates Anthropic `messages`/`tools`/`tool_use`/`tool_result` payloads to Gemini `generateContent`
@@ -67,12 +67,10 @@ GCP_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}$")
 KNOWN_GEMINI_MODELS = frozenset(
     {
         "gemini-4-carbon",
-        "gemini-4-argon",
-        "gemini-3.8-flash",
-        "gemini-flash-next",
+        "gemini-4-hydrogen",
     }
 )
-PRO_CLASS_MODELS = frozenset({"gemini-4-carbon", "gemini-4-argon"})
+PRO_CLASS_MODELS = frozenset({"gemini-4-carbon"})
 LONG_DECODE_MODELS = frozenset({"gemini-4-carbon"})
 LONG_DECODE_SEGMENT_TOKENS = 65536
 
@@ -153,9 +151,7 @@ LONG_DECODE_RE = re.compile(
 
 DEFAULT_PRICES_PER_MTOK: dict[str, tuple[float, float, float]] = {
     "gemini-4-carbon": (2.00, 0.20, 12.00),
-    "gemini-4-argon": (2.00, 0.20, 12.00),
-    "gemini-3.8-flash": (0.50, 0.05, 3.00),
-    "gemini-flash-next": (0.50, 0.05, 3.00),
+    "gemini-4-hydrogen": (1.50, 0.075, 7.50),
     "claude-opus-5-5": (4.00, 0.20, 20.00),
     "claude-sonnet-5-5": (2.00, 0.20, 10.00),
 }
@@ -163,9 +159,8 @@ FALLBACK_PRICE_PER_MTOK = (4.00, 0.40, 20.00)
 
 GATEWAY_MODEL_CATALOG: list[dict[str, Any]] = [
     {"id": "claude-gemini-4-carbon", "display_name": "Gemini 4 Carbon", "created_at": "2026-11-10T00:00:00Z", "type": "model"},
-    {"id": "claude-gemini-4-argon", "display_name": "Gemini 4 Argon", "created_at": "2026-10-13T00:00:00Z", "type": "model"},
-    {"id": "claude-gemini-3.8-flash", "display_name": "Gemini 3.8 Flash", "created_at": "2026-09-01T00:00:00Z", "type": "model"},
-    {"id": "claude-auto-gemini", "display_name": "Gemini auto router (flash / argon / carbon)", "created_at": "2026-11-01T00:00:00Z", "type": "model"},
+    {"id": "claude-gemini-4-hydrogen", "display_name": "Gemini 4 Hydrogen", "created_at": "2026-11-10T00:00:00Z", "type": "model"},
+    {"id": "claude-auto-gemini", "display_name": "Gemini auto router (hydrogen / carbon)", "created_at": "2026-11-01T00:00:00Z", "type": "model"},
     {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5 (Anthropic passthrough)", "created_at": "2026-09-15T00:00:00Z", "type": "model"},
     {"id": "claude-sonnet-5-5", "display_name": "Claude Sonnet 5.5 (Anthropic passthrough)", "created_at": "2026-09-15T00:00:00Z", "type": "model"},
 ]
@@ -293,8 +288,8 @@ def normalize_model_id(model_id: str) -> str:
     raw = strip_virtual_wrappers(model_id).strip().lower()
     if raw == "carbon":
         return "gemini-4-carbon"
-    if raw == "argon":
-        return "gemini-4-argon"
+    if raw == "hydrogen":
+        return "gemini-4-hydrogen"
     return raw
 
 
@@ -421,7 +416,7 @@ def classify_and_route(
     subagent_flag: bool = False,
     simulate_429_primary: bool = False,
 ) -> dict[str, Any]:
-    """Choose an upstream `provider/model` for a request across Flash 3.8, Argon, and Carbon."""
+    """Choose an upstream `provider/model` for a request across Hydrogen and Carbon."""
     del is_summary, has_safeguards
     session_id = str(session_id)
     unwrapped = normalize_model_id(requested_model or "")
@@ -436,24 +431,24 @@ def classify_and_route(
     digest = hashlib.sha256(last_text.encode("utf-8")).hexdigest()[:16]
     sec_target = resolve_security_target()
 
-    # 1. Haiku-class background calls route to gemini-3.8-flash (never gemini-3.5-flash-lite).
+    # 1. Haiku-class background calls route to gemini-4-hydrogen (never gemini-3.5-flash-lite).
     if "haiku" in unwrapped:
         return _decision(
-            "gemini/gemini-3.8-flash",
-            "background_haiku_flash",
-            "Haiku-class request routed to gemini-3.8-flash.",
+            "gemini/gemini-4-hydrogen",
+            "background_haiku_hydrogen",
+            "Haiku-class request routed to gemini-4-hydrogen.",
             False,
             digest,
         )
 
-    # 2. Auto router within the Gemini family (gemini-3.8-flash / gemini-4-argon / gemini-4-carbon).
+    # 2. Auto router within the Gemini family (gemini-4-hydrogen / gemini-4-carbon).
     if unwrapped in ("claude-auto-gemini", "auto-gemini"):
         if SECURITY_RE.search(last_text):
             target, tier = sec_target, "security"
         elif token_count_est > 150_000 or LONG_DECODE_RE.search(last_text):
             target, tier = "gemini/gemini-4-carbon", "long_decode_or_large_context"
         else:
-            target, tier = "gemini/gemini-3.8-flash", "workhorse_flash"
+            target, tier = "gemini/gemini-4-hydrogen", "workhorse_hydrogen"
         return _decision(target, "single_family_complexity_router", f"Auto router tier: {tier}.", False, digest)
 
     # 3. Explicit Gemini model.
@@ -483,7 +478,7 @@ def classify_and_route(
         elif token_count_est > 150_000 or LONG_DECODE_RE.search(last_text):
             target, rule = "gemini/gemini-4-carbon", "subagent_deep_pro"
         else:
-            target, rule = "gemini/gemini-3.8-flash", "subagent_workhorse_flash"
+            target, rule = "gemini/gemini-4-hydrogen", "subagent_workhorse_hydrogen"
         return _decision(target, rule, "Subagent request.", False, digest)
 
     # 6. Existing session pin.
@@ -507,7 +502,7 @@ def classify_and_route(
         fallback = normalize_model_id(
             os.environ.get("CC_AGY_UNMAPPED_MODEL")
             or os.environ.get("GEMINI4_UNMAPPED_MODEL")
-            or "gemini-3.8-flash"
+            or "gemini-4-hydrogen"
         )
         target, rule = "gemini/" + resolve_gemini_model(fallback), "unmapped_model_default"
     pinned = _pin_if_absent(session_id, target, max(1, turn_count))

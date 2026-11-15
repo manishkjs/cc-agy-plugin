@@ -59,6 +59,8 @@ from server.verification_policy import (
     satisfies_timeout_promotion,
 )
 from server.regions import (
+    DEFAULT_FAST_MODEL,
+    is_fast_workhorse_model,
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_DIFF_PAGE_TOKENS,
     MAX_TOOL_RESPONSE_TOKENS,
@@ -1153,8 +1155,8 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         return self.worker_backend is None
 
     def _resolve_escalation_target_model(self, current_model: str) -> str | None:
-        """Return the escalated worker model (default `DEFAULT_ESCALATION_MODEL`, Carbon zero-thinking) when escalating from Flash, or None."""
-        if "flash" not in (current_model or "").lower():
+        """Return the escalated worker model (default `DEFAULT_ESCALATION_MODEL`, Carbon zero-thinking) when escalating from the fast tier, or None."""
+        if not is_fast_workhorse_model(current_model):
             return None
         raw_esc = os.environ.get("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "").strip()
         if raw_esc.lower() in ("0", "false", "no", "off"):
@@ -1176,7 +1178,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
     def _same_model_retry_limit(self) -> int:
         """Plugin-side retries on the same worker model before handing a failed turn back to the Lead.
 
-        Defaults to 1 in the economy profile (which has no Argon escalation) and 0 elsewhere;
+        Defaults to 1 in the economy profile (which has no Carbon escalation) and 0 elsewhere;
         `CC_AGY_SAME_MODEL_RETRIES` overrides it.
         """
         raw = os.environ.get("CC_AGY_SAME_MODEL_RETRIES", "").strip()
@@ -2476,6 +2478,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         agy_prior_conversation_usage: dict[str, Any] | None = None,
         agy_prior_conversation_turns: int | None = None,
         turn_instructions: Mapping[str, str] | None = None,
+        prewalk: bool | None = None,
     ) -> dict[str, Any]:
         token_keys = (
             "prompt_token_count",
@@ -2539,6 +2542,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         orig_branch, pre_branches = self._snapshot_branches() if in_place else (None, [])
         worker_out: dict[str, Any] = {}
         active_agy_conv_id: str | None = agy_conversation_id
+        worker_prewalk_meta: dict[str, Any] | None = None
         active_agy_conv_usage: dict[str, int] | None = (
             {k: int(agy_prior_conversation_usage.get(k) or 0) for k in token_keys}
             if isinstance(agy_prior_conversation_usage, dict)
@@ -2651,7 +2655,10 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 nm_linked=bool(worker_nm_links),
                 isolated_worktree=(not in_place),
                 turn_instructions=turn_instructions,
+                prewalk=prewalk,
             )
+            if isinstance(worker_out.get("prewalk"), dict):
+                worker_prewalk_meta = dict(worker_out["prewalk"])
             if worker_out.get("agy_conversation_id"):
                 active_agy_conv_id = str(worker_out["agy_conversation_id"])
             if isinstance(worker_out.get("agy_conversation_usage"), dict):
@@ -3295,7 +3302,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 and not existing_rec_for_intent.get("escalated_from_model")
                 and not existing_rec_for_intent.get("skip_balanced_qa")
                 and not existing_rec_for_intent.get("qa_review")
-                and "flash" in (model or "").lower()
+                and is_fast_workhorse_model(model)
                 and resolve_cost_profile() == "balanced"
                 and _qa_flag_chk is not False
                 and (self.worker_backend is None or _qa_flag_chk is True)
@@ -3441,6 +3448,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 **({"acceptance_remapped": active_acceptance_remapped} if active_acceptance_remapped else {}),
                 "external_worktree_tamper": external_tamper,
                 "preloaded_files": list(preloaded_files or []),
+                **({"prewalk": worker_prewalk_meta} if worker_prewalk_meta else {}),
                 **({"agy_conversation_id": active_agy_conv_id} if active_agy_conv_id else {}),
                 **(
                     {"agy_conversation_usage": dict(active_agy_conv_usage)}
@@ -3917,8 +3925,13 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         progress_callback: Callable[[int, int | None, str], None] | None = None,
         stop_event: threading.Event | None = None,
         _skip_balanced_qa: bool = False,
+        prewalk: bool | None = None,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
+
+        `prewalk=True` (or `CC_AGY_PREWALK=1`) opens the job on the frontier guide model
+        (`gemini-4-carbon`) and switches to the fast executor (`gemini-4-hydrogen`) on the
+        same warm `agy acp` session after the first real code edit. Meant for hard tasks.
 
         By default the worker edits an isolated standalone copy of the repo and its diff is
         applied later with delegate_apply (or automatically when auto_apply=True / CC_AGY_AUTO_APPLY_ON_PASS=1).
@@ -4385,6 +4398,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 recorded_budget={"max_tool_calls": budget_calls, "max_total_tokens": budget_tokens},
                 baseline_acceptance_probe=baseline_probe,
                 acceptance_remapped=acceptance_remapped,
+                prewalk=prewalk,
             )
             self._futures[job_id] = fut
             self._owned_job_ids.add(job_id)
@@ -4606,7 +4620,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         timeout_seconds: float | None = None,
         wait_budget: float | None = None,
     ) -> dict[str, Any]:
-        """Handle post-completion escalation (Flash -> Argon) or auto-apply for a synchronous/wait-sliced job."""
+        """Handle post-completion escalation (Hydrogen -> Carbon) or auto-apply for a synchronous/wait-sliced job."""
         allow_turn1_inplace_escalation = (
             self.worker_backend is None
             or is_strict_mode_enabled()
@@ -4686,7 +4700,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 if prior_flash_summary
                 else ""
             )
-            esc_target_name = self._resolve_escalation_target_model(str(receipt.get("model") or "")) or "Gemini 4 Argon"
+            esc_target_name = self._resolve_escalation_target_model(str(receipt.get("model") or "")) or "Gemini 4 Carbon"
             worker_timeout = float(timeout_seconds or receipt.get("timeout_seconds") or 600.0)
             if esc_session_deadline is not None:
                 worker_timeout = min(worker_timeout, max(60.0, rem_esc_budget))
@@ -4729,7 +4743,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             else None
         )
         if retry_reason:
-            # Economy has no Argon escalation: give the same worker one more turn inside the plugin so the
+            # Economy has no Carbon escalation: give the same worker one more turn inside the plugin so the
             # Opus Lead is not woken (and billed) just to say "keep going".
             acc_failures = [
                 f"$ {r.get('command', '')} (exit {r.get('exit_code', 1)}):\n{r.get('output_tail', '')}"
@@ -5073,7 +5087,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
             if raw_fp and raw_fp not in prior_inspected_files and len(prior_inspected_files) < 8:
                 prior_inspected_files.append(raw_fp)
 
-        prior_model = str(receipt.get("model") or "gemini-flash-next")
+        prior_model = str(receipt.get("model") or DEFAULT_FAST_MODEL)
         model = prior_model
         escalated_from: str | None = None
         target_esc_model = self._resolve_escalation_target_model(model)
@@ -5260,8 +5274,8 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 or receipt.get("stop_reason") == "MAX_TOOL_CALLS_EXCEEDED"
             )
             if (escalated_from is not None or _prompt_source == "plugin_qa_review") and not explicit_calls:
-                # Guarantee Argon at least 60 tool calls even after a 75-call Flash checkpoint
-                # (100 - 75 = 25 would starve Argon on multi-file tasks), while still bounding it.
+                # Guarantee Carbon at least 60 tool calls even after a 75-call Hydrogen checkpoint
+                # (100 - 75 = 25 would starve Carbon on multi-file tasks), while still bounding it.
                 phase_budget_calls = max(min(60, budget_calls), rem_calls)
             elif rem_calls > 0 and not fresh_slice:
                 phase_budget_calls = rem_calls

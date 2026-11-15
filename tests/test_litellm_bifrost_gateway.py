@@ -87,7 +87,7 @@ class _MockGatewayServer:
                         "candidatesTokenCount": 12,
                         "totalTokenCount": 54,
                     },
-                    "modelVersion": "gemini-flash-next",
+                    "modelVersion": "gemini-4-hydrogen",
                 }
                 encoded = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
@@ -378,14 +378,14 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
         monkeypatch.setenv("CC_AGY_DATA_DIR", str(tmp_path / "ask_data"))
         res_bf = ask_gemini(
             "ping",
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             thinking_level="LOW",
             workspace_root=tmp_path,
         )
         assert res_bf["text"] == "bifrost-pong"
         assert len(srv.requests) == 1
         req_bf = srv.requests[0]
-        assert req_bf["path"] == "/genai/v1beta/models/gemini-flash-next:generateContent"
+        assert req_bf["path"] == "/genai/v1beta/models/gemini-4-hydrogen:generateContent"
         assert req_bf["headers"]["authorization"] == f"Bearer {oidc_jwt}"
         assert req_bf["headers"]["x-bf-vk"] == "bf-vk-eng-platform"
         # Cloud Run OIDC JWT stays strictly in Authorization: Bearer and never overwrites x-goog-api-key
@@ -404,12 +404,12 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
                 "GEMINI_API_KEY": "sk-litellm-gemini-vk",
             }
         )
-        writer_gem = make_genai_writer(auth_gem, "gemini-flash-next", thinking_level="LOW")
+        writer_gem = make_genai_writer(auth_gem, "gemini-4-hydrogen", thinking_level="LOW")
         reply_gem = writer_gem(WriterRequest(task=sample_task, system="Return JSON.", prompt="Write x = 42"))
         assert json.loads(reply_gem.text)["content"] == "x = 42\n"
         assert len(srv_gem.requests) == 1
         req_gem = srv_gem.requests[0]
-        assert req_gem["path"] == "/gemini/v1beta/models/gemini-flash-next:generateContent"
+        assert req_gem["path"] == "/gemini/v1beta/models/gemini-4-hydrogen:generateContent"
         assert req_gem["headers"]["x-goog-api-key"] == "sk-litellm-gemini-vk"
         assert req_gem["headers"]["authorization"] == "Bearer sk-litellm-gemini-vk"
 
@@ -422,7 +422,7 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
                 "GEMINI_API_KEY": "sk-litellm-gemini-vk",
             }
         )
-        writer_gem_oidc = make_genai_writer(auth_gem_oidc, "gemini-flash-next", thinking_level="LOW")
+        writer_gem_oidc = make_genai_writer(auth_gem_oidc, "gemini-4-hydrogen", thinking_level="LOW")
         reply_gem_oidc = writer_gem_oidc(WriterRequest(task=sample_task, system="Return JSON.", prompt="Write oidc_gem = 7"))
         assert json.loads(reply_gem_oidc.text)["content"] == "oidc_gem = 7\n"
         req_gem_oidc = srv_gem_oidc.requests[0]
@@ -440,7 +440,7 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
             }
         )
         assert auth_gem_tok.get("api_key") is None
-        writer_gem_tok = make_genai_writer(auth_gem_tok, "gemini-flash-next", thinking_level="LOW")
+        writer_gem_tok = make_genai_writer(auth_gem_tok, "gemini-4-hydrogen", thinking_level="LOW")
         reply_gem_tok = writer_gem_tok(
             WriterRequest(task=sample_task, system="Return JSON.", prompt="Write team_key = 1")
         )
@@ -454,7 +454,7 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
     # Also verifies `make_genai_writer` strips `publishers/google/models/` on custom gateways
     with _MockGatewayServer(reply_text='{"path": "a.py", "content": "vtx = 1\\n"}') as srv_vtx:
         auth_vtx = resolve_auth_config(
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             env={
                 "CC_AGY_VERTEX_BASE_URL": f"{srv_vtx.origin}/vertex_ai",
                 "CC_AGY_VERTEX_BASE_URL_TOKEN": "sk-litellm-vertex-vk",
@@ -463,17 +463,17 @@ def test_live_loopback_wire_bifrost_genai_with_oidc_and_virtual_key_and_litellm_
         )
         writer_vtx = make_genai_writer(
             auth_vtx,
-            "publishers/google/models/gemini-flash-next",
+            "publishers/google/models/gemini-4-hydrogen",
             thinking_level="LOW",
         )
         reply_vtx = writer_vtx(WriterRequest(task=sample_task, system="Return JSON.", prompt="Write vtx = 1"))
         assert json.loads(reply_vtx.text)["content"] == "vtx = 1\n"
-        assert reply_vtx.model == "publishers/google/models/gemini-flash-next"
+        assert reply_vtx.model == "publishers/google/models/gemini-4-hydrogen"
         assert len(srv_vtx.requests) == 1
         req_vtx = srv_vtx.requests[0]
         assert (
             req_vtx["path"]
-            == "/vertex_ai/v1beta1/projects/acme-prod-ai/locations/global/publishers/google/models/gemini-flash-next:generateContent"
+            == "/vertex_ai/v1beta1/projects/acme-prod-ai/locations/global/publishers/google/models/gemini-4-hydrogen:generateContent"
         )
         assert req_vtx["headers"]["authorization"] == "Bearer sk-litellm-vertex-vk"
         assert req_vtx["headers"]["x-goog-api-key"] == "sk-litellm-vertex-vk"
@@ -689,7 +689,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     )
     agent_writer_bf = make_agent_writer(
         auth_bf,
-        "publishers/google/models/gemini-flash-next",
+        "publishers/google/models/gemini-4-hydrogen",
         thinking_level="LOW",
         workspace_dir=tmp_path,
     )
@@ -699,7 +699,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     text_models_bf = [m for m in captured_configs[0].models if types.ModelType.TEXT in m.types]
     image_models_bf = [m for m in captured_configs[0].models if types.ModelType.IMAGE in m.types]
     assert len(text_models_bf) == 1
-    assert text_models_bf[0].name == "gemini-flash-next"
+    assert text_models_bf[0].name == "gemini-4-hydrogen"
     assert isinstance(text_models_bf[0].endpoint, types.GeminiAPIEndpoint)
     assert text_models_bf[0].endpoint.base_url == "http://localhost:8080/genai"
     assert text_models_bf[0].endpoint.http_headers["x-bf-vk"] == "bf-vk-only-no-gemini-key"
@@ -717,7 +717,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     )
     agent_writer_vtx = make_agent_writer(
         auth_vtx,
-        "gemini-flash-next",
+        "gemini-4-hydrogen",
         thinking_level="LOW",
         workspace_dir=tmp_path,
     )
@@ -736,7 +736,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     worker_out = run_antigravity_worker(
         prompts=["Implement feature"],
         workspace_dir=tmp_path,
-        model="gemini-flash-next",
+        model="gemini-4-hydrogen",
     )
     assert worker_out["text"] == '{"content": "ok\\n"}'
     assert len(captured_configs) == 1
@@ -757,7 +757,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     run_antigravity_worker(
         prompts=["Implement feature directly"],
         workspace_dir=tmp_path,
-        model="gemini-flash-next",
+        model="gemini-4-hydrogen",
     )
     assert len(captured_configs) == 1
     direct_text_models = [m for m in captured_configs[0].models if types.ModelType.TEXT in m.types]
@@ -773,7 +773,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     )
     direct_writer_fn = make_agent_writer(
         auth_direct_writer,
-        "gemini-flash-next",
+        "gemini-4-hydrogen",
         workspace_dir=tmp_path,
     )
     direct_writer_fn(
@@ -995,7 +995,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
             monkeypatch.setenv(env_k, env_v)
 
         captured_configs.clear()
-        a1 = resolve_auth_config(model="gemini-flash-next")
+        a1 = resolve_auth_config(model="gemini-4-hydrogen")
         assert a1["base_url"] == "https://litellm.corp/gemini", f"{case_label} pass-1 lost base_url: {a1}"
         assert a1["base_url"] is not None
         if forbidden_key:
@@ -1004,7 +1004,7 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
         run_antigravity_worker(
             prompts=[f"Run {case_label}"],
             workspace_dir=tmp_path,
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project=a1.get("project"),
             location=a1.get("location"),
             api_key=a1.get("api_key"),
@@ -1027,14 +1027,14 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
             requested_location=a1.get("location"),
             requested_api_key=a1.get("api_key"),
             requested_auth_mode=a1.get("auth_mode"),
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
         )
         for rk in routing_keys:
             assert a_followup.get(rk) == a1.get(rk), f"{case_label} routing mismatch on {rk}: {a_followup} vs {a1}"
         run_antigravity_worker(
             prompts=[f"Followup {case_label}"],
             workspace_dir=tmp_path,
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project=a_followup.get("project"),
             location=a_followup.get("location"),
             api_key=a_followup.get("api_key"),
@@ -1084,14 +1084,14 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
             monkeypatch.setenv(env_k, env_v)
 
         captured_configs.clear()
-        a_vtx_gw = resolve_auth_config(model="gemini-flash-next")
+        a_vtx_gw = resolve_auth_config(model="gemini-4-hydrogen")
         assert a_vtx_gw["base_url"] == "https://litellm.corp/vertex_ai", f"{vtx_gw_label} lost base_url: {a_vtx_gw}"
         assert a_vtx_gw["gateway_wire"] == "vertex"
         assert a_vtx_gw.get("api_key") is None
         run_antigravity_worker(
             prompts=[f"Run {vtx_gw_label}"],
             workspace_dir=tmp_path,
-            model="gemini-flash-next",
+            model="gemini-4-hydrogen",
             project=a_vtx_gw.get("project"),
             location=a_vtx_gw.get("location"),
             api_key=a_vtx_gw.get("api_key"),
@@ -1133,13 +1133,13 @@ def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_
     )
     cache_name = create_shared_cache(
         auth_bf,
-        "publishers/google/models/gemini-flash-next",
+        "publishers/google/models/gemini-4-hydrogen",
         "System instructions",
         "x" * 20_000,
         ttl_seconds=300,
     )
     assert cache_name == "cachedContents/test-123"
-    assert recorded_cache_models == ["gemini-flash-next"]
+    assert recorded_cache_models == ["gemini-4-hydrogen"]
 
 
 def test_installer_gateway_wire_all_five_hosts_doctor_and_secret_scrubbing(
@@ -1609,9 +1609,9 @@ def test_build_genai_client_pins_v1beta_and_deduplicates_versioned_gateway_paths
     direct_client = build_genai_client({"api_key": "AIzaSyUnitTestKey0000000000000000"})
     try:
         req_direct = direct_client._api_client._build_request(
-            "post", "models/gemini-flash-next:generateContent", {}, None
+            "post", "models/gemini-4-hydrogen:generateContent", {}, None
         )
-        assert req_direct.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-next:generateContent"
+        assert req_direct.url == "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
     finally:
         close_genai_client(direct_client)
 
@@ -1633,9 +1633,9 @@ def test_build_genai_client_pins_v1beta_and_deduplicates_versioned_gateway_paths
         )
         try:
             req_gw = gw_client._api_client._build_request(
-                "post", "models/gemini-flash-next:generateContent", {}, None
+                "post", "models/gemini-4-hydrogen:generateContent", {}, None
             )
-            assert req_gw.url == f"{expected_prefix}models/gemini-flash-next:generateContent"
+            assert req_gw.url == f"{expected_prefix}models/gemini-4-hydrogen:generateContent"
         finally:
             close_genai_client(gw_client)
 
@@ -1677,7 +1677,7 @@ def test_build_genai_client_pins_v1beta_and_deduplicates_versioned_gateway_paths
         )
         try:
             req_vx = vx_client._api_client._build_request(
-                "post", "publishers/google/models/gemini-flash-next:generateContent", {}, None
+                "post", "publishers/google/models/gemini-4-hydrogen:generateContent", {}, None
             )
             assert expected_ver_segment in req_vx.url
         finally:

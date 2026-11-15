@@ -113,7 +113,7 @@ PUBLIC_SETTINGS: tuple[SettingSpec, ...] = (
         "CC_AGY_COST_PROFILE",
         "Models, Cost & Budgets",
         "balanced",
-        "Routing preset: economy (Flash only), balanced (Flash -> Carbon), or quality (Argon).",
+        "Routing preset: economy (Hydrogen only), balanced (Hydrogen -> Carbon), or quality (Carbon).",
     ),
     SettingSpec(
         "CC_AGY_DEFAULT_DELEGATE_MODEL",

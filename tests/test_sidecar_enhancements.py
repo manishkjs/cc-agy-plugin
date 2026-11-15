@@ -96,10 +96,10 @@ def test_carbon_model_routing_and_pricing() -> None:
     assert "gemini-4-carbon" in LONG_DECODE_MODELS
     assert is_long_decode_model("gemini-4-carbon")
     assert is_long_decode_model("carbon")
-    assert not is_long_decode_model("gemini-3.8-flash")
+    assert not is_long_decode_model("gemini-4-hydrogen")
     assert normalize_wire_model_name("carbon", custom_gateway=False) == "gemini-4-carbon"
     assert resolve_ask_thinking_level(None, "gemini-4-carbon", env={}) == "MEDIUM"
-    assert resolve_ask_thinking_level(None, "gemini-4-argon", env={}) is None
+    assert resolve_ask_thinking_level(None, "gemini-4-hydrogen", env={}) is None
     assert (
         resolve_ask_thinking_level(
             None, "gemini-4-carbon", env={"CC_AGY_PRO_THINKING_LEVEL": "HIGH"}
@@ -510,23 +510,23 @@ def test_gateway_excludes_flash_lite_and_replays_thought_signatures(tmp_path: Pa
     with pytest.raises(GatewayRequestError):
         resolve_gemini_model("gemini-3.5-flash-lite")
 
-    # Haiku background calls route to gemini-3.8-flash, never flash-lite
+    # Haiku background calls route to gemini-4-hydrogen, never flash-lite
     route = classify_and_route(
         session_id="s-1",
         requested_model="claude-3-5-haiku-latest",
         messages=[{"role": "user", "content": "hi"}],
         token_count_est=10,
     )
-    assert route["selected_model"] == "gemini/gemini-3.8-flash"
+    assert route["selected_model"] == "gemini/gemini-4-hydrogen"
 
-    # Auto router routes complex/long-decode to gemini-4-carbon and simple to gemini-3.8-flash
+    # Auto router routes complex/long-decode to gemini-4-carbon and simple to gemini-4-hydrogen
     auto_simple = classify_and_route(
         session_id="s-2",
         requested_model="claude-auto-gemini",
         messages=[{"role": "user", "content": "hi"}],
         token_count_est=10,
     )
-    assert auto_simple["selected_model"] == "gemini/gemini-3.8-flash"
+    assert auto_simple["selected_model"] == "gemini/gemini-4-hydrogen"
 
     auto_complex = classify_and_route(
         session_id="s-3",

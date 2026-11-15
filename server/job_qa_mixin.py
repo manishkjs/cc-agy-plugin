@@ -12,7 +12,7 @@ from typing import Any
 from server.ast_regression_guards import _is_test_file_path
 from server.job_git_utils import _env_int
 from server.receipts import BudgetExceededError, validate_job_id
-from server.regions import env_flag, resolve_cost_profile, truncate_to_token_budget
+from server.regions import env_flag, is_fast_workhorse_model, resolve_cost_profile, truncate_to_token_budget
 from server.verification_policy import classify_verification
 from server.worker_prompt_builder import (
     QA_REVIEW_MAX_TOKENS,
@@ -36,7 +36,7 @@ class JobQAMixin:
         """Merge a 1-shot QA review's usage and metadata onto `job-*.json` without creating a separate receipt."""
         safe_id = validate_job_id(job_id)
         receipt = self.store.read_receipt(safe_id)
-        prior_model = str(receipt.get("model") or "gemini-flash-next")
+        prior_model = str(receipt.get("model") or "gemini-4-hydrogen")
         u = dict(receipt.get("usage") or {})
         pq = int((qa_usage or {}).get("prompt_token_count") or 0)
         cq = int((qa_usage or {}).get("cached_content_token_count") or 0)
@@ -178,7 +178,7 @@ class JobQAMixin:
         ):
             return None
         cur_model = str(receipt.get("model") or "")
-        if "flash" not in cur_model.lower() and not post_escalation_round:
+        if not is_fast_workhorse_model(cur_model) and not post_escalation_round:
             return None
         qa_model = self._resolve_escalation_target_model(cur_model) or (
             cur_model if (post_escalation_round or autonomous_solo) else None

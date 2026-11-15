@@ -82,6 +82,7 @@ _HIDDEN_HOME_DIRS = (
     ".claude",
     ".codex",
     ".cursor",
+    ".gemini/config",
     ".anthropic",
     ".openai",
     ".gem",
@@ -631,6 +632,8 @@ def build_bwrap_prefix(
     masked_dirs_seen: set[str] = set()
     for rel in _HIDDEN_HOME_DIRS:
         for hidden_dir in _resolve_existing_dir(home, rel):
+            if hidden_dir == config_dir or hidden_dir in config_dir.parents:
+                continue
             key = str(hidden_dir)
             if key not in masked_dirs_seen:
                 masked_dirs_seen.add(key)
@@ -736,9 +739,11 @@ def build_seatbelt_profile(
         hidden_dirs.append(base / "Library" / "Caches")
         for rel in _HIDDEN_HOME_DIRS:
             cand = base / rel
-            hidden_dirs.append(cand)
+            if cand != config_dir and cand not in config_dir.parents:
+                hidden_dirs.append(cand)
             for resolved_dir in _resolve_existing_dir(base, rel):
-                hidden_dirs.append(resolved_dir)
+                if resolved_dir != config_dir and resolved_dir not in config_dir.parents:
+                    hidden_dirs.append(resolved_dir)
     for xdg_dir in _extra_xdg_hidden_dirs(env):
         hidden_dirs.append(xdg_dir)
     for protected_dir in _protected_plugin_dirs(workspace, home, data_dir=data_dir, env=env):

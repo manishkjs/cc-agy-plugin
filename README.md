@@ -42,7 +42,7 @@ You keep typing prompts and reviewing diffs the same way you do today. In our 26
 
 ### What you get
 
-- **Lower cost per task.** Everyday reads, edits, and test retries run on `gemini-flash-next` (`50¢` in / `300¢` out per 1M tokens). Under the default profile the worker moves to Gemini Carbon with zero thinking (`200¢` / `1,200¢`) only when a check fails or a retry is needed.
+- **Lower cost per task.** Everyday reads, edits, and test retries run on `gemini-4-hydrogen` (`150¢` in / `750¢` out per 1M tokens, `7.5¢` cached). Under the default profile the worker moves to Gemini Carbon with zero thinking (`200¢` / `1,200¢`) only when a check fails or a retry is needed. Pass `prewalk=true` on hard tasks so `gemini-4-carbon` plans and lands the first edit before handing off the same session to `gemini-4-hydrogen`.
 - **A working tree that stays clean.** Workers run in a disposable git copy. Nothing reaches your repo until the checks pass and the diff is applied.
 - **Verification on every job.** The plugin runs your tests when it finds them, and falls back to syntax and compile checks when it does not.
 - **Receipts you can audit.** Every run writes an HMAC-SHA256 signed receipt with token counts and cost in cents.
@@ -212,7 +212,7 @@ Once installed, open your project in Claude Code, Cursor, OpenCode, Codex, or An
 | What you want to do | Example prompt | What happens behind the scenes |
 |:--|:--|:--|
 | **Check your setup (free)** | *"Run doctor to verify my Gemini setup."* (or `/cc-agy-plugin:doctor` in Claude Code, `/doctor` in OpenCode) | Verifies credentials, active `cost_profile`, installed SDKs, git status, and detected test runner offline at **0 tokens**. |
-| **Fix a bug or build a feature** | *"Delegate adding input validation to `api/orders.py` with unit tests, review the diff, and apply it."* | Runs `gemini-flash-next` in an isolated git copy (`delegate_start`), runs checks, lets your lead agent inspect `get_diff`, and merges with `delegate_apply`. |
+| **Fix a bug or build a feature** | *"Delegate adding input validation to `api/orders.py` with unit tests, review the diff, and apply it."* | Runs `gemini-4-hydrogen` in an isolated git copy (`delegate_start`), runs checks, lets your lead agent inspect `get_diff`, and merges with `delegate_apply`. |
 | **Edit many files from one plan (6+ files)** | *"Plan the new webhook handlers across all 8 files and write them with `delegate_file_batch`."* | Validates the plan locally, writes files in parallel with per-file verification, retries failures automatically, and returns one combined diff. |
 | **Get a fast second opinion** | *"Ask Gemini to review my current git diff for edge cases and race conditions."* | Sends a single-shot `ask_gemini` query without spinning up a worker copy or touching files. |
 | **Undo an applied worker job** | *"Revert worker job `<job_id>`."* | Restores every file touched by that job from its signed pre-apply backup (`delegate_revert`) if no newer manual edits conflict. |
@@ -235,7 +235,7 @@ Every worker digest reports a `verification` mode, so you always know how a chan
 
 **Projects without tests (`verification: "smoke_only"`).** When no test command is given or detected, the plugin runs fast read-only syntax and compile checks on every changed file: Python parse and import, `tsc --noEmit` with your repo's TypeScript, `node --check`, `go build`, `cargo check --offline`, `bash -n`, and JSON validation.
 
-Files that fail to parse or compile are rejected and escalated to `gemini-4-carbon-zero` under `balanced` (`gemini-4-argon` under `quality`). When the smoke checks pass, the digest tells your lead agent to review the diff line by line against your request before finishing.
+Files that fail to parse or compile are rejected and escalated to `gemini-4-carbon-zero` under `balanced` (`gemini-4-carbon` under `quality`). When the smoke checks pass, the digest tells your lead agent to review the diff line by line against your request before finishing.
 
 <a id="options"></a>
 
@@ -258,9 +258,9 @@ See [Authentication precedence](#authentication-precedence) for exact credential
 
 | Profile | How models are chosen | Best when |
 |:--|:--|:--|
-| **`balanced`** *(default)* | Starts on fast, low-cost **`gemini-flash-next`**. Steps up automatically to **`gemini-4-carbon-zero`** (Carbon, zero thinking) on the same git copy if a check fails or a retry is needed, then returns to Flash on the next new task. Quota errors (`429` / `503`) stop automatic retries and hand control back to your lead agent. | Everyday engineering where you want Flash speed and pricing with Carbon Zero-Think backup on hard bugs. |
-| **`economy`** | Keeps all worker and `ask_gemini` calls on **`gemini-flash-next`** and turns off automatic step-up to Carbon Zero-Think. | Tight budgets, boilerplate generation, docs, and well-scoped tasks. |
-| **`quality`** | Starts all worker and `ask_gemini` calls directly on **`gemini-4-argon`** with deeper reasoning from turn one. | Complex multi-file architecture bugs, subtle concurrency fixes, or tricky math/logic changes. |
+| **`balanced`** *(default)* | Starts on fast **`gemini-4-hydrogen`**. Steps up automatically to **`gemini-4-carbon-zero`** (Carbon, zero thinking) on the same git copy if a check fails or a retry is needed, then returns to Hydrogen on the next new task. Pass `prewalk=true` on difficult tasks for a `gemini-4-carbon` -> `gemini-4-hydrogen` intra-worker handoff. Quota errors (`429` / `503`) stop automatic retries and hand control back to your lead agent. | Everyday engineering where you want Hydrogen speed with Carbon backup on hard bugs. |
+| **`economy`** | Keeps all worker and `ask_gemini` calls on **`gemini-4-hydrogen`** and turns off automatic step-up to Carbon Zero-Think. | Tight budgets, boilerplate generation, docs, and well-scoped tasks. |
+| **`quality`** | Starts all worker and `ask_gemini` calls directly on **`gemini-4-carbon`** with deeper reasoning from turn one. | Complex multi-file architecture bugs, subtle concurrency fixes, or tricky math/logic changes. |
 
 ### You stay in full control
 
@@ -298,7 +298,7 @@ python3 -m server.install --host all --auth gemini-enterprise \
 ```bash
 export CC_AGY_BIFROST_POLICY_URL="https://bifrost.internal.example.com"
 export CC_AGY_BIFROST_AGY_VIRTUAL_KEY="sk-bf-agy-..."          # falls back to CC_AGY_BIFROST_VIRTUAL_KEY
-export CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-3.8-flash-medium" # used for policy-routed when rules cannot be read
+export CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-4-hydrogen-medium" # used for policy-routed when rules cannot be read
 ```
 
 Before each `agy` run the plugin asks the gateway which `agy-cli/<model>` entries the key may use. A revoked key or a model that is not on the list stops the run at 0 tokens. Ask for the model `policy-routed` to run whatever model the gateway's routing rule currently selects. The laptop only makes outbound HTTPS calls, so no inbound port is needed. Two limits to know: the allowlist must contain the `agy` model names you actually run (or `policy-routed`), and Bifrost does not see the tokens these runs use. The check runs on the developer's machine, so treat it as a guard against mistakes and revoked keys, not a security boundary: someone with full control of the machine can skip it. Token counts stay in the plugin's receipts and in the Gemini Enterprise console.
@@ -416,7 +416,7 @@ Ask your agent to revert it by `job_id`, which calls `delegate_revert`. It resto
 <details>
 <summary><b>How do I cap spend?</b></summary>
 
-Set `--max-daily-cents` (for example `500` for 500¢ a day) to enforce a UTC daily spend cap for the workspace. Use `--profile economy` to keep every worker call on `gemini-flash-next`. `/cc-agy-plugin:cost` in Claude Code and `/cost` in OpenCode report what has been spent.
+Set `--max-daily-cents` (for example `500` for 500¢ a day) to enforce a UTC daily spend cap for the workspace. Use `--profile economy` to keep every worker call on `gemini-4-hydrogen`. `/cc-agy-plugin:cost` in Claude Code and `/cost` in OpenCode report what has been spent.
 
 </details>
 
@@ -444,7 +444,7 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 <details>
 <summary><b>Which Gemini models does it use?</b></summary>
 
-`gemini-flash-next` by default. Under `balanced`, a failed check moves the job to `gemini-4-carbon-zero`. Under `quality`, jobs start on `gemini-4-argon`. You can override the model per call or with `CC_AGY_DEFAULT_DELEGATE_MODEL` and `CC_AGY_DEFAULT_ASK_MODEL`.
+`gemini-4-hydrogen` by default. Under `balanced`, a failed check moves the job to `gemini-4-carbon-zero` (and `prewalk=true` runs Turn 1 planning plus the first edit on `gemini-4-carbon` before handing off to `gemini-4-hydrogen`). Under `quality`, jobs start on `gemini-4-carbon`. You can override the model per call or with `CC_AGY_DEFAULT_DELEGATE_MODEL` and `CC_AGY_DEFAULT_ASK_MODEL`.
 
 </details>
 
@@ -483,8 +483,8 @@ Configured Gemini model rates in `server/regions.py` and Claude lead rates in `s
 | Model | Role | Uncached Input / 1M | Cached Input / 1M | Output / 1M |
 |---|---|---|---|---|
 | **Claude Opus 5.5** | Lead Planner & Reviewer (`server/true_cost.py`, override via `CC_AGY_LEAD_RATES`; legacy Opus 4.x/5.0 at 500¢ / 50¢ / 2,500¢) | 400¢ | 20¢ | 2,000¢ |
-| **Gemini Flash** (`gemini-flash-next`) | Default Worker & Review Model (`balanced` / `economy`) | 50¢ | 5¢ | 300¢ |
-| **Gemini 4 Argon / Carbon** | `balanced` Retry Escalation (`gemini-4-carbon-zero`) & `quality` Profile Reasoning Worker (`gemini-4-argon`) | 200¢ | 20¢ | 1,200¢ |
+| **Gemini 4 Hydrogen** (`gemini-4-hydrogen`) | Default Worker & Review Model (`balanced` / `economy`) | 150¢ | 7.5¢ | 750¢ |
+| **Gemini 4 Carbon** (`gemini-4-carbon`) | `balanced` Retry Escalation (`gemini-4-carbon-zero`), Opt-in `/prewalk` Guide, & `quality` Profile Reasoning Worker (`gemini-4-carbon`) | 200¢ | 20¢ | 1,200¢ |
 | **Gemini 3.1 Pro** | Supported Pro Preview Model | 200¢ | 20¢ | 1,200¢ |
 | **Gemini 2.5 Flash** | Supported Regional Review Model | 30¢ | 3¢ | 250¢ |
 
@@ -511,9 +511,9 @@ Google's Cloud Code server guardrail permits Gemini Enterprise business OAuth se
 ### Retry, thinking-level, and override mechanics
 
 Profile goals (`balanced`, `economy`, `quality`) are summarized in [Options](#options). Additional runtime mechanics:
-- **Default reasoning depth**: Mutating worker turns use `LOW` thinking on `gemini-flash-next`, zero thinking on escalated `gemini-4-carbon-zero` turns in `balanced`, `MEDIUM` on `gemini-4-argon` in `quality`, and `HIGH` on read-only worker turns (override via `thinking_level` or `CC_AGY_DELEGATE_THINKING_LEVEL`).
+- **Default reasoning depth**: Mutating worker turns use `LOW` thinking on `gemini-4-hydrogen`, zero thinking on escalated `gemini-4-carbon-zero` turns in `balanced`, `MEDIUM` on `gemini-4-carbon` in `quality`, and `HIGH` on read-only worker turns (override via `thinking_level` or `CC_AGY_DELEGATE_THINKING_LEVEL`).
 - **Quota short-circuit**: Worker `429` or `503` quota errors set `escalation.escalate_to_lead=true` (`reason="quota_or_rate_limit"`) immediately without burning retry turns unless `force_retry=true` is passed.
-- **Per-call overrides**: Pass `model="gemini-flash-next"` or `model="gemini-4-argon"` per call, or set `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL`.
+- **Per-call overrides**: Pass `model="gemini-4-hydrogen"` or `model="gemini-4-carbon"` per call, or set `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL`.
 
 ---
 
@@ -549,8 +549,8 @@ Profile goals (`balanced`, `economy`, `quality`) are summarized in [Options](#op
 
 | Tool | Purpose |
 |---|---|
-| `ask_gemini` | Fast single-shot query via `google-genai` (or `agy --mode plan` in `gemini_enterprise` mode) without spinning up a workspace copy. Best for code reviews, architecture checks, and second opinions. Default model: `gemini-flash-next` (`gemini-4-argon` when `cost_profile="quality"`). |
-| `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, and `thinking_level` (`api_key`/`project` available only when GE mode is not pinned). Default model: `gemini-flash-next` (auto-escalating to `gemini-4-carbon-zero` on retries under `balanced`, or starting on `gemini-4-argon` under `quality`). |
+| `ask_gemini` | Fast single-shot query via `google-genai` (or `agy --mode plan` in `gemini_enterprise` mode) without spinning up a workspace copy. Best for code reviews, architecture checks, and second opinions. Default model: `gemini-4-hydrogen` (`gemini-4-carbon` when `cost_profile="quality"`). |
+| `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, and `prewalk` (`api_key`/`project` available only when GE mode is not pinned). Default model: `gemini-4-hydrogen` (auto-escalating to `gemini-4-carbon-zero` on retries under `balanced`, or starting on `gemini-4-carbon` under `quality`). |
 | `delegate_result` | Wait for a background job to finish (default `240s` wait cap so Claude Code's 5-minute prompt cache stays warm) and return its compact digest. |
 | `delegate_status` | Inspect live progress signals (`report_to_lead`), token usage, and USD/cents cost (broken out by `by_auth_mode`: `$0.00` billed for included GE seats vs pay-as-you-go) for a single `job_id`, or omit `job_id` to list recent jobs and cumulative totals. |
 | `get_diff` | Retrieve the unified git diff from a job's worktree, filtered by file or glob and paginated by token budget (`default: 4000`, `max: 8000` tokens per page). |
@@ -593,7 +593,7 @@ flowchart LR
 **How a task runs**
 - A writer gets one task, the files it needs, and the shared context, and must answer with one JSON object: the whole file, or exact `find`/`replace` edits. Nothing is silently patched: a wrong path, an empty file, or a `find` block that does not match once is rejected and costs an attempt. CRLF files stay CRLF.
 - The plugin writes the answer into the job copy and runs the task's checks (own process group, killed whole on timeout, no vendor credentials in the environment). Only a passing file lands.
-- Attempts 1 and 2 use the routed writer (`gemini-flash-next`, LOW thinking by default; `writer="agent"` uses a writer-only Antigravity agent with a short custom system prompt, FINISH as its only tool, and 3 model calls). Attempt 3 uses Claude. Rate limits and 5xx (`408`, `429`, `5xx`, `529`) wait with jittered backoff capped at 60 s and do not count as failed attempts; a reply cut off at the output limit moves to the next writer for free; `401`/`403` stops the batch with the fix.
+- Attempts 1 and 2 use the routed writer (`gemini-4-hydrogen`, LOW thinking by default; `writer="agent"` uses a writer-only Antigravity agent with a short custom system prompt, FINISH as its only tool, and 3 model calls). Attempt 3 uses Claude. Rate limits and 5xx (`408`, `429`, `5xx`, `529`) wait with jittered backoff capped at 60 s and do not count as failed attempts; a reply cut off at the output limit moves to the next writer for free; `401`/`403` stops the batch with the fix.
 - Files needed by every task are sent once as a Gemini context cache (1 hour TTL) or as Claude's cached system prompt, and the first task runs alone to warm the cache.
 - Every landed task is journaled with its fingerprint and file hash, so re-sending the same plan after an interruption resumes and skips finished tasks at zero cost.
 - One HMAC-signed receipt per batch records each task's state, attempts, writer, and added-line hashes. `delegate_apply`, `delegate_revert`, and the Stop-hook provenance check work identically to agent jobs.
@@ -631,7 +631,7 @@ Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_d
 | `--agy-cli-path`, `--install-agy-cli` / `userConfig.agy_cli_path` / `CC_AGY_CLI_BIN`, `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | External `agy` binary and OAuth config directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
 | `userConfig.gemini_api_key` / `GEMINI_API_KEY` (`GOOGLE_API_KEY`) | unset | Google AI Studio API key (redacted from child shells and receipts). |
 | `--project` / `userConfig.google_cloud_project` / `GOOGLE_CLOUD_PROJECT` | unset (required on Vertex) | Google Cloud project ID for pay-as-you-go Vertex AI (`aiplatform.googleapis.com`). |
-| `--location` / `userConfig.google_cloud_location` / `GOOGLE_CLOUD_LOCATION` | `us-central1` | Preferred Vertex AI region (`gemini-flash-next` and `gemini-4-argon` route to `global` automatically). |
+| `--location` / `userConfig.google_cloud_location` / `GOOGLE_CLOUD_LOCATION` | `us-central1` | Preferred Vertex AI region (`gemini-4-hydrogen` and `gemini-4-carbon` route to `global` automatically). |
 | `--base-url` / `userConfig.vertex_base_url` / `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`, `CC_AGY_GEMINI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) | unset | Custom AI gateway URL for LiteLLM (`/vertex_ai` or `/gemini`), Bifrost (`/genai`), Portkey, Apigee, or Cloud Run proxies (`CC_AGY_VERTEX_BASE_URL` takes priority over an ambient shell `GEMINI_API_KEY`; in `auto` or `gateway` mode, `GOOGLE_GEMINI_BASE_URL` and `CC_AGY_GEMINI_BASE_URL` also accept `GEMINI_API_KEY` when no gateway bearer token or Bifrost virtual key is set; Windows PowerShell bootstrap in `scripts/bootstrap-gateway.ps1`). |
 | `--gateway-wire` / `userConfig.gateway_wire` / `CC_AGY_GATEWAY_WIRE` | `auto` | Gateway wire protocol (`auto`, `vertex`, `gemini`, `litellm-vertex`, `litellm-gemini`, or `bifrost`). `auto` selects `gemini` (`/v1beta/models/...`, `GeminiAPIEndpoint`) when the gateway path ends in `/genai` or `/gemini`, when `CC_AGY_GEMINI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL` is used, or when `CC_AGY_BIFROST_VIRTUAL_KEY` is set, and selects `vertex` (`/v1beta1/projects/...`, `VertexEndpoint`) otherwise; an explicit trailing `/v1`, `/v1alpha`, `/v1beta`, or `/v1beta1` on `--base-url` sets the SDK API version without doubling the path segment. |
 | `userConfig.vertex_base_url_token` / `CC_AGY_VERTEX_BASE_URL_TOKEN` | unset | Bearer token or virtual key sent to the custom gateway as `Authorization: Bearer` and `x-goog-api-key` (redacted from child shells and receipts). |

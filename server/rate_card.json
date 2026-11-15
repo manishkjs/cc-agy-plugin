@@ -8,9 +8,7 @@
         "gemini-3-flash",
         "gemini-3.5-flash",
         "gemini-3.6-flash",
-        "gemini-3.7-flash",
-        "gemini-3.8-flash",
-        "gemini-flash-next"
+        "gemini-3.7-flash"
       ],
       "expires_after": "2026-12-31",
       "note": "Promotional Gemini 3.x Flash pricing ($0.50 input / $0.05 cached / $3.00 output per 1M tokens); re-verify public Vertex AI rate card after 2026-12-31."
@@ -98,15 +96,40 @@
       "cached_input": 0.05,
       "output": 3.00
     },
-    "gemini-flash-next": {
-      "input": 0.50,
-      "cached_input": 0.05,
-      "output": 3.00
+    "gemini-4-hydrogen": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
     },
-    "gemini-3.8-flash": {
-      "input": 0.50,
-      "cached_input": 0.05,
-      "output": 3.00
+    "hydrogen": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
+    },
+    "gemini-4-hydrogen-xhigh": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
+    },
+    "gemini-4-hydrogen-high": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
+    },
+    "gemini-4-hydrogen-medium": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
+    },
+    "gemini-4-hydrogen-low": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
+    },
+    "gemini-4-hydrogen-zero": {
+      "input": 1.50,
+      "cached_input": 0.075,
+      "output": 7.50
     },
     "gemini-2.5-pro": {
       "input": 1.25,
@@ -137,20 +160,6 @@
       "long_context_output_multiplier": 1.5
     },
     "gemini-3.1-pro-preview": {
-      "input": 2.00,
-      "cached_input": 0.20,
-      "output": 12.00,
-      "long_context_input_multiplier": 2.0,
-      "long_context_output_multiplier": 1.5
-    },
-    "gemini-4-argon": {
-      "input": 2.00,
-      "cached_input": 0.20,
-      "output": 12.00,
-      "long_context_input_multiplier": 2.0,
-      "long_context_output_multiplier": 1.5
-    },
-    "argon": {
       "input": 2.00,
       "cached_input": 0.20,
       "output": 12.00,
@@ -248,12 +257,22 @@
     "claude-5-5-sonnet": [2.00, 0.20, 2.50, 4.00, 10.00],
     "claude-sonnet-5": [2.00, 0.20, 2.50, 4.00, 10.00],
     "sonnet": [3.00, 0.30, 3.75, 6.00, 15.00],
+    "fable-5.2": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "fable-5-2": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "fable-5.1": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "fable-5-1": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "fable": [4.00, 0.20, 5.00, 8.00, 20.00],
+    "opus-4-6": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4.6": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4-7": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "opus-4.7": [5.00, 0.50, 6.25, 10.00, 25.00],
+    "haiku-5.5": [1.00, 0.10, 1.25, 2.00, 5.00],
+    "haiku-5-5": [1.00, 0.10, 1.25, 2.00, 5.00],
     "haiku": [1.00, 0.10, 1.25, 2.00, 5.00]
   },
   "gemini_thinking_levels": {
     "default": ["LOW", "MEDIUM", "HIGH"],
     "prefixes": {
-      "gemini-3.8-flash": ["LOW", "MEDIUM", "HIGH"],
       "gemini-3.7-flash": ["LOW", "MEDIUM", "HIGH"],
       "gemini-3.6-flash": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
       "gemini-3.5-flash-lite": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
@@ -264,9 +283,8 @@
       "gemini-3-flash": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
       "gemini-2.5": ["LOW", "MEDIUM", "HIGH"],
       "gemini-robotics-er-2": ["MINIMAL", "LOW", "MEDIUM", "HIGH"],
-      "gemini-flash-next": ["LOW", "MEDIUM", "HIGH"],
-      "gemini-4-argon": ["LOW", "MEDIUM", "HIGH"],
-      "argon": ["LOW", "MEDIUM", "HIGH"],
+      "gemini-4-hydrogen": ["LOW", "MEDIUM", "HIGH", "EXTRA_HIGH"],
+      "hydrogen": ["LOW", "MEDIUM", "HIGH", "EXTRA_HIGH"],
       "gemini-4-carbon": ["LOW", "MEDIUM", "HIGH"],
       "carbon": ["LOW", "MEDIUM", "HIGH"]
     }
@@ -283,7 +301,7 @@
         "max_output_tokens": 65536,
         "input_modalities": ["text", "image", "pdf", "audio", "video"]
       },
-      "argon": {
+      "hydrogen": {
         "context_window": 1048576,
         "max_output_tokens": 65536,
         "input_modalities": ["text", "image", "pdf", "audio", "video"]

@@ -56,8 +56,6 @@ _REAL_ACCOUNT_HOME: Path | None = _real_account_home()
 # asia-south1 or europe-west4) and require the "global" Vertex endpoint.
 GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
     {
-        "gemini-4-argon",
-        "argon",
         "gemini-4-carbon",
         "carbon",
         "gemini-4-carbon-high",
@@ -67,8 +65,13 @@ GLOBAL_ONLY_MODELS: frozenset[str] = frozenset(
         "carbon-g",
         "carbon-g-zero",
         "bon-experiment-arm-226",
-        "gemini-flash-next",
-        "gemini-3.8-flash",
+        "gemini-4-hydrogen",
+        "hydrogen",
+        "gemini-4-hydrogen-xhigh",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-zero",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
@@ -142,20 +145,33 @@ def resolve_ask_thinking_level(
         return "MEDIUM"
     return None
 
-# Default Flash worker model (cost_profile economy/balanced and single-shot asks).
-DEFAULT_FLASH_MODEL = "gemini-flash-next"
-# Step-up model when a Flash turn fails its checks (balanced profile). Carbon with zero thinking
-# solved every task Flash solved plus 2 more in the 26-task suite; override with CC_AGY_ESCALATE_MODEL_ON_FAILURE.
+# Default fast worker model (cost_profile economy/balanced and single-shot asks).
+DEFAULT_FAST_MODEL = "gemini-4-hydrogen"
+DEFAULT_FLASH_MODEL = DEFAULT_FAST_MODEL
+# Default frontier worker model (cost_profile quality, prewalk guide, and advisor).
+DEFAULT_FRONTIER_MODEL = "gemini-4-carbon"
+# Step-up model when a Hydrogen turn fails its checks (balanced profile).
 DEFAULT_ESCALATION_MODEL = "gemini-4-carbon-zero"
+
+
+def is_fast_workhorse_model(model: str | None) -> bool:
+    """Return True when `model` is a fast/workhorse tier model (`gemini-4-hydrogen` or `*-flash*`)."""
+    low = str(model or "").strip().lower()
+    if "/models/" in low:
+        low = low[low.rfind("/models/") + len("/models/") :]
+    elif low.startswith("models/"):
+        low = low[len("models/") :]
+    return "hydrogen" in low or "flash" in low
 
 
 def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> str:
     """Return the upstream API model ID for `model` while preserving plugin tier aliases on gateways.
 
     On direct Google AI Studio and Vertex AI endpoints (`custom_gateway=False`), publisher models
-    use canonical IDs such as `gemini-4-carbon` while thinking depth is carried via `thinking_config`
-    (`thinking_budget=0` or `thinking_level`). Custom Vertex gateways (`custom_gateway=True`) receive
-    the tier-qualified alias verbatim so gateway routers can dispatch per-tier model targets.
+    use canonical IDs such as `gemini-4-carbon` and `gemini-4-hydrogen` while thinking depth is carried
+    via `thinking_config` (`thinking_budget=0` or `thinking_level`). Custom Vertex gateways
+    (`custom_gateway=True`) receive the tier-qualified alias verbatim so gateway routers can dispatch
+    per-tier model targets.
     """
     cleaned = str(model or "").strip()
     if not cleaned:
@@ -178,8 +194,15 @@ def normalize_wire_model_name(model: str, *, custom_gateway: bool = False) -> st
         "carbon-g",
     ):
         return "gemini-4-carbon"
-    if low == "argon":
-        return "gemini-4-argon"
+    if low in (
+        "hydrogen",
+        "gemini-4-hydrogen-zero",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
+    ):
+        return "gemini-4-hydrogen"
     if low.endswith("-zero") and len(cleaned) > 5:
         return cleaned[:-5]
     return cleaned
@@ -295,7 +318,7 @@ def resolve_vertex_location(
     """Resolve a valid Vertex AI location for the given model.
 
     Returns (resolved_location, reroute_note).
-    If a global-only model (such as gemini-3.8-flash or gemini-4-argon)
+    If a global-only model (such as gemini-4-hydrogen or gemini-4-carbon)
     is requested against a regional endpoint like asia-south1 or us-central1,
     automatically routes to 'global' and returns an explanatory note.
     """
@@ -349,15 +372,15 @@ def resolve_default_delegate_model(
     )
     req_clean = (requested_model or "").strip()
     if req_clean and not req_clean.startswith("${"):
-        if override and req_clean == "gemini-3.8-flash" and "flash" in override.lower():
+        if override and req_clean in ("gemini-4-hydrogen", "hydrogen") and is_fast_workhorse_model(override):
             return override
         return req_clean
     if override:
         return override
     profile = resolve_cost_profile(source)
     if profile == "quality":
-        return "gemini-4-argon"
-    return DEFAULT_FLASH_MODEL
+        return DEFAULT_FRONTIER_MODEL
+    return DEFAULT_FAST_MODEL
 
 
 def resolve_default_ask_model(
@@ -376,15 +399,15 @@ def resolve_default_ask_model(
     )
     req_clean = (requested_model or "").strip()
     if req_clean and not req_clean.startswith("${"):
-        if override and req_clean == "gemini-3.8-flash" and "flash" in override.lower():
+        if override and req_clean in ("gemini-4-hydrogen", "hydrogen") and is_fast_workhorse_model(override):
             return override
         return req_clean
     if override:
         return override
     profile = resolve_cost_profile(source)
     if profile == "quality":
-        return "gemini-4-argon"
-    return DEFAULT_FLASH_MODEL
+        return DEFAULT_FRONTIER_MODEL
+    return DEFAULT_FAST_MODEL
 
 
 def sanitize_placeholder_env() -> None:

@@ -25,9 +25,11 @@ import time
 from typing import Any, Callable, Mapping
 import unicodedata
 import urllib.parse
+import uuid
 
 from server.genai_client import extract_usage_metadata
 from server.regions import (
+    is_fast_workhorse_model,
     clamp_gemini_thinking_level,
     env_flag,
     is_strict_mode_enabled,
@@ -346,7 +348,7 @@ def resolve_thinking_level(
     model_low = (model or "").strip().lower()
     clean_val = _normalize_thinking_token(value)
     esc_env = _normalize_thinking_token(os.environ.get("CC_AGY_ESCALATION_THINKING_LEVEL"))
-    if not read_only and "flash" not in model_low:
+    if not read_only and not is_fast_workhorse_model(model_low):
         if esc_env and not esc_env.startswith("${") and esc_env in THINKING_LEVELS:
             return clean_val if clean_val in THINKING_LEVELS else esc_env
         if model_low.endswith("-zero"):
@@ -505,6 +507,38 @@ def _parse_proto_fields(buf: bytes) -> dict[int, int | bytes]:
 
 _MAX_CREDIBLE_STEP_INPUT_TOKENS = 20_000_000
 _MAX_CREDIBLE_STEP_OUTPUT_TOKENS = 5_000_000
+
+
+def drop_sqlite_baseline(
+    telemetry: dict[str, Any],
+    baseline: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Drop the first `baseline` requests/tool calls (an earlier phase in a shared save_dir) and re-total.
+
+    A prewalk executor resumes the guide's conversation in the same localharness `save_dir`,
+    so its SQLite trajectory still holds the guide's model calls; without this they would be
+    billed a second time at the executor's rate.
+    """
+    if not baseline:
+        return telemetry
+    skip_reqs = max(0, int(baseline.get("requests") or 0))
+    skip_calls = max(0, int(baseline.get("tool_calls") or 0))
+    kept_reqs = list(telemetry.get("requests") or [])[skip_reqs:]
+    out = dict(telemetry)
+    out["requests"] = kept_reqs
+    out["tool_calls"] = list(telemetry.get("tool_calls") or [])[skip_calls:]
+    for key in (
+        "prompt_token_count",
+        "cached_content_token_count",
+        "candidates_token_count",
+        "thoughts_token_count",
+        "total_token_count",
+    ):
+        out[key] = sum(int(r.get(key) or 0) for r in kept_reqs)
+    out["max_request_prompt_tokens"] = max(
+        (int(r.get("prompt_token_count") or 0) for r in kept_reqs), default=0
+    )
+    return out
 
 
 def extract_sqlite_session_telemetry(save_dir: str | Path | None) -> dict[str, Any]:
@@ -2241,6 +2275,150 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             raise cli_payload
         return cli_payload
 
+    from server.prewalk import resolve_prewalk_config
+
+    raw_prewalk = request.get("prewalk")
+    prewalk_cfg = resolve_prewalk_config(
+        None,
+        requested_model=str(request.get("model") or ""),
+        read_only=is_read_only_tool_set(request.get("enabled_tools"), request.get("disabled_tools")),
+        explicit_prewalk=raw_prewalk if isinstance(raw_prewalk, bool) else None,
+    )
+    if prewalk_cfg.enabled and request.get("prompts"):
+        return await _run_sdk_prewalk(request, prewalk_cfg)
+    return await _run_sdk_worker(request)
+
+
+_PREWALK_USAGE_KEYS = (
+    "prompt_token_count",
+    "cached_content_token_count",
+    "candidates_token_count",
+    "thoughts_token_count",
+    "total_token_count",
+)
+
+
+def _phase_token_usage(usage: Mapping[str, Any]) -> dict[str, int]:
+    return {k: max(0, int(usage.get(k) or 0)) for k in _PREWALK_USAGE_KEYS}
+
+
+async def _run_sdk_prewalk(request: dict[str, Any], prewalk_cfg: Any) -> dict[str, Any]:
+    """Run an SDK worker as a prewalk: frontier guide until the first real edit, then the fast executor.
+
+    Both phases share one localharness `save_dir` and one `conversation_id`, so phase 2
+    resumes the guide's trajectory (files read, checklist, first edit) on the executor model
+    with a continuation prompt that no longer carries the planning block.
+    """
+    from server.prewalk import (
+        build_prewalk_continuation_prompt,
+        inject_prewalk_planning_block,
+        record_model_phase_usage,
+    )
+
+    prompts = [str(p) for p in request["prompts"]]
+    shared_save_dir = tempfile.mkdtemp(prefix="cc-agy-prewalk-save-")
+    conversation_id = str(uuid.uuid4())
+    meta: dict[str, Any] = {
+        "enabled": True,
+        "guide_model": prewalk_cfg.guide_model,
+        "executor_model": prewalk_cfg.executor_model,
+        "swapped": False,
+        "first_edit_path": None,
+        "skipped_reason": None,
+    }
+    by_model: dict[str, dict[str, int]] = {}
+    phase_requests: list[dict[str, Any]] = []
+    try:
+        phase1_req = {
+            **request,
+            "model": prewalk_cfg.guide_model,
+            "prompts": [
+                inject_prewalk_planning_block(
+                    prompts[0],
+                    max_items=prewalk_cfg.max_checklist_items,
+                    acceptance=request.get("acceptance"),
+                )
+            ],
+            "_sdk_save_dir": shared_save_dir,
+            "_sdk_conversation_id": conversation_id,
+            "_prewalk_stop_on_first_edit": True,
+        }
+        phase1 = await _run_sdk_worker(phase1_req)
+        record_model_phase_usage(
+            by_model,
+            phase_requests,
+            model=prewalk_cfg.guide_model,
+            phase="prewalk_guide",
+            phase_usage=phase1.get("usage") or {},
+        )
+        first_edit = phase1.get("prewalk_first_edit_path")
+        if not first_edit:
+            phase1.pop("_sdk_sqlite_counts", None)
+            meta["skipped_reason"] = "no_edit_in_phase1"
+            meta["by_model"] = by_model
+            phase1.pop("prewalk_first_edit_path", None)
+            return {**phase1, "prewalk": meta}
+
+        meta["swapped"] = True
+        meta["first_edit_path"] = str(first_edit)
+        phase2_req = {
+            **request,
+            "model": prewalk_cfg.executor_model,
+            "prompts": [
+                build_prewalk_continuation_prompt(
+                    first_edited_path=str(first_edit),
+                    acceptance=request.get("acceptance"),
+                ),
+                *prompts[1:],
+            ],
+            "_sdk_save_dir": shared_save_dir,
+            "_sdk_conversation_id": conversation_id,
+            "_sdk_resume": True,
+            "_sdk_sqlite_baseline": phase1.pop("_sdk_sqlite_counts", None),
+        }
+        if request.get("max_tool_calls"):
+            phase2_req["max_tool_calls"] = max(
+                1, int(request["max_tool_calls"]) - len(phase1.get("tool_calls") or [])
+            )
+        phase2 = await _run_sdk_worker(phase2_req)
+        phase2.pop("_sdk_sqlite_counts", None)
+        record_model_phase_usage(
+            by_model,
+            phase_requests,
+            model=prewalk_cfg.executor_model,
+            phase="prewalk_executor",
+            phase_usage=phase2.get("usage") or {},
+        )
+        meta["by_model"] = by_model
+
+        u1 = phase1.get("usage") or {}
+        u2 = phase2.get("usage") or {}
+        merged_usage: dict[str, Any] = {
+            k: int(u1.get(k) or 0) + int(u2.get(k) or 0) for k in _PREWALK_USAGE_KEYS
+        }
+        merged_usage["max_request_prompt_tokens"] = max(
+            int(u1.get("max_request_prompt_tokens") or 0),
+            int(u2.get("max_request_prompt_tokens") or 0),
+        )
+        merged_usage["requests"] = list(u1.get("requests") or []) + list(u2.get("requests") or [])
+        merged_usage["turns"] = list(u1.get("turns") or []) + list(u2.get("turns") or [])
+        if not merged_usage["requests"]:
+            merged_usage["requests"] = phase_requests
+        return {
+            **phase2,
+            "usage": merged_usage,
+            "tool_calls": list(phase1.get("tool_calls") or []) + list(phase2.get("tool_calls") or []),
+            "thoughts": list(phase1.get("thoughts") or []) + list(phase2.get("thoughts") or []),
+            "command_runs": list(phase1.get("command_runs") or []) + list(phase2.get("command_runs") or []),
+            "containment_warning": phase2.get("containment_warning") or phase1.get("containment_warning"),
+            "prewalk": meta,
+        }
+    finally:
+        shutil.rmtree(shared_save_dir, ignore_errors=True)
+
+
+async def _run_sdk_worker(request: dict[str, Any]) -> dict[str, Any]:
+    """Run one `google.antigravity` worker session (Vertex, AI Studio, or gateway auth)."""
     from google import antigravity as ag
     from google.antigravity import policy, types
 
@@ -2394,7 +2572,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     capabilities = types.CapabilitiesConfig(**cap_kwargs)
 
     # Keep the SDK's own session/artifact files outside the repo so they never show up in the diff.
-    save_dir = tempfile.mkdtemp(prefix="cc-agy-save-")
+    shared_save_dir = str(request.get("_sdk_save_dir") or "")
+    save_dir = shared_save_dir or tempfile.mkdtemp(prefix="cc-agy-save-")
 
     # Hard caps so one job cannot read tens of millions of tokens; when hit, the turn stops with a
     # MAX_*_EXCEEDED stop reason and the job becomes a "checkpoint" the lead can continue or redirect.
@@ -2559,6 +2738,19 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
             )
         elif hasattr(types, "CustomSystemInstructions"):
             cfg_kwargs["system_instructions"] = types.CustomSystemInstructions(text=sys_text)
+    if request.get("_sdk_conversation_id"):
+        cfg_kwargs["conversation_id"] = str(request["_sdk_conversation_id"])
+        cfg_kwargs["session_continuation_mode"] = (
+            types.SessionContinuationMode.RESUME
+            if request.get("_sdk_resume")
+            else types.SessionContinuationMode.CREATE_OR_RESUME
+        )
+    prewalk_state: dict[str, Any] = {"first_edit_path": None, "pending": {}, "cancel_task": None}
+    agent_holder_for_hooks: list[Any] = [None]
+    if request.get("_prewalk_stop_on_first_edit"):
+        cfg_kwargs["hooks"] = _build_prewalk_first_edit_hooks(
+            ws_str, prewalk_state, agent_holder_for_hooks
+        )
     cfg = ag.LocalAgentConfig(**cfg_kwargs)
 
     tool_calls_log: list[dict[str, Any]] = []
@@ -2576,6 +2768,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     text_out = ""
     resp = None
     agent_ref = None
+    drained_resp_ids: set[int] = set()
+    sqlite_counts: dict[str, int] = {"requests": 0, "tool_calls": 0}
     timeout_sec = float(request.get("timeout_seconds") or 300.0)
     stop_reason: str | None = None
 
@@ -2594,6 +2788,7 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
     try:
         agent_ref = await agent.__aenter__()
         entered = True
+        agent_holder_for_hooks[0] = agent_ref
         turn_instr_map = request.get("turn_instructions")
         turn_reminder_block = (
             render_keyed_turn_instructions(turn_instr_map)
@@ -2611,60 +2806,91 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 resp = await maybe_await(agent_ref.chat(eff_prompt_turn))
             else:
                 resp = await maybe_await(agent_ref.continue_session(eff_prompt_turn))
-            await asyncio.wait_for(
-                maybe_await(resp.resolve()),
-                timeout=timeout_sec,
-            )
-            await asyncio.wait_for(
-                drain_response_streams(resp, tool_calls_log, thoughts_log),
-                timeout=3.0,
-            )
-            text_fn = getattr(resp, "text", None)
-            if callable(text_fn):
-                text_out = str((await maybe_await(text_fn())) or "")
-            elif isinstance(text_fn, str):
-                text_out = text_fn
-            # Turn.usage_metadata is accumulated across all model invocations in the turn.
-            turn_usage = await resolve_turn_usage(resp)
-            if not any(turn_usage.values()):
-                turn_usage = extract_usage_from_session(agent_ref, resp)
-            for k in (
-                "prompt_token_count",
-                "cached_content_token_count",
-                "candidates_token_count",
-                "thoughts_token_count",
-                "total_token_count",
-            ):
-                usage[k] += turn_usage[k]
-            usage["turns"].append(dict(turn_usage))
+            turn_usage_added = False
+            try:
+                await asyncio.wait_for(
+                    maybe_await(resp.resolve()),
+                    timeout=timeout_sec,
+                )
+                drained_resp_ids.add(id(resp))
+                await asyncio.wait_for(
+                    drain_response_streams(resp, tool_calls_log, thoughts_log),
+                    timeout=3.0,
+                )
+                text_fn = getattr(resp, "text", None)
+                if callable(text_fn):
+                    text_out = str((await maybe_await(text_fn())) or "")
+                elif isinstance(text_fn, str):
+                    text_out = text_fn
+                # Turn.usage_metadata is accumulated across all model invocations in the turn.
+                turn_usage = await resolve_turn_usage(resp)
+                if not any(turn_usage.values()):
+                    turn_usage = extract_usage_from_session(agent_ref, resp)
+                for k in (
+                    "prompt_token_count",
+                    "cached_content_token_count",
+                    "candidates_token_count",
+                    "thoughts_token_count",
+                    "total_token_count",
+                ):
+                    usage[k] += turn_usage[k]
+                usage["turns"].append(dict(turn_usage))
+                turn_usage_added = True
 
-            # Extract per-invocation usage from resp.steps when available so >200k long-context
-            # pricing is evaluated on single model calls rather than accumulated multi-step turns.
-            steps_stream = getattr(resp, "steps", None)
-            if steps_stream is not None:
-                try:
-                    if hasattr(steps_stream, "__aiter__"):
-                        async for st in steps_stream:
-                            st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
-                            if any(st_u.values()):
-                                usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
-                                usage["max_request_prompt_tokens"] = max(
-                                    int(usage.get("max_request_prompt_tokens") or 0),
-                                    int(st_u.get("prompt_token_count") or 0),
-                                )
-                    elif hasattr(steps_stream, "__iter__"):
-                        for st in steps_stream:
-                            st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
-                            if any(st_u.values()):
-                                usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
-                                usage["max_request_prompt_tokens"] = max(
-                                    int(usage.get("max_request_prompt_tokens") or 0),
-                                    int(st_u.get("prompt_token_count") or 0),
-                                )
-                except Exception:
-                    pass
-            stop_reason = await resolve_stop_reason(resp)
-        sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+                # Extract per-invocation usage from resp.steps when available so >200k long-context
+                # pricing is evaluated on single model calls rather than accumulated multi-step turns.
+                steps_stream = getattr(resp, "steps", None)
+                if steps_stream is not None:
+                    try:
+                        if hasattr(steps_stream, "__aiter__"):
+                            async for st in steps_stream:
+                                st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
+                                if any(st_u.values()):
+                                    usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
+                                    usage["max_request_prompt_tokens"] = max(
+                                        int(usage.get("max_request_prompt_tokens") or 0),
+                                        int(st_u.get("prompt_token_count") or 0),
+                                    )
+                        elif hasattr(steps_stream, "__iter__"):
+                            for st in steps_stream:
+                                st_u = extract_usage_metadata(await maybe_await(getattr(st, "usage_metadata", None)))
+                                if any(st_u.values()):
+                                    usage["requests"].append({**st_u, "per_call": True, "model": resolved_model})
+                                    usage["max_request_prompt_tokens"] = max(
+                                        int(usage.get("max_request_prompt_tokens") or 0),
+                                        int(st_u.get("prompt_token_count") or 0),
+                                    )
+                    except Exception:
+                        pass
+                stop_reason = await resolve_stop_reason(resp)
+            except (Exception, asyncio.CancelledError) as turn_exc:
+                # The SDK surfaces our own prewalk `conversation.cancel()` as
+                # `AntigravityCancelledError` from every stream on this turn; keep what ran.
+                if not _is_own_prewalk_cancel(turn_exc, prewalk_state):
+                    raise
+                if id(resp) not in drained_resp_ids:
+                    drained_resp_ids.add(id(resp))
+                    try:
+                        await asyncio.wait_for(
+                            drain_response_streams(resp, tool_calls_log, thoughts_log),
+                            timeout=3.0,
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        pass
+                if not turn_usage_added:
+                    turn_usage = extract_usage_from_session(agent_ref, resp)
+                    for k in _PREWALK_USAGE_KEYS:
+                        usage[k] += int(turn_usage.get(k) or 0)
+                    usage["turns"].append(dict(turn_usage))
+            if prewalk_state["first_edit_path"] is not None:
+                stop_reason = "PREWALK_FIRST_EDIT"
+                break
+        raw_sqlite = extract_sqlite_session_telemetry(save_dir)
+        sqlite_counts = {
+            "requests": len(raw_sqlite.get("requests") or []),
+            "tool_calls": len(raw_sqlite.get("tool_calls") or []),
+        }
+        sqlite_telemetry = drop_sqlite_baseline(raw_sqlite, request.get("_sdk_sqlite_baseline"))
         pub_tot = int(usage.get("total_token_count") or 0)
         sql_tot = int(sqlite_telemetry.get("total_token_count") or 0)
         if pub_tot > 0 and sql_tot > max(pub_tot * 4, pub_tot + 500_000):
@@ -2691,15 +2917,21 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         abnormal_exit = True
         # Attach partial usage and tool calls before closing the agent so the caller's finally
         # block records everything consumed prior to the failure or timeout without blocking.
-        try:
-            await asyncio.wait_for(
-                drain_response_streams(resp, tool_calls_log, thoughts_log),
-                timeout=2.0,
-            )
-        except (Exception, asyncio.CancelledError):
-            pass
+        if resp is not None and id(resp) not in drained_resp_ids:
+            try:
+                await asyncio.wait_for(
+                    drain_response_streams(resp, tool_calls_log, thoughts_log),
+                    timeout=2.0,
+                )
+            except (Exception, asyncio.CancelledError):
+                pass
         partial_usage = extract_usage_from_session(agent_ref, resp)
-        sqlite_telemetry = extract_sqlite_session_telemetry(save_dir)
+        raw_sqlite = extract_sqlite_session_telemetry(save_dir)
+        sqlite_counts = {
+            "requests": len(raw_sqlite.get("requests") or []),
+            "tool_calls": len(raw_sqlite.get("tool_calls") or []),
+        }
+        sqlite_telemetry = drop_sqlite_baseline(raw_sqlite, request.get("_sdk_sqlite_baseline"))
         base_tot = max(
             int(usage.get("total_token_count") or 0),
             int(partial_usage.get("total_token_count") or 0),
@@ -2760,7 +2992,8 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
                 live_state_file.unlink(missing_ok=True)
             except OSError:
                 pass
-        shutil.rmtree(save_dir, ignore_errors=True)
+        if not shared_save_dir:
+            shutil.rmtree(save_dir, ignore_errors=True)
         shutil.rmtree(Path(ws_str) / ".ctx-session-reads", ignore_errors=True)
 
     return {
@@ -2772,7 +3005,78 @@ async def _default_antigravity_backend(request: dict[str, Any]) -> dict[str, Any
         "containment": containment_mode,
         "containment_warning": containment_warning,
         "command_runs": list(sj_command_runs),
+        **(
+            {"prewalk_first_edit_path": prewalk_state["first_edit_path"]}
+            if prewalk_state["first_edit_path"]
+            else {}
+        ),
+        **({"_sdk_sqlite_counts": sqlite_counts} if request.get("_sdk_save_dir") else {}),
     }
+
+
+def _is_own_prewalk_cancel(exc: BaseException, prewalk_state: Mapping[str, Any]) -> bool:
+    """Return True when `exc` comes from the prewalk's own turn cancel, not a timeout or real cancel."""
+    if prewalk_state.get("first_edit_path") is None:
+        return False
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        return False
+    if isinstance(exc, asyncio.TimeoutError) and not isinstance(exc, asyncio.CancelledError):
+        return False
+    return True
+
+
+def _build_prewalk_first_edit_hooks(
+    workspace_dir: str,
+    prewalk_state: dict[str, Any],
+    agent_holder: list[Any],
+) -> list[Any]:
+    """Build SDK hooks that cancel the turn after the first successful edit to a real repo file.
+
+    The pre-tool hook only records edit targets and always allows the call, so it never
+    loosens or tightens the configured policies. The post-tool hook schedules
+    `conversation.cancel()` once a recorded edit completes without an error.
+    """
+    from google.antigravity import hooks as ag_hooks
+    from google.antigravity import types as ag_types
+
+    from server.prewalk import is_acp_edit_tool, is_real_code_edit_target
+
+    @ag_hooks.pre_tool_call_decide
+    async def _record_edit_target(data: Any) -> Any:
+        name = str(getattr(data, "name", "") or "")
+        if prewalk_state["first_edit_path"] is None and is_acp_edit_tool({"name": name}):
+            args = getattr(data, "args", None) or {}
+            raw_path = (
+                getattr(data, "canonical_path", None)
+                or args.get("TargetFile")
+                or args.get("targetFile")
+                or args.get("path")
+                or args.get("Path")
+                or args.get("file_path")
+                or ""
+            )
+            rel = is_real_code_edit_target(str(raw_path), workspace_dir=workspace_dir) if raw_path else None
+            if rel:
+                prewalk_state["pending"][getattr(data, "id", None) or "_last"] = rel
+        return ag_types.HookResult(allow=True)
+
+    @ag_hooks.post_tool_call
+    async def _cancel_after_first_edit(data: Any) -> None:
+        if prewalk_state["first_edit_path"] is not None or getattr(data, "error", None):
+            return
+        pending = prewalk_state["pending"]
+        rel = pending.pop(getattr(data, "id", None) or "_last", None) or pending.pop("_last", None)
+        if not rel:
+            return
+        prewalk_state["first_edit_path"] = rel
+        agent_ref = agent_holder[0]
+        if agent_ref is not None:
+            prewalk_state["cancel_task"] = asyncio.get_running_loop().create_task(
+                agent_ref.conversation.cancel()
+            )
+
+    return [_record_edit_target, _cancel_after_first_edit]
 
 
 async def resolve_stop_reason(resp: Any) -> str | None:
@@ -3283,8 +3587,14 @@ def run_antigravity_worker(
     nm_linked: bool = False,
     isolated_worktree: bool = False,
     turn_instructions: Mapping[str, str] | None = None,
+    prewalk: bool | None = None,
 ) -> dict[str, Any]:
-    """Run an Antigravity worker synchronously or via custom test backend."""
+    """Run an Antigravity worker synchronously or via custom test backend.
+
+    `prewalk=True` asks the `agy acp` worker to open on the frontier guide model and
+    switch to the fast executor on the same session after the first real code edit;
+    `None` defers to `CC_AGY_PREWALK` / `CC_AGY_WORKER_STRATEGY`.
+    """
     resolved_auth = resolve_auth_config(
         requested_project=project,
         requested_location=location,
@@ -3356,6 +3666,7 @@ def run_antigravity_worker(
             if isinstance(turn_instructions, Mapping) and turn_instructions
             else {}
         ),
+        **({"prewalk": bool(prewalk)} if prewalk is not None else {}),
     }
     extra_cancel_hooks: list[Callable[[], None]] = []
     in_async_runner = [False]
@@ -3438,4 +3749,5 @@ def run_antigravity_worker(
         **({"denied_actions": list(result["denied_actions"])} if result.get("denied_actions") else {}),
         **({"worker_sandbox": dict(result["worker_sandbox"])} if result.get("worker_sandbox") else {}),
         **({"usage_estimated": True} if result.get("usage_estimated") else {}),
+        **({"prewalk": dict(result["prewalk"])} if isinstance(result.get("prewalk"), Mapping) else {}),
     }

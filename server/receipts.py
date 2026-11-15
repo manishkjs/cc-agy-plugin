@@ -19,7 +19,7 @@ from typing import Any, Callable, Mapping
 import uuid
 
 from server import file_lock as fcntl
-from server.regions import estimate_cost_usd, resolve_max_daily_cents
+from server.regions import DEFAULT_FAST_MODEL, estimate_cost_usd, resolve_max_daily_cents
 from server.verify import run_git
 
 _VALID_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -570,7 +570,7 @@ def _receipt_list_equivalent_cents(rec: Mapping[str, Any]) -> float:
             return _finite_positive(cost.get("total_cost_cents"))
     usage = rec.get("usage") or {}
     est = estimate_cost_usd(
-        str(rec.get("model") or "gemini-flash-next"),
+        str(rec.get("model") or "gemini-4-hydrogen"),
         usage,
         single_request=(rec.get("kind") == "ask"),
     )
@@ -944,7 +944,7 @@ class ReceiptStore:
             prev_rec = {}
 
         usage = record.get("usage") or {}
-        model = str(record.get("model") or "gemini-flash-next")
+        model = str(record.get("model") or "gemini-4-hydrogen")
         precomputed = record.get("precomputed_cost")
         if isinstance(precomputed, dict) and "total_cost_cents" in precomputed:
             # Jobs that mix models (e.g. Gemini writers plus a Claude fallback) price each call themselves.
@@ -1215,7 +1215,7 @@ class ReceiptStore:
 
             usage = r.get("usage") or {}
             cost = r.get("cost") or estimate_cost_usd(
-                str(r.get("model") or "gemini-flash-next"),
+                str(r.get("model") or DEFAULT_FAST_MODEL),
                 usage,
                 single_request=(r.get("kind") == "ask"),
             )

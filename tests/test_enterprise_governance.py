@@ -282,7 +282,7 @@ def test_installer_writes_enterprise_settings_for_every_host_without_secrets() -
         enterprise_location="US",
         enterprise_user_tier="gcp-ge-plus-tier",
         bifrost_policy_url=POLICY_URL + "/",
-        bifrost_agy_policy_model="gemini-3.8-flash-medium",
+        bifrost_agy_policy_model="gemini-4-hydrogen-medium",
     )
 
     codex_block = build_codex_server_block(auth_mode="gemini-enterprise", extra_env=extra_env)
@@ -462,55 +462,55 @@ def test_denied_job_pauses_unapplied_and_resumes_the_same_conversation(tmp_path:
 
 
 def test_policy_is_off_without_a_policy_url() -> None:
-    verdict = enforce_agy_model_policy("gemini-4-argon", "high", {"CC_AGY_BIFROST_VIRTUAL_KEY": "sdk-key"})
+    verdict = enforce_agy_model_policy("gemini-4-carbon", "high", {"CC_AGY_BIFROST_VIRTUAL_KEY": "sdk-key"})
 
-    assert verdict == {"enabled": False, "model": "gemini-4-argon", "allowed": None, "policy_routed": False}
+    assert verdict == {"enabled": False, "model": "gemini-4-carbon", "allowed": None, "policy_routed": False}
     assert inspect_bifrost_policy({})["enabled"] is False
 
 
 def test_policy_allows_listed_models_and_sends_both_key_headers() -> None:
-    gateway = _FakeBifrost(["agy-cli/gemini-4-argon-high", "vertex/gemini-3.8-flash"])
+    gateway = _FakeBifrost(["agy-cli/gemini-4-carbon-high", "vertex/gemini-4-hydrogen"])
 
-    verdict = enforce_agy_model_policy("gemini-4-argon", "high", _policy_env(), transport=gateway)
+    verdict = enforce_agy_model_policy("gemini-4-carbon", "high", _policy_env(), transport=gateway)
 
     url, headers = gateway.calls[0]
-    assert verdict["enabled"] is True and verdict["model"] == "gemini-4-argon"
-    assert verdict["allowed"] == frozenset({"gemini-4-argon-high"})
+    assert verdict["enabled"] is True and verdict["model"] == "gemini-4-carbon"
+    assert verdict["allowed"] == frozenset({"gemini-4-carbon-high"})
     assert url == f"{POLICY_URL}/v1/models"
     assert headers["Authorization"] == f"Bearer {AGY_VIRTUAL_KEY}" and headers["x-bf-vk"] == AGY_VIRTUAL_KEY
 
 
 def test_policy_denies_unlisted_model_and_revoked_key() -> None:
-    gateway = _FakeBifrost(["agy-cli/gemini-3.8-flash-medium"])
+    gateway = _FakeBifrost(["agy-cli/gemini-4-hydrogen-medium"])
     revoked = _FakeBifrost([], models_status=401)
 
-    with pytest.raises(BifrostPolicyError, match="'gemini-4-argon' is not allowed"):
-        enforce_agy_model_policy("gemini-4-argon", "high", _policy_env(), transport=gateway)
+    with pytest.raises(BifrostPolicyError, match="'gemini-4-carbon' is not allowed"):
+        enforce_agy_model_policy("gemini-4-carbon", "high", _policy_env(), transport=gateway)
     bifrost_policy.clear_policy_cache()
     with pytest.raises(BifrostPolicyError, match="HTTP 401"):
-        enforce_agy_model_policy("gemini-3.8-flash-medium", None, _policy_env(), transport=revoked)
+        enforce_agy_model_policy("gemini-4-hydrogen-medium", None, _policy_env(), transport=revoked)
 
 
 def test_policy_routed_resolves_from_routing_rules_then_fallback_model() -> None:
-    allowed = ["agy-cli/policy-routed", "agy-cli/gemini-3.8-flash-medium", "agy-cli/gemini-4-argon-high"]
-    with_rules = _FakeBifrost(allowed, routed_model="gemini-4-argon-high")
+    allowed = ["agy-cli/policy-routed", "agy-cli/gemini-4-hydrogen-medium", "agy-cli/gemini-4-carbon-high"]
+    with_rules = _FakeBifrost(allowed, routed_model="gemini-4-carbon-high")
     rules_env = _policy_env(CC_AGY_BIFROST_POLICY_USER="reader", CC_AGY_BIFROST_POLICY_PASSWORD="reader-pass")
-    fallback_env = _policy_env(CC_AGY_BIFROST_AGY_POLICY_MODEL="agy-cli/gemini-3.8-flash-medium")
+    fallback_env = _policy_env(CC_AGY_BIFROST_AGY_POLICY_MODEL="agy-cli/gemini-4-hydrogen-medium")
 
     routed = enforce_agy_model_policy("agy-cli/policy-routed", "low", rules_env, transport=with_rules)
     bifrost_policy.clear_policy_cache()
     fell_back = enforce_agy_model_policy("policy-routed", None, fallback_env, transport=_FakeBifrost(allowed))
     bifrost_policy.clear_policy_cache()
 
-    assert routed["policy_routed"] is True and routed["model"] == "gemini-4-argon-high"
+    assert routed["policy_routed"] is True and routed["model"] == "gemini-4-carbon-high"
     assert with_rules.calls[1][1]["Authorization"].startswith("Basic ")
-    assert fell_back["model"] == "gemini-3.8-flash-medium"
+    assert fell_back["model"] == "gemini-4-hydrogen-medium"
     with pytest.raises(BifrostPolicyError, match="could not be resolved"):
         enforce_agy_model_policy("policy-routed", None, _policy_env(), transport=_FakeBifrost(allowed))
     bifrost_policy.clear_policy_cache()
     with pytest.raises(BifrostPolicyError, match="does not allow 'policy-routed'"):
         enforce_agy_model_policy(
-            "policy-routed", None, fallback_env, transport=_FakeBifrost(["agy-cli/gemini-3.8-flash-medium"])
+            "policy-routed", None, fallback_env, transport=_FakeBifrost(["agy-cli/gemini-4-hydrogen-medium"])
         )
 
 
@@ -548,39 +548,39 @@ def test_policy_url_and_key_validation() -> None:
 
 
 def test_doctor_summary_reports_status_and_allowed_count_without_the_key() -> None:
-    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-3.8-flash-medium"])
-    env = _policy_env(CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-3.8-flash-medium")
+    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-4-hydrogen-medium"])
+    env = _policy_env(CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-4-hydrogen-medium")
 
     offline = inspect_bifrost_policy(env)
     live = inspect_bifrost_policy(env, live=True, transport=gateway)
     broken = inspect_bifrost_policy({"CC_AGY_BIFROST_POLICY_URL": "http://bifrost.example.com"})
 
     assert offline["enabled"] is True and offline["allowed_model_count"] is None
-    assert live["allowed_model_count"] == 2 and live["policy_routed_model"] == "gemini-3.8-flash-medium"
+    assert live["allowed_model_count"] == 2 and live["policy_routed_model"] == "gemini-4-hydrogen-medium"
     assert AGY_VIRTUAL_KEY not in json.dumps(offline) + json.dumps(live)
     assert broken["enabled"] is False and "https://" in broken["error"]
 
 
 def test_agy_model_resolution_enforces_policy_before_spawning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-3.8-flash-medium"])
+    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-4-hydrogen-medium"])
     monkeypatch.setattr(bifrost_policy, "_default_transport", gateway)
     env = _policy_env(
         CC_AGY_CLI_CONFIG_DIR=str(tmp_path / "cfg"),
-        CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-3.8-flash-medium",
+        CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-4-hydrogen-medium",
     )
 
     model, effort, note = _resolve_cached_model_for_cli("agy", "policy-routed", "high", env)
 
-    assert (model, effort) == ("gemini-3.8-flash-medium", None)
+    assert (model, effort) == ("gemini-4-hydrogen-medium", None)
     assert "policy-routed" in str(note)
     with pytest.raises(BifrostPolicyError, match="not allowed"):
-        _resolve_cached_model_for_cli("agy", "gemini-4-argon", "high", env)
+        _resolve_cached_model_for_cli("agy", "gemini-4-carbon", "high", env)
     with pytest.raises(BifrostPolicyError, match="not allowed"):
         run_agy_cli_worker(
             {
                 "workspace_dir": str(tmp_path),
                 "prompt": "never sent",
-                "model": "gemini-4-argon",
+                "model": "gemini-4-carbon",
                 "env": {**env, "CC_AGY_CLI_BIN": str(_make_fake_agy(tmp_path / "bin" / "agy", "raise SystemExit(3)\n"))},
             }
         )
@@ -595,9 +595,9 @@ _CATALOG_AGY_BODY = """
         with open(os.environ["FAKE_AGY_LOG"], "a", encoding="utf-8") as fh:
             fh.write("models\\n")
         sys.stderr.write("Fetching available models...\\n")
-        print("gemini-4-argon-high\\tGemini 4 Argon (High)")
-        print("gemini-3.8-flash-medium\\tGemini 3.8 Flash (Medium)")
-        print("gemini-3.8-flash-low\\tGemini 3.8 Flash (Low)")
+        print("gemini-4-carbon-high\\tGemini 4 Carbon (High)")
+        print("gemini-4-hydrogen-medium\\tGemini 4 Hydrogen (Medium)")
+        print("gemini-4-hydrogen-low\\tGemini 4 Hydrogen (Low)")
         raise SystemExit(0)
 """
 
@@ -626,11 +626,11 @@ def test_model_catalog_is_parsed_cached_in_memory_and_on_disk(tmp_path: Path) ->
     expired = agy_state.load_agy_model_catalog(fake_agy, {**env, "CC_AGY_MODEL_CATALOG_TTL_SECONDS": "0"})
     state_file = tmp_path / "state" / "agy_model_catalog.json"
 
-    assert first == ("gemini-4-argon-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low")
+    assert first == ("gemini-4-carbon-high", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-low")
     assert second == first and from_disk == first and expired == first
     assert (tmp_path / "agy.log").read_text(encoding="utf-8").count("models") == 2
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
-    assert agy_state.catalog_offers("gemini-4-argon", first) and not agy_state.catalog_offers("gemini-flash-next", first)
+    assert agy_state.catalog_offers("gemini-4-carbon", first) and not agy_state.catalog_offers("gemini-4.1-hydrogen", first)
     assert agy_state.inspect_agy_model_catalog(fake_agy, env)["source"] == "disk_cache"
     assert agy_state.load_agy_model_catalog(fake_agy, {**env, "CC_AGY_MODEL_CATALOG": "0"}) is None
 
@@ -643,8 +643,8 @@ def test_unreadable_catalog_means_unknown_and_changes_nothing(tmp_path: Path) ->
 
     assert agy_state.load_agy_model_catalog(broken_agy, env) is None
     assert agy_state.load_agy_model_catalog(str(tmp_path / "missing-agy"), env) is None
-    assert _resolve_cached_model_for_cli(broken_agy, "gemini-flash-next", "low", env) == (
-        "gemini-flash-next", "low", None,
+    assert _resolve_cached_model_for_cli(broken_agy, "gemini-4-hydrogen", "low", env) == (
+        "gemini-4-hydrogen", "low", None,
     )
     assert agy_state.parse_agy_models_output("\x1b[32mgemini-x-1\x1b[0m  Name\nBad Slug Here\n\n") == ("gemini-x-1",)
 
@@ -653,20 +653,20 @@ def test_model_mismatch_is_fixed_from_the_catalog_before_any_run(tmp_path: Path,
     fake_agy = str(_make_fake_agy(tmp_path / "bin" / "agy", _CATALOG_AGY_BODY))
     env = _catalog_env(tmp_path)
 
-    model, effort, note = _resolve_cached_model_for_cli(fake_agy, "gemini-flash-next", "low", env)
-    offered = _resolve_cached_model_for_cli(fake_agy, "gemini-4-argon", "high", env)
+    model, effort, note = _resolve_cached_model_for_cli(fake_agy, "gemini-4.1-hydrogen", "low", env)
+    offered = _resolve_cached_model_for_cli(fake_agy, "gemini-4-carbon", "high", env)
 
-    assert model == "gemini-3.8-flash-low" and effort is None and "gemini-flash-next" in str(note)
-    assert offered == ("gemini-4-argon", "high", None)
+    assert model == "gemini-4-hydrogen-low" and effort is None and "gemini-4.1-hydrogen" in str(note)
+    assert offered == ("gemini-4-carbon", "high", None)
 
-    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-3.8-flash-medium", "agy-cli/gemini-9-unoffered"])
+    gateway = _FakeBifrost(["agy-cli/policy-routed", "agy-cli/gemini-4-hydrogen-medium", "agy-cli/gemini-9-unoffered"])
     monkeypatch.setattr(bifrost_policy, "_default_transport", gateway)
     _MODEL_FALLBACK_CACHE.clear()
     governed = {**env, **_policy_env(CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-9-unoffered")}
 
-    intersected, _, _ = _resolve_cached_model_for_cli(fake_agy, "gemini-flash-next", "low", governed)
+    intersected, _, _ = _resolve_cached_model_for_cli(fake_agy, "gemini-4.1-hydrogen", "low", governed)
 
-    assert intersected == "gemini-3.8-flash-medium"
+    assert intersected == "gemini-4-hydrogen-medium"
     with pytest.raises(BifrostPolicyError, match="does not offer"):
         _resolve_cached_model_for_cli(fake_agy, "policy-routed", None, governed)
 
@@ -699,7 +699,7 @@ def _ask_request(tmp_path: Path, question: str, **overrides: Any) -> dict[str, A
     }
     context = "=== FILE: big.py ===\nSECRET_CONTEXT_BODY\n=== END FILE ==="
     return {
-        "model": "gemini-3.8-flash-low",
+        "model": "gemini-4-hydrogen-low",
         "prompt": f"{context}\n\n{question}",
         "prompt_prefix": context,
         "prompt_delta": question,
@@ -739,7 +739,7 @@ def test_follow_up_ask_resumes_with_only_the_new_question_and_delta_usage(tmp_pa
     "overrides",
     [
         {"session_id": "host-session-B"},
-        {"model": "gemini-3.8-flash-medium"},
+        {"model": "gemini-4-hydrogen-medium"},
         {"workspace_root": "/another/workspace"},
         {"prompt_prefix": "=== FILE: other.py ==="},
         {"env": {"CC_AGY_CONVERSATION_TTL_SECONDS": "0"}},
@@ -969,8 +969,8 @@ def test_bifrost_effort_suffix_matching_gateway_controls_and_fast_pre_tool_guard
     from server.bifrost_policy import is_model_allowed
     from server.gateway import DEFAULT_PRICES_PER_MTOK, gemini_endpoint, translate_anthropic_to_gemini_payload
 
-    assert is_model_allowed("gemini-3.8-flash-high", None, frozenset({"gemini-3.8-flash"})) is True
-    assert DEFAULT_PRICES_PER_MTOK["gemini-3.8-flash"] == (0.50, 0.05, 3.00)
+    assert is_model_allowed("gemini-4-hydrogen-high", None, frozenset({"gemini-4-hydrogen"})) is True
+    assert DEFAULT_PRICES_PER_MTOK["gemini-4-hydrogen"] == (1.50, 0.075, 7.50)
     assert DEFAULT_PRICES_PER_MTOK["claude-opus-5-5"] == (4.00, 0.20, 20.00)
 
     translated = translate_anthropic_to_gemini_payload(
@@ -980,7 +980,7 @@ def test_bifrost_effort_suffix_matching_gateway_controls_and_fast_pre_tool_guard
                 {"role": "user", "content": "Part B"},
             ]
         },
-        "gemini-flash-next",
+        "gemini-4-hydrogen",
     )
     assert len(translated["contents"]) == 1
     assert len(translated["contents"][0]["parts"]) == 2
@@ -992,12 +992,12 @@ def test_bifrost_effort_suffix_matching_gateway_controls_and_fast_pre_tool_guard
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-proj")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
     monkeypatch.setattr("server.gateway._vertex_access_token", lambda: "mock-oauth-bearer-token")
-    url, headers = gemini_endpoint("gemini-flash-next")
+    url, headers = gemini_endpoint("gemini-4-hydrogen")
     assert "/locations/global/" in url
 
     monkeypatch.setenv("CC_AGY_BLOCKED_PROJECTS", "my-proj")
     with pytest.raises(Exception, match="CC_AGY_BLOCKED_PROJECTS"):
-        gemini_endpoint("gemini-flash-next")
+        gemini_endpoint("gemini-4-hydrogen")
 
     guard_script = Path(__file__).resolve().parent.parent / "scripts" / "pre_tool_guard.py"
     t0 = time.monotonic()

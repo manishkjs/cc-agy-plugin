@@ -126,10 +126,10 @@ class TestDeclarativeRateCard:
     def test_rate_card_json_loads_and_preserves_backward_compatible_rates(self) -> None:
         card = load_rate_card()
         assert validate_rate_card(card) == []
-        assert MODEL_PRICING_PER_1M_USD["gemini-3.8-flash"] == {
-            "input": 0.50,
-            "cached_input": 0.05,
-            "output": 3.00,
+        assert MODEL_PRICING_PER_1M_USD["gemini-4-hydrogen"] == {
+            "input": 1.50,
+            "cached_input": 0.075,
+            "output": 7.50,
         }
         assert MODEL_PRICING_PER_1M_USD["gemini-3.7-flash"]["input"] == 0.50
         assert DEFAULT_LEAD_RATES["sonnet"] == (3.00, 0.30, 3.75, 6.00, 15.00)
@@ -157,7 +157,7 @@ class TestDeclarativeRateCard:
         assert check_promotional_rate_expiry(date(2026, 12, 31)) == []
         expired = check_promotional_rate_expiry("2027-01-01")
         assert len(expired) >= 2
-        assert any("gemini-3.8-flash" in msg for msg in expired)
+        assert any("gemini-3.7-flash" in msg for msg in expired)
         assert any("sonnet-5.5" in msg for msg in expired)
 
 
@@ -401,7 +401,7 @@ class TestOptInTelemetryAndIdentityPrecedence:
                 "kind": "delegate",
                 "status": "ok",
                 "auth_mode": "vertex",
-                "model": "gemini-flash-next",
+                "model": "gemini-4-hydrogen",
                 "prompt": "TOP_SECRET_PROMPT_DO_NOT_LEAK",
                 "diff": "+SECRET_DIFF_LINE",
                 "workspace_root": str(ws),
@@ -428,7 +428,7 @@ class TestOptInTelemetryAndIdentityPrecedence:
         assert str(ws) not in raw_text
         ev = json.loads(raw_text)
         assert ev["job_id"] == "job-tel-1"
-        assert ev["cost_cents"] == pytest.approx(0.1975)
+        assert ev["cost_cents"] == pytest.approx(0.52875)
         assert ev["cost_cents"] == pytest.approx(rec["cost"]["total_cost_cents"])
         assert ev["usage"]["total_token_count"] == 2400
         assert ev["user_id"] == "alice"

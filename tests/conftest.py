@@ -18,7 +18,43 @@ def _bare_python_agy_sdk_stub(tmp_path_factory: pytest.TempPathFactory) -> Path 
     stub_root = tmp_path_factory.mktemp("agy_sdk_stub")
     pkg = stub_root / "google" / "antigravity"
     pkg.mkdir(parents=True, exist_ok=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("from . import hooks, types\n", encoding="utf-8")
+    (pkg / "types.py").write_text(
+        "class AntigravityCancelledError(Exception):\n"
+        "    pass\n\n"
+        "class ToolCall:\n"
+        "    def __init__(self, name='', id='', args=None):\n"
+        "        self.name = name\n"
+        "        self.id = id\n"
+        "        self.args = args or {}\n\n"
+        "class ToolResult:\n"
+        "    def __init__(self, name='', id='', error=None, output=None):\n"
+        "        self.name = name\n"
+        "        self.id = id\n"
+        "        self.error = error\n"
+        "        self.output = output\n\n"
+        "class HookResult:\n"
+        "    def __init__(self, allow=True, reason=''):\n"
+        "        self.allow = allow\n"
+        "        self.reason = reason\n",
+        encoding="utf-8",
+    )
+    (pkg / "hooks.py").write_text(
+        "class _Hook:\n"
+        "    def __init__(self, fn):\n"
+        "        self._fn = fn\n"
+        "    async def run(self, context=None, data=None):\n"
+        "        return await self._fn(data)\n\n"
+        "def pre_tool_call_decide(fn):\n"
+        "    return _Hook(fn)\n\n"
+        "def post_tool_call(fn):\n"
+        "    return _Hook(fn)\n",
+        encoding="utf-8",
+    )
+    if importlib.util.find_spec("google.genai") is None:
+        genai_pkg = stub_root / "google" / "genai"
+        genai_pkg.mkdir(parents=True, exist_ok=True)
+        (genai_pkg / "__init__.py").write_text("", encoding="utf-8")
     sys.path.insert(0, str(stub_root))
     importlib.invalidate_caches()
     return stub_root

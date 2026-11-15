@@ -116,7 +116,7 @@ def test_fix1_delegate_cancel_prevents_flash_to_argon_escalation(
     subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo), check=True)
 
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_models: list[str] = []
     phase1_in_flight = threading.Event()
@@ -137,7 +137,7 @@ def test_fix1_delegate_cancel_prevents_flash_to_argon_escalation(
     try:
         started = jm.delegate_start(
             "Implement add(a, b) in app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             wait=False,
             auto_apply=False,
@@ -148,7 +148,7 @@ def test_fix1_delegate_cancel_prevents_flash_to_argon_escalation(
         release_phase1.set()
         res = jm.delegate_result(jid, wait=True, timeout=5.0)
         assert res["status"] == "cancelled"
-        assert seen_models == ["gemini-3.8-flash"]
+        assert seen_models == ["gemini-4-hydrogen"]
         assert "escalated_from_model" not in res
     finally:
         release_phase1.set()
@@ -183,7 +183,7 @@ def test_fix2_provenance_check_skips_plugin_escalation_traceback_prompts(
     monkeypatch.setenv("CC_AGY_STRICT_MODE", "1")
     monkeypatch.setenv("CC_AGY_DATA_DIR", str(data_dir))
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     monkeypatch.setenv("CC_AGY_AUTO_APPLY_ON_PASS", "1")
 
     # Simulate Phase 1 failing with a >12-line Python snippet in acceptance output,
@@ -211,12 +211,12 @@ def test_fix2_provenance_check_skips_plugin_escalation_traceback_prompts(
     try:
         res = jm.delegate_start(
             "Return the Basic auth header from proxy_header() in auth.py.",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 test_auth.py"],
             wait=True,
         )
-        assert res["model"] == "gemini-4-argon"
+        assert res["model"] == "gemini-4-carbon"
         assert res["applied"] is True
         raw_rec = store.read_receipt(res["job_id"])
         assert raw_rec["prompt_sources"] == ["lead", "plugin_escalation"]
@@ -256,7 +256,7 @@ def test_fix3_unitemized_flash_tokens_on_timeout_escalation_are_priced_at_flash_
         "candidates_token_count": 10_000,
         "thoughts_token_count": 0,
         "total_token_count": 210_000,
-        "requests": [{"prompt_token_count": 50_000, "candidates_token_count": 2_000, "model": "gemini-3.8-flash"}],
+        "requests": [{"prompt_token_count": 50_000, "candidates_token_count": 2_000, "model": "gemini-4-hydrogen"}],
     }
     sql_tel = {
         "requests": [
@@ -265,13 +265,13 @@ def test_fix3_unitemized_flash_tokens_on_timeout_escalation_are_priced_at_flash_
         ],
         "max_request_prompt_tokens": 70_000,
     }
-    _reconcile_phase_usage_requests(u_phase, sql_tel, "gemini-3.8-flash")
+    _reconcile_phase_usage_requests(u_phase, sql_tel, "gemini-4-hydrogen")
     assert sum(r["prompt_token_count"] for r in u_phase["requests"]) == 200_000
-    assert all(r["model"] == "gemini-3.8-flash" for r in u_phase["requests"])
+    assert all(r["model"] == "gemini-4-hydrogen" for r in u_phase["requests"])
 
     # Now test full Phase 1 Flash timeout (with partial requests < total tokens) -> Phase 2 Argon escalation
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     phase = 0
 
@@ -321,17 +321,17 @@ def test_fix3_unitemized_flash_tokens_on_timeout_escalation_are_priced_at_flash_
     try:
         res = jm.delegate_start(
             "Update x in app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             wait=True,
             auto_apply=False,
         )
-        assert res["model"] == "gemini-4-argon"
+        assert res["model"] == "gemini-4-carbon"
         # Expected:
-        # Flash: 200k input @ $0.50/1M ($0.10) + 10k output @ $3.00/1M ($0.03) = $0.13
-        # Argon: 100k input @ $2.00/1M ($0.20) + 10k output @ $12.00/1M ($0.12) = $0.32
-        # Total = $0.45 (NOT $0.645 if the 100k unitemized Flash remainder were priced at Argon!)
-        assert abs(float(res["cost"]["total_cost_usd"]) - 0.45) < 1e-6
+        # Hydrogen: 200k input @ $1.50/1M ($0.30) + 10k output @ $7.50/1M ($0.075) = $0.375
+        # Carbon: 100k input @ $2.00/1M ($0.20) + 10k output @ $12.00/1M ($0.12) = $0.32
+        # Total = $0.695 (NOT higher if the 100k unitemized Hydrogen remainder were priced at Carbon!)
+        assert abs(float(res["cost"]["total_cost_usd"]) - 0.695) < 1e-6
     finally:
         jm.shutdown()
 
@@ -351,7 +351,7 @@ def test_fix4_escalation_subtracts_phase1_tool_calls_and_tokens_from_phase2_budg
     subprocess.run(["git", "commit", "-qm", "init"], cwd=str(repo), check=True)
 
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_reqs: list[dict[str, Any]] = []
 
@@ -385,7 +385,7 @@ def test_fix4_escalation_subtracts_phase1_tool_calls_and_tokens_from_phase2_budg
     try:
         res = jm.delegate_start(
             "Update app.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             wait=True,
             auto_apply=False,
@@ -443,7 +443,7 @@ def test_fix5_checklist_and_semicolon_dictation_guarded_while_1line_api_hints_pa
 
     monkeypatch.setenv("CC_AGY_REPAIR_CODE_DICTATION", "1")
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
 
     seen_models: list[str] = []
 
@@ -474,7 +474,7 @@ def test_fix5_checklist_and_semicolon_dictation_guarded_while_1line_api_hints_pa
         assert out["status"] == "spec_conflict"
         assert "is_error" not in out
         assert "urllib3.util.parse_url" in out["spec_conflict"]
-        assert seen_models == ["gemini-flash-next"]
+        assert seen_models == ["gemini-4-hydrogen"]
     finally:
         jm.shutdown()
 
@@ -525,7 +525,7 @@ def test_fix6_vacuous_acceptance_blocked_and_single_multifile_git_diff_spotcheck
     try:
         d1 = jm.delegate_start(
             "Update A and B",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 test_ok.py"],
             wait=True,
@@ -549,7 +549,7 @@ def test_fix6_vacuous_acceptance_blocked_and_single_multifile_git_diff_spotcheck
 
         d2 = jm.delegate_start(
             "Update both a.py and b.py",
-            model="gemini-3.8-flash",
+            model="gemini-4-hydrogen",
             project="p",
             acceptance=["python3 test_ok.py"],
             wait=True,
@@ -603,7 +603,7 @@ def test_opus_r1_budget_continuation_exemptions_and_stop_reason(
     jm1 = JobManager(workspace_root=r1, store=ReceiptStore(tmp_path / "d_p1", workspace_root=r1), worker_backend=w_tok)
     try:
         d1 = jm1.delegate_start(
-            "Update app.py", model="gemini-4-argon", project="p", wait=True, auto_apply=False, max_total_tokens=1000
+            "Update app.py", model="gemini-4-carbon", project="p", wait=True, auto_apply=False, max_total_tokens=1000
         )
         assert d1["status"] == "ok"
         c1 = jm1.delegate_continue(d1["job_id"], "Add docstring.", wait=True, auto_apply=False)
@@ -616,7 +616,7 @@ def test_opus_r1_budget_continuation_exemptions_and_stop_reason(
     # P1c: Flash explicit max_tool_calls=10 + escalation -> auto-escalation halts at cap (`MAX_TOOL_CALLS_EXCEEDED`),
     # while an explicit Lead `delegate_continue` proceeds cleanly onto Argon!
     monkeypatch.setenv("CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE", "1")
-    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-argon")
+    monkeypatch.setenv("CC_AGY_ESCALATE_MODEL_ON_FAILURE", "gemini-4-carbon")
     r2 = tmp_path / "r_p1c"
     _init_repo(r2)
     (r2 / "app.py").write_text("x = 1\n", encoding="utf-8")
@@ -638,15 +638,15 @@ def test_opus_r1_budget_continuation_exemptions_and_stop_reason(
     jm2 = JobManager(workspace_root=r2, store=ReceiptStore(tmp_path / "d_p1c", workspace_root=r2), worker_backend=w_flash)
     try:
         d2 = jm2.delegate_start(
-            "Update app.py", model="gemini-3.8-flash", project="p", wait=True, auto_apply=False, max_tool_calls=10
+            "Update app.py", model="gemini-4-hydrogen", project="p", wait=True, auto_apply=False, max_tool_calls=10
         )
         assert d2["status"] == "checkpoint"
         assert d2.get("budget_exhausted") is True
-        assert seen_invocations == [("gemini-3.8-flash", 10)]
+        assert seen_invocations == [("gemini-4-hydrogen", 10)]
 
         c2 = jm2.delegate_continue(d2["job_id"], "Finish the remaining edit.", wait=True, auto_apply=False)
         assert c2.get("continued") is not False
-        assert seen_invocations == [("gemini-3.8-flash", 10), ("gemini-4-argon", 10)]
+        assert seen_invocations == [("gemini-4-hydrogen", 10), ("gemini-4-carbon", 10)]
     finally:
         jm2.shutdown()
 
@@ -731,7 +731,7 @@ def test_opus_r1_process_tree_and_save_dir_env_termination_plus_shutdown_status(
     jm9 = JobManager(
         workspace_root=r9, store=ReceiptStore(tmp_path / "d_p9", workspace_root=r9), worker_backend=slow_worker
     )
-    d9 = jm9.delegate_start("Long job", project="p", model="gemini-4-argon", wait=False)
+    d9 = jm9.delegate_start("Long job", project="p", model="gemini-4-carbon", wait=False)
     assert started_evt.wait(timeout=3.0)
     jm9.shutdown(wait=True)
     rec9 = jm9.store.read_receipt(d9["job_id"])
@@ -766,7 +766,7 @@ def test_opus_r1_provenance_apostrophe_git_diff_and_skipped_acceptance_guards(tm
             + "\n".join(f"    v{i} = compute_{i}(v{i - 1})" for i in range(1, 16))
             + "\n    return v15\n"
         )
-        jm4.delegate_start(smuggled, project="p", model="gemini-4-argon", wait=True, auto_apply=False)
+        jm4.delegate_start(smuggled, project="p", model="gemini-4-carbon", wait=True, auto_apply=False)
         verdict = verify_workspace_provenance(
             r4, st4, env={"CC_AGY_STRICT_MODE": "true", "CC_AGY_DATA_DIR": str(d4)}, strict=True
         )

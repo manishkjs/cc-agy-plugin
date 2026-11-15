@@ -1487,11 +1487,13 @@ def select_fallback_agy_model(
     available_models: Sequence[str],
 ) -> str | None:
     """Select the closest Gemini model from `agy`'s `Available models:` catalog."""
+    from server.regions import is_fast_workhorse_model
+
     if not available_models:
         return None
     req_low = (requested_model or "").lower()
-    want_flash = "flash" in req_low
-    want_pro = ("argon" in req_low) or ("carbon" in req_low) or ("pro" in req_low) or not want_flash
+    want_fast = is_fast_workhorse_model(req_low)
+    want_pro = ("carbon" in req_low) or ("pro" in req_low) or not want_fast
     eff_low = (requested_effort or "").strip().lower()
 
     best_score: tuple[int, int, int, int, int] | None = None
@@ -1503,17 +1505,17 @@ def select_fallback_agy_model(
             continue
         if "lite" in low and "lite" not in req_low:
             continue
-        is_flash = "flash" in low
-        is_pro_or_argon = ("argon" in low) or ("carbon" in low) or ("pro" in low)
-        if want_flash and not is_flash:
+        is_fast = is_fast_workhorse_model(low)
+        is_frontier = ("carbon" in low) or ("pro" in low)
+        if want_fast and not is_fast:
             continue
-        if want_pro and not want_flash and not is_pro_or_argon:
+        if want_pro and not want_fast and not is_frontier:
             continue
 
         ver_match = re.search(r"gemini[\s\-]*(\d+)(?:\.(\d+))?", low)
         major = int(ver_match.group(1)) if ver_match else 0
         minor = int(ver_match.group(2)) if (ver_match and ver_match.group(2)) else 0
-        argon_bonus = 1 if (("argon" in req_low and "argon" in low) or ("carbon" in req_low and "carbon" in low)) else 0
+        family_bonus = 1 if any(fam in req_low and fam in low for fam in ("carbon", "hydrogen")) else 0
 
         eff_bonus = 0
         if eff_low:
@@ -1523,7 +1525,7 @@ def select_fallback_agy_model(
             eff_bonus = 1
 
         base_clean_bonus = 0 if _model_has_explicit_effort(entry) else 1
-        score = (argon_bonus, major, minor, eff_bonus, base_clean_bonus)
+        score = (family_bonus, major, minor, eff_bonus, base_clean_bonus)
         if best_score is None or score > best_score:
             best_score = score
             best_entry = entry
@@ -2427,6 +2429,22 @@ def _is_missing_conversation_error(err_text: str) -> bool:
 
 
 def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
+    """Execute an agentic worker job through the external `agy` CLI.
+
+    Wraps `_run_agy_cli_worker_impl` so the warm `agy acp` process used by an
+    intra-worker prewalk (frontier guide, then fast executor on the same session)
+    is always terminated when the worker call returns or raises.
+    """
+    from server.agy_acp import close_acp_job_session
+
+    warm_pool_key = f"prewalk-{secrets.token_hex(6)}"
+    try:
+        return _run_agy_cli_worker_impl(request, warm_pool_key=warm_pool_key)
+    finally:
+        close_acp_job_session(warm_pool_key)
+
+
+def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> dict[str, Any]:
     """Execute an agentic worker job through external `agy --output-format stream-json`.
 
     Write workers are confined by `server.worker_sandbox` (see `CC_AGY_WORKER_SANDBOX`).
@@ -2442,7 +2460,9 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
     cfg_key = str(agy_cli_config_dir(env))
 
     workspace_dir = str(request["workspace_dir"])
-    requested_model = str(request.get("model") or "gemini-flash-next")
+    from server.regions import DEFAULT_FAST_MODEL
+
+    requested_model = str(request.get("model") or DEFAULT_FAST_MODEL)
     thinking_level = request.get("thinking_level")
     effort = map_thinking_level_to_effort(thinking_level, requested_model)
     active_model, active_effort, reroute_note = _resolve_cached_model_for_cli(
@@ -2476,6 +2496,53 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
     from server.agy_acp import resolve_cli_protocol, run_agy_acp_turn
 
     cli_protocol = resolve_cli_protocol(env)
+
+    from server.prewalk import (
+        build_prewalk_continuation_prompt,
+        inject_prewalk_planning_block,
+        record_model_phase_usage,
+        resolve_prewalk_config,
+    )
+
+    raw_prewalk_flag = request.get("prewalk")
+    prewalk_cfg = resolve_prewalk_config(
+        env,
+        requested_model=str(request.get("model") or ""),
+        read_only=read_only,
+        explicit_prewalk=raw_prewalk_flag if isinstance(raw_prewalk_flag, bool) else None,
+    )
+    prewalk_meta: dict[str, Any] | None = None
+    prewalk_active = False
+    guide_model, guide_effort = active_model, active_effort
+    if prewalk_cfg.enabled:
+        prewalk_meta = {
+            "enabled": True,
+            "guide_model": prewalk_cfg.guide_model,
+            "executor_model": prewalk_cfg.executor_model,
+            "swapped": False,
+            "first_edit_path": None,
+            "skipped_reason": None,
+        }
+        if cli_protocol != "acp":
+            prewalk_meta["skipped_reason"] = "requires_acp_protocol"
+        elif conv_id:
+            prewalk_meta["skipped_reason"] = "resumed_conversation"
+        else:
+            prewalk_active = True
+            guide_model, guide_effort, _ = _resolve_cached_model_for_cli(
+                agy_bin,
+                prewalk_cfg.guide_model,
+                map_thinking_level_to_effort(thinking_level, prewalk_cfg.guide_model),
+                env=env,
+            )
+            active_model, active_effort, _ = _resolve_cached_model_for_cli(
+                agy_bin,
+                prewalk_cfg.executor_model,
+                map_thinking_level_to_effort(thinking_level, prewalk_cfg.executor_model),
+                env=env,
+            )
+    by_model_usage: dict[str, dict[str, int]] = {}
+    phase_requests: list[dict[str, Any]] = []
 
     prompts: list[str] = list(request.get("prompts") or [])
     if not prompts and request.get("prompt"):
@@ -2514,7 +2581,14 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
 
     attempts_started = [0]
 
-    def _run_attempt(prompt_text: str, conversation: str | None) -> dict[str, Any]:
+    def _run_attempt(
+        prompt_text: str,
+        conversation: str | None,
+        *,
+        turn_model: str,
+        turn_effort: str | None,
+        stop_on_first_edit: bool = False,
+    ) -> dict[str, Any]:
         remaining = job_deadline - time.monotonic()
         # The first attempt always runs; later ones need at least a second left to be useful.
         floor = _MIN_ATTEMPT_SECONDS if attempts_started[0] else 0.0
@@ -2531,8 +2605,8 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                 agy_bin=agy_bin,
                 prompt_text=prompt_text,
                 cwd=workspace_dir,
-                model=active_model,
-                effort=active_effort,
+                model=turn_model,
+                effort=turn_effort,
                 strict_model_selection=bifrost_strict,
                 read_only=read_only,
                 skip_permissions=skip_permissions,
@@ -2546,13 +2620,17 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                 sandbox_prefix=sandbox_prefix,
                 progress_path=progress_path,
                 host_workspace_root=host_ws_root,
+                job_id=warm_pool_key if prewalk_active else None,
+                keep_warm=prewalk_active,
+                allowed_paths=request.get("allowed_paths"),
+                stop_on_first_edit=stop_on_first_edit,
             )
         return _run_stream_json_turn(
             agy_bin=agy_bin,
             prompt_text=prompt_text,
             cwd=workspace_dir,
-            model=active_model,
-            effort=active_effort,
+            model=turn_model,
+            effort=turn_effort,
             mode=mode,
             skip_permissions=skip_permissions,
             conversation_id=conversation,
@@ -2587,7 +2665,16 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
         all_tool_calls.extend(failed.get("tool_calls") or [])
         all_thoughts.extend(failed.get("thoughts") or [])
 
-    for turn_idx, raw_prompt in enumerate(prompts):
+    turn_plan: list[dict[str, str]] = [{"raw": str(p), "phase": ""} for p in prompts]
+    if prewalk_active:
+        turn_plan[0]["phase"] = "prewalk_guide"
+    turn_idx = -1
+    while turn_idx + 1 < len(turn_plan):
+        turn_idx += 1
+        raw_prompt = turn_plan[turn_idx]["raw"]
+        phase = turn_plan[turn_idx]["phase"]
+        is_guide_turn = phase == "prewalk_guide"
+        turn_model, turn_effort = (guide_model, guide_effort) if is_guide_turn else (active_model, active_effort)
         had_resumed = bool(conv_id)
         formatted_prompt = _format_cli_worker_prompt(
             raw_prompt,
@@ -2596,8 +2683,19 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
             read_only=read_only,
             is_followup=(turn_idx > 0 or had_resumed),
         )
+        if is_guide_turn:
+            formatted_prompt = inject_prewalk_planning_block(
+                formatted_prompt,
+                max_items=prewalk_cfg.max_checklist_items,
+                acceptance=request.get("acceptance"),
+            )
+        attempt_kwargs: dict[str, Any] = {
+            "turn_model": turn_model,
+            "turn_effort": turn_effort,
+            "stop_on_first_edit": is_guide_turn,
+        }
         try:
-            turn_out = _run_attempt(formatted_prompt, conv_id)
+            turn_out = _run_attempt(formatted_prompt, conv_id, **attempt_kwargs)
 
             if not turn_out["ok"] and turn_idx == 0 and conv_id and _is_missing_conversation_error(turn_out["error"]):
                 _count_failed_attempt(turn_out, had_resumed)
@@ -2612,17 +2710,17 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                     read_only=read_only,
                     is_followup=False,
                 )
-                turn_out = _run_attempt(formatted_prompt, None)
+                turn_out = _run_attempt(formatted_prompt, None, **attempt_kwargs)
 
-            seen_worker_states: set[tuple[str, str | None]] = {(active_model, active_effort)}
+            seen_worker_states: set[tuple[str, str | None]] = {(turn_model, turn_effort)}
             for _retry_idx in range(2):
                 if turn_out["ok"]:
                     break
                 retry_spec = _maybe_retry_model_error(
                     err_text=turn_out["error"],
                     agy_bin=agy_bin,
-                    requested_model=active_model,
-                    effort=active_effort,
+                    requested_model=turn_model,
+                    effort=turn_effort,
                     env=env,
                 )
                 if retry_spec is None:
@@ -2632,8 +2730,13 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                     break
                 seen_worker_states.add((next_model, next_effort))
                 _count_failed_attempt(turn_out, had_resumed)
-                active_model, active_effort = next_model, next_effort
-                turn_out = _run_attempt(formatted_prompt, conv_id)
+                turn_model, turn_effort = next_model, next_effort
+                if is_guide_turn:
+                    guide_model, guide_effort = next_model, next_effort
+                else:
+                    active_model, active_effort = next_model, next_effort
+                attempt_kwargs.update(turn_model=turn_model, turn_effort=turn_effort)
+                turn_out = _run_attempt(formatted_prompt, conv_id, **attempt_kwargs)
         except TimeoutError as exc:
             part_u = getattr(exc, "partial_usage", None) or {}
             if getattr(exc, "partial_usage_from_snapshot", False):
@@ -2716,9 +2819,38 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
                 exc.partial_agy_conversation_turns = max(1, base_conv_turns)  # type: ignore[attr-defined]
             raise exc
 
+        if prewalk_meta is not None:
+            record_model_phase_usage(
+                by_model_usage,
+                phase_requests,
+                model=turn_model,
+                phase=phase or "worker",
+                phase_usage=delta_u,
+            )
+
         last_text = str(turn_out.get("text") or "")
         stop_reason = str(turn_out.get("stop_reason") or "STOP")
         denied_actions = list(turn_out.get("denied_actions") or [])
+        if is_guide_turn and prewalk_meta is not None:
+            first_edit = turn_out.get("prewalk_first_edit_path")
+            if first_edit and stop_reason == "PREWALK_FIRST_EDIT":
+                prewalk_meta["swapped"] = True
+                prewalk_meta["first_edit_path"] = str(first_edit)
+                turn_plan.insert(
+                    turn_idx + 1,
+                    {
+                        "raw": build_prewalk_continuation_prompt(
+                            first_edited_path=str(first_edit),
+                            acceptance=request.get("acceptance"),
+                        ),
+                        "phase": "prewalk_executor",
+                    },
+                )
+                stop_reason = "STOP"
+                continue
+            if stop_reason == "PREWALK_FIRST_EDIT":
+                stop_reason = "STOP"
+            prewalk_meta["skipped_reason"] = "phase1_completed" if first_edit else "no_edit_in_phase1"
         if (
             stop_reason == "STOP"
             and max_total_tokens is not None
@@ -2729,12 +2861,17 @@ def run_agy_cli_worker(request: dict[str, Any]) -> dict[str, Any]:
         if stop_reason in ("MAX_TOOL_CALLS_EXCEEDED", "MAX_TOTAL_TOKENS_EXCEEDED", "DENIED_ACTIONS"):
             break
 
+    if prewalk_meta is not None:
+        prewalk_meta["by_model"] = by_model_usage
+        if phase_requests:
+            agg_usage["requests"] = list(phase_requests)
     return {
         "text": last_text,
         "usage": agg_usage,
         "tool_calls": all_tool_calls,
         "thoughts": all_thoughts,
         "stop_reason": stop_reason,
+        **({"prewalk": prewalk_meta} if prewalk_meta is not None else {}),
         "containment": "agy_cli",
         "containment_warning": sandbox.warning if (sandbox and not read_only) else None,
         **({"worker_sandbox": sandbox.summary()} if (sandbox and (not read_only or sandbox.backend)) else {}),
@@ -3061,7 +3198,9 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
     ensure_enterprise_seat_ready(env)
     agy_bin = _resolve_or_bootstrap_agy_bin(env)
 
-    requested_model = str(request.get("model") or "gemini-flash-next")
+    from server.regions import DEFAULT_FAST_MODEL
+
+    requested_model = str(request.get("model") or DEFAULT_FAST_MODEL)
     effort = map_thinking_level_to_effort(request.get("thinking_level"), requested_model)
     active_model, active_effort, reroute_note = _resolve_cached_model_for_cli(
         agy_bin, requested_model, effort, env=env

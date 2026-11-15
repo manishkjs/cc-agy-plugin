@@ -235,10 +235,10 @@ def test_cost_profiles_and_shipped_default_models(monkeypatch: pytest.MonkeyPatc
     ):
         monkeypatch.delenv(key, raising=False)
 
-    # Default profile is balanced -> gemini-flash-next for both worker and ask_gemini
+    # Default profile is balanced -> gemini-4-hydrogen for both worker and ask_gemini
     assert resolve_cost_profile({}) == "balanced"
-    assert resolve_default_delegate_model(None, env={}) == "gemini-flash-next"
-    assert resolve_default_ask_model(None, env={}) == "gemini-flash-next"
+    assert resolve_default_delegate_model(None, env={}) == "gemini-4-hydrogen"
+    assert resolve_default_ask_model(None, env={}) == "gemini-4-hydrogen"
 
     # Unexpanded ${user_config.*} placeholders are sanitized and fall back to cost_profile
     placeholder_env = {
@@ -247,24 +247,24 @@ def test_cost_profiles_and_shipped_default_models(monkeypatch: pytest.MonkeyPatc
         "CC_AGY_USERCFG_DEFAULT_ASK_MODEL": "${user_config.default_ask_model}",
     }
     assert resolve_cost_profile(placeholder_env) == "quality"
-    assert resolve_default_delegate_model(None, env=placeholder_env) == "gemini-4-argon"
-    assert resolve_default_ask_model(None, env=placeholder_env) == "gemini-4-argon"
+    assert resolve_default_delegate_model(None, env=placeholder_env) == "gemini-4-carbon"
+    assert resolve_default_ask_model(None, env=placeholder_env) == "gemini-4-carbon"
 
     # Explicit default_delegate_model still wins over cost_profile
     explicit_env = {
         "CC_AGY_USERCFG_COST_PROFILE": "economy",
-        "CC_AGY_DEFAULT_DELEGATE_MODEL": "gemini-4-argon",
+        "CC_AGY_DEFAULT_DELEGATE_MODEL": "gemini-4-carbon",
     }
-    assert resolve_default_delegate_model(None, env=explicit_env) == "gemini-4-argon"
+    assert resolve_default_delegate_model(None, env=explicit_env) == "gemini-4-carbon"
 
-    # Flash family environment overrides explicitly supersede hardcoded gemini-3.8-flash prompt requests
+    # Flash family environment overrides explicitly supersede hardcoded gemini-4-hydrogen prompt requests
     flash_next_env = {
-        "CC_AGY_DEFAULT_DELEGATE_MODEL": "gemini-flash-next",
-        "CC_AGY_DEFAULT_ASK_MODEL": "gemini-flash-next",
+        "CC_AGY_DEFAULT_DELEGATE_MODEL": "gemini-4-hydrogen",
+        "CC_AGY_DEFAULT_ASK_MODEL": "gemini-4-hydrogen",
     }
-    assert resolve_default_delegate_model("gemini-3.8-flash", env=flash_next_env) == "gemini-flash-next"
-    assert resolve_default_ask_model("gemini-3.8-flash", env=flash_next_env) == "gemini-flash-next"
-    assert resolve_default_delegate_model("gemini-4-argon", env=flash_next_env) == "gemini-4-argon"
+    assert resolve_default_delegate_model("gemini-4-hydrogen", env=flash_next_env) == "gemini-4-hydrogen"
+    assert resolve_default_ask_model("gemini-4-hydrogen", env=flash_next_env) == "gemini-4-hydrogen"
+    assert resolve_default_delegate_model("gemini-4-carbon", env=flash_next_env) == "gemini-4-carbon"
 
     # sanitize_placeholder_env cleans CC_AGY_USERCFG_COST_PROFILE when unexpanded
     monkeypatch.setenv("CC_AGY_USERCFG_COST_PROFILE", "${user_config.cost_profile}")
@@ -273,9 +273,9 @@ def test_cost_profiles_and_shipped_default_models(monkeypatch: pytest.MonkeyPatc
 
     # Thinking level respects cost_profile="quality" on mutating Flash calls
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "quality")
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "MEDIUM"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "MEDIUM"
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "balanced")
-    assert resolve_thinking_level(None, model="gemini-3.8-flash", read_only=False) == "LOW"
+    assert resolve_thinking_level(None, model="gemini-4-hydrogen", read_only=False) == "LOW"
 
     # End-to-end ask_gemini default model check
     repo = tmp_path / "repo"
@@ -290,8 +290,8 @@ def test_cost_profiles_and_shipped_default_models(monkeypatch: pytest.MonkeyPatc
         return {"text": "looks good", "usage": {"prompt_token_count": 10, "candidates_token_count": 5}}
 
     res = ask_gemini("Review a.py", project="test-p", workspace_root=repo, store=store, backend=fake_ask)
-    assert res["model"] == "gemini-flash-next"
-    assert seen_models == ["gemini-flash-next"]
+    assert res["model"] == "gemini-4-hydrogen"
+    assert seen_models == ["gemini-4-hydrogen"]
 
     # plugin.json must not hardcode default on default_delegate_model / default_ask_model
     manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
@@ -345,7 +345,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
 
     jm = JobManager(workspace_root=repo, store=store, worker_backend=worker)
 
-    # Task 1: clean applied job on auth.py -> runs on gemini-flash-next
+    # Task 1: clean applied job on auth.py -> runs on gemini-4-hydrogen
     d1 = jm.delegate_start(
         "Update login in auth.py",
         allowed_paths=["auth.py"],
@@ -354,9 +354,9 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
         wait=True,
     )
     assert d1["applied"] is True
-    assert d1["model"] == "gemini-flash-next"
+    assert d1["model"] == "gemini-4-hydrogen"
 
-    # Task 2: completely unrelated task on billing.py in the same session -> MUST stay on gemini-flash-next!
+    # Task 2: completely unrelated task on billing.py in the same session -> MUST stay on gemini-4-hydrogen!
     d2 = jm.delegate_start(
         "Implement charge amount in billing.py",
         allowed_paths=["billing.py"],
@@ -365,7 +365,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
         wait=True,
     )
     assert d2["applied"] is True
-    assert d2["model"] == "gemini-flash-next"
+    assert d2["model"] == "gemini-4-hydrogen"
     assert "escalated_from_model" not in d2
 
     # Task 3: post-apply bugfix on billing.py (overlapping file + fix intent) -> escalates to DEFAULT_ESCALATION_MODEL (Carbon zero)!
@@ -377,7 +377,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
         wait=True,
     )
     assert d3["model"] == "gemini-4-carbon-zero"
-    assert d3.get("escalated_from_model") == "gemini-flash-next"
+    assert d3.get("escalated_from_model") == "gemini-4-hydrogen"
 
     # Economy profile disables auto-escalation even on overlapping follow-up
     monkeypatch.setenv("CC_AGY_COST_PROFILE", "economy")
@@ -387,7 +387,7 @@ def test_smart_escalation_preserves_flash_for_unrelated_second_task(
         project="p",
         wait=True,
     )
-    assert d4["model"] == "gemini-flash-next"
+    assert d4["model"] == "gemini-4-hydrogen"
     assert "escalated_from_model" not in d4
 
 
@@ -548,7 +548,7 @@ def test_doctor_diagnostics_redacts_secrets_and_works_via_mcp_and_cli(
     assert secret_key not in serialized
     assert report["healthy"] is True
     assert report["cost_profile"] == "quality"
-    assert report["default_delegate_model"] == "gemini-4-argon"
+    assert report["default_delegate_model"] == "gemini-4-carbon"
     assert report["auth"]["auth_mode"] == "api_key"
     assert report["auth"]["api_key_configured"] is True
     assert report["workspace"]["is_git_repo"] is True
@@ -878,7 +878,7 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
         auto_apply=False,
     )
     assert jf1["acceptance_passed"] is False
-    assert jf1["model"] == "gemini-flash-next"
+    assert jf1["model"] == "gemini-4-hydrogen"
 
     # Disjoint Task 2 on mod_clean.py stays on Flash
     jf2 = jm_f.delegate_start(
@@ -889,7 +889,7 @@ def test_opus_round1_regressions_sparse_imports_widen_mvnw_gradle_and_guard(
         wait=True,
         auto_apply=False,
     )
-    assert jf2["model"] == "gemini-flash-next"
+    assert jf2["model"] == "gemini-4-hydrogen"
     assert "escalated_from_model" not in jf2
 
 
@@ -907,8 +907,8 @@ def test_normalize_wire_model_name_strips_tier_suffixes_only_on_direct_endpoints
         assert normalize_wire_model_name(alias, custom_gateway=False) == "gemini-4-carbon"
         assert normalize_wire_model_name(alias, custom_gateway=True) == alias
 
-    assert normalize_wire_model_name("gemini-flash-next", custom_gateway=False) == "gemini-flash-next"
-    assert normalize_wire_model_name("gemini-4-argon", custom_gateway=False) == "gemini-4-argon"
+    assert normalize_wire_model_name("gemini-4-hydrogen", custom_gateway=False) == "gemini-4-hydrogen"
+    assert normalize_wire_model_name("gemini-4-carbon", custom_gateway=False) == "gemini-4-carbon"
 
 
 

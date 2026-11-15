@@ -32,6 +32,7 @@ from server.batch_plan import BatchPlanError, load_batch_plan, validate_batch_pl
 from server.batch_runner import FileBatchRunner, batch_task_log, probe_writers
 from server.assist_tools import AssistRequestError, prepare_document, prepare_replication, prepare_tests
 from server.model_routes import (
+    DEFAULT_BATCH_MODEL,
     DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS,
     DEFAULT_FLASH_MAX_TOOL_CALLS,
     DEFAULT_MAX_TOOL_CALLS,
@@ -89,7 +90,7 @@ def _build_delegate_input_properties(
         },
         "model": {
             "type": "string",
-            "description": "Vertex Gemini model ID (default: gemini-flash-next, or gemini-4-argon when cost_profile='quality').",
+            "description": "Vertex Gemini model ID (default: gemini-4-hydrogen, or gemini-4-carbon when cost_profile='quality').",
         },
         "allowed_paths": {
             "type": "array",
@@ -129,7 +130,7 @@ def _build_delegate_input_properties(
             "type": "integer",
             "description": (
                 f"Per-turn worker cap (default {DEFAULT_FLASH_MAX_TOOL_CALLS} on Flash in balanced, "
-                f"{DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS} in economy, {DEFAULT_MAX_TOOL_CALLS} on Argon/Pro, "
+                f"{DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS} in economy, {DEFAULT_MAX_TOOL_CALLS} on Carbon, "
                 "env CC_AGY_MAX_TOOL_CALLS / CC_AGY_FLASH_MAX_TOOL_CALLS; 0 = no cap). "
                 "When hit, status becomes 'checkpoint' and you decide whether to continue."
             ),
@@ -192,6 +193,10 @@ def _build_delegate_input_properties(
         "type": "string",
         "description": qa_review_description,
     }
+    props["prewalk"] = {
+        "type": "boolean",
+        "description": "Hard tasks only: Carbon plans and makes the first edit, Hydrogen finishes.",
+    }
     return props
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -211,7 +216,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Vertex Gemini model ID (default: gemini-flash-next; respects cost_profile).",
+                    "description": "Vertex Gemini model ID (default: gemini-4-hydrogen; respects cost_profile).",
                 },
                 "context_files": {
                     "type": "array",
@@ -565,7 +570,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 prompt_description="Task specification for the Gemini worker.",
                 auto_apply_description="Automatically apply the worktree diff to the main workspace if status='ok' (default: true).",
                 qa_review_description=(
-                    "Optional 1-shot QA reviewer model (e.g. 'gemini-4-argon'). When set, audits the worker's "
+                    "Optional 1-shot QA reviewer model (e.g. 'gemini-4-carbon'). When set, audits the worker's "
                     "git diff (capped at 25,000 tokens, HIGH thinking) against the task prompt after Turn 1 and, "
                     "if concrete bugs are found, runs delegate_continue as a fresh worker session on the edited "
                     "worktree before auto_apply. Experimental: not yet shown to raise solve rate."
@@ -585,7 +590,7 @@ _AUTH_PROPS: dict[str, Any] = {
 _WRITER_PROPS: dict[str, Any] = {
     "writer": {"type": "string", "enum": ["genai", "agent"],
                "description": "Low-cost writer: 'genai' (one generate_content call, default) or 'agent' (Antigravity, writer-only or bounded reader)."},
-    "model": {"type": "string", "description": "Writer model (default gemini-flash-next, 'gemini-4-argon', or CC_AGY_BATCH_MODEL)."},
+    "model": {"type": "string", "description": "Writer model (default gemini-4-hydrogen, 'gemini-4-carbon', or CC_AGY_BATCH_MODEL)."},
     "thinking_level": {"type": "string", "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH"], "description": "Writer thinking (default LOW)."},
     "read_budget": {"type": "integer", "description": "Bounded read-only lookups per task on the agent writer (default 0 = blind writer, max 12; e.g. 6 on messy brownfield repos)."},
     "claude_writer": {"type": "boolean", "description": "Use Claude (claude -p, no tools) as the third attempt (default true)."},
@@ -1352,7 +1357,7 @@ class MCPServer:
 
     def _run_file_batch(self, plan: Any, args: dict[str, Any], progress_token: Any, *, request_id: Any = None,
                         opencode_session_id: str | None = None, **runner_kwargs: Any) -> dict[str, Any]:
-        raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or "gemini-flash-next")
+        raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or DEFAULT_BATCH_MODEL)
         auth = self._batch_auth(args, raw_model_hint)
         try:
             settings = resolve_batch_settings(args, auth_mode=str(auth.get("auth_mode") or ""))
@@ -1443,7 +1448,7 @@ class MCPServer:
             )
 
         if name == "probe_writers":
-            raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or "gemini-flash-next")
+            raw_model_hint = str(args.get("model") or os.environ.get("CC_AGY_BATCH_MODEL") or DEFAULT_BATCH_MODEL)
             try:
                 auth = self._batch_auth(args, raw_model_hint)
             except ValueError as exc:
@@ -1717,6 +1722,9 @@ class MCPServer:
             wait_b = True if sync_convenience else parse_bool(args.get("wait"), False)
             in_place_b = parse_bool(args.get("in_place"), False)
             preload_b = parse_bool(args.get("preload_files"), True)
+            prewalk_arg: bool | None = (
+                parse_bool(args.get("prewalk"), False) if args.get("prewalk") is not None else None
+            )
             if sync_convenience:
                 from server.regions import resolve_auto_apply_override
 
@@ -1779,6 +1787,7 @@ class MCPServer:
                 progress_callback=report_del if wait_b else None,
                 stop_event=stop_del if wait_b else None,
                 _skip_balanced_qa=will_run_qa,
+                prewalk=prewalk_arg,
             )
         finally:
             cleanup_del()

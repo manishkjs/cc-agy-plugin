@@ -454,11 +454,13 @@ def resolve_budget(
     *,
     model: str | None = None,
 ) -> tuple[int | None, int | None]:
-    """Per-turn worker caps (defaults 55 tool calls on Flash in balanced, 100 on Flash in economy and on Pro/Argon/Carbon,
+    """Per-turn worker caps (defaults 55 tool calls on Hydrogen/Flash in balanced, 100 in economy and on Pro/Carbon,
     5M tokens; env overrides; 0 disables)."""
+    from server.regions import is_fast_workhorse_model
+
     if max_tool_calls is not None:
         calls = max_tool_calls
-    elif "flash" in (model or "").lower() and not str(os.environ.get("CC_AGY_MAX_TOOL_CALLS") or "").strip():
+    elif is_fast_workhorse_model(model) and not str(os.environ.get("CC_AGY_MAX_TOOL_CALLS") or "").strip():
         flash_default = (
             DEFAULT_ECONOMY_FLASH_MAX_TOOL_CALLS
             if resolve_cost_profile() == "economy"

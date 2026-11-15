@@ -332,6 +332,57 @@ def collect_lead_usage(
             ) / 1_000_000.0
             per_model_usd[model] = per_model_usd.get(model, 0.0) + msg_usd
 
+        # Anthropic `/advisor` (`advisor_20260301`): top-level `usage` reflects executor tokens only;
+        # advisor sub-inferences appear under `usage.iterations` with `type == "advisor_message"`.
+        iterations = u.get("iterations")
+        if isinstance(iterations, list):
+            for it_obj in iterations:
+                if not isinstance(it_obj, dict) or it_obj.get("type") != "advisor_message":
+                    continue
+                adv_model = str(it_obj.get("model") or "opus").strip() or "opus"
+                adv_cc = it_obj.get("cache_creation") if isinstance(it_obj.get("cache_creation"), dict) else {}
+                adv_w5 = int(adv_cc.get("ephemeral_5m_input_tokens") or 0)
+                adv_w1h = int(adv_cc.get("ephemeral_1h_input_tokens") or 0)
+                adv_wtot = int(it_obj.get("cache_creation_input_tokens") or 0)
+                if adv_w5 + adv_w1h < adv_wtot:
+                    adv_w5 += adv_wtot - (adv_w5 + adv_w1h)
+                adv_in = int(it_obj.get("input_tokens") or 0)
+                adv_cr = int(it_obj.get("cache_read_input_tokens") or 0)
+                adv_out = int(it_obj.get("output_tokens") or 0)
+                adv_row = per_model.setdefault(
+                    adv_model,
+                    {
+                        "messages": 0,
+                        "input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_write_5m_tokens": 0,
+                        "cache_write_1h_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_cents": 0.0,
+                        "priced": True,
+                    },
+                )
+                adv_row["messages"] += 1
+                adv_row["input_tokens"] += adv_in
+                adv_row["cache_read_input_tokens"] += adv_cr
+                adv_row["cache_write_5m_tokens"] += adv_w5
+                adv_row["cache_write_1h_tokens"] += adv_w1h
+                adv_row["output_tokens"] += adv_out
+                adv_r = rate_for_model(adv_model, rates_cache[msg_date])
+                if adv_r is None:
+                    adv_row["priced"] = False
+                    if adv_model not in unpriced_models:
+                        unpriced_models.append(adv_model)
+                else:
+                    adv_usd = (
+                        adv_in * adv_r[0]
+                        + adv_cr * adv_r[1]
+                        + adv_w5 * adv_r[2]
+                        + adv_w1h * adv_r[3]
+                        + adv_out * adv_r[4]
+                    ) / 1_000_000.0
+                    per_model_usd[adv_model] = per_model_usd.get(adv_model, 0.0) + adv_usd
+
     total_cents = 0.0
     all_priced = len(unpriced_models) == 0
     for unpriced_model in unpriced_models:
