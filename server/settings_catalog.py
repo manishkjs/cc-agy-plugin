@@ -76,7 +76,7 @@ PUBLIC_SETTINGS: tuple[SettingSpec, ...] = (
         "CC_AGY_REQUIRE_GE_TIER",
         "Connection & Auth",
         "0",
-        "Set to `1` to require an explicit `gcp-ge-*` enterprise tier in `cache/onboarding.json` for GE OAuth sign-ins.",
+        "Set to `1` to require verified enterprise onboarding (`enterpriseOnboardingComplete: true` in `cache/onboarding.json`) for GE OAuth sign-ins.",
     ),
     SettingSpec(
         "CC_AGY_REPO_REF",
