@@ -71,9 +71,9 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
 3. If they picked "Gemini Enterprise Seat":
    - Run:
        ${python_bin} "${checkout_dir}/server/agy_login.py"
-   - If it prints a Google OAuth URL (https://accounts.google.com/...), show that clickable URL verbatim to the user right away and ask them (via AskUserQuestion or chat) to click it, sign in with their Gemini Enterprise account, and paste back the authorization code.
-   - As soon as they paste the code (or callback URL), finish sign-in with:
-       ${python_bin} "${checkout_dir}/server/agy_login.py" --complete "<PASTE_CODE_OR_URL>"
+   - If it prints a Google OAuth URL (https://accounts.google.com/...), show that clickable URL verbatim to the user right away and ask them (via AskUserQuestion or chat) to click it, sign in with their Gemini Enterprise account, click 'Copy to Clipboard' on the callback page, and paste back the code.
+   - As soon as they paste the code, finish sign-in with:
+       ${python_bin} "${checkout_dir}/server/agy_login.py" --complete "<PASTE_CODE>"
 
 4. Verify readiness with:
      ${python_bin} "${checkout_dir}/server/install.py" --doctor --human --auth <AUTH> --workspace "${orig_cwd}"

@@ -25,8 +25,8 @@ After the user selects their options:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py"
    ```
-   If it prints a `https://accounts.google.com/...` URL, show that clickable URL verbatim to the user, ask for the authorization code, and run:
+   If it prints a `https://accounts.google.com/...` URL, show that clickable URL verbatim to the user, ask them to click **Copy to Clipboard** on the Antigravity callback page and paste the code, and run:
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py" --complete "<CODE_OR_URL>"
+   python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py" --complete "<PASTE_CODE>"
    ```
 3. Run `doctor` on the `vertex` MCP server (or `python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/install.py" --doctor --human --auth <AUTH>`) and tell the user if `/reload-plugins` is needed.

@@ -52,7 +52,7 @@ def strip_ansi(text: str) -> str:
 
 
 def extract_oauth_code(raw_value: str) -> str:
-    """Extract an OAuth authorization code from either a raw code string or a full callback URL."""
+    """Extract an OAuth authorization code from a pasted code string (or URL if `?code=` is still present)."""
     cleaned = (raw_value or "").strip()
     if not cleaned:
         raise ValueError("Authorization code cannot be empty.")
@@ -62,7 +62,10 @@ def extract_oauth_code(raw_value: str) -> str:
         codes = params.get("code")
         if codes and codes[0].strip():
             return codes[0].strip()
-        raise ValueError("No `code=` query parameter found in the pasted callback URL.")
+        raise ValueError(
+            "The browser address bar strips `?code=` after loading. Click the 'Copy to Clipboard' "
+            "button inside the Antigravity callback page and paste that 4/... code instead."
+        )
     return cleaned
 
 
@@ -578,7 +581,7 @@ def run_interactive_or_url_login(
                 "  Gemini Enterprise Sign-In\n"
                 "  1. Open this URL in your browser and sign in with your work account:\n\n"
                 f"     {auth_url}\n\n"
-                "  2. Copy the authorization code shown in the browser and paste it below:\n"
+                "  2. Click 'Copy to Clipboard' on the Antigravity page and paste the code below:\n"
                 "  Authorization code: "
             )
             tty_out.flush()
@@ -615,7 +618,7 @@ def run_interactive_or_url_login(
         return 0
 
     plugin_root = Path(__file__).resolve().parent.parent
-    complete_cmd = f'{sys.executable} "{plugin_root}/server/agy_login.py" --complete "<PASTE_CODE_OR_URL>"'
+    complete_cmd = f'{sys.executable} "{plugin_root}/server/agy_login.py" --complete "<PASTE_CODE>"'
     auth_url = started["auth_url"]
     print(
         "\n"
@@ -624,12 +627,12 @@ def run_interactive_or_url_login(
         f"{auth_url}\n\n"
         "HOW TO FINISH SIGN-IN (1 STEP):\n"
         "  1. Click the URL above, sign in with your Gemini Enterprise work account,\n"
-        "     and copy the authorization code shown in your browser.\n"
+        "     and click 'Copy to Clipboard' on the Antigravity callback page.\n"
         "  2. Paste that code right into chat!\n\n"
         "AGENT / CLAUDE CODE INSTRUCTION:\n"
         "  - Display the clickable URL above verbatim to the user right now and ask\n"
-        "    them to reply with the authorization code (using AskUserQuestion or chat).\n"
-        "  - As soon as the user pastes the code (or callback URL), run:\n"
+        "    them to reply with the copied authorization code (via AskUserQuestion or chat).\n"
+        "  - As soon as the user pastes the code, run:\n"
         f"      {complete_cmd}\n"
         "========================================================================\n",
         flush=True,
