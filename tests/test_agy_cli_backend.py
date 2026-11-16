@@ -2331,6 +2331,83 @@ class TestUserControlGuarantees:
         assert status_ambig["ok"] is False
         assert "CC_AGY_REQUIRE_GE_TIER=1" in (status_ambig["error"] or "")
 
+    def test_two_step_pkce_url_login_and_zero_flag_quickstart_dropdown_onboarding(
+        self, tmp_path: Path
+    ):
+        from server.agy_login import complete_two_step_login, extract_oauth_code, start_two_step_login
+
+        assert (
+            extract_oauth_code("https://antigravity.google/oauth-callback?state=s1&code=4%2F0ATestPkceCode99&scope=email")
+            == "4/0ATestPkceCode99"
+        )
+        assert extract_oauth_code("  4/0ARawCode  ") == "4/0ARawCode"
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        cfg_dir = fake_home / ".gemini" / "antigravity-cli"
+        cde_logic = """
+            if os.environ.get("AGY_CLI_CDE_AUTH_ACTION") == "login" and not argv:
+                sys.stdout.write(
+                    "\\x1b[1mPlease visit the following URL to authorize the application:\\x1b[0m\\n\\n"
+                    "\\x1b[34mhttps://accounts.google.com/o/oauth2/auth?client_id=884354919052-test&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=abc123\\x1b[0m\\n\\n"
+                    "Enter the authorization code:\\n"
+                )
+                sys.stdout.flush()
+                entered = sys.stdin.readline().strip()
+                if entered != "4/0AValidCode777":
+                    sys.stderr.write("Authentication failed: invalid_grant\\n")
+                    raise SystemExit(1)
+                gem_dir = os.path.join(os.environ["HOME"], ".gemini")
+                os.makedirs(gem_dir, exist_ok=True)
+                tok_file = os.path.join(gem_dir, "jetski-standalone-oauth-token")
+                with open(tok_file, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "token": {"access_token": "dummy-access-tok", "refresh_token": "dummy-refresh-tok"},
+                            "auth_method": "gcp",
+                            "id_token_email": "alice@corp.example.com",
+                        },
+                        fh,
+                    )
+                sys.stdout.write("Successfully authenticated as alice@corp.example.com.\\n")
+                sys.stdout.flush()
+                raise SystemExit(0)
+        """
+        ext_bin = _make_mock_external_agy(tmp_path / "bin" / "agy", extra_python_logic=cde_logic)
+        login_env = {
+            **os.environ,
+            "HOME": str(fake_home),
+            "CC_AGY_CLI_BIN": str(ext_bin),
+            "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
+            "CC_AGY_AUTH_MODE": "gemini_enterprise",
+            "CC_AGY_WORKER_SANDBOX": "off",
+        }
+        login_env.pop("PYTEST_CURRENT_TEST", None)
+
+        started = start_two_step_login(login_env, timeout_seconds=30)
+        assert started["ok"] is True, started
+        assert started["auth_url"].startswith("https://accounts.google.com/o/oauth2/auth?")
+
+        completed = complete_two_step_login(
+            "https://antigravity.google/oauth-callback?state=abc123&code=4%2F0AValidCode777",
+            login_env,
+        )
+        assert completed["ok"] is True, completed
+        assert completed["email"] == "alice@corp.example.com"
+        assert completed["tier_id"] == "gcp-enterprise"
+        assert (cfg_dir / "antigravity-oauth-token").is_file()
+        assert not (fake_home / ".gemini" / "jetski-standalone-oauth-token").exists()
+
+        repo = tmp_path / "repo"
+        _init_git_repo(repo)
+        doc = run_doctor(workspace_root=repo, env=login_env, store=ReceiptStore(tmp_path / "st", workspace_root=repo))
+        assert doc["status"] == "ok", doc
+        assert doc["healthy"] is True
+        assert doc["auth"]["agy_cli"]["auth_configured"] is True
+        assert doc["auth"]["agy_cli"]["tier_verified_enterprise"] is True
+        assert doc["auth"]["agy_cli"]["tier_id"] == "gcp-enterprise"
+
+
 
 
 

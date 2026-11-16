@@ -68,17 +68,32 @@ Setup takes about a minute in a normal terminal shell.
 
 The installer sets up either the standalone Antigravity CLI (`~/.local/share/cc-agy-plugin/bin/agy`) for Gemini Enterprise seats or an isolated Python environment (`~/.local/share/cc-agy-plugin/venv`) for AI Studio and Vertex AI. That keeps you clear of `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, and macOS Homebrew. Secrets are never written to config files.
 
-### 1. One-command quickstart (recommended)
+### 1. One-command interactive setup (recommended)
 
-Run a single command to clone or update `~/.local/share/cc-agy-plugin/repo`, configure your host, and verify readiness with `--doctor`:
+Paste this single command into **Claude Code** or a **terminal**:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash
+```
+
+What happens next:
+1. **Pick from dropdowns.** Inside Claude Code it pops up native dropdown pickers for your connection (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and model preset (`Balanced`, `Quality`, or `Economy`). In a regular terminal it opens an arrow-key (`↑/↓`) selector.
+2. **One-click Gemini Enterprise sign-in.** When you pick Gemini Enterprise, local macOS/desktop machines open your browser automatically and save your seat token with zero copy-pasting; over SSH or inside remote Claude Code sessions it prints a clickable Google OAuth link right in chat so you click once and paste the code back.
+3. **Automatic `--doctor` check.** Verifies MCP tools, `gcp-enterprise` seat tier, and git workspace readiness at 0 tokens. Re-run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to switch modes or refresh sign-in.
+
+<details>
+<summary><b>Non-interactive / CI flags & version pinning</b></summary>
+
+```bash
+# Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
-# Or pin a specific release tag / commit SHA (and optional CLI version / SHA-512 / enterprise manifest mirror) for reproducibility:
+# Pin a specific release tag or 40-char commit SHA:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.0 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
 uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.0 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
+
+</details>
 
 Or clone manually if you prefer working from your own directory:
 
@@ -109,11 +124,11 @@ python3 -m server.install --host codex --auth gemini-enterprise
 # Or install into Antigravity CLI / IDE (~/.gemini/config/):
 python3 -m server.install --host agy --auth gemini-enterprise
 
-# Or run with no flags for the 4-question interactive wizard:
+# Or run with no flags for the arrow-key dropdown wizard:
 python3 -m server.install
 
-# Sign in once in a terminal with your work Google account (then type /exit or Ctrl+C):
-~/.local/share/cc-agy-plugin/bin/agy
+# Sign in with a clickable Google OAuth link (opens browser automatically on desktop, or prints URL over SSH):
+python3 -m server.agy_login
 ```
 
 </details>

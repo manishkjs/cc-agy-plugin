@@ -778,9 +778,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     elif not auth_ok:
         error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
         remediation = (
-            "Run `/cc-agy-plugin:login` in Claude Code (on macOS it opens a Terminal window for the sign-in), "
-            f"or open a terminal and run `{agy_bin}` once: pick 'Use a Google Cloud project', finish the browser "
-            "sign-in with your Gemini Enterprise work account, then `/exit`. Or set `ANTIGRAVITY_OAUTH_TOKEN`."
+            "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login`) to get a clickable "
+            "Gemini Enterprise Google OAuth sign-in URL and complete sign-in in one step, or set `ANTIGRAVITY_OAUTH_TOKEN`."
         )
         if seat["requested"] and seat["error"]:
             error = f"{error} {seat['error']}"

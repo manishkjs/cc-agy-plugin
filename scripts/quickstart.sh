@@ -1,7 +1,9 @@
 #!/bin/bash
 # One-command bootstrap installer for cc-agy-plugin.
-# Safely clones or updates ~/.local/share/cc-agy-plugin/repo, runs server.install,
-# and verifies readiness with --doctor against the caller's working directory.
+# Safely clones or updates ~/.local/share/cc-agy-plugin/repo, runs interactive
+# dropdown setup (on /dev/tty in a terminal, or via host dropdown prompts inside
+# Claude Code / Cursor / OpenCode), completes Gemini Enterprise OAuth via a
+# clickable sign-in URL, and verifies readiness with --doctor.
 
 set -euo pipefail
 
@@ -24,6 +26,59 @@ wants_enterprise_signin() {
     prev="${arg}"
   done
   return "${enterprise}"
+}
+
+is_dry_run() {
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "--dry-run" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+has_controlling_tty() {
+  { true </dev/tty >/dev/tty; } 2>/dev/null
+}
+
+emit_agent_dropdown_onboarding() {
+  local checkout_dir="$1"
+  local python_bin="$2"
+  local orig_cwd="$3"
+  cat <<EOF
+
+[CC_AGY_INTERACTIVE_ONBOARDING]
+cc-agy-plugin is downloaded to ${checkout_dir}.
+
+AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
+1. Immediately call AskUserQuestion (no preamble) to let the user pick from two dropdowns:
+   - Question 1 (header: "Auth mode"): "How should cc-agy-plugin connect to Gemini?"
+     Options:
+       * "Gemini Enterprise Seat (Recommended)" — Included \$0 seat quota via standalone agy CLI
+       * "Google AI Studio API Key" — Pay-as-you-go with GEMINI_API_KEY
+       * "Google Cloud Vertex AI" — Pay-as-you-go with GOOGLE_CLOUD_PROJECT and ADC
+       * "Enterprise AI Gateway" — Route through LiteLLM or Bifrost gateway URL
+   - Question 2 (header: "Preset"): "Which model routing preset do you want?"
+     Options:
+       * "Balanced (Recommended)" — Default worker gemini-4-hydrogen, escalates to gemini-4-carbon
+       * "Quality" — Default worker gemini-4-carbon
+       * "Economy" — Lowest-cost worker routing
+
+2. Map their choices to flags (--auth gemini-enterprise | api-key | vertex | gateway, --profile balanced | quality | economy) and run:
+     ${python_bin} "${checkout_dir}/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
+
+3. If they picked "Gemini Enterprise Seat":
+   - Run:
+       ${python_bin} "${checkout_dir}/server/agy_login.py"
+   - If it prints a Google OAuth URL (https://accounts.google.com/...), show that clickable URL verbatim to the user right away and ask them (via AskUserQuestion or chat) to click it, sign in with their Gemini Enterprise account, and paste back the authorization code.
+   - As soon as they paste the code (or callback URL), finish sign-in with:
+       ${python_bin} "${checkout_dir}/server/agy_login.py" --complete "<PASTE_CODE_OR_URL>"
+
+4. Verify readiness with:
+     ${python_bin} "${checkout_dir}/server/install.py" --doctor --human --auth <AUTH> --workspace "${orig_cwd}"
+   and remind the user to run /reload-plugins in already-open Claude Code tabs.
+EOF
 }
 
 main() {
@@ -106,13 +161,37 @@ main() {
     touch "${checkout_dir}/${MANAGED_MARKER}"
   fi
 
+  # Zero-flag invocation:
+  # - In a real terminal (`curl ... | bash` where stdin was consumed by curl), reattach /dev/tty
+  #   so the user gets the interactive arrow-key dropdown wizard + immediate OAuth sign-in.
+  # - Inside an agent tool runner without /dev/tty (e.g. pasted directly into Claude Code),
+  #   emit structured instructions so Claude Code pops up native AskUserQuestion dropdowns!
+  if [[ $# -eq 0 ]]; then
+    if [[ -z "${PYTEST_CURRENT_TEST:-}" ]] && has_controlling_tty; then
+      (
+        cd "${checkout_dir}"
+        "${python_bin}" -m server.install </dev/tty >/dev/tty
+        if "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and not s.get('auth_configured') else 1)" 2>/dev/null; then
+          PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
+        fi
+        "${python_bin}" -m server.install --doctor --human --allow-pending-login --workspace "${orig_cwd}"
+      )
+      return 0
+    else
+      emit_agent_dropdown_onboarding "${checkout_dir}" "${python_bin}" "${orig_cwd}"
+      return 0
+    fi
+  fi
+
   (
     cd "${checkout_dir}"
     "${python_bin}" -m server.install "$@"
     if wants_enterprise_signin "$@"; then
       PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
     fi
-    "${python_bin}" -m server.install --doctor --human --allow-pending-login --workspace "${orig_cwd}"
+    if ! is_dry_run "$@"; then
+      "${python_bin}" -m server.install --doctor --human --allow-pending-login --workspace "${orig_cwd}"
+    fi
   )
 }
 

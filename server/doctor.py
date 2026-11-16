@@ -80,8 +80,32 @@ def _discover_installed_host_mcp_env(base_env: Mapping[str, str]) -> dict[str, s
     cursor_cfg = expand_path_with_env(base_env.get("CURSOR_CONFIG_DIR") or (home_dir / ".cursor"), base_env) / "mcp.json"
     agy_cfg = expand_path_with_env(base_env.get("AGY_CONFIG_DIR") or (home_dir / ".gemini" / "config"), base_env) / "mcp_config.json"
     codex_cfg = expand_path_with_env(base_env.get("CODEX_HOME") or (home_dir / ".codex"), base_env) / "config.toml"
+    claude_cfg = expand_path_with_env(base_env.get("CLAUDE_CONFIG_DIR") or (home_dir / ".claude"), base_env) / "settings.json"
 
     candidates: list[dict[str, Any]] = []
+    if claude_cfg.is_file():
+        try:
+            c_data = json.loads(claude_cfg.read_text(encoding="utf-8"))
+            p_cfgs = c_data.get("pluginConfigs") if isinstance(c_data, dict) else None
+            if isinstance(p_cfgs, dict):
+                for p_name, p_entry in p_cfgs.items():
+                    if not isinstance(p_name, str) or not p_name.startswith("cc-agy-plugin"):
+                        continue
+                    opts = p_entry.get("options") if isinstance(p_entry, dict) and isinstance(p_entry.get("options"), dict) else p_entry
+                    if isinstance(opts, dict):
+                        mapped_claude_env: dict[str, Any] = {}
+                        for ok, ov in opts.items():
+                            if not isinstance(ok, str):
+                                continue
+                            mapped_claude_env[f"CC_AGY_USERCFG_{ok.upper()}"] = ov
+                            if ok == "auth_mode":
+                                mapped_claude_env["CC_AGY_AUTH_MODE"] = ov
+                            elif ok == "agy_cli_path":
+                                mapped_claude_env["CC_AGY_CLI_BIN"] = ov
+                        if mapped_claude_env:
+                            candidates.append(mapped_claude_env)
+        except Exception:
+            pass
     if opencode_cfg.is_file():
         try:
             oc_data = _loads_jsonc(opencode_cfg.read_text(encoding="utf-8"))
@@ -92,7 +116,12 @@ def _discover_installed_host_mcp_env(base_env: Mapping[str, str]) -> dict[str, s
                     for srv in servers_map.values():
                         if isinstance(srv, dict) and isinstance(srv.get("environment"), dict):
                             cmd_str = " ".join(str(x) for x in (srv.get("command") or []) if x)
-                            if "server/main.py" in cmd_str or "cc-agy-plugin" in cmd_str or "CC_AGY_" in str(srv["environment"]):
+                            if (
+                                "server/main.py" in cmd_str
+                                or "run_mcp_server.sh" in cmd_str
+                                or "cc-agy-plugin" in cmd_str
+                                or "CC_AGY_" in str(srv["environment"])
+                            ):
                                 candidates.append(srv["environment"])
         except Exception:
             pass
@@ -105,7 +134,12 @@ def _discover_installed_host_mcp_env(base_env: Mapping[str, str]) -> dict[str, s
                     for srv in mcp_srvs.values():
                         if isinstance(srv, dict) and isinstance(srv.get("env"), dict):
                             args_str = " ".join(str(x) for x in (srv.get("args") or []) if x)
-                            if "server/main.py" in args_str or "cc-agy-plugin" in args_str or "CC_AGY_" in str(srv["env"]):
+                            if (
+                                "server/main.py" in args_str
+                                or "run_mcp_server.sh" in args_str
+                                or "cc-agy-plugin" in args_str
+                                or "CC_AGY_" in str(srv["env"])
+                            ):
                                 candidates.append(srv["env"])
             except Exception:
                 pass
@@ -117,7 +151,12 @@ def _discover_installed_host_mcp_env(base_env: Mapping[str, str]) -> dict[str, s
                 for srv in mcp_srvs.values():
                     if isinstance(srv, dict) and isinstance(srv.get("env"), dict):
                         args_str = " ".join(str(x) for x in (srv.get("args") or []) if x)
-                        if "server/main.py" in args_str or "cc-agy-plugin" in args_str or "CC_AGY_" in str(srv["env"]):
+                        if (
+                            "server/main.py" in args_str
+                            or "run_mcp_server.sh" in args_str
+                            or "cc-agy-plugin" in args_str
+                            or "CC_AGY_" in str(srv["env"])
+                        ):
                             candidates.append(srv["env"])
         except Exception:
             pass

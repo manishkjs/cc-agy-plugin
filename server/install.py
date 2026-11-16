@@ -2435,6 +2435,70 @@ def preflight(
     return out
 
 
+def _tty_select_dropdown(
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    default_index: int = 0,
+) -> str | None:
+    """Render an interactive ↑/↓ arrow-key dropdown on a real POSIX terminal, or return None to fall back."""
+    if sys.platform == "win32" or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    if (os.environ.get("TERM") or "").strip().lower() in ("", "dumb"):
+        return None
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return None
+
+    idx = max(0, min(default_index, len(options) - 1))
+    fd = sys.stdin.fileno()
+    try:
+        old_attrs = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+
+    def _draw(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\x1b[{len(options) + 1}A")
+        sys.stdout.write(f"\r\x1b[2K{title} (use ↑/↓ arrows and Enter):\n")
+        for i, (_val, label) in enumerate(options):
+            marker = "❯" if i == idx else " "
+            sys.stdout.write(f"\r\x1b[2K  {marker} {i + 1}. {label}\n")
+        sys.stdout.flush()
+
+    _draw(first=True)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b"\r", b"\n"):
+                break
+            if ch == b"\x03":
+                raise KeyboardInterrupt
+            if ch == b"\x04":
+                raise EOFError
+            if b"1" <= ch <= b"9":
+                num = int(ch.decode("ascii")) - 1
+                if 0 <= num < len(options):
+                    idx = num
+                    break
+            if ch == b"\x1b":
+                seq = os.read(fd, 2)
+                if seq == b"[A":
+                    idx = (idx - 1) % len(options)
+                elif seq == b"[B":
+                    idx = (idx + 1) % len(options)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            _draw(first=False)
+            tty.setraw(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    _draw(first=False)
+    return options[idx][0]
+
+
 def run_interactive_wizard(
     *,
     input_fn: Any = input,
@@ -2442,9 +2506,10 @@ def run_interactive_wizard(
     env: dict[str, str] | None = None,
 ) -> list[str]:
     """Ask 4 plain-English setup questions when cc-agy-install runs with no flags in a terminal."""
-    from server.agy_cli import inspect_agy_cli_offline, managed_agy_bin_dir, MANAGED_CLI_BIN_NAME
+    from server.agy_cli import inspect_agy_cli_offline
 
     source = env if env is not None else os.environ
+    use_tty_dropdown = input_fn is input
     output_fn("cc-agy-plugin quick setup (press Enter for the default in brackets)\n")
 
     host_map = {
@@ -2467,18 +2532,34 @@ def run_interactive_wizard(
         "opencode": "opencode",
         "open-code": "opencode",
     }
-    host: str | None = None
-    for _attempt in range(3):
-        host_raw = str(
-            input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor, 6=OpenCode] (1): ")
-            or ""
-        ).strip().lower()
-        if host_raw in host_map:
-            host = host_map[host_raw]
-            break
-        output_fn(
-            f"   Unrecognized host {host_raw!r}. Enter 1-6 or one of: all, codex, claude, agy, cursor, opencode."
+    host: str | None = (
+        _tty_select_dropdown(
+            "1. Coding tool",
+            [
+                ("claude", "Claude Code"),
+                ("all", "All installed hosts (Claude Code, Cursor, OpenCode, Antigravity, Codex)"),
+                ("cursor", "Cursor"),
+                ("opencode", "OpenCode"),
+                ("agy", "Antigravity CLI / IDE"),
+                ("codex", "Codex"),
+            ],
+            default_index=0,
         )
+        if use_tty_dropdown
+        else None
+    )
+    if host is None:
+        for _attempt in range(3):
+            host_raw = str(
+                input_fn("1. Coding tool [1=All, 2=Codex, 3=Claude Code, 4=Antigravity, 5=Cursor, 6=OpenCode] (1): ")
+                or ""
+            ).strip().lower()
+            if host_raw in host_map:
+                host = host_map[host_raw]
+                break
+            output_fn(
+                f"   Unrecognized host {host_raw!r}. Enter 1-6 or one of: all, codex, claude, agy, cursor, opencode."
+            )
     if host is None:
         raise ValueError("Invalid host selection in interactive setup wizard.")
 
@@ -2524,13 +2605,28 @@ def run_interactive_wizard(
         default_auth_label = "gemini-enterprise"
     else:
         default_auth_label = "api_key"
-    auth_raw = str(
-        input_fn(
-            "2. Gemini connection [1=API key in shell, 2=Google Cloud project, 3=AI gateway URL, "
-            f"4=Gemini Enterprise subscription (`agy` CLI)] ({default_auth_label}): "
-        )
-        or ""
-    ).strip().lower()
+    auth_options = [
+        ("4", "Gemini Enterprise subscription ($0 included seat quota via `agy` CLI)"),
+        ("1", "Google AI Studio API key (GEMINI_API_KEY in shell)"),
+        ("2", "Google Cloud Vertex AI project (GOOGLE_CLOUD_PROJECT + ADC)"),
+        ("3", "Enterprise AI gateway URL (LiteLLM / Bifrost)"),
+    ]
+    default_auth_idx = {"gemini-enterprise": 0, "api_key": 1, "vertex": 2, "gateway": 3}.get(default_auth_label, 0)
+    picked_auth = (
+        _tty_select_dropdown("2. Gemini connection", auth_options, default_index=default_auth_idx)
+        if use_tty_dropdown
+        else None
+    )
+    if picked_auth is not None:
+        auth_raw = picked_auth
+    else:
+        auth_raw = str(
+            input_fn(
+                "2. Gemini connection [1=API key in shell, 2=Google Cloud project, 3=AI gateway URL, "
+                f"4=Gemini Enterprise subscription (`agy` CLI)] ({default_auth_label}): "
+            )
+            or ""
+        ).strip().lower()
     auth_flag: str | None = None
     project: str | None = None
     base_url: str | None = None
@@ -2541,9 +2637,8 @@ def run_interactive_wizard(
         auth_flag = "gemini-enterprise"
         ent_status = inspect_agy_cli_offline(source)
         if not ent_status.get("auth_configured"):
-            agy_hint = ent_status.get("agy_bin") or str(managed_agy_bin_dir(source) / MANAGED_CLI_BIN_NAME)
             output_fn(
-                f"   Tip: after setup installs `agy`, run `{agy_hint}` once in a terminal to sign in with your Google work account."
+                "   Tip: after setup installs `agy`, `python3 -m server.agy_login` will open a sign-in link automatically."
             )
     elif auth_raw in ("2", "vertex", "gcp") or (not auth_raw and default_auth_label == "vertex"):
         proj_prompt = f"   Google Cloud project ID ({detected_proj}): " if detected_proj else "   Google Cloud project ID: "
@@ -2565,10 +2660,26 @@ def run_interactive_wizard(
     elif not has_key:
         output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
-    prof_raw = str(
-        input_fn("3. Model preset [1=balanced (Hydrogen then Carbon), 2=economy (Hydrogen only), 3=quality (Carbon first)] (1): ")
-        or ""
-    ).strip().lower()
+    picked_prof = (
+        _tty_select_dropdown(
+            "3. Model preset",
+            [
+                ("balanced", "Balanced — gemini-4-hydrogen default, escalates to gemini-4-carbon (Recommended)"),
+                ("quality", "Quality — gemini-4-carbon default"),
+                ("economy", "Economy — lowest-cost worker routing"),
+            ],
+            default_index=0,
+        )
+        if use_tty_dropdown
+        else None
+    )
+    if picked_prof is not None:
+        prof_raw = picked_prof
+    else:
+        prof_raw = str(
+            input_fn("3. Model preset [1=balanced (Hydrogen then Carbon), 2=economy (Hydrogen only), 3=quality (Carbon first)] (1): ")
+            or ""
+        ).strip().lower()
     prof_map = {
         "": "balanced",
         "1": "balanced",
