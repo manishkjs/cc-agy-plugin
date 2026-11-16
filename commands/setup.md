@@ -25,7 +25,7 @@ After the user selects their options:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py"
    ```
-   If it prints a `https://accounts.google.com/...` URL, show that clickable URL verbatim to the user, ask them to click **Copy to Clipboard** on the Antigravity callback page and paste the code, and run:
+   If it prints a sign-in URL, show BOTH the **short 1-line URL** (`https://is.gd/...` on its own line so it never wraps in `Terminal.app`) AND `[Sign in with Google](<full_url>)`, tell the user it is **already copied to their clipboard (`Cmd+V` in browser)**, ask them to click **Copy to Clipboard** on the Antigravity callback page and paste the code, and run:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py" --complete "<PASTE_CODE>"
    ```

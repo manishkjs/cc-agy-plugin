@@ -17,6 +17,7 @@ Supports three seamless sign-in paths without requiring users to navigate full-s
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Mapping
 import hashlib
 import json
@@ -31,7 +32,9 @@ import sys
 import tempfile
 import time
 from typing import Any
+import urllib.error
 import urllib.parse
+import urllib.request
 
 _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
@@ -535,6 +538,99 @@ def _open_controlling_tty() -> tuple[Any, Any] | None:
         return None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Stop at the first 301/302 redirect so we can verify `Location == auth_url`."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def shorten_and_verify_oauth_url(auth_url: str, env: Mapping[str, str] | None = None) -> str | None:
+    """Create a ~20-char single-line HTTPS redirect URL and verify its `Location` matches `auth_url` verbatim.
+
+    Long 500+ char OAuth URLs wrap across 4 indented lines inside TUI hosts (such as Claude Code in
+    macOS `Terminal.app`), breaking both `Cmd+Click` URL detection and mouse selection. A verified
+    20-char URL fits on one line on every terminal width. Disable via `CC_AGY_SHORT_URL=0`.
+    """
+    source = os.environ if env is None else env
+    if (source.get("CC_AGY_SHORT_URL") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if source.get("PYTEST_CURRENT_TEST"):
+        return None
+
+    endpoints = (
+        "https://is.gd/create.php?" + urllib.parse.urlencode({"format": "simple", "url": auth_url}),
+        "https://tinyurl.com/api-create.php?" + urllib.parse.urlencode({"url": auth_url}),
+    )
+    no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler)
+    for api_url in endpoints:
+        try:
+            req = urllib.request.Request(api_url, headers={"User-Agent": "cc-agy-plugin/0.3"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                candidate = resp.read(256).decode("utf-8", errors="replace").strip()
+            if not candidate.startswith("https://") or len(candidate) > 48 or any(c.isspace() for c in candidate):
+                continue
+            location = ""
+            try:
+                check_req = urllib.request.Request(candidate, headers={"User-Agent": "cc-agy-plugin/0.3"})
+                no_redirect_opener.open(check_req, timeout=2.5)
+            except urllib.error.HTTPError as redirect_exc:
+                if redirect_exc.code in (301, 302, 303, 307, 308):
+                    location = str(redirect_exc.headers.get("Location") or "")
+            if location == auth_url:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def copy_url_to_terminal_clipboard_osc52(url: str) -> bool:
+    """Emit an OSC 52 clipboard sequence to `/dev/tty` or an ancestor PTY (`/proc/<pid>/fd/1`).
+
+    When run inside an SSH session or a TUI agent like Claude Code whose own stdout is a pipe,
+    walking same-UID ancestor `/proc/<pid>/fd/{1,2}` finds the underlying SSH PTY (`/dev/pts/N`)
+    so the full OAuth URL is placed straight into the user's laptop clipboard (`Cmd+V`).
+    """
+    if not url or sys.platform == "win32":
+        return False
+    encoded = base64.b64encode(url.encode("utf-8")).decode("ascii")
+    osc52_bytes = f"\x1b]52;c;{encoded}\x07".encode("ascii")
+
+    try:
+        with open("/dev/tty", "wb", buffering=0) as tty_handle:
+            tty_handle.write(osc52_bytes)
+            return True
+    except OSError:
+        pass
+
+    if not Path("/proc").is_dir():
+        return False
+    my_uid = os.getuid()
+    pid = os.getppid()
+    visited: set[int] = set()
+    for _depth in range(8):
+        if pid <= 1 or pid in visited:
+            break
+        visited.add(pid)
+        proc_dir = Path(f"/proc/{pid}")
+        try:
+            if proc_dir.stat().st_uid != my_uid:
+                break
+            for fd_num in (1, 2, 0):
+                fd_link = proc_dir / "fd" / str(fd_num)
+                target = os.readlink(fd_link)
+                if target.startswith(("/dev/pts/", "/dev/tty")):
+                    with open(target, "wb", buffering=0) as pty_handle:
+                        pty_handle.write(osc52_bytes)
+                        return True
+            stat_text = (proc_dir / "stat").read_text(encoding="utf-8")
+            rparen = stat_text.rfind(")")
+            pid = int(stat_text[rparen + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return False
+
+
 def run_interactive_or_url_login(
     env: Mapping[str, str] | None = None,
     *,
@@ -576,11 +672,15 @@ def run_interactive_or_url_login(
             config_dir = agy_cli_config_dir(source)
             had_standalone = (home_dir / ".gemini" / "jetski-standalone-oauth-token").is_file()
             proc, auth_url = _spawn_cde_login_and_capture_url(agy_bin, env=source)
+            short_url = shorten_and_verify_oauth_url(auth_url, source)
+            copied_osc52 = copy_url_to_terminal_clipboard_osc52(auth_url)
+            primary_link = short_url or auth_url
+            clip_note = " (also copied to your clipboard — press Cmd+V in your browser!)" if copied_osc52 else ""
             tty_out.write(
                 "\n"
                 "  Gemini Enterprise Sign-In\n"
-                "  1. Open this URL in your browser and sign in with your work account:\n\n"
-                f"     {auth_url}\n\n"
+                f"  1. Open this link in your browser{clip_note}:\n\n"
+                f"     {primary_link}\n\n"
                 "  2. Click 'Copy to Clipboard' on the Antigravity page and paste the code below:\n"
                 "  Authorization code: "
             )
@@ -620,20 +720,27 @@ def run_interactive_or_url_login(
     plugin_root = Path(__file__).resolve().parent.parent
     complete_cmd = f'{sys.executable} "{plugin_root}/server/agy_login.py" --complete "<PASTE_CODE>"'
     auth_url = started["auth_url"]
+    short_url = shorten_and_verify_oauth_url(auth_url, source)
+    copied_osc52 = copy_url_to_terminal_clipboard_osc52(auth_url)
+    short_line = f"Short 1-line URL (never wraps): {short_url}\n" if short_url else ""
+    osc52_line = "Clipboard: Full sign-in URL was ALREADY copied to the user's clipboard via OSC 52 (they can press Cmd+V / Ctrl+V in their browser!).\n" if copied_osc52 else ""
     print(
         "\n"
         "========================================================================\n"
-        "GEMINI ENTERPRISE SIGN-IN URL (CLICK TO AUTHORIZE):\n\n"
-        f"{auth_url}\n\n"
-        "HOW TO FINISH SIGN-IN (1 STEP):\n"
-        "  1. Click the URL above, sign in with your Gemini Enterprise work account,\n"
-        "     and click 'Copy to Clipboard' on the Antigravity callback page.\n"
-        "  2. Paste that code right into chat!\n\n"
-        "AGENT / CLAUDE CODE INSTRUCTION:\n"
-        "  - Display the clickable URL above verbatim to the user right now and ask\n"
-        "    them to reply with the copied authorization code (via AskUserQuestion or chat).\n"
-        "  - As soon as the user pastes the code, run:\n"
-        f"      {complete_cmd}\n"
+        "GEMINI ENTERPRISE SIGN-IN READY:\n\n"
+        f"{short_line}"
+        f"Markdown link: [Sign in with Google]({auth_url})\n"
+        f"{osc52_line}\n"
+        "AGENT / CLAUDE CODE — DISPLAY THIS EXACTLY SO THE LINK IS EASY TO OPEN:\n"
+        "  1. Show the short 1-line URL on its own line (so it never wraps in macOS\n"
+        "     Terminal.app: tell the user they can press Cmd+V in their browser right\n"
+        "     now because it's already in their clipboard, drag-select the short URL\n"
+        "     to copy it, or hold Fn+Cmd+Double-Click in Terminal.app / Cmd+Click in\n"
+        "     iTerm2/Ghostty/VS Code on `[Sign in with Google](...)`).\n"
+        "  2. Ask them to sign in with their Gemini Enterprise account, click\n"
+        "     'Copy to Clipboard' on the Antigravity page, and paste the code here.\n"
+        "  3. As soon as they paste the code, run:\n"
+        f"       {complete_cmd}\n"
         "========================================================================\n",
         flush=True,
     )

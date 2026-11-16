@@ -71,7 +71,7 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
 3. If they picked "Gemini Enterprise Seat":
    - Run:
        ${python_bin} "${checkout_dir}/server/agy_login.py"
-   - If it prints a Google OAuth URL (https://accounts.google.com/...), show that clickable URL verbatim to the user right away and ask them (via AskUserQuestion or chat) to click it, sign in with their Gemini Enterprise account, click 'Copy to Clipboard' on the callback page, and paste back the code.
+   - When it prints the sign-in link, show BOTH the short 1-line URL (`https://is.gd/...` on its own line so it never wraps in Terminal.app) AND `[Sign in with Google](<full_url>)`, and mention that the URL is already copied to their clipboard (`Cmd+V` in browser) — or in macOS Terminal.app drag-select the short URL / `Fn+Cmd+Double-Click`. Ask them to sign in, click 'Copy to Clipboard' on the Antigravity page, and paste back the code.
    - As soon as they paste the code, finish sign-in with:
        ${python_bin} "${checkout_dir}/server/agy_login.py" --complete "<PASTE_CODE>"
 
