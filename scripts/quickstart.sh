@@ -8,6 +8,24 @@ set -euo pipefail
 readonly DEFAULT_REPO_URL="https://github.com/manishkjs/cc-agy-plugin.git"
 readonly MANAGED_MARKER=".cc-agy-managed-repo"
 
+# Returns 0 when the install args select Gemini Enterprise (agy CLI) and are not a dry run.
+wants_enterprise_signin() {
+  local arg prev="" enterprise=1
+  for arg in "$@"; do
+    case "${arg}" in
+      --dry-run) return 1 ;;
+      --auth=gemini-enterprise | --auth=agy-cli | --auth=gemini_enterprise) enterprise=0 ;;
+    esac
+    if [[ "${prev}" == "--auth" ]]; then
+      case "${arg}" in
+        gemini-enterprise | agy-cli | gemini_enterprise) enterprise=0 ;;
+      esac
+    fi
+    prev="${arg}"
+  done
+  return "${enterprise}"
+}
+
 main() {
   local orig_cwd
   orig_cwd="$(pwd)"
@@ -91,6 +109,9 @@ main() {
   (
     cd "${checkout_dir}"
     "${python_bin}" -m server.install "$@"
+    if wants_enterprise_signin "$@"; then
+      PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
+    fi
     "${python_bin}" -m server.install --doctor --human --allow-pending-login --workspace "${orig_cwd}"
   )
 }

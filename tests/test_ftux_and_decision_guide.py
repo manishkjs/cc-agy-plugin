@@ -707,6 +707,7 @@ def test_cli_doctor_host_discovery_quickstart_repo_guard_ge_auth_mode_override_a
     user_proj = tmp_path / "user_app"
     _init_git_repo(user_proj, {"main.py": "x = 1\n"})
     clean_cli_env = {
+        "CC_AGY_SKIP_SIGNIN": "1",
         "HOME": str(fake_home),
         "XDG_CONFIG_HOME": str(fake_home / ".config"),
         "XDG_DATA_HOME": str(fake_home / ".local" / "share"),
