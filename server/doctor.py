@@ -429,9 +429,10 @@ def run_doctor(
                     remediations.append(str(ent_check["remediation"]))
             elif not ent_check.get("tier_verified_enterprise"):
                 warnings.append(
-                    "Antigravity CLI sign-in is present, but `cache/onboarding.json` does not yet record an explicit "
-                    "`gcp-ge-*` enterprise tier. Verify you signed in with your licensed Gemini Enterprise work account "
-                    "(or set `CC_AGY_REQUIRE_GE_TIER=1` to enforce strict tier verification)."
+                    "Antigravity CLI sign-in is present, but `cache/onboarding.json` does not yet record "
+                    "`enterpriseOnboardingComplete: true` (or a `gcp-ge-*` enterprise tier). Complete the one-time "
+                    "`agy` onboarding with your licensed Gemini Enterprise work account (or set "
+                    "`CC_AGY_REQUIRE_GE_TIER=1` to enforce strict tier verification)."
                 )
         elif auth_mode == "vertex":
             adc_found = any(p.is_file() for p in _default_adc_candidates(active_env))
@@ -599,22 +600,12 @@ def run_doctor(
     has_agy = _module_available("google.antigravity") or python_has_module(sdk_py, "google.antigravity")
     has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")
     cli_only_enterprise = (active_auth_mode == "gemini_enterprise") or cli_detected_unsigned
-    if not has_genai:
-        if cli_only_enterprise:
-            warnings.append(
-                "Optional Python package `google-genai` is not installed (not required in `gemini_enterprise` CLI mode)."
-            )
-        else:
-            issues.append("Python package `google-genai` is not installed.")
-            remediations.append("Install plugin dependencies: `python3 -m server.install`")
-    if not has_agy:
-        if cli_only_enterprise:
-            warnings.append(
-                "Optional Python package `google-antigravity` is not installed (not required in `gemini_enterprise` CLI mode)."
-            )
-        else:
-            issues.append("Python package `google-antigravity` is not installed.")
-            remediations.append("Install Antigravity SDK: `python3 -m server.install`")
+    if not has_genai and not cli_only_enterprise:
+        issues.append("Python package `google-genai` is not installed.")
+        remediations.append("Install plugin dependencies: `python3 -m server.install`")
+    if not has_agy and not cli_only_enterprise:
+        issues.append("Python package `google-antigravity` is not installed.")
+        remediations.append("Install Antigravity SDK: `python3 -m server.install`")
     if not has_ctx and not cli_only_enterprise:
         warnings.append(
             "Optional `ctx-harness` (Straitjacket) package is not installed; worker shell output containment will fall back to raw Antigravity tools."

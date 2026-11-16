@@ -2253,6 +2253,85 @@ class TestUserControlGuarantees:
         finally:
             jm.shutdown(wait=True)
 
+    def test_real_agy_onboarding_schema_recognizes_enterprise_tier_and_clean_doctor_status(
+        self, tmp_path: Path
+    ):
+        repo = tmp_path / "repo"
+        _init_git_repo(repo)
+        ext_bin = _make_mock_external_agy(tmp_path / "bin" / "agy")
+        cfg_dir = tmp_path / "agy_cfg"
+        (cfg_dir / "cache").mkdir(parents=True)
+        # Real `agy` (`1.0.9+`) writes only `enterpriseOnboardingComplete` and `previousAuthMethod`
+        # to `cache/onboarding.json` (and stores OAuth tokens in macOS Keychain when no token file exists).
+        (cfg_dir / "cache" / "onboarding.json").write_text(
+            json.dumps(
+                {
+                    "consumerOnboardingComplete": False,
+                    "enterpriseOnboardingComplete": True,
+                    "onboardingComplete": False,
+                    "previousAuthMethod": "gcp",
+                }
+            ),
+            encoding="utf-8",
+        )
+        base_env = {
+            "HOME": str(tmp_path),
+            "CC_AGY_AUTH_MODE": "gemini_enterprise",
+            "CC_AGY_CLI_BIN": str(ext_bin),
+            "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
+            "CC_AGY_WORKER_SANDBOX": "off",
+        }
+        status_default = inspect_agy_cli_offline(base_env)
+        assert status_default["ok"] is True
+        assert status_default["tier_verified_enterprise"] is True
+        assert status_default["tier_id"] == "gcp-enterprise"
+        assert status_default["consumer_account_detected"] is False
+
+        status_strict = inspect_agy_cli_offline({**base_env, "CC_AGY_REQUIRE_GE_TIER": "1"})
+        assert status_strict["ok"] is True
+        assert status_strict["tier_verified_enterprise"] is True
+        assert status_strict["error"] is None
+
+        store = ReceiptStore(tmp_path / "store", workspace_root=repo)
+        doc_report = run_doctor(
+            workspace_root=repo,
+            env={**base_env, "CC_AGY_REQUIRE_GE_TIER": "1"},
+            store=store,
+        )
+        assert doc_report["healthy"] is True
+        assert doc_report["status"] == "ok"
+        assert doc_report["issues"] == []
+        assert doc_report["warnings"] == []
+        assert doc_report["auth"]["agy_cli"]["tier_verified_enterprise"] is True
+        assert doc_report["auth"]["agy_cli"]["tier_id"] == "gcp-enterprise"
+
+        # Pre-migration `settings.json` with `enterpriseOnboardingComplete: true` also works
+        legacy_cfg = tmp_path / "legacy_cfg"
+        legacy_cfg.mkdir(parents=True)
+        (legacy_cfg / "settings.json").write_text(
+            json.dumps({"enterpriseOnboardingComplete": True}),
+            encoding="utf-8",
+        )
+        status_legacy = inspect_agy_cli_offline({**base_env, "CC_AGY_CLI_CONFIG_DIR": str(legacy_cfg)})
+        assert status_legacy["ok"] is True
+        assert status_legacy["tier_verified_enterprise"] is True
+        assert status_legacy["tier_id"] == "gcp-enterprise"
+
+        # Ambiguous `onboardingComplete: true` without `enterpriseOnboardingComplete` stays unverified
+        ambig_cfg = tmp_path / "ambig_cfg"
+        (ambig_cfg / "cache").mkdir(parents=True)
+        (ambig_cfg / "cache" / "onboarding.json").write_text(
+            json.dumps({"onboardingComplete": True}),
+            encoding="utf-8",
+        )
+        status_ambig = inspect_agy_cli_offline(
+            {**base_env, "CC_AGY_CLI_CONFIG_DIR": str(ambig_cfg), "CC_AGY_REQUIRE_GE_TIER": "1"}
+        )
+        assert status_ambig["tier_verified_enterprise"] is False
+        assert status_ambig["ok"] is False
+        assert "CC_AGY_REQUIRE_GE_TIER=1" in (status_ambig["error"] or "")
+
+
 
 
 

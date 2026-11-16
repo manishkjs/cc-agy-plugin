@@ -459,44 +459,61 @@ def resolve_agy_cli_binary(
 def _read_onboarding_metadata_ext(config_dir: Path) -> tuple[bool, str | None, str | None, bool]:
     """Return `(complete, companion_project, tier_id, consumer_only)` from `cache/onboarding.json`."""
     onboarding_file = config_dir / "cache" / "onboarding.json"
-    try:
-        if onboarding_file.is_file() and onboarding_file.stat().st_size > 2:
-            data = json.loads(onboarding_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                raw_proj = data.get("cloudaicompanionProject")
-                comp_proj = str(raw_proj).strip() if isinstance(raw_proj, str) and str(raw_proj).strip() else None
-                raw_tier = data.get("tierId")
-                tier_id = str(raw_tier).strip() if isinstance(raw_tier, str) and str(raw_tier).strip() else None
-                ent_flag = bool(data.get("enterpriseOnboardingComplete"))
-                cons_flag = bool(data.get("consumerOnboardingComplete"))
-                complete = any(
-                    bool(data.get(flag_key))
-                    for flag_key in (
-                        "onboardingComplete",
-                        "enterpriseOnboardingComplete",
-                        "consumerOnboardingComplete",
-                    )
-                ) or bool(tier_id or comp_proj)
-                tier_l = (tier_id or "").lower()
-                is_ge_tier = bool(
-                    tier_l in ENTERPRISE_USER_TIERS
-                    or tier_l.startswith("gcp-ge-")
-                    or "enterprise" in tier_l
+    settings_file = config_dir / "settings.json"
+    candidate_files = (onboarding_file, settings_file)
+    for meta_file in candidate_files:
+        try:
+            if not (meta_file.is_file() and meta_file.stat().st_size > 2):
+                continue
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            if meta_file == settings_file and not any(
+                k in data
+                for k in ("onboardingComplete", "enterpriseOnboardingComplete", "consumerOnboardingComplete")
+            ):
+                continue
+            raw_proj = data.get("cloudaicompanionProject")
+            comp_proj = str(raw_proj).strip() if isinstance(raw_proj, str) and str(raw_proj).strip() else None
+            raw_tier = data.get("tierId")
+            tier_id = str(raw_tier).strip() if isinstance(raw_tier, str) and str(raw_tier).strip() else None
+            ent_flag = bool(data.get("enterpriseOnboardingComplete"))
+            cons_flag = bool(data.get("consumerOnboardingComplete"))
+            raw_prev_auth = data.get("previousAuthMethod")
+            prev_auth = str(raw_prev_auth).strip().lower() if isinstance(raw_prev_auth, str) else ""
+            is_business_auth = prev_auth in ("gcp", "wif", "adc", "gateway")
+            if tier_id is None and (ent_flag or (is_business_auth and not cons_flag)):
+                tier_id = f"gcp-enterprise-{prev_auth}" if prev_auth and prev_auth != "gcp" else "gcp-enterprise"
+            complete = any(
+                bool(data.get(flag_key))
+                for flag_key in (
+                    "onboardingComplete",
+                    "enterpriseOnboardingComplete",
+                    "consumerOnboardingComplete",
                 )
-                is_known_consumer_tier = bool(
-                    tier_l in ("free-tier", "standard-tier", "legacy-tier", "consumer", "personal", "individual", "trial")
+            ) or bool(tier_id or comp_proj)
+            tier_l = (tier_id or "").lower()
+            is_ge_tier = bool(
+                ent_flag
+                or (is_business_auth and not cons_flag)
+                or tier_l in ENTERPRISE_USER_TIERS
+                or tier_l.startswith("gcp-ge-")
+                or "enterprise" in tier_l
+            )
+            is_known_consumer_tier = bool(
+                tier_l in ("free-tier", "standard-tier", "legacy-tier", "consumer", "personal", "individual", "trial")
+            )
+            consumer_only = bool(
+                not ent_flag
+                and not is_ge_tier
+                and (
+                    (cons_flag and not comp_proj)
+                    or is_known_consumer_tier
                 )
-                consumer_only = bool(
-                    not ent_flag
-                    and not is_ge_tier
-                    and (
-                        (cons_flag and not comp_proj)
-                        or is_known_consumer_tier
-                    )
-                )
-                return complete, comp_proj, tier_id, consumer_only
-    except (OSError, ValueError):
-        pass
+            )
+            return complete, comp_proj, tier_id, consumer_only
+        except (OSError, ValueError):
+            continue
     return False, None, None, False
 
 
@@ -781,8 +798,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'unknown'}) while CC_AGY_REQUIRE_GE_TIER=1 is set."
         )
         remediation = (
-            f"Run `{agy_bin}` once with your licensed Gemini Enterprise work account so `cache/onboarding.json` "
-            "records your `gcp-ge-*` tier, or unset `CC_AGY_REQUIRE_GE_TIER`."
+            f"Run `{agy_bin}` once and choose 'Use a Google Cloud project' (or your enterprise SSO option) "
+            "so `cache/onboarding.json` records `enterpriseOnboardingComplete: true`, or unset `CC_AGY_REQUIRE_GE_TIER`."
         )
     elif seat_failure:
         error = seat_failure
