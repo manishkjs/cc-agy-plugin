@@ -77,9 +77,9 @@ curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/script
 ```
 
 What happens next:
-1. **Pick from dropdowns.** Inside Claude Code it pops up native dropdown pickers for your connection (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and model preset (`Balanced`, `Quality`, or `Economy`). In a regular terminal it opens an arrow-key (`↑/↓`) selector.
-2. **One-click Gemini Enterprise sign-in.** When you pick Gemini Enterprise, local macOS/desktop machines open your browser automatically and save your seat token with zero copy-pasting; over SSH or inside remote Claude Code sessions it prints a clickable Google OAuth link right in chat so you click once and paste the code back.
-3. **Automatic `--doctor` check.** Verifies MCP tools, `gcp-enterprise` seat tier, and git workspace readiness at 0 tokens. Re-run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to switch modes or refresh sign-in.
+1. **Pick from dropdowns.** Inside Claude Code, two dropdowns ask how you connect (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and which model preset you want (`Balanced`, `Quality`, or `Economy`). In a regular terminal, an arrow-key (`↑/↓`) selector opens instead.
+2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens automatically and saves your seat token without copy-pasting. Over SSH or on a remote VM, the sign-in URL is automatically copied to your laptop clipboard (press `Cmd+V` in your browser) and printed as a short 1-line link that never wraps in macOS Terminal: sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat.
+3. **Automatic `--doctor` check.** Confirms MCP tools, your `gcp-enterprise` seat tier, and git workspace readiness at 0 tokens. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to change settings or sign in again.
 
 <details>
 <summary><b>Non-interactive / CI flags & version pinning</b></summary>
@@ -101,11 +101,11 @@ Or clone manually if you prefer working from your own directory:
 git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
 ```
 
-### 2. Install for your host and connection
+### 2. Manual setup by host and connection (optional)
 
-Pick the connection that matches your account, then run its command. If you would rather be asked, run `python3 -m server.install` with no flags for a 4-question interactive wizard.
+If you cloned the repository manually (`git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin`) and want to pass flags directly instead of using the dropdown wizard (`python3 -m server.install`), expand your connection type below:
 
-<details open>
+<details>
 <summary><b>Option A: Gemini Enterprise work subscription</b> (uses your included monthly seat)</summary>
 
 ```bash
@@ -236,6 +236,8 @@ Once installed, open your project in Claude Code, Cursor, OpenCode, Codex, or An
 
 | Claude Code | OpenCode | What it does |
 |:--|:--|:--|
+| `/cc-agy-plugin:setup` | n/a | Opens interactive dropdowns to choose your connection mode and model preset, then runs sign-in and `doctor`. |
+| `/cc-agy-plugin:login` | n/a | Signs in to Gemini Enterprise (auto-opens browser on local desktop, or copies the OAuth link to clipboard and prints a 1-line link over SSH). |
 | `/cc-agy-plugin:agy <question or task>` | `/agy <question or task>` | Talks directly to Antigravity/Gemini: routes questions to `ask_gemini` (with conversation reuse on GE) and code edits to `delegate_to_gemini`. |
 | `/cc-agy-plugin:doctor` | `/doctor` | Offline readiness check for credentials, SDKs, `cost_profile`, git workspace, and test runner (zero token cost). |
 | `/cc-agy-plugin:delegate <task>` | `/delegate <task>` | Hands `<task>` to an isolated Gemini worker, verifies checks, inspects the diff, and applies clean results (you can also mention `@gemini-delegator` in OpenCode). |
@@ -723,7 +725,8 @@ cc-agy-plugin/
 │   ├── main.py               # MCP stdio entry point + managed venv re-exec
 │   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
 │   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
-│   ├── install.py            # Interactive 4-step wizard + Codex/Claude/Cursor/OpenCode/Antigravity installer (cc-agy-install)
+│   ├── agy_login.py          # Automatic browser loopback & 2-step SSH PKCE OAuth login (1-line link + OSC 52)
+│   ├── install.py            # Arrow-key dropdown wizard + Codex/Claude/Cursor/OpenCode/Antigravity installer (cc-agy-install)
 │   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
 │   ├── rate_card.json        # Declarative Gemini & Claude pricing rate card + promo-expiry metadata
 │   ├── rate_card.py          # Rate-card validator, promo-expiry check & per-model thinkingLevel clamping
@@ -750,10 +753,12 @@ cc-agy-plugin/
 │   └── harness_validator.py  # Pre-flight check of prompt budgets, skills, scripts, hooks & doc sync
 ├── skills/vertex/SKILL.md    # Routing skill instructions for Claude Code and Codex
 ├── agents/gemini-delegator.md # Orchestrator subagent definition
-├── commands/                 # /cc-agy-plugin:{agy,delegate,doctor,jobs,cost} slash commands
+├── commands/                 # /cc-agy-plugin:{setup,login,agy,delegate,doctor,jobs,cost} slash commands
 ├── hooks/hooks.json          # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
 ├── scripts/
-│   ├── quickstart.sh         # 1-command persistent clone/update + install + --doctor bootstrap
+│   ├── quickstart.sh         # 1-command clone/update + dropdown setup + OAuth login + --doctor bootstrap
+│   ├── agy_signin.sh         # Thin shell wrapper invoking server.agy_login
+│   ├── run_mcp_server.sh     # Python 3.10+ MCP launcher (avoids macOS /usr/bin/python3 3.9 crashes)
 │   ├── install_agy_cli.sh    # SHA-512 verified standalone Antigravity CLI (`agy`) installer
 │   ├── bootstrap-gateway.ps1 # Windows PowerShell enterprise gateway + OIDC setup script
 │   ├── sync_docs.py          # Shared routing table & budget constant synchronizer

@@ -302,7 +302,9 @@ def _exchange_code_with_running_cde_proc(
     assert proc.stdin is not None and proc.stdout is not None
     proc.stdin.write(code + "\n")
     proc.stdin.flush()
-    proc.stdin.close()
+    # Do not call proc.stdin.close() before proc.communicate(): on Python 3.10/3.11,
+    # Popen.communicate() calls self.stdin.flush() before closing stdin and raises
+    # ValueError("I/O operation on closed file") if stdin was already closed.
     remaining_out, _ = proc.communicate(timeout=timeout_seconds)
     clean_out = strip_ansi(remaining_out or "")
     if proc.returncode != 0:
