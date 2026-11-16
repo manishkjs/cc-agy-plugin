@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "vertex": {
-      "command": "python3",
+      "command": "sh",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/server/main.py"
+        "${CLAUDE_PLUGIN_ROOT}/scripts/run_mcp_server.sh"
       ],
       "env": {
         "CC_AGY_USERCFG_AUTH_MODE": "${user_config.auth_mode}",

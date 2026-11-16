@@ -47,13 +47,13 @@ def test_cursor_plugin_manifest_mcp_and_hooks_contracts() -> None:
     assert manifest["hooks"] == "./.cursor-plugin/hooks.json"
 
     raw_mcp = mcp_path.read_text(encoding="utf-8")
-    assert "${CURSOR_PLUGIN_ROOT}/server/main.py" in raw_mcp
+    assert "${CURSOR_PLUGIN_ROOT}/scripts/run_mcp_server.sh" in raw_mcp
     assert "${PLUGIN_ROOT}" not in raw_mcp
     assert "${PLUGIN_DATA}" not in raw_mcp
     assert "${user_config." not in raw_mcp
     mcp_data = json.loads(raw_mcp)
-    assert mcp_data["mcpServers"]["agy"]["command"] == "python3"
-    assert mcp_data["mcpServers"]["agy"]["args"] == ["${CURSOR_PLUGIN_ROOT}/server/main.py"]
+    assert mcp_data["mcpServers"]["agy"]["command"] == "sh"
+    assert mcp_data["mcpServers"]["agy"]["args"] == ["${CURSOR_PLUGIN_ROOT}/scripts/run_mcp_server.sh"]
 
     hooks_data = json.loads(hooks_path.read_text(encoding="utf-8"))
     assert hooks_data == {"version": 1, "hooks": {}}

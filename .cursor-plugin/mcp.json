@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "agy": {
-      "command": "python3",
+      "command": "sh",
       "args": [
-        "${CURSOR_PLUGIN_ROOT}/server/main.py"
+        "${CURSOR_PLUGIN_ROOT}/scripts/run_mcp_server.sh"
       ]
     }
   }
