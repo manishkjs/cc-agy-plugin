@@ -411,13 +411,16 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
                 except ValueError as exc:
                     conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
                     continue
-                result = _exchange_code_with_running_cde_proc(
-                    proc,
-                    raw_req,
-                    config_dir=config_dir,
-                    home_dir=home_dir,
-                    had_standalone_before=had_standalone,
-                )
+                try:
+                    result = _exchange_code_with_running_cde_proc(
+                        proc,
+                        raw_req,
+                        config_dir=config_dir,
+                        home_dir=home_dir,
+                        had_standalone_before=had_standalone,
+                    )
+                except Exception as exc:
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 conn.sendall((json.dumps(result) + "\n").encode("utf-8"))
                 return 0 if result.get("ok") else 1
         return 1
@@ -453,8 +456,14 @@ def start_two_step_login(
     state_dir = _login_state_dir(source)
     _cleanup_stale_hold_session(state_dir)
     session_file = state_dir / "session.json"
+    daemon_log = state_dir / "daemon.log"
+    _atomic_write_private(daemon_log, b"")
 
-    with open(os.devnull, "rb") as devnull_in, open(os.devnull, "wb") as devnull_out:
+    with (
+        open(os.devnull, "rb") as devnull_in,
+        open(os.devnull, "wb") as devnull_out,
+        open(daemon_log, "ab") as log_err,
+    ):
         subprocess.Popen(
             [
                 sys.executable,
@@ -469,7 +478,7 @@ def start_two_step_login(
             env=source,
             stdin=devnull_in,
             stdout=devnull_out,
-            stderr=devnull_out,
+            stderr=log_err,
             start_new_session=True,
             close_fds=True,
         )
@@ -509,16 +518,25 @@ def complete_two_step_login(
             ),
         }
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(35.0)
-        client.connect(str(sock_path))
-        client.sendall((clean_code + "\n").encode("utf-8"))
-        chunks: list[bytes] = []
-        while True:
-            chunk = client.recv(8192)
-            if not chunk:
-                break
-            chunks.append(chunk)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(35.0)
+            client.connect(str(sock_path))
+            client.sendall((clean_code + "\n").encode("utf-8"))
+            chunks: list[bytes] = []
+            while True:
+                chunk = client.recv(8192)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": (
+                f"Sign-in helper socket closed ({type(exc).__name__}: {exc}). "
+                "Run `python3 -m server.agy_login --start` to generate a fresh sign-in link."
+            ),
+        }
     raw_reply = b"".join(chunks).decode("utf-8", errors="replace").strip()
     try:
         parsed = json.loads(raw_reply)
@@ -526,7 +544,15 @@ def complete_two_step_login(
             return parsed
     except ValueError:
         pass
-    return {"ok": False, "error": raw_reply or "Empty response from login helper."}
+    log_tail = ""
+    daemon_log = state_dir / "daemon.log"
+    if daemon_log.is_file():
+        try:
+            log_tail = daemon_log.read_text(encoding="utf-8", errors="replace").strip()[-400:]
+        except OSError:
+            log_tail = ""
+    detail = raw_reply or log_tail or "Empty response from login helper."
+    return {"ok": False, "error": detail}
 
 
 def _open_controlling_tty() -> tuple[Any, Any] | None:
