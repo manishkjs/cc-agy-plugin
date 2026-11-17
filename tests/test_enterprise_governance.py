@@ -798,28 +798,37 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
         encoding="utf-8",
     )
     script = (
-        f"const m = await import({json.dumps(str(root / 'opencode-plugin' / 'index.ts'))});\n"
+        f"const m = await import({json.dumps(str(root / 'opencode-plugin' / 'internal.ts'))});\n"
+        f"const entry = await import({json.dumps(str(root / 'opencode-plugin' / 'index.ts'))});\n"
         "const cfg = {command: {cost: {template: 'user-defined'}}};\n"
         "m.applyConfig(cfg, process.env);\n"
         "const kept = {mcp: {servers: {agy: {command: ['mine']}}}};\n"
         "m.applyConfig(kept, process.env);\n"
-        "const plugin = await m.default({});\n"
+        "const exportsInfo = Object.entries(entry).map(([k, v]) => [k, typeof v]);\n"
+        "const plugin = await entry.default({});\n"
         "const seat = await plugin.auth.methods[0].authorize({});\n"
         "const noKey = await plugin.auth.methods[1].authorize({geminiApiKey: ' '});\n"
-        "console.log(JSON.stringify({cfg, kept, seat, noKey, hooks: Object.keys(plugin)}));\n"
+        "console.log(JSON.stringify({cfg, kept, seat, noKey, hooks: Object.keys(plugin), exportsInfo}));\n"
     )
+    run_env = {"PATH": os.environ.get("PATH", os.defpath), "XDG_DATA_HOME": str(tmp_path / "data"), "HOME": str(tmp_path)}
     proc = subprocess.run(
-        [node, "--input-type=module", "-e", script],
-        capture_output=True, text=True, timeout=60, check=False,
-        env={"PATH": os.environ.get("PATH", os.defpath), "XDG_DATA_HOME": str(tmp_path / "data"), "HOME": str(tmp_path)},
+        [node, "--experimental-strip-types", "--input-type=module", "-e", script],
+        capture_output=True, text=True, timeout=60, check=False, env=run_env,
     )
-    if proc.returncode != 0 and "ERR_UNKNOWN_FILE_EXTENSION" in proc.stderr:
+    if proc.returncode != 0 and "bad option" in proc.stderr:
+        proc = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True, text=True, timeout=60, check=False, env=run_env,
+        )
+    if proc.returncode != 0 and ("ERR_UNKNOWN_FILE_EXTENSION" in proc.stderr or "ERR_NO_TYPESCRIPT" in proc.stderr):
         pytest.skip("this node version cannot load TypeScript directly")
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     server = out["cfg"]["mcp"]["agy"]
     package = json.loads((root / "package.json").read_text(encoding="utf-8"))
-    source = (root / "opencode-plugin" / "index.ts").read_text(encoding="utf-8")
+    source = "".join(
+        (root / "opencode-plugin" / name).read_text(encoding="utf-8") for name in ("index.ts", "internal.ts")
+    )
 
     assert server["type"] == "local" and server["command"][1] == str(root / "server" / "main.py")
     assert server["environment"] == {
@@ -833,6 +842,8 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
     assert "agy" not in {k for k in out["kept"]["mcp"] if k != "servers"}
     assert out["seat"]["key"] == "gemini-enterprise-seat" and out["noKey"] == {"type": "failed"}
     assert sorted(out["hooks"]) == ["auth", "config"]
+    # OpenCode loads every export of the entry file as a plugin factory: exactly one, a function.
+    assert out["exportsInfo"] == [["default", "function"]]
     assert package["main"] == "./opencode-plugin/index.ts"
     assert "createServer" not in source and "Bun.serve" not in source and ".listen(" not in source
     assert any(str(p).endswith(".opencode/skills/cc-agy-plugin/SKILL.md") for p in out["cfg"].get("instructions", []))
@@ -1012,3 +1023,11 @@ def test_bifrost_effort_suffix_matching_gateway_controls_and_fast_pre_tool_guard
     elapsed = time.monotonic() - t0
     assert proc.returncode == 0
     assert elapsed < 0.45, f"pre_tool_guard took {elapsed:.3f}s (expected < 0.45s)"
+
+
+def test_opencode_entry_file_exports_only_the_default_plugin_factory() -> None:
+    """OpenCode treats every export of the entry file as a plugin; a non-function export breaks loading."""
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "opencode-plugin" / "index.ts").read_text(encoding="utf-8")
+    export_lines = [line.strip() for line in source.splitlines() if line.lstrip().startswith("export ")]
+    assert export_lines == ["export default CcAgyPlugin;"]

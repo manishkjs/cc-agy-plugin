@@ -23,6 +23,7 @@ for rel in \
   .cursor-plugin/hooks.json \
   cursor/rules/cc-agy-coexistence.mdc \
   opencode-plugin/index.ts \
+  opencode-plugin/internal.ts \
   .opencode/skills/cc-agy-plugin/SKILL.md \
   .opencode/agents/gemini-delegator.md \
   .opencode/commands/delegate.md \

@@ -9,7 +9,7 @@ to low-cost Gemini workers that run in an isolated git copy of your repo.
 
 [![Validate](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg)](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.7-1a73e8)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.3.8-1a73e8)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20OpenCode%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
@@ -93,9 +93,9 @@ What happens next:
 # Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 # Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.7 bash -s -- --host opencode --auth gemini-enterprise
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.8 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.7 cc-agy-plugin --host claude --auth gemini-enterprise
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.8 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
 </details>
@@ -200,7 +200,7 @@ The plugin detects the wire format from the gateway path: Gemini `/v1beta/models
 - Installed asset hashes are tracked in `.cc-agy-plugin-assets.json`. Any pre-existing or user-edited file is backed up to `*.bak-*` before it is replaced.
 - Symlinked asset files are unlinked before writing, so the external dotfiles target is never modified. Symlinked directories are written through.
 - The same skill, commands, and subagent are bundled in this repository under `.opencode/`.
-- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login` and pick `cc-agy`. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
+- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login`, choose **Other**, and enter the provider id `cc-agy` (searching for `cc-agy` in the provider list shows no matches, because plugin providers are not in OpenCode's built-in catalog). OpenCode then offers the four login methods: Gemini Enterprise seat, Gemini API key, Google Cloud Vertex AI project, or AI Gateway. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
 
 **Cursor**
 
@@ -474,7 +474,7 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.3.7, Apache 2.0 |
+| **Version** | 0.3.8, Apache 2.0 |
 | **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 
