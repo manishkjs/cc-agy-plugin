@@ -22,6 +22,9 @@ If the MCP tools (`delegate_start`, `delegate_file_batch`, `ask_gemini`, `doctor
 
 For zero-token readiness diagnostics or workspace spend checks, call `doctor()` or `cost_report()`.
 
+For Gemini Enterprise sign-in or re-login (if `doctor()` or `agy` reports missing or rejected credentials), run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh` in a terminal (pass `--force` for a fresh login).
+For a 2-step sign-in link in headless/SSH sessions, run `sh ~/.local/share/cc-agy-plugin/current/scripts/py.sh ~/.local/share/cc-agy-plugin/current/server/agy_login.py --start --json`.
+
 ## Cost and safety rules
 
 1. **Delegate early, do not read the repo twice.** Dispatch on Turn 1 or Turn 2. The plugin automatically gives the Gemini worker a cached Repository Map and line-numbered file outlines.

@@ -874,3 +874,33 @@ run_case 0 0 0
 """
     proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, check=True)
     assert proc.stdout.strip().splitlines() == ["1:1", "1:0"]
+
+
+def test_first_time_lookup_failure_keeps_unverified_token_for_one_step_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    cfg_dir = home / ".gemini" / "antigravity-cli"
+    cfg_dir.mkdir(parents=True)
+    standalone = home / ".gemini" / "jetski-standalone-oauth-token"
+    standalone.write_text(
+        json.dumps({"token": {"access_token": "tok-new", "refresh_token": "ref-new"}, "auth_method": "gcp"}),
+        encoding="utf-8",
+    )
+
+    def _net_down(*_a: Any, **_k: Any) -> list[dict[str, str]]:
+        raise agy_login.LicenseLookupError("couldn't reach the license service (offline)")
+
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", _net_down)
+    env = _env(home, cfg_dir)
+    first = agy_login.finalize_enterprise_onboarding(cfg_dir, home, had_standalone_token_before=False, env=env)
+    assert first["verified"] is False
+    assert first["problem"] == "lookup_failed"
+    assert (cfg_dir / "antigravity-oauth-token").is_file()
+    assert agy_cli._inspect_auth_files(cfg_dir, env) == (False, None)
+
+    _fake_licenses(monkeypatch, [_LICENSE_A])
+    healed = agy_login.heal_enterprise_token(env)
+    assert healed["healed"] is True
+    assert healed["project_id"] == "proj-alpha"
+    assert agy_cli._inspect_auth_files(cfg_dir, env)[0] is True

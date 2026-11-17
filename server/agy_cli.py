@@ -183,6 +183,11 @@ _THIRD_PARTY_AUTH_HOST_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_HTTP_URL_HOST_RE = re.compile(r"https?://(?:[^/\s@]+@)?([a-z0-9.-]+)", re.IGNORECASE)
+_GOOGLE_URL_HOST_SUFFIXES = ("google.com", "googleapis.com", "googleusercontent.com", "gstatic.com")
+
+_TERMINAL_SIGNIN_FALLBACK = "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh` in a terminal)"
+
 _GOOGLE_AUTH_HOST_OR_EXPLICIT_RE = re.compile(
     r"\b(?:googleapis\.com|cloudcode|antigravity|sign in with google|incomplete gcp onboarding)\b",
     re.IGNORECASE,
@@ -1186,7 +1191,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         remediation = (
             "Run the one-line quickstart again (it installs `agy`), or "
             f"`python3 -m server.install --auth gemini-enterprise` to install `agy` to `{managed_bin}`. "
-            "Then run `/cc-agy-plugin:login` in Claude Code to sign in."
+            f"Then run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in."
         )
     elif version_mismatch:
         error = (
@@ -1201,20 +1206,21 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         if token_gap:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
             remediation = (
-                "Run `/cc-agy-plugin:login` in Claude Code. It looks up your Gemini Enterprise license with "
+                f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK}. "
+                "It looks up your Gemini Enterprise license with "
                 "the saved token and repairs it; if the token has expired it prints a fresh sign-in link instead."
             )
         elif token_problem:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_problem}."
-            remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
+            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in again."
         elif auth_failure_marker_active:
             error = f"Antigravity CLI at `{agy_bin}` rejected the saved sign-in on its last call."
-            remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
+            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in again."
         else:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
             remediation = (
-                "Run `/cc-agy-plugin:login` in Claude Code to get a Gemini Enterprise sign-in link, "
-                "or set `ANTIGRAVITY_OAUTH_TOKEN`."
+                f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} "
+                "to get a Gemini Enterprise sign-in link, or set `ANTIGRAVITY_OAUTH_TOKEN`."
             )
         if seat["requested"] and seat["error"]:
             error = f"{error} {seat['error']}"
@@ -1224,8 +1230,9 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'consumer'}) rather than a licensed Gemini Enterprise seat."
         )
         remediation = (
-            "Run `/cc-agy-plugin:login --force` in Claude Code and sign in with your licensed "
-            "Gemini Enterprise work account (not a personal Gmail account)."
+            "Run `/cc-agy-plugin:login --force` in Claude Code "
+            "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh --force` in a terminal) "
+            "and sign in with your licensed Gemini Enterprise work account (not a personal Gmail account)."
         )
     elif unverified_tier_blocked:
         error = (
@@ -1233,8 +1240,9 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'unknown'}) while CC_AGY_REQUIRE_GE_TIER=1 is set."
         )
         remediation = (
-            "Run `/cc-agy-plugin:login --force` in Claude Code so the plugin records your license tier, "
-            "or unset `CC_AGY_REQUIRE_GE_TIER`."
+            "Run `/cc-agy-plugin:login --force` in Claude Code "
+            "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh --force` in a terminal) "
+            "so the plugin records your license tier, or unset `CC_AGY_REQUIRE_GE_TIER`."
         )
     elif seat_failure:
         error = seat_failure
@@ -1906,6 +1914,11 @@ def normalize_denied_actions(
     return records
 
 
+def _is_google_url_host(host: str) -> bool:
+    cleaned = host.strip(".").lower()
+    return any(cleaned == suffix or cleaned.endswith(f".{suffix}") for suffix in _GOOGLE_URL_HOST_SUFFIXES)
+
+
 def _is_non_agy_tool_or_policy_error(lower: str) -> bool:
     """Return True for third-party tool 401/403s or GCP VPC-SC/IAM policy denials (not broken OAuth sign-in)."""
     if any(pat in lower for pat in _POLICY_OR_IAM_DENIAL_PATTERNS):
@@ -1913,6 +1926,9 @@ def _is_non_agy_tool_or_policy_error(lower: str) -> bool:
     if _GOOGLE_AUTH_HOST_OR_EXPLICIT_RE.search(lower):
         return False
     if _THIRD_PARTY_AUTH_HOST_RE.search(lower):
+        return True
+    url_hosts = _EXPLICIT_HTTP_URL_HOST_RE.findall(lower)
+    if url_hosts and not any(_is_google_url_host(host) for host in url_hosts):
         return True
     return any(pat in lower for pat in _NON_AGY_TOOL_AUTH_PATTERNS)
 
@@ -2307,8 +2323,10 @@ def _format_auth_remediation(raw_err: str, agy_bin: str, env: Mapping[str, str] 
     cfg_dir = agy_cli_config_dir(env)
     return (
         f"Gemini Enterprise `agy` CLI authentication failed: {raw_err.strip()}. "
-        "Run `/cc-agy-plugin:login` in Claude Code: it repairs a saved token that agy rejects, or prints "
-        "a one-click sign-in link (use `/cc-agy-plugin:login --force` to always start a fresh sign-in). "
+        f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK}: "
+        "it repairs a saved token that agy rejects, or prints "
+        "a one-click sign-in link (use `/cc-agy-plugin:login --force` or `agy_signin.sh --force` "
+        "to always start a fresh sign-in). "
         f"Credentials are stored in `{cfg_dir}`. Do not use `{agy_bin} -p` to sign in: print mode gives "
         "up after 60 seconds on a headless machine."
     )

@@ -480,8 +480,6 @@ def finalize_enterprise_onboarding(
                     prev_auth_method = "wif"
         except (UnicodeDecodeError, ValueError):
             parsed_token = None
-        if not had_standalone_token_before:
-            standalone_token_file.unlink(missing_ok=True)
     elif cli_token_file.is_file() and cli_token_file.stat().st_size > 10:
         try:
             loaded_tok = json.loads(cli_token_file.read_text(encoding="utf-8"))
@@ -512,9 +510,9 @@ def finalize_enterprise_onboarding(
     effective_display = resolved_license["tier_display_name"]
     effective_proj = resolved_license["project_id"]
     effective_region = resolved_license["region"] or "global"
-    # Only a license we actually resolved counts. Writing "onboarding complete" or rewriting the
-    # token file without one makes doctor report "signed in" (or bumps mtime past cc-agy-auth-failed)
-    # while agy rejects every call, and would clobber a previously working token on --force.
+    # Only a license we actually resolved counts. Writing "onboarding complete" or rewriting an
+    # already-on-disk failed token without one makes doctor report "signed in" (or bumps mtime past
+    # cc-agy-auth-failed) while agy rejects every call, and would clobber a working token on --force.
     verified = bool(effective_tier and effective_proj)
 
     if verified:
@@ -575,6 +573,28 @@ def finalize_enterprise_onboarding(
         )
         clear_auth_failure_marker(config_dir)
         invalidate_agy_auth_caches(env=env, config_dir=config_dir)
+    elif standalone_is_newest and token_on_disk and parsed_token is not None:
+        # Preserve a freshly exchanged standalone token on first-time login or when the prior CLI
+        # token was already broken/rejected, so the user can retry `/login` (after network recovery)
+        # or `/login --project <ID>` without repeating Google OAuth. Strip license fields so
+        # `stored_token_onboarding_gap` keeps `doctor` reporting `auth_configured=False` until
+        # verified, and never overwrite an existing healthy CLI token (e.g. --force on an unlicensed
+        # personal account).
+        from server.agy_cli import stored_token_problem
+
+        has_healthy_existing_cli = (
+            cli_token_file.is_file()
+            and stored_token_problem(cli_token_file) is None
+            and not _is_auth_failure_marker_active(config_dir, (cli_token_file, config_dir / "cache" / "onboarding.json"))
+        )
+        if not has_healthy_existing_cli and parsed_token.get("auth_method") == "gcp":
+            unverified_tok = dict(parsed_token)
+            for field in ("user_tier", "tier_display_name", "project_id"):
+                unverified_tok.pop(field, None)
+            _atomic_write_private(cli_token_file, json.dumps(unverified_tok).encode("utf-8"))
+
+    if standalone_is_newest and not had_standalone_token_before:
+        standalone_token_file.unlink(missing_ok=True)
 
     if verified:
         problem = None
@@ -677,6 +697,18 @@ def try_acp_business_browser_login(
     import queue
     import threading
 
+    from server.agy_cli import _stat_sig, stored_token_problem
+
+    config_dir = agy_cli_config_dir(env)
+    token_file = config_dir / "antigravity-oauth-token"
+    pre_token_sig = _stat_sig(token_file)
+    pre_token_bytes: bytes | None = None
+    if token_file.is_file():
+        try:
+            pre_token_bytes = token_file.read_bytes()
+        except OSError:
+            pre_token_bytes = None
+
     proc = subprocess.Popen(
         [agy_bin, "acp"],
         stdin=subprocess.PIPE,
@@ -721,7 +753,7 @@ def try_acp_business_browser_login(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.3"}},
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.4"}},
                 }
             )
             + "\n"
@@ -744,47 +776,62 @@ def try_acp_business_browser_login(
             return False, str(err_msg or "agy acp authenticate failed")
 
         # authenticate(oauth-business) only succeeds after agy's own resolveEnterpriseLicense
-        # found and saved a license. On keychain platforms agy stores the new token in the OS
-        # keychain (never in `~/.gemini/jetski-standalone-oauth-token`), so reading a stale
-        # standalone/file token would falsely return `no_license` and skip clearing the failure
-        # marker. Only finalize from disk when a fresh valid token file exists; otherwise drop
-        # any stale file and record completion directly.
-        config_dir = agy_cli_config_dir(env)
-        token_file = config_dir / "antigravity-oauth-token"
-        from server.agy_cli import stored_token_problem
+        # ran. Compare the token file's stat+bytes against the pre-login snapshot so we know
+        # whether THIS login wrote `antigravity-oauth-token` (e.g. Linux desktop keyring
+        # fallback) vs saved into the OS keychain (where any pre-existing token file is stale
+        # and must not shadow the new keychain sign-in).
+        cur_token_sig = _stat_sig(token_file)
+        cur_token_bytes: bytes | None = None
+        if token_file.is_file():
+            try:
+                cur_token_bytes = token_file.read_bytes()
+            except OSError:
+                cur_token_bytes = None
+        token_written_during_login = token_file.is_file() and (
+            cur_token_sig != pre_token_sig or cur_token_bytes != pre_token_bytes
+        )
 
         if _platform_keeps_token_in_keychain(env):
-            has_fresh_valid_token = (
-                token_file.exists()
-                and stored_token_problem(token_file) is None
-                and not _is_auth_failure_marker_active(config_dir, (token_file,))
-            )
-            if has_fresh_valid_token:
+            if token_written_during_login:
                 onboarding = finalize_enterprise_onboarding(
                     config_dir,
                     _home_dir(env),
                     had_standalone_token_before=True,
                     env=env,
                 )
-                if not onboarding.get("verified"):
+                if onboarding.get("verified"):
+                    return True, ""
+                # Keep the newly written token file on disk (never delete it or falsely mark
+                # onboarding complete when the file still has a problem/missing license).
+                if stored_token_problem(token_file) is None:
                     _mark_enterprise_onboarding_complete(config_dir, env=env)
-            else:
-                if token_file.exists():
-                    token_file.unlink(missing_ok=True)
-                _mark_enterprise_onboarding_complete(config_dir, env=env)
-        else:
-            if token_file.exists() and stored_token_problem(token_file) is not None:
+                    return True, ""
+                return False, describe_onboarding_problem(onboarding)
+            # Token went to the OS keychain, not the file: drop any stale pre-existing token file
+            # (e.g. from an earlier SSH session) so it cannot shadow the new keychain sign-in.
+            if token_file.exists():
                 token_file.unlink(missing_ok=True)
-            onboarding = finalize_enterprise_onboarding(
-                config_dir,
-                _home_dir(env),
-                had_standalone_token_before=True,
-                env=env,
-            )
-            if onboarding.get("problem") == "keychain":
-                # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
-                _mark_enterprise_onboarding_complete(config_dir, env=env)
-        return True, ""
+            _mark_enterprise_onboarding_complete(config_dir, env=env)
+            return True, ""
+
+        if not token_written_during_login and token_file.exists() and stored_token_problem(token_file) is not None:
+            token_file.unlink(missing_ok=True)
+        onboarding = finalize_enterprise_onboarding(
+            config_dir,
+            _home_dir(env),
+            had_standalone_token_before=True,
+            env=env,
+        )
+        if onboarding.get("verified"):
+            return True, ""
+        if onboarding.get("problem") == "keychain":
+            # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
+            _mark_enterprise_onboarding_complete(config_dir, env=env)
+            return True, ""
+        if token_file.is_file() and stored_token_problem(token_file) is None:
+            _mark_enterprise_onboarding_complete(config_dir, env=env)
+            return True, ""
+        return False, describe_onboarding_problem(onboarding)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return False, str(exc)
     finally:

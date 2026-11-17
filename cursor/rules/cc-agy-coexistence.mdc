@@ -16,3 +16,6 @@ The `agy` (or `vertex`) MCP server executes repository-scale reads, multimodal v
 - **Live CVE & dependency upgrade audit (Google Search grounded)**: `ask_gemini(prompt="Audit declared dependencies for CVEs and upgrades", check_dependencies=true)`.
 
 Pass workspace-relative paths rather than pasting file contents into prompts. Switching the Composer model mid-conversation discards the prompt cache; delegate to these MCP tools instead of switching the parent model.
+
+For Gemini Enterprise sign-in or re-login (if `doctor` or `agy` reports missing or rejected credentials), run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh` in a terminal (pass `--force` for a fresh login).
+For a 2-step sign-in link in headless/SSH sessions, run `sh ~/.local/share/cc-agy-plugin/current/scripts/py.sh ~/.local/share/cc-agy-plugin/current/server/agy_login.py --start --json`.

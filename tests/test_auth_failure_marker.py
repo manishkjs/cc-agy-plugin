@@ -713,33 +713,241 @@ def test_auto_mode_routes_to_gemini_enterprise_when_only_failure_marker_active(t
 def test_unverified_finalize_preserves_working_token_and_keeps_marker_active(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    cfg_dir = tmp_path / "cfg"
     fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
-    cli_token = _write_valid_token(cfg_dir)
-    _write_onboarding(cfg_dir)
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [])
+    monkeypatch.setattr(agy_login, "self_assign_enterprise_license", lambda *_a, **_k: None)
+
+    # 1. Healthy existing CLI token (no failure marker) + newer unlicensed standalone (e.g. --force
+    #    on a personal account) must preserve the working CLI token untouched.
+    cfg_healthy = tmp_path / "cfg-healthy"
+    home_healthy = tmp_path / "home-healthy"
+    cli_token = _write_valid_token(cfg_healthy)
+    _write_onboarding(cfg_healthy)
     orig_bytes = cli_token.read_bytes()
     orig_mtime_ns = cli_token.stat().st_mtime_ns
-    marker = agy_cli.record_auth_failure_marker(cfg_dir)
-    assert marker is not None
 
-    # Newer unlicensed standalone token (e.g. from --force landing on a personal account).
-    standalone = tmp_path / ".gemini" / "jetski-standalone-oauth-token"
+    standalone = home_healthy / ".gemini" / "jetski-standalone-oauth-token"
     standalone.parent.mkdir(parents=True, exist_ok=True)
     standalone.write_text(json.dumps({"token": {"access_token": "unlicensed"}, "auth_method": "gcp"}), encoding="utf-8")
-    newer_ns = marker.stat().st_mtime_ns + 5_000_000_000
+    newer_ns = orig_mtime_ns + 5_000_000_000
     os.utime(standalone, ns=(newer_ns, newer_ns))
+
+    env_healthy = _env(home_healthy, cfg_healthy, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    res_healthy = agy_login.finalize_enterprise_onboarding(
+        cfg_healthy, home_healthy, had_standalone_token_before=False, env=env_healthy
+    )
+    assert res_healthy["verified"] is False
+    assert cli_token.read_bytes() == orig_bytes
+    assert cli_token.stat().st_mtime_ns == orig_mtime_ns
+    assert agy_cli.inspect_agy_cli_offline(env_healthy)["auth_configured"] is True
+
+    # 2. Failed heal on an already-on-disk revoked token (e.g. --project switch with no seat, no
+    #    newer standalone) must NEVER bump cli_token_file's mtime past cc-agy-auth-failed.
+    cfg_failed = tmp_path / "cfg-failed"
+    home_failed = tmp_path / "home-failed"
+    revoked_token = _write_valid_token(cfg_failed)
+    _write_onboarding(cfg_failed)
+    revoked_bytes = revoked_token.read_bytes()
+    revoked_mtime_ns = revoked_token.stat().st_mtime_ns
+    marker = agy_cli.record_auth_failure_marker(cfg_failed)
+    assert marker is not None
+
+    env_failed = _env(
+        home_failed,
+        cfg_failed,
+        fake_agy,
+        CC_AGY_TOKEN_IN_KEYCHAIN="0",
+        CC_AGY_ENTERPRISE_PROJECT="proj-beta",
+    )
+    res_failed = agy_login.finalize_enterprise_onboarding(
+        cfg_failed, home_failed, had_standalone_token_before=True, env=env_failed
+    )
+    assert res_failed["verified"] is False
+    assert revoked_token.read_bytes() == revoked_bytes
+    assert revoked_token.stat().st_mtime_ns == revoked_mtime_ns
+    status_failed = agy_cli.inspect_agy_cli_offline(env_failed)
+    assert status_failed["auth_configured"] is False
+    assert status_failed["auth_failure_marker_active"] is True
+
+
+def test_unverified_first_time_and_failed_standalone_token_is_preserved_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
+
+    # 1. First-time SSH login hits transient lookup_failed: fresh standalone token is preserved
+    #    as an unverified (license-stripped) CLI token so retry via heal_enterprise_token succeeds
+    #    without repeating Google OAuth, while doctor still reports auth_configured=False until healed.
+    home_1 = tmp_path / "home1"
+    cfg_1 = home_1 / ".gemini" / "antigravity-cli"
+    cfg_1.mkdir(parents=True)
+    standalone_1 = home_1 / ".gemini" / "jetski-standalone-oauth-token"
+    standalone_1.write_text(
+        json.dumps(
+            {
+                "token": {"access_token": "fresh-ssh-tok", "refresh_token": "ref-ssh"},
+                "auth_method": "gcp",
+                "user_tier": "",
+                "project_id": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _raise_net(*_a: Any, **_k: Any) -> list[dict[str, str]]:
+        raise agy_login.LicenseLookupError("couldn't reach the license service (temporary DNS error)")
+
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", _raise_net)
+    env_1 = _env(home_1, cfg_1, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    res_1 = agy_login.finalize_enterprise_onboarding(cfg_1, home_1, had_standalone_token_before=False, env=env_1)
+
+    assert res_1["verified"] is False
+    assert res_1["problem"] == "lookup_failed"
+    assert not standalone_1.exists()
+    cli_1 = cfg_1 / "antigravity-oauth-token"
+    assert cli_1.is_file()
+    saved_1 = json.loads(cli_1.read_text(encoding="utf-8"))
+    assert saved_1["token"]["access_token"] == "fresh-ssh-tok"
+    assert not saved_1.get("user_tier") and not saved_1.get("project_id")
+    assert agy_cli.inspect_agy_cli_offline(env_1)["auth_configured"] is False
+
+    # Network recovers -> heal_enterprise_token finishes without a second Google OAuth.
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [dict(_LICENSE_OK)])
+    healed_1 = agy_login.heal_enterprise_token(env_1)
+    assert healed_1["healed"] is True
+    assert healed_1["project_id"] == "proj-alpha"
+    assert agy_cli.inspect_agy_cli_offline(env_1)["auth_configured"] is True
+
+    # 2. Prior rejected CLI token (active marker) + fresh standalone token with no_license:
+    #    fresh token replaces the rejected token (stripped of license fields) so `--project` can heal it.
+    home_2 = tmp_path / "home2"
+    cfg_2 = home_2 / ".gemini" / "antigravity-cli"
+    _write_valid_token(cfg_2)
+    _write_onboarding(cfg_2)
+    marker_2 = agy_cli.record_auth_failure_marker(cfg_2)
+    assert marker_2 is not None
+    standalone_2 = home_2 / ".gemini" / "jetski-standalone-oauth-token"
+    standalone_2.parent.mkdir(parents=True, exist_ok=True)
+    standalone_2.write_text(
+        json.dumps({"token": {"access_token": "fresh-relogin-tok", "refresh_token": "ref-2"}, "auth_method": "gcp"}),
+        encoding="utf-8",
+    )
+    newer_ns = marker_2.stat().st_mtime_ns + 5_000_000_000
+    os.utime(standalone_2, ns=(newer_ns, newer_ns))
 
     monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [])
     monkeypatch.setattr(agy_login, "self_assign_enterprise_license", lambda *_a, **_k: None)
-    env = _env(tmp_path, cfg_dir, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
-    res = agy_login.finalize_enterprise_onboarding(cfg_dir, tmp_path, had_standalone_token_before=False, env=env)
+    env_2 = _env(home_2, cfg_2, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    res_2 = agy_login.finalize_enterprise_onboarding(cfg_2, home_2, had_standalone_token_before=False, env=env_2)
+    assert res_2["verified"] is False
+    assert res_2["problem"] == "no_license"
+    saved_2 = json.loads((cfg_2 / "antigravity-oauth-token").read_text(encoding="utf-8"))
+    assert saved_2["token"]["access_token"] == "fresh-relogin-tok"
+    assert agy_cli.inspect_agy_cli_offline(env_2)["auth_configured"] is False
 
-    assert res["verified"] is False
-    assert cli_token.read_bytes() == orig_bytes
-    assert cli_token.stat().st_mtime_ns == orig_mtime_ns
-    status = agy_cli.inspect_agy_cli_offline(env)
-    assert status["auth_configured"] is False
-    assert status["auth_failure_marker_active"] is True
+
+def test_keychain_browser_login_preserves_new_fallback_token_and_drops_stale_ssh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Case A (fable-3 P2-T3): Linux desktop where agy falls back to writing a license-less
+    # antigravity-oauth-token during THIS login and license lookup fails/is disabled:
+    # token_file must NOT be deleted and doctor must NOT lie signed_in=True.
+    cfg_a = tmp_path / "cfg-a"
+    cfg_a.mkdir()
+    acp_writes_token = tmp_path / "bin-a" / "agy"
+    acp_writes_token.parent.mkdir(parents=True)
+    acp_writes_token.write_text(
+        f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        "if '--help' in sys.argv: print('Antigravity CLI --output-format --mode'); sys.exit(0)\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    if msg.get('method') == 'authenticate':\n"
+        "        p = pathlib.Path(os.environ['CC_AGY_CLI_CONFIG_DIR']) / 'antigravity-oauth-token'\n"
+        "        p.write_text(json.dumps({'token': {'access_token': 'fallback-tok'}, 'auth_method': 'gcp'}))\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    acp_writes_token.chmod(0o755)
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [])
+    monkeypatch.setattr(agy_login, "self_assign_enterprise_license", lambda *_a, **_k: None)
+    env_a = _env(tmp_path, cfg_a, acp_writes_token, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+
+    ok_a, reason_a = agy_login.try_acp_business_browser_login(str(acp_writes_token), env=env_a, timeout_seconds=10)
+    assert ok_a is False
+    assert "no Gemini Enterprise license" in reason_a
+    assert (cfg_a / "antigravity-oauth-token").is_file()
+    assert not (cfg_a / "cache" / "onboarding.json").exists()
+    assert agy_cli.inspect_agy_cli_offline(env_a)["auth_configured"] is False
+
+    # Case B (carbon-3 P2): macOS keychain where a valid pre-existing SSH antigravity-oauth-token
+    # existed BEFORE login, and agy saves the new browser token to OS keychain (leaving the file
+    # untouched): stale SSH token file must be unlinked so it cannot shadow the new keychain login.
+    cfg_b = tmp_path / "cfg-b"
+    stale_ssh_tok = _write_valid_token(cfg_b)
+    (cfg_b / "settings.json").write_text(json.dumps({"gcp": {"project": "proj-beta"}}), encoding="utf-8")
+    acp_keychain = tmp_path / "bin-b" / "agy"
+    acp_keychain.parent.mkdir(parents=True)
+    acp_keychain.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        "if '--help' in sys.argv: print('Antigravity CLI --output-format --mode'); sys.exit(0)\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    acp_keychain.chmod(0o755)
+    env_b = _env(tmp_path, cfg_b, acp_keychain, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+
+    ok_b, reason_b = agy_login.try_acp_business_browser_login(str(acp_keychain), env=env_b, timeout_seconds=10)
+    assert (ok_b, reason_b) == (True, "")
+    assert not stale_ssh_tok.exists()
+    onboarding_b = json.loads((cfg_b / "cache" / "onboarding.json").read_text(encoding="utf-8"))
+    assert onboarding_b["cloudaicompanionProject"] == "proj-beta"
+    assert agy_cli.inspect_agy_cli_offline(env_b)["auth_configured"] is True
+
+
+def test_generalized_third_party_http_url_errors_are_excluded():
+    for third_party_err in (
+        "GET https://artifactory.corp.internal/api/npm/pkg returned HTTP 401 Unauthorized",
+        "POST https://api.stripe.com/v1/charges failed: HTTP 401 authentication failed",
+        "GET https://evilgoogle.com/v1/token returned HTTP 401 Unauthorized",
+        "HTTP 403 Forbidden from https://nexus.internal.example:8443/repository/pypi",
+    ):
+        assert agy_cli.is_agy_auth_error(third_party_err) is False, third_party_err
+        assert agy_cli.is_agy_oauth_credential_rejected(third_party_err) is False, third_party_err
+
+    assert agy_cli.is_agy_auth_error("GET https://accounts.google.com/o/oauth2/token returned HTTP 401 Unauthorized") is True
+    assert agy_cli.is_agy_oauth_credential_rejected("GET https://cloudcode-pa.googleapis.com/v1:generateContent returned HTTP 401") is True
+
+
+def test_remediations_and_host_docs_include_host_neutral_terminal_signin(tmp_path: Path):
+    cfg_dir = tmp_path / "cfg"
+    fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
+
+    # Missing token remediation keeps Claude Code command and adds host-neutral terminal script.
+    env = _env(tmp_path, cfg_dir, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    s_missing = agy_cli.inspect_agy_cli_offline(env)
+    assert "Run `/cc-agy-plugin:login` in Claude Code" in (s_missing["remediation"] or "")
+    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in (s_missing["remediation"] or "")
+
+    # Active failure marker remediation also includes host-neutral terminal fallback.
+    _write_valid_token(cfg_dir)
+    agy_cli.record_auth_failure_marker(cfg_dir)
+    s_marker = agy_cli.inspect_agy_cli_offline(env)
+    assert "Run `/cc-agy-plugin:login` in Claude Code" in (s_marker["remediation"] or "")
+    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in (s_marker["remediation"] or "")
+
+    # _format_auth_remediation also includes host-neutral terminal fallback.
+    formatted = agy_cli._format_auth_remediation("HTTP 401 from cloudcode-pa.googleapis.com", str(fake_agy), env=env)
+    assert "Run `/cc-agy-plugin:login` in Claude Code" in formatted
+    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in formatted
+
+    # Cursor rule and Codex skill point to host-neutral sign-in helpers without em-dashes.
+    for rel in ("cursor/rules/cc-agy-coexistence.mdc", "plugins/cc-agy-plugin/skills/vertex/SKILL.md"):
+        doc_text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "agy_signin.sh" in doc_text, rel
+        assert "agy_login.py --start --json" in doc_text, rel
+        assert "\u2014" not in doc_text, rel
 
 
 def test_keychain_browser_login_ignores_stale_standalone_and_clears_marker(
