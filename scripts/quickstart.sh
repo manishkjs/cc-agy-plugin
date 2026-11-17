@@ -46,16 +46,19 @@ emit_agent_dropdown_onboarding() {
   local checkout_dir="$1"
   local python_bin="$2"
   local orig_cwd="$3"
-  cat <<EOF
+  # Quoted heredoc: bash must not run the backticks or expand anything in this text.
+  # The three paths are filled in afterwards with plain string replacement.
+  local template
+  template="$(cat <<'EOF'
 
 [CC_AGY_INTERACTIVE_ONBOARDING]
-cc-agy-plugin is downloaded to ${checkout_dir}.
+cc-agy-plugin is downloaded to @CHECKOUT_DIR@.
 
 AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
 1. Immediately call AskUserQuestion (no preamble) to let the user pick from two dropdowns:
    - Question 1 (header: "Auth mode"): "How should cc-agy-plugin connect to Gemini?"
      Options:
-       * "Gemini Enterprise Seat (Recommended)" — Included \$0 seat quota via standalone agy CLI
+       * "Gemini Enterprise Seat (Recommended)" — Included $0 seat quota via standalone agy CLI
        * "Google AI Studio API Key" — Pay-as-you-go with GEMINI_API_KEY
        * "Google Cloud Vertex AI" — Pay-as-you-go with GOOGLE_CLOUD_PROJECT and ADC
        * "Enterprise AI Gateway" — Route through LiteLLM or Bifrost gateway URL
@@ -66,19 +69,31 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
        * "Economy" — Lowest-cost worker routing
 
 2. Map their choices to flags (--auth gemini-enterprise | api-key | vertex | gateway, --profile balanced | quality | economy) and run:
-     ${python_bin} "${checkout_dir}/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
+     @PYTHON_BIN@ "@CHECKOUT_DIR@/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
 
-3. If they picked "Gemini Enterprise Seat":
-   - Run:
-       ${python_bin} "${checkout_dir}/server/agy_login.py"
-   - When it prints the sign-in link, show BOTH the short 1-line URL (`https://is.gd/...` on its own line so it never wraps in Terminal.app) AND `[Sign in with Google](<full_url>)`, and mention that the URL is already copied to their clipboard (`Cmd+V` in browser) — or in macOS Terminal.app drag-select the short URL / `Fn+Cmd+Double-Click`. Ask them to sign in, click 'Copy to Clipboard' on the Antigravity page, and paste back the code.
-   - As soon as they paste the code, finish sign-in with:
-       ${python_bin} "${checkout_dir}/server/agy_login.py" --complete "<PASTE_CODE>"
+3. If they picked "Gemini Enterprise Seat", run:
+     @PYTHON_BIN@ "@CHECKOUT_DIR@/server/agy_login.py" --start --json
+   - If the JSON has "already_signed_in": true, go to step 4.
+   - If it has "auth_url": show "short_url" on its own line first (if set; it never wraps in
+     macOS Terminal.app), then [Sign in with Google](<auth_url>). If "copied_to_clipboard" is
+     true, say the link is already on their clipboard. Ask them to sign in with their Gemini
+     Enterprise work account, click 'Copy to Clipboard' on the Antigravity page, and paste the code.
+   - When they paste the code, run:
+       @PYTHON_BIN@ "@CHECKOUT_DIR@/server/agy_login.py" --complete "<PASTE_CODE>"
+     It looks up their license and project, so the first agy call works. Report the tier and
+     project it prints. If it prints [WARN] about no license, ask for the project that holds
+     their seats, then rerun with CC_AGY_ENTERPRISE_PROJECT=<project> and --force.
+   - Never tell the user to sign in with `agy -p`: print mode gives up after 60 seconds.
 
 4. Verify readiness with:
-     ${python_bin} "${checkout_dir}/server/install.py" --doctor --human --auth <AUTH> --workspace "${orig_cwd}"
+     @PYTHON_BIN@ "@CHECKOUT_DIR@/server/install.py" --doctor --human --auth <AUTH> --workspace "@ORIG_CWD@"
    and remind the user to run /reload-plugins in already-open Claude Code tabs.
 EOF
+)"
+  template="${template//@CHECKOUT_DIR@/${checkout_dir}}"
+  template="${template//@PYTHON_BIN@/${python_bin}}"
+  template="${template//@ORIG_CWD@/${orig_cwd}}"
+  printf '%s\n' "${template}"
 }
 
 main() {

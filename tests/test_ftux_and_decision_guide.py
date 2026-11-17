@@ -1090,3 +1090,28 @@ def test_quickstart_sha_and_tag_pinning_host_deletion_overlay_and_bifrost_acp_st
     )
     assert res_unoffered["ok"] is False
     assert "not offered by this `agy acp` session" in res_unoffered["error"]
+
+
+def test_quickstart_agent_onboarding_text_runs_no_commands(tmp_path: Path):
+    """The no-TTY onboarding text must print verbatim: no backtick command substitution."""
+    repo_root = Path(__file__).resolve().parent.parent
+    script = (repo_root / "scripts" / "quickstart.sh").read_text(encoding="utf-8")
+    start = script.index("emit_agent_dropdown_onboarding() {")
+    end = script.index("\n}\n", start) + 3
+    marker = tmp_path / "ran"
+    checkout = f"{tmp_path}/my repo/x$y`touch {marker}`"
+    proc = subprocess.run(
+        ["bash", "-c", script[start:end] + '\nemit_agent_dropdown_onboarding "$1" python3 "$2"', "_", checkout, "/w s"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+
+    assert proc.stderr == ""
+    assert not marker.exists()
+    assert "`agy -p`" in proc.stdout
+    assert "Included $0 seat quota" in proc.stdout
+    assert f'python3 "{checkout}/server/agy_login.py" --start --json' in proc.stdout
+    assert '--workspace "/w s"' in proc.stdout
+    assert "@CHECKOUT_DIR@" not in proc.stdout
