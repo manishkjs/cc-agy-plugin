@@ -8,7 +8,7 @@
       "name": "cc-agy-plugin",
       "source": "./",
       "description": "Delegate coding, review and research tasks to Gemini (gemini-4-hydrogen and gemini-4-carbon) via your Gemini Enterprise subscription (`agy` CLI), Google AI Studio, or Vertex AI (`google-antigravity` SDK), with isolated worker copies, test-gated diffs and signed receipts.",
-      "version": "0.3.8"
+      "version": "0.3.9"
     }
   ]
 }

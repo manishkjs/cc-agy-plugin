@@ -646,6 +646,84 @@ def test_opencode_entry_loads_in_node_and_registers_the_shared_server(tmp_path: 
                for p in loaded["instructions"])
 
 
+def test_opencode_auth_methods_ask_only_for_what_they_need(tmp_path: Path) -> None:
+    """OpenCode 1.19.6 appends a required "Enter your API key" prompt to every `type: "api"` method.
+
+    Only the Gemini API key method may be `type: "api"`, and it must not ask for the key a second
+    time. The other methods are empty-url "auto" oauth steps that open no browser, and what they
+    save reads back exactly like entries saved by earlier plugin versions (`type: "api"`).
+    """
+    node_cmd = _node_ts_command()
+    if node_cmd is None:
+        pytest.skip("no node on PATH can import TypeScript (needs Node 22.6+ built with type stripping)")
+    internal_url = (REPO_ROOT / "opencode-plugin" / "internal.ts").as_uri()
+    entry_url = (REPO_ROOT / "opencode-plugin" / "index.ts").as_uri()
+    filled = {
+        "Gemini Enterprise seat": {},
+        "Google Cloud Vertex AI project": {"project": "my-proj", "location": "us-central1"},
+        "AI Gateway": {"baseUrl": "https://gw.example.com/vertex_ai/", "gatewayToken": "gw-token"},
+    }
+    legacy_seat = {"type": "api", "key": "gemini-enterprise-seat",
+                   "metadata": {"authMode": "gemini_enterprise", "bifrostPolicyUrl": ""}}
+    script = (
+        f"const m = await import({json.dumps(internal_url)});\n"
+        f"const entry = await import({json.dumps(entry_url)});\n"
+        f"const filled = {json.dumps(filled)};\n"
+        "const hooks = await entry.default({});\n"
+        "const methods = [];\n"
+        "for (const method of hooks.auth.methods) {\n"
+        "  const info = {type: method.type, label: method.label,\n"
+        "    prompts: (method.prompts || []).map((p) => ({key: p.key, message: p.message}))};\n"
+        "  if (method.type === 'oauth') {\n"
+        "    const prefix = Object.keys(filled).find((k) => method.label.startsWith(k));\n"
+        "    const step = await method.authorize(filled[prefix] || {});\n"
+        "    const result = await step.callback();\n"
+        "    // What OpenCode then writes to auth.json for a key result.\n"
+        "    const saved = {type: 'api', key: result.key, metadata: result.metadata};\n"
+        "    Object.assign(info, {url: step.url, method: step.method, result, env: m.buildServerEnvironment(saved),\n"
+        "      emptyResult: await (await method.authorize({})).callback()});\n"
+        "  }\n"
+        "  methods.push(info);\n"
+        "}\n"
+        f"const legacyEnv = m.buildServerEnvironment({json.dumps(legacy_seat)});\n"
+        "const typedKeyEnv = m.buildServerEnvironment({type: 'api', key: ' typed-gemini-key '});\n"
+        "console.log(JSON.stringify({methods, legacyEnv, typedKeyEnv}));\n"
+    )
+
+    proc = subprocess.run(
+        [*node_cmd, "--input-type=module", "-e", script],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60, check=False,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "XDG_DATA_HOME": str(tmp_path / "data")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    by_label = {m["label"].split(" (")[0]: m for m in out["methods"]}
+
+    api_methods = [m for m in out["methods"] if m["type"] == "api"]
+    assert [m["label"] for m in api_methods] == ["Gemini API key (Google AI Studio)"]
+    for method in api_methods:
+        own_key_prompts = [p for p in method["prompts"] if re.search(r"api.?key", f"{p['key']} {p['message']}", re.I)]
+        assert not own_key_prompts, f"{method['label']} asks for the API key twice: {own_key_prompts}"
+    for name in filled:
+        method = by_label[name]
+        assert method["type"] == "oauth", f"{name} must not be type api (OpenCode would ask for an API key)"
+        assert method["url"] == "" and method["method"] == "auto", f"{name} must not send the user to a browser"
+        assert method["result"]["type"] == "success" and method["result"]["key"], method["result"]
+    assert by_label["Google Cloud Vertex AI project"]["emptyResult"] == {"type": "failed"}
+    assert by_label["AI Gateway"]["emptyResult"] == {"type": "failed"}
+    # A seat entry saved by an older plugin version (type "api") maps to the same MCP env as a new one.
+    assert out["legacyEnv"] == by_label["Gemini Enterprise seat"]["env"] == {"CC_AGY_AUTH_MODE": "gemini_enterprise"}
+    assert by_label["Google Cloud Vertex AI project"]["env"] == {
+        "CC_AGY_AUTH_MODE": "vertex", "GOOGLE_CLOUD_PROJECT": "my-proj", "GOOGLE_CLOUD_LOCATION": "us-central1",
+    }
+    assert by_label["AI Gateway"]["env"] == {
+        "CC_AGY_AUTH_MODE": "gateway", "CC_AGY_VERTEX_BASE_URL": "https://gw.example.com/vertex_ai",
+        "CC_AGY_VERTEX_BASE_URL_TOKEN": "gw-token",
+    }
+    # The key typed at OpenCode's own prompt is saved without metadata and still selects api_key mode.
+    assert out["typedKeyEnv"] == {"CC_AGY_AUTH_MODE": "api_key", "GEMINI_API_KEY": "typed-gemini-key"}
+
+
 def _claude_command_index(cmds: list[list[str]], head: list[str]) -> int:
     matches = [idx for idx, cmd in enumerate(cmds) if cmd[: len(head)] == head]
     assert len(matches) == 1, f"expected one `{' '.join(head)}` command, got {matches}"

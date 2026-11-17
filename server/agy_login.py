@@ -753,7 +753,7 @@ def try_acp_business_browser_login(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.8"}},
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.9"}},
                 }
             )
             + "\n"

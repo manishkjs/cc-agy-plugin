@@ -784,11 +784,11 @@ def test_failed_or_expired_resume_falls_back_to_the_full_prompt(tmp_path: Path) 
 
 
 def test_opencode_entry_point_registers_server_commands_and_agent_without_secrets_on_disk(tmp_path: Path) -> None:
-    import shutil
+    from tests.test_harness_contracts import _node_ts_command
 
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is not installed")
+    node_cmd = _node_ts_command()
+    if node_cmd is None:
+        pytest.skip("no node on PATH can load TypeScript directly")
     root = Path(__file__).resolve().parent.parent
     auth_dir = tmp_path / "data" / "opencode"
     auth_dir.mkdir(parents=True)
@@ -806,22 +806,18 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
         "m.applyConfig(kept, process.env);\n"
         "const exportsInfo = Object.entries(entry).map(([k, v]) => [k, typeof v]);\n"
         "const plugin = await entry.default({});\n"
-        "const seat = await plugin.auth.methods[0].authorize({});\n"
-        "const noKey = await plugin.auth.methods[1].authorize({geminiApiKey: ' '});\n"
-        "console.log(JSON.stringify({cfg, kept, seat, noKey, hooks: Object.keys(plugin), exportsInfo}));\n"
+        "const seatStep = await plugin.auth.methods[0].authorize({});\n"
+        "const seat = await seatStep.callback();\n"
+        "const apiMethod = plugin.auth.methods[1];\n"
+        "const blankKeyEnv = m.buildServerEnvironment({key: ' '});\n"
+        "console.log(JSON.stringify({cfg, kept, seatStep, seat, apiMethod, blankKeyEnv,\n"
+        "  hooks: Object.keys(plugin), exportsInfo}));\n"
     )
     run_env = {"PATH": os.environ.get("PATH", os.defpath), "XDG_DATA_HOME": str(tmp_path / "data"), "HOME": str(tmp_path)}
     proc = subprocess.run(
-        [node, "--experimental-strip-types", "--input-type=module", "-e", script],
+        [*node_cmd, "--input-type=module", "-e", script],
         capture_output=True, text=True, timeout=60, check=False, env=run_env,
     )
-    if proc.returncode != 0 and "bad option" in proc.stderr:
-        proc = subprocess.run(
-            [node, "--input-type=module", "-e", script],
-            capture_output=True, text=True, timeout=60, check=False, env=run_env,
-        )
-    if proc.returncode != 0 and ("ERR_UNKNOWN_FILE_EXTENSION" in proc.stderr or "ERR_NO_TYPESCRIPT" in proc.stderr):
-        pytest.skip("this node version cannot load TypeScript directly")
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     server = out["cfg"]["mcp"]["agy"]
@@ -829,6 +825,7 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
     source = "".join(
         (root / "opencode-plugin" / name).read_text(encoding="utf-8") for name in ("index.ts", "internal.ts")
     )
+    bundled_commands = {p.stem for p in (root / ".opencode" / "commands").glob("*.md")}
 
     assert server["type"] == "local" and server["command"][1] == str(root / "server" / "main.py")
     assert server["environment"] == {
@@ -836,18 +833,23 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
         "CC_AGY_BIFROST_POLICY_URL": POLICY_URL,
         "CC_AGY_BIFROST_AGY_VIRTUAL_KEY": AGY_VIRTUAL_KEY,
     }
-    assert set(out["cfg"]["command"]) == {"agy", "cost", "delegate", "doctor", "jobs"}
+    assert set(out["cfg"]["command"]) == bundled_commands | {"cost"}
     assert out["cfg"]["command"]["cost"] == {"template": "user-defined"}
     assert out["cfg"]["agent"]["gemini-delegator"]["permission"] == {"edit": "deny"}
     assert "agy" not in {k for k in out["kept"]["mcp"] if k != "servers"}
-    assert out["seat"]["key"] == "gemini-enterprise-seat" and out["noKey"] == {"type": "failed"}
+    # The seat method needs no browser and no API key: an empty-url "auto" oauth step.
+    assert out["seatStep"]["url"] == "" and out["seatStep"]["method"] == "auto"
+    assert out["seat"]["key"] == "gemini-enterprise-seat"
+    assert out["seat"]["metadata"]["authMode"] == "gemini_enterprise"
+    # The API-key method leaves the single key prompt to OpenCode; a blank key enables nothing.
+    assert out["apiMethod"]["type"] == "api" and "prompts" not in out["apiMethod"]
+    assert out["blankKeyEnv"] == {}
     assert sorted(out["hooks"]) == ["auth", "config"]
     # OpenCode loads every export of the entry file as a plugin factory: exactly one, a function.
     assert out["exportsInfo"] == [["default", "function"]]
     assert package["main"] == "./opencode-plugin/index.ts"
     assert "createServer" not in source and "Bun.serve" not in source and ".listen(" not in source
     assert any(str(p).endswith(".opencode/skills/cc-agy-plugin/SKILL.md") for p in out["cfg"].get("instructions", []))
-    assert len(plugin_methods := out["cfg"]) >= 0
 
 
 def test_corrupt_conversation_json_and_concurrent_lease_isolation(tmp_path: Path) -> None:

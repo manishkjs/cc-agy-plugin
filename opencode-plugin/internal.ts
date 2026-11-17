@@ -39,6 +39,15 @@ export function buildServerEnvironment(auth: StoredAuth): Record<string, string>
   const meta = auth.metadata || {};
   const key = String(auth.key || "").trim();
   const environment: Record<string, string> = {};
+  if (!meta.authMode) {
+    // The API-key method has no prompts and no authorize step, so OpenCode saves the key typed
+    // at its own "Enter your API key" prompt as `{type: "api", key}` with no metadata.
+    if (key && key !== SEAT_PLACEHOLDER_KEY) {
+      environment.CC_AGY_AUTH_MODE = "api_key";
+      environment.GEMINI_API_KEY = key;
+    }
+    return environment;
+  }
   if (meta.authMode === "api_key") {
     environment.CC_AGY_AUTH_MODE = "api_key";
     if (key) environment.GEMINI_API_KEY = key;
@@ -161,12 +170,34 @@ function isPolicyUrl(value: string): boolean {
   return /^https:\/\/[^\s?#@]+$/.test(value) || /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/[^\s?#]*)?$/.test(value);
 }
 
+type SavedCredential =
+  | { type: "success"; provider: string; key: string; metadata: Record<string, string> }
+  | { type: "failed" };
+
+/**
+ * Wrap a credential as an OpenCode `type: "oauth"` result that needs no browser step.
+ *
+ * OpenCode appends its own required "Enter your API key" prompt to every `type: "api"` method,
+ * but not to `type: "oauth"` ones. With an empty `url`, `opencode auth login` prints no link,
+ * shows `instructions`, and saves `callback()`'s `key` and `metadata` as a `type: "api"` entry
+ * in `auth.json`: the same shape earlier versions of this plugin saved, so `readStoredAuth`
+ * and `buildServerEnvironment` read old and new entries the same way.
+ */
+export function savedWithoutBrowser(credential: SavedCredential, instructions: string) {
+  return {
+    url: "",
+    instructions,
+    method: "auto" as const,
+    callback: async () => credential,
+  };
+}
+
 export const CcAgyPlugin: Plugin = async () => ({
   auth: {
     provider: PROVIDER_ID,
     methods: [
       {
-        type: "api",
+        type: "oauth",
         label: "Gemini Enterprise seat (sign in once with the agy CLI)",
         prompts: [
           {
@@ -184,36 +215,29 @@ export const CcAgyPlugin: Plugin = async () => ({
             placeholder: "sk-bf-agy-...",
           },
         ],
-        authorize: async (inputs: Record<string, string> = {}) => ({
-          type: "success" as const,
-          provider: PROVIDER_ID,
-          key: String(inputs.bifrostAgyVirtualKey || "").trim() || SEAT_PLACEHOLDER_KEY,
-          metadata: {
-            authMode: "gemini_enterprise",
-            bifrostPolicyUrl: String(inputs.bifrostPolicyUrl || "").trim().replace(/\/+$/, ""),
-          },
-        }),
+        authorize: async (inputs: Record<string, string> = {}) =>
+          savedWithoutBrowser(
+            {
+              type: "success",
+              provider: PROVIDER_ID,
+              key: String(inputs.bifrostAgyVirtualKey || "").trim() || SEAT_PLACEHOLDER_KEY,
+              metadata: {
+                authMode: "gemini_enterprise",
+                bifrostPolicyUrl: String(inputs.bifrostPolicyUrl || "").trim().replace(/\/+$/, ""),
+              },
+            },
+            "Saved. If you have not signed in to your Gemini Enterprise seat yet, run /login in OpenCode.",
+          ),
       },
       {
+        // No prompts and no authorize step: OpenCode asks "Enter your API key" itself (and refuses an
+        // empty key), then saves it as `{type: "api", key}`. `buildServerEnvironment` maps that entry
+        // to api_key mode, in both `opencode auth login` and the TUI's connect dialog.
         type: "api",
         label: "Gemini API key (Google AI Studio)",
-        prompts: [
-          {
-            type: "text",
-            key: "geminiApiKey",
-            message: "Gemini API key",
-            validate: (value: string) => (value.trim().length > 8 ? undefined : "Required"),
-          },
-        ],
-        authorize: async (inputs: Record<string, string> = {}) => {
-          const key = String(inputs.geminiApiKey || "").trim();
-          return key
-            ? { type: "success" as const, provider: PROVIDER_ID, key, metadata: { authMode: "api_key" } }
-            : { type: "failed" as const };
-        },
       },
       {
-        type: "api",
+        type: "oauth",
         label: "Google Cloud Vertex AI project (uses gcloud ADC)",
         prompts: [
           {
@@ -232,18 +256,21 @@ export const CcAgyPlugin: Plugin = async () => ({
         authorize: async (inputs: Record<string, string> = {}) => {
           const project = String(inputs.project || "").trim();
           const location = String(inputs.location || "").trim();
-          return project
-            ? {
-                type: "success" as const,
-                provider: PROVIDER_ID,
-                key: SEAT_PLACEHOLDER_KEY,
-                metadata: { authMode: "vertex", project, ...(location ? { location } : {}) },
-              }
-            : { type: "failed" as const };
+          return savedWithoutBrowser(
+            project
+              ? {
+                  type: "success",
+                  provider: PROVIDER_ID,
+                  key: SEAT_PLACEHOLDER_KEY,
+                  metadata: { authMode: "vertex", project, ...(location ? { location } : {}) },
+                }
+              : { type: "failed" },
+            "Saved. The plugin uses your gcloud Application Default Credentials for this project.",
+          );
         },
       },
       {
-        type: "api",
+        type: "oauth",
         label: "AI Gateway (LiteLLM / Bifrost / custom proxy)",
         prompts: [
           {
@@ -268,18 +295,21 @@ export const CcAgyPlugin: Plugin = async () => ({
           const baseUrl = String(inputs.baseUrl || "").trim().replace(/\/+$/, "");
           const token = String(inputs.gatewayToken || "").trim();
           const bifrostVirtualKey = String(inputs.bifrostVirtualKey || "").trim();
-          return baseUrl
-            ? {
-                type: "success" as const,
-                provider: PROVIDER_ID,
-                key: token || SEAT_PLACEHOLDER_KEY,
-                metadata: {
-                  authMode: "gateway",
-                  baseUrl,
-                  ...(bifrostVirtualKey ? { bifrostVirtualKey } : {}),
-                },
-              }
-            : { type: "failed" as const };
+          return savedWithoutBrowser(
+            baseUrl
+              ? {
+                  type: "success",
+                  provider: PROVIDER_ID,
+                  key: token || SEAT_PLACEHOLDER_KEY,
+                  metadata: {
+                    authMode: "gateway",
+                    baseUrl,
+                    ...(bifrostVirtualKey ? { bifrostVirtualKey } : {}),
+                  },
+                }
+              : { type: "failed" },
+            "Saved. The plugin sends Gemini requests through this gateway.",
+          );
         },
       },
     ],
