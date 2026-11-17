@@ -126,7 +126,7 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
 
 4. Gemini Enterprise only: sign in.
    Before running the command below, tell the user:
-   "A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+   "Checking your Gemini Enterprise sign-in. On a local desktop, a browser window may open for Google sign-in (waits up to 90 seconds); over SSH or headless Linux, a sign-in link will appear next."
    Then run:
      sh "@CHECKOUT_DIR@/scripts/py.sh" "@CHECKOUT_DIR@/server/agy_login.py" --start --json
    - "already_signed_in" or "signed_in": true -> go to step 5.
@@ -272,7 +272,11 @@ main() {
         picked_project="$(last_install project)"
         picked_base_url="$(last_install base_url)"
         if [[ "${picked_auth}" == "gemini_enterprise" ]] && "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and (not s.get('auth_configured') or s.get('consumer_account_detected')) else 1)" 2>/dev/null; then
-          PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || true  # Doctor below says what's left.
+          signin_rc=0
+          PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || signin_rc=$?
+          if [[ "${signin_rc}" -ne 0 && "${install_rc}" -eq 0 ]]; then
+            install_rc="${signin_rc}"
+          fi
         fi
         doctor_args=(--doctor --human --allow-pending-login --workspace "${orig_cwd}")
         if [[ -n "${picked_auth}" ]]; then
@@ -310,7 +314,11 @@ main() {
       if has_arg --non-interactive "$@"; then
         export CC_AGY_NONINTERACTIVE=1
       fi
-      PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || true  # Doctor below says what's left.
+      signin_rc=0
+      PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || signin_rc=$?
+      if [[ "${signin_rc}" -ne 0 && "${install_rc}" -eq 0 ]]; then
+        install_rc="${signin_rc}"
+      fi
     fi
     if ! is_dry_run "$@"; then
       doctor_args=(--doctor --human --allow-pending-login --workspace "${orig_cwd}")

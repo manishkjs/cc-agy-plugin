@@ -20,7 +20,8 @@ from server import agy_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_BROWSER_NOTICE = (
-    "A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+    "Checking your Gemini Enterprise sign-in. On a local desktop, a browser window may open "
+    "for Google sign-in (waits up to 90 seconds); over SSH or headless Linux, a sign-in link will appear next."
 )
 _LICENSE_OK = {
     "user_tier": "gcp-ge-plus-tier",
@@ -596,3 +597,243 @@ def test_quickstart_agent_text_announces_browser_wait_before_start():
     assert EXPECTED_BROWSER_NOTICE in step4
     assert step4.index(EXPECTED_BROWSER_NOTICE) < step4.index("--start --json")
     assert "\u2014" not in step4
+
+
+# --- Round-5 edge-case fixes ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "GET https://api.github.com/repos/org/repo returned HTTP 403 Forbidden",
+        "npm ERR! 403 Forbidden - GET https://registry.npmjs.org/@scope/pkg",
+        "ERROR: HTTP 403 Forbidden from https://pypi.org/simple/pkg/",
+        "fatal: unable to access 'https://github.com/org/repo.git/': The requested URL returned error: 403",
+        "HTTP 403 Forbidden: Request is prohibited by organization's policy (VPC Service Controls)",
+        "HTTP 403 PermissionDenied: Caller does not have permission on project foo",
+        "HTTP 403 accessNotConfigured: Cloud Code API has not been used in project",
+        "Action unauthorized for protected branch",
+    ],
+)
+def test_third_party_403_and_vpc_sc_iam_denials_are_not_agy_auth_errors(msg: str):
+    assert agy_cli.is_agy_auth_error(msg) is False
+    assert agy_cli.is_agy_oauth_credential_rejected(msg) is False
+
+
+def test_oauth_rejection_classifier_is_strict_and_never_writes_marker_on_403(tmp_path: Path):
+    # Strictly rejected/missing/expired Google OAuth credential errors.
+    for oauth_err in (
+        "HTTP 401 from cloudcode-pa.googleapis.com",
+        "invalid_grant: token has been expired or revoked",
+        "invalid_token: credentials are invalid",
+        "Not logged in. Please sign in with Google.",
+        "incomplete GCP onboarding",
+        "UNAUTHENTICATED: missing required authentication credential",
+        "Reauthentication required",
+    ):
+        assert agy_cli.is_agy_oauth_credential_rejected(oauth_err) is True, oauth_err
+
+    # 403s and bare 401/unauthorized without OAuth context must never trip the failure marker.
+    for non_marker_err in (
+        "RPC failed: status = 403",
+        "HTTP 403 Forbidden",
+        "cloudcode-pa.googleapis.com returned 403",
+        "HTTP 401 Unauthorized",
+        "unauthorized",
+    ):
+        assert agy_cli.is_agy_oauth_credential_rejected(non_marker_err) is False, non_marker_err
+
+    cfg_dir = tmp_path / "cfg"
+    _write_valid_token(cfg_dir)
+    _write_onboarding(cfg_dir)
+    marker = agy_cli.auth_failure_marker_path(cfg_dir)
+
+    for err_text, expect_remediation in (
+        ("GET https://api.github.com/repos/a/b returned HTTP 403 Forbidden", False),
+        ("HTTP 403 PermissionDenied: VPC Service Controls blocked request", False),
+        ("RPC failed: status = 403", True),
+    ):
+        fake_agy = _make_fake_agy(tmp_path / f"bin-{abs(hash(err_text))}" / "agy", mode="auth_error", error_text=err_text)
+        env = _env(tmp_path, cfg_dir, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+        with pytest.raises(RuntimeError) as exc_info:
+            agy_cli.run_agy_cli_ask({"prompt": "hi", "model": "gemini-4-hydrogen", "env": env})
+        assert not marker.exists(), err_text
+        assert ("/cc-agy-plugin:login" in str(exc_info.value)) is expect_remediation
+
+
+def test_auto_mode_routes_to_gemini_enterprise_when_only_failure_marker_active(tmp_path: Path):
+    from server.regions import resolve_auth_config
+
+    fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
+
+    # 1. File-based valid token + active failure marker -> doctor sees ok=False, auto mode still routes to agy.
+    cfg_file = tmp_path / "cfg-file"
+    _write_valid_token(cfg_file)
+    _write_onboarding(cfg_file)
+    agy_cli.record_auth_failure_marker(cfg_file)
+    env_file = _env(tmp_path, cfg_file, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    status_file = agy_cli.inspect_agy_cli_offline(env_file)
+    assert status_file["ok"] is False
+    assert status_file["auth_configured"] is False
+    assert status_file["auth_failure_marker_active"] is True
+    assert status_file["recoverable_auto_agy"] is True
+    assert resolve_auth_config(env=env_file)["auth_mode"] == "gemini_enterprise"
+
+    # 2. Keychain enterprise onboarding.json + active failure marker -> auto mode still routes to agy.
+    cfg_kc = tmp_path / "cfg-kc"
+    _write_onboarding(cfg_kc)
+    agy_cli.record_auth_failure_marker(cfg_kc)
+    env_kc = _env(tmp_path, cfg_kc, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+    status_kc = agy_cli.inspect_agy_cli_offline(env_kc)
+    assert status_kc["ok"] is False
+    assert status_kc["auth_failure_marker_active"] is True
+    assert status_kc["recoverable_auto_agy"] is True
+    assert resolve_auth_config(env=env_kc)["auth_mode"] == "gemini_enterprise"
+
+    # 3. Consumer-only onboarding + active marker must NOT be recoverable in auto mode.
+    cfg_cons = tmp_path / "cfg-cons"
+    (cfg_cons / "cache").mkdir(parents=True)
+    (cfg_cons / "cache" / "onboarding.json").write_text(
+        json.dumps({"consumerOnboardingComplete": True, "tierId": "free-tier"}), encoding="utf-8"
+    )
+    agy_cli.record_auth_failure_marker(cfg_cons)
+    env_cons = _env(tmp_path, cfg_cons, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+    assert agy_cli.inspect_agy_cli_offline(env_cons)["recoverable_auto_agy"] is False
+    with pytest.raises(ValueError, match="Missing credentials"):
+        resolve_auth_config(env=env_cons)
+
+    # 4. Version mismatch + active marker must NOT be recoverable in auto mode.
+    (fake_agy.parent / "agy.manifest.json").write_text(json.dumps({"version": "1.2.3"}), encoding="utf-8")
+    env_ver = {**env_file, "CC_AGY_CLI_VERSION": "9.9.9"}
+    assert agy_cli.inspect_agy_cli_offline(env_ver)["recoverable_auto_agy"] is False
+    with pytest.raises(ValueError, match="Missing credentials"):
+        resolve_auth_config(env=env_ver)
+
+
+def test_unverified_finalize_preserves_working_token_and_keeps_marker_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg_dir = tmp_path / "cfg"
+    fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
+    cli_token = _write_valid_token(cfg_dir)
+    _write_onboarding(cfg_dir)
+    orig_bytes = cli_token.read_bytes()
+    orig_mtime_ns = cli_token.stat().st_mtime_ns
+    marker = agy_cli.record_auth_failure_marker(cfg_dir)
+    assert marker is not None
+
+    # Newer unlicensed standalone token (e.g. from --force landing on a personal account).
+    standalone = tmp_path / ".gemini" / "jetski-standalone-oauth-token"
+    standalone.parent.mkdir(parents=True, exist_ok=True)
+    standalone.write_text(json.dumps({"token": {"access_token": "unlicensed"}, "auth_method": "gcp"}), encoding="utf-8")
+    newer_ns = marker.stat().st_mtime_ns + 5_000_000_000
+    os.utime(standalone, ns=(newer_ns, newer_ns))
+
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [])
+    monkeypatch.setattr(agy_login, "self_assign_enterprise_license", lambda *_a, **_k: None)
+    env = _env(tmp_path, cfg_dir, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    res = agy_login.finalize_enterprise_onboarding(cfg_dir, tmp_path, had_standalone_token_before=False, env=env)
+
+    assert res["verified"] is False
+    assert cli_token.read_bytes() == orig_bytes
+    assert cli_token.stat().st_mtime_ns == orig_mtime_ns
+    status = agy_cli.inspect_agy_cli_offline(env)
+    assert status["auth_configured"] is False
+    assert status["auth_failure_marker_active"] is True
+
+
+def test_keychain_browser_login_ignores_stale_standalone_and_clears_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg_dir = tmp_path / "cfg"
+    _write_onboarding(cfg_dir)
+    stale_cli_tok = _write_valid_token(cfg_dir)
+    marker = agy_cli.record_auth_failure_marker(cfg_dir)
+    assert marker is not None
+
+    # Stale unlicensed standalone token sitting in ~/.gemini/ must not poison keychain browser login.
+    standalone = tmp_path / ".gemini" / "jetski-standalone-oauth-token"
+    standalone.parent.mkdir(parents=True, exist_ok=True)
+    standalone.write_text(json.dumps({"token": {"access_token": "stale"}, "auth_method": "gcp"}), encoding="utf-8")
+
+    acp_agy = tmp_path / "bin" / "agy"
+    acp_agy.parent.mkdir(parents=True, exist_ok=True)
+    acp_agy.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        "if '--help' in sys.argv: print('Antigravity CLI --output-format --mode'); sys.exit(0)\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    acp_agy.chmod(0o755)
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [])
+    env = _env(tmp_path, cfg_dir, acp_agy, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+
+    ok, reason = agy_login.try_acp_business_browser_login(str(acp_agy), env=env, timeout_seconds=10)
+
+    assert (ok, reason) == (True, "")
+    assert not stale_cli_tok.exists()
+    assert not marker.exists()
+    status = agy_cli.inspect_agy_cli_offline(env)
+    assert status["ok"] is True
+    assert status["auth_configured"] is True
+
+
+def test_explicit_project_switch_falls_through_when_token_expired_or_marker_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg_dir = tmp_path / "cfg"
+    fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
+    _write_valid_token(cfg_dir)
+    _write_onboarding(cfg_dir, project="proj-alpha")
+
+    browser_calls: list[str] = []
+
+    def _fake_browser(_agy: str, *, env: dict[str, str], timeout_seconds: float) -> tuple[bool, str]:
+        del _agy, env, timeout_seconds
+        browser_calls.append("browser")
+        return True, ""
+
+    monkeypatch.setattr(agy_login, "can_use_local_browser_loopback", lambda _env: True)
+    monkeypatch.setattr(agy_login, "try_acp_business_browser_login", _fake_browser)
+
+    # 1. Active failure marker + explicit project -> falls through to fresh sign-in.
+    agy_cli.record_auth_failure_marker(cfg_dir)
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [dict(_LICENSE_OK)])
+    monkeypatch.setattr(agy_login, "self_assign_enterprise_license", lambda *_a, **_k: None)
+    env = _env(
+        tmp_path,
+        cfg_dir,
+        fake_agy,
+        CC_AGY_TOKEN_IN_KEYCHAIN="0",
+        CC_AGY_ENTERPRISE_PROJECT="proj-beta",
+    )
+    res_marker = agy_login.start_two_step_login(env)
+    assert res_marker == {"ok": True, "signed_in": True, "method": "browser"}
+    assert browser_calls == ["browser"]
+
+    # 2. No failure marker, but token rejected with HTTP 401 -> falls through to fresh sign-in
+    #    in both start_two_step_login and run_interactive_or_url_login.
+    agy_cli.clear_auth_failure_marker(cfg_dir)
+
+    def _raise_401(*_a: Any, **_k: Any) -> list[dict[str, str]]:
+        raise agy_login.LicenseLookupError("the license service rejected the saved token (HTTP 401); it has probably expired")
+
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", _raise_401)
+    browser_calls.clear()
+    res_401 = agy_login.start_two_step_login(env)
+    assert res_401 == {"ok": True, "signed_in": True, "method": "browser"}
+    assert browser_calls == ["browser"]
+
+    browser_calls.clear()
+    rc_401 = agy_login.run_interactive_or_url_login(env)
+    assert rc_401 == 0
+    assert browser_calls == ["browser"]
+
+    # 3. Live usable token with no seat on proj-beta -> run_interactive_or_url_login fails early (rc=1).
+    monkeypatch.setattr(agy_login, "fetch_enterprise_licenses", lambda *_a, **_k: [dict(_LICENSE_OK)])
+    browser_calls.clear()
+    rc_no_seat = agy_login.run_interactive_or_url_login(env)
+    assert rc_no_seat == 1
+    assert browser_calls == []

@@ -766,3 +766,111 @@ def test_doctor_with_explicit_auth_still_uses_the_saved_project(tmp_path: Path, 
 
     assert not any("Missing Google Cloud project ID" in issue for issue in report["issues"]), report["issues"]
     assert report["auth"]["auth_mode"] == "vertex"
+
+
+# --- Round-5 non-interactive, Ctrl+D skip, and quickstart exit-code regressions ---------------
+
+
+@pytest.mark.parametrize("flag_env", [{"CI": "1"}, {"CI": "true"}, {"CC_AGY_NONINTERACTIVE": "1"}])
+def test_ci_and_noninteractive_never_block_in_browser_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag_env: dict[str, str], capsys: pytest.CaptureFixture[str]
+):
+    calls: list[str] = []
+    _stub_browser_failure(monkeypatch, calls)
+    monkeypatch.setattr(agy_login.sys, "platform", "darwin")
+
+    rc = agy_login.run_interactive_or_url_login(
+        {"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "1", **flag_env}
+    )
+
+    assert rc == 0
+    assert calls == []
+    assert "sign-in is still needed" in capsys.readouterr().out
+
+
+def test_tty_eof_skip_returns_zero_and_failed_exchange_returns_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import io
+
+    class _DummyProc:
+        def poll(self) -> int | None:
+            return 0
+
+        def kill(self) -> None:
+            pass
+
+    class _EofReader:
+        def readline(self) -> str:
+            raise EOFError
+
+        def close(self) -> None:
+            pass
+
+    class _CaptureWriter:
+        def __init__(self) -> None:
+            self.chunks: list[str] = []
+
+        def write(self, text: str) -> int:
+            self.chunks.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def text(self) -> str:
+            return "".join(self.chunks)
+
+    monkeypatch.setattr(agy_login, "heal_enterprise_token", lambda _env: {})
+    monkeypatch.setattr(agy_login, "inspect_agy_cli_offline", lambda _env: {"agy_bin": "/x/agy", "auth_configured": False})
+    monkeypatch.setattr(agy_login, "can_use_local_browser_loopback", lambda _env: False)
+    monkeypatch.setattr(agy_login, "is_interactive_terminal", lambda _env: True)
+    monkeypatch.setattr(agy_login, "_spawn_cde_login_and_capture_url", lambda *_a, **_k: (_DummyProc(), "https://accounts.google.com/o/oauth2/auth?x=1"))
+    monkeypatch.setattr(agy_login, "copy_url_to_terminal_clipboard_osc52", lambda _u: False)
+
+    env = {"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "0"}
+
+    # 1. Ctrl+D (EOFError) -> intentional skip, returns 0.
+    out_buf = _CaptureWriter()
+    monkeypatch.setattr(agy_login, "_open_controlling_tty", lambda: (_EofReader(), out_buf))
+    rc_eof = agy_login.run_interactive_or_url_login(env)
+    assert rc_eof == 0
+    assert "Skipped sign-in for now. Run /cc-agy-plugin:login in Claude Code when ready." in out_buf.text()
+
+    # 2. Pasted bad code where exchange fails -> returns 1.
+    out_fail = _CaptureWriter()
+    monkeypatch.setattr(agy_login, "_open_controlling_tty", lambda: (io.StringIO("4/BADCODE\n"), out_fail))
+    monkeypatch.setattr(
+        agy_login,
+        "_exchange_code_with_running_cde_proc",
+        lambda *_a, **_k: {"ok": False, "error": "invalid authorization code"},
+    )
+    rc_bad = agy_login.run_interactive_or_url_login(env)
+    assert rc_bad == 1
+
+
+def test_quickstart_propagates_signin_failure_and_still_runs_doctor():
+    script = (REPO_ROOT / "scripts" / "quickstart.sh").read_text(encoding="utf-8")
+    assert "agy_signin.sh\" || true" not in script
+    assert script.count("signin_rc=0") >= 2
+
+    # Exercise the exact exit-code propagation logic used in both quickstart.sh branches.
+    harness = """
+set -euo pipefail
+run_case() {
+  local install_rc="$1" signin_exit="$2" doctor_exit="$3"
+  local signin_rc=0 doctor_ran=0
+  (exit "${signin_exit}") || signin_rc=$?
+  if [[ "${signin_rc}" -ne 0 && "${install_rc}" -eq 0 ]]; then
+    install_rc="${signin_rc}"
+  fi
+  doctor_ran=1
+  (exit "${doctor_exit}") || install_rc=$?
+  printf '%s:%s\\n' "${doctor_ran}" "${install_rc}"
+}
+run_case 0 1 0
+run_case 0 0 0
+"""
+    proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip().splitlines() == ["1:1", "1:0"]

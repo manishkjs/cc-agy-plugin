@@ -178,12 +178,42 @@ _QUOTA_OR_TRANSIENT_PATTERNS = (
     "service unavailable",
 )
 
-_AUTH_ERROR_PATTERNS = (
+_THIRD_PARTY_AUTH_HOST_RE = re.compile(
+    r"\b(?:[a-z0-9-]+\.)?(?:github\.com|npmjs\.org|pypi\.org|gitlab\.com|bitbucket\.org|docker\.io|amazonaws\.com|yarnpkg\.com|crates\.io|rubygems\.org)\b",
+    re.IGNORECASE,
+)
+
+_GOOGLE_AUTH_HOST_OR_EXPLICIT_RE = re.compile(
+    r"\b(?:googleapis\.com|cloudcode|antigravity|sign in with google|incomplete gcp onboarding)\b",
+    re.IGNORECASE,
+)
+
+_POLICY_OR_IAM_DENIAL_PATTERNS = (
+    "vpc service controls",
+    "vpc-sc",
+    "vpc_sc",
+    "accessnotconfigured",
+    "access_not_configured",
+    "service_disabled",
+    "permission_denied",
+    "permissiondenied",
+    "caller does not have permission",
+    "iam permission",
+)
+
+_NON_AGY_TOOL_AUTH_PATTERNS = (
+    "npm err!",
+    "fatal: unable to access ",
+    "fatal: authentication failed for 'http",
+)
+
+_OAUTH_CREDENTIAL_REJECTED_PATTERNS = (
     "not logged in",
     "not authenticated",
     "unauthenticated",
     "authentication required",
     "authentication failed",
+    "silent auth failed",
     "login required",
     "please sign in",
     "sign in with google",
@@ -191,15 +221,20 @@ _AUTH_ERROR_PATTERNS = (
     "expired oauth",
     "missing oauth",
     "invalid_grant",
+    "invalid_token",
     "token has been expired or revoked",
+    "token expired",
     "expired or revoked",
     "credentials missing",
     "no stored credentials",
+    "credentials are invalid",
+    "incomplete gcp onboarding",
     "reauthentication required",
     "missing required authentication credential",
     "antigravity sdk is not available on an enterprise account",
-    "unauthorized",
 )
+
+_AUTH_ERROR_PATTERNS = _OAUTH_CREDENTIAL_REJECTED_PATTERNS
 
 _AUTH_CONTEXT_HTTP_RE = re.compile(
     r"(?:googleapis\.com|cloudcode|antigravity|oauth|unauthenticated)"
@@ -208,6 +243,14 @@ _AUTH_CONTEXT_HTTP_RE = re.compile(
     r"(?:googleapis\.com|cloudcode|antigravity|oauth|sign[- ]in)"
     r"|(?:http(?:/\d(?:\.\d)?)?|status(?:\s+code)?|error(?:\s+code)?)\s*[:=]?\s*(?:401|403)\b"
     r"|\b(?:401\s+unauthorized|403\s+forbidden)\b",
+    re.IGNORECASE,
+)
+
+_OAUTH_REJECTED_HTTP_401_RE = re.compile(
+    r"(?:googleapis\.com|cloudcode|antigravity|oauth)[^\n]{0,120}\b401\b"
+    r"|\b401\b[^\n]{0,120}(?:googleapis\.com|cloudcode|antigravity|oauth)"
+    r"|\boauth\b[^\n]{0,80}\bunauthorized\b"
+    r"|\bunauthorized\b[^\n]{0,80}\boauth\b",
     re.IGNORECASE,
 )
 
@@ -1057,7 +1100,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     _sync_agy_auth_state(source, config_dir=cfg_dir)
     auth_ok, cred_source = _inspect_auth_files(cfg_dir, source)
     seat = resolve_enterprise_adc_seat(source)
-    _onboarding_ok, companion_project, tier_id, consumer_only = _read_onboarding_metadata_ext(cfg_dir)
+    onboarding_ok, companion_project, tier_id, consumer_only = _read_onboarding_metadata_ext(cfg_dir)
     managed_bin = managed_agy_bin_dir(source) / MANAGED_CLI_BIN_NAME
     pinned_version = _clean_env_str(source, "CC_AGY_CLI_VERSION") or None
     detected_version = _read_installed_agy_version_offline(agy_bin, env=source) if agy_bin else None
@@ -1073,22 +1116,46 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         or "enterprise" in tier_l
         or bool(companion_project)
     )
-    unverified_tier_blocked = bool(
-        auth_ok
-        and not tier_verified_enterprise
+    would_unverified_tier_block = bool(
+        not tier_verified_enterprise
         and _env_flag("CC_AGY_REQUIRE_GE_TIER", source) is True
     )
-    consumer_blocked = bool(
-        auth_ok
-        and consumer_only
+    would_consumer_block = bool(
+        consumer_only
         and not seat["active"]
         and _env_flag("CC_AGY_ALLOW_CONSUMER_AGY", source) is not True
     )
+    unverified_tier_blocked = bool(auth_ok and would_unverified_tier_block)
+    consumer_blocked = bool(auth_ok and would_consumer_block)
     version_mismatch = bool(
         binary_found
         and pinned_version
         and detected_version
         and detected_version != pinned_version
+    )
+    token_file_path = cfg_dir / "antigravity-oauth-token"
+    onboarding_file_path = cfg_dir / "cache" / "onboarding.json"
+    token_file_present = token_file_path.exists()
+    token_gap = stored_token_onboarding_gap(token_file_path) if token_file_present else None
+    token_problem = stored_token_problem(token_file_path) if token_file_present else None
+    token_file_usable = bool(token_file_present and token_problem is None)
+    keychain_onboarding_usable = bool(
+        not token_file_present and _platform_keeps_token_in_keychain(source) and onboarding_ok
+    )
+    marker_refs = (token_file_path, onboarding_file_path) if token_file_present else (onboarding_file_path,)
+    auth_failure_marker_active = bool(
+        not auth_ok
+        and (token_file_usable or keychain_onboarding_usable)
+        and _is_auth_failure_marker_active(cfg_dir, marker_refs)
+    )
+    recoverable_auto_agy = bool(
+        binary_found
+        and auth_failure_marker_active
+        and (token_file_usable or (keychain_onboarding_usable and tier_verified_enterprise))
+        and seat_failure is None
+        and not would_consumer_block
+        and not would_unverified_tier_block
+        and not version_mismatch
     )
     ok = (
         binary_found
@@ -1131,11 +1198,6 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             "or update `CC_AGY_CLI_VERSION`."
         )
     elif not auth_ok:
-        token_file_path = cfg_dir / "antigravity-oauth-token"
-        onboarding_file_path = cfg_dir / "cache" / "onboarding.json"
-        token_gap = stored_token_onboarding_gap(token_file_path)
-        token_problem = stored_token_problem(token_file_path) if token_file_path.exists() else None
-        marker_refs = (token_file_path, onboarding_file_path) if token_file_path.exists() else (onboarding_file_path,)
         if token_gap:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
             remediation = (
@@ -1145,7 +1207,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         elif token_problem:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_problem}."
             remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
-        elif _is_auth_failure_marker_active(cfg_dir, marker_refs):
+        elif auth_failure_marker_active:
             error = f"Antigravity CLI at `{agy_bin}` rejected the saved sign-in on its last call."
             remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
         else:
@@ -1190,6 +1252,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         "pinned_version": pinned_version,
         "managed_bin_path": str(managed_bin),
         "auth_configured": auth_ok,
+        "auth_failure_marker_active": auth_failure_marker_active,
+        "recoverable_auto_agy": recoverable_auto_agy,
         "consumer_account_detected": consumer_blocked,
         "tier_verified_enterprise": tier_verified_enterprise,
         "credential_source": cred_source,
@@ -1842,14 +1906,46 @@ def normalize_denied_actions(
     return records
 
 
+def _is_non_agy_tool_or_policy_error(lower: str) -> bool:
+    """Return True for third-party tool 401/403s or GCP VPC-SC/IAM policy denials (not broken OAuth sign-in)."""
+    if any(pat in lower for pat in _POLICY_OR_IAM_DENIAL_PATTERNS):
+        return True
+    if _GOOGLE_AUTH_HOST_OR_EXPLICIT_RE.search(lower):
+        return False
+    if _THIRD_PARTY_AUTH_HOST_RE.search(lower):
+        return True
+    return any(pat in lower for pat in _NON_AGY_TOOL_AUTH_PATTERNS)
+
+
 def is_agy_auth_error(message: str) -> bool:
     """Return True if `message` indicates missing, expired, or unauthorized `agy` OAuth credentials."""
     lower = (message or "").lower()
     if any(qpat in lower for qpat in _QUOTA_OR_TRANSIENT_PATTERNS):
         return False
+    if _is_non_agy_tool_or_policy_error(lower):
+        return False
     if any(pat in lower for pat in _AUTH_ERROR_PATTERNS):
         return True
     return bool(_AUTH_CONTEXT_HTTP_RE.search(lower))
+
+
+def is_agy_oauth_credential_rejected(message: str) -> bool:
+    """Return True only when `message` specifically indicates rejected/missing/expired Google OAuth credentials.
+
+    Stricter than `is_agy_auth_error`: never triggers on HTTP 403, IAM/VPC-SC `PermissionDenied`,
+    `accessNotConfigured`, third-party tool errors, or bare `"unauthorized"` without Google/OAuth
+    context, so recording `cc-agy-auth-failed` cannot invalidate a healthy sign-in.
+    """
+    lower = (message or "").lower()
+    if any(qpat in lower for qpat in _QUOTA_OR_TRANSIENT_PATTERNS):
+        return False
+    if _is_non_agy_tool_or_policy_error(lower):
+        return False
+    if re.search(r"\b403\b", lower):
+        return False
+    if any(pat in lower for pat in _OAUTH_CREDENTIAL_REJECTED_PATTERNS):
+        return True
+    return bool(_OAUTH_REJECTED_HTTP_401_RE.search(lower))
 
 
 def _extract_available_models(error_text: str) -> list[str]:
@@ -3201,7 +3297,8 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
         if not turn_out["ok"]:
             err_msg = str(turn_out["error"])
             if is_agy_auth_error(err_msg):
-                _note_agy_auth_failure(env)
+                if is_agy_oauth_credential_rejected(err_msg):
+                    _note_agy_auth_failure(env)
                 err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
             exc = RuntimeError(err_msg)
             exc.partial_usage = agg_usage  # type: ignore[attr-defined]
@@ -3750,7 +3847,8 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
         if not out["ok"]:
             err_msg = str(out["error"])
             if is_agy_auth_error(err_msg):
-                _note_agy_auth_failure(env)
+                if is_agy_oauth_credential_rejected(err_msg):
+                    _note_agy_auth_failure(env)
                 err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
             exc = RuntimeError(err_msg)
             partial = dict(out["usage"])
@@ -3862,7 +3960,8 @@ def run_agy_cli_structured_writer(
     if not out["ok"]:
         err_msg = str(out["error"])
         if is_agy_auth_error(err_msg):
-            _note_agy_auth_failure(env)
+            if is_agy_oauth_credential_rejected(err_msg):
+                _note_agy_auth_failure(env)
             err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
         exc = RuntimeError(err_msg)
         exc.partial_usage = out["usage"]  # type: ignore[attr-defined]

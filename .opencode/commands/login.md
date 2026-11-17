@@ -3,7 +3,7 @@ description: Sign in to Gemini Enterprise for cc-agy-plugin, or repair a saved s
 ---
 
 Before running the command below, tell the user:
-"A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+"Checking your Gemini Enterprise sign-in. On a local desktop, a browser window may open for Google sign-in (waits up to 90 seconds); over SSH or headless Linux, a sign-in link will appear next."
 
 Then run the sign-in helper (keep `--force` if the user asked for a fresh sign-in):
 

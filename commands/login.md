@@ -4,7 +4,7 @@ description: Sign in to Gemini Enterprise, or repair a saved sign-in that agy re
 ---
 
 Before running the command below, tell the user:
-"A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+"Checking your Gemini Enterprise sign-in. On a local desktop, a browser window may open for Google sign-in (waits up to 90 seconds); over SSH or headless Linux, a sign-in link will appear next."
 
 Then run the sign-in helper. Pass through what the user typed after the command (`--force` for a
 fresh sign-in, `--project <ID>` to pick the seat project):

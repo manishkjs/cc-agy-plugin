@@ -2246,7 +2246,8 @@ def resolve_auth_config(
     if _should_auto_detect_agy_cli(env, source_env):
         from server.agy_cli import inspect_agy_cli_offline
 
-        if inspect_agy_cli_offline(source_env).get("ok"):
+        agy_status = inspect_agy_cli_offline(source_env)
+        if agy_status.get("ok") or agy_status.get("recoverable_auto_agy"):
             return _finish(
                 {
                     "auth_mode": "gemini_enterprise",

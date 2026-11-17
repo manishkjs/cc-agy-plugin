@@ -480,8 +480,6 @@ def finalize_enterprise_onboarding(
                     prev_auth_method = "wif"
         except (UnicodeDecodeError, ValueError):
             parsed_token = None
-        if parsed_token is None:
-            _atomic_write_private(cli_token_file, raw_bytes)
         if not had_standalone_token_before:
             standalone_token_file.unlink(missing_ok=True)
     elif cli_token_file.is_file() and cli_token_file.stat().st_size > 10:
@@ -509,23 +507,30 @@ def finalize_enterprise_onboarding(
             config_dir=config_dir,
             env=env,
         )
-        for field in ("user_tier", "tier_display_name", "project_id", "region"):
-            if resolved_license[field]:
-                parsed_token[field] = resolved_license[field]
-        _atomic_write_private(
-            cli_token_file,
-            json.dumps(parsed_token).encode("utf-8"),
-        )
 
     effective_tier = resolved_license["user_tier"]
     effective_display = resolved_license["tier_display_name"]
     effective_proj = resolved_license["project_id"]
     effective_region = resolved_license["region"] or "global"
-    # Only a license we actually resolved counts. Writing "onboarding complete" without one
-    # makes doctor report "signed in" while agy rejects every call.
+    # Only a license we actually resolved counts. Writing "onboarding complete" or rewriting the
+    # token file without one makes doctor report "signed in" (or bumps mtime past cc-agy-auth-failed)
+    # while agy rejects every call, and would clobber a previously working token on --force.
     verified = bool(effective_tier and effective_proj)
 
     if verified:
+        if token_on_disk and parsed_token is not None:
+            for field in ("user_tier", "tier_display_name", "project_id", "region"):
+                if resolved_license[field]:
+                    parsed_token[field] = resolved_license[field]
+            new_token_bytes = json.dumps(parsed_token).encode("utf-8")
+            existing_bytes: bytes | None = None
+            if cli_token_file.is_file():
+                try:
+                    existing_bytes = cli_token_file.read_bytes()
+                except OSError:
+                    existing_bytes = None
+            if standalone_is_newest or existing_bytes != new_token_bytes:
+                _atomic_write_private(cli_token_file, new_token_bytes)
         onboarding_file = config_dir / "cache" / "onboarding.json"
         existing_onboarding: dict[str, Any] = {}
         if onboarding_file.is_file():
@@ -716,7 +721,7 @@ def try_acp_business_browser_login(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.2"}},
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.3"}},
                 }
             )
             + "\n"
@@ -739,26 +744,46 @@ def try_acp_business_browser_login(
             return False, str(err_msg or "agy acp authenticate failed")
 
         # authenticate(oauth-business) only succeeds after agy's own resolveEnterpriseLicense
-        # found and saved a license. A leftover broken token file from an earlier attempt would
-        # now shadow that sign-in for doctor, so drop it.
+        # found and saved a license. On keychain platforms agy stores the new token in the OS
+        # keychain (never in `~/.gemini/jetski-standalone-oauth-token`), so reading a stale
+        # standalone/file token would falsely return `no_license` and skip clearing the failure
+        # marker. Only finalize from disk when a fresh valid token file exists; otherwise drop
+        # any stale file and record completion directly.
         config_dir = agy_cli_config_dir(env)
         token_file = config_dir / "antigravity-oauth-token"
         from server.agy_cli import stored_token_problem
 
-        if token_file.exists() and (
-            stored_token_problem(token_file) is not None
-            or (_platform_keeps_token_in_keychain(env) and _is_auth_failure_marker_active(config_dir, (token_file,)))
-        ):
-            token_file.unlink(missing_ok=True)
-        onboarding = finalize_enterprise_onboarding(
-            config_dir,
-            _home_dir(env),
-            had_standalone_token_before=True,
-            env=env,
-        )
-        if onboarding.get("problem") == "keychain":
-            # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
-            _mark_enterprise_onboarding_complete(config_dir, env=env)
+        if _platform_keeps_token_in_keychain(env):
+            has_fresh_valid_token = (
+                token_file.exists()
+                and stored_token_problem(token_file) is None
+                and not _is_auth_failure_marker_active(config_dir, (token_file,))
+            )
+            if has_fresh_valid_token:
+                onboarding = finalize_enterprise_onboarding(
+                    config_dir,
+                    _home_dir(env),
+                    had_standalone_token_before=True,
+                    env=env,
+                )
+                if not onboarding.get("verified"):
+                    _mark_enterprise_onboarding_complete(config_dir, env=env)
+            else:
+                if token_file.exists():
+                    token_file.unlink(missing_ok=True)
+                _mark_enterprise_onboarding_complete(config_dir, env=env)
+        else:
+            if token_file.exists() and stored_token_problem(token_file) is not None:
+                token_file.unlink(missing_ok=True)
+            onboarding = finalize_enterprise_onboarding(
+                config_dir,
+                _home_dir(env),
+                had_standalone_token_before=True,
+                env=env,
+            )
+            if onboarding.get("problem") == "keychain":
+                # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
+                _mark_enterprise_onboarding_complete(config_dir, env=env)
         return True, ""
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return False, str(exc)
@@ -1191,6 +1216,41 @@ def _live_hold_session(state_dir: Path) -> dict[str, Any] | None:
     return meta
 
 
+def _should_abort_explicit_project_switch(healed: Mapping[str, Any], config_dir: Path) -> bool:
+    """Return True only when a `--project` switch failed on a live, usable saved token.
+
+    When the saved token is missing, expired, rejected (`401`/`invalid_grant`), or already
+    invalidated by `cc-agy-auth-failed`, callers should fall through to a fresh sign-in
+    for the requested project instead of failing early.
+    """
+    if healed.get("healed") or healed.get("already_complete"):
+        return False
+    token_file = config_dir / "antigravity-oauth-token"
+    onboarding_file = config_dir / "cache" / "onboarding.json"
+    marker_refs = (token_file, onboarding_file) if token_file.exists() else (onboarding_file,)
+    if _is_auth_failure_marker_active(config_dir, marker_refs):
+        return False
+    reason = str(healed.get("reason") or "")
+    low = reason.lower()
+    if not low:
+        return False
+    unusable_token_signals = (
+        "no readable token",
+        "not a gemini enterprise token",
+        "no access token",
+        "expired",
+        "401",
+        "invalid_grant",
+        "invalid_token",
+        "rejected",
+        "unauthenticated",
+        "unauthorized",
+    )
+    if any(sig in low for sig in unusable_token_signals):
+        return False
+    return True
+
+
 def start_two_step_login(
     env: Mapping[str, str] | None = None,
     *,
@@ -1206,15 +1266,15 @@ def start_two_step_login(
         force: Skip the "already signed in" short-circuit and always start a fresh sign-in.
     """
     source = dict(os.environ if env is None else env)
-    explicit_proj = _configured_enterprise_project_and_location(agy_cli_config_dir(source), source)[0]
+    config_dir = agy_cli_config_dir(source)
+    explicit_proj = _configured_enterprise_project_and_location(config_dir, source)[0]
     if not force:
         healed = heal_enterprise_token(source)
-        if explicit_proj and not (healed.get("healed") or healed.get("already_complete")):
+        if explicit_proj and _should_abort_explicit_project_switch(healed, config_dir):
             reason = healed.get("reason") or "the license lookup failed"
-            if "no readable token" not in reason and "not a Gemini Enterprise token" not in reason:
-                # The user asked for a specific seat project and the switch failed: say so
-                # instead of reporting the old sign-in as fine.
-                return {"ok": False, "error": f"Couldn't switch to seat project '{explicit_proj}': {reason}."}
+            # The user asked for a specific seat project and the switch failed on a live token:
+            # say so instead of reporting the old sign-in as fine.
+            return {"ok": False, "error": f"Couldn't switch to seat project '{explicit_proj}': {reason}."}
         status = inspect_agy_cli_offline(source)
         project_change_pending = bool(
             explicit_proj
@@ -1535,12 +1595,17 @@ def run_interactive_or_url_login(
     if (source.get("CC_AGY_SKIP_SIGNIN") or "").strip() == "1" or source.get("PYTEST_CURRENT_TEST"):
         return 0
 
-    explicit_proj = _configured_enterprise_project_and_location(agy_cli_config_dir(source), source)[0]
+    config_dir = agy_cli_config_dir(source)
+    explicit_proj = _configured_enterprise_project_and_location(config_dir, source)[0]
     healed: dict[str, Any] = {}
     if not force:
         healed = heal_enterprise_token(source)
         if healed.get("healed"):
             print(f"Repaired saved Gemini Enterprise sign-in (project={healed.get('project_id')}).")
+        elif explicit_proj and _should_abort_explicit_project_switch(healed, config_dir):
+            reason = healed.get("reason") or "the license lookup failed"
+            print(f"Couldn't switch to seat project '{explicit_proj}': {reason}.", file=sys.stderr)
+            return 1
     status = inspect_agy_cli_offline(source)
     project_change_pending = bool(
         explicit_proj
@@ -1559,6 +1624,14 @@ def run_interactive_or_url_login(
     agy_bin = status.get("agy_bin")
     if not agy_bin:
         print("Antigravity CLI (`agy`) is not installed yet; skipping sign-in.", file=sys.stderr)
+        return 0
+
+    # 0. CI or an explicit --non-interactive run: never block in a browser wait, prompt on tty,
+    #    or leave a sign-in helper waiting.
+    if (source.get("CI") or "").strip().lower() in ("1", "true", "yes") or (
+        source.get("CC_AGY_NONINTERACTIVE") or ""
+    ).strip() == "1":
+        print("Gemini Enterprise sign-in is still needed. Run `/cc-agy-plugin:login` in Claude Code.")
         return 0
 
     # 1. Local desktop with a browser (not SSH): agy's own browser sign-in, no copy-paste.
@@ -1583,9 +1656,12 @@ def run_interactive_or_url_login(
         proc: subprocess.Popen[str] | None = None
         try:
             home_dir = _home_dir(source)
-            config_dir = agy_cli_config_dir(source)
             had_standalone = (home_dir / ".gemini" / "jetski-standalone-oauth-token").is_file()
-            proc, auth_url = _spawn_cde_login_and_capture_url(agy_bin, env=source)
+            try:
+                proc, auth_url = _spawn_cde_login_and_capture_url(agy_bin, env=source)
+            except (RuntimeError, OSError) as exc:
+                tty_out.write(f"\nCould not start Gemini Enterprise sign-in: {exc}\n")
+                return 1
             short_url = shorten_and_verify_oauth_url(auth_url, source)
             copied_osc52 = copy_url_to_terminal_clipboard_osc52(auth_url)
             tty_out.write("\n  Gemini Enterprise sign-in\n  1. Open this link in your browser:\n\n")
@@ -1599,9 +1675,14 @@ def run_interactive_or_url_login(
             while True:
                 tty_out.write("  Authorization code (or press Ctrl+D to skip): ")
                 tty_out.flush()
-                pasted = tty_in.readline()
+                try:
+                    pasted = tty_in.readline()
+                except EOFError:
+                    pasted = ""
                 if not pasted:
-                    tty_out.write("\nSign-in skipped. Run `/cc-agy-plugin:login` later to finish.\n")
+                    tty_out.write(
+                        "\nSkipped sign-in for now. Run /cc-agy-plugin:login in Claude Code when ready.\n"
+                    )
                     return 0
                 try:
                     extract_oauth_code(pasted)
@@ -1626,14 +1707,7 @@ def run_interactive_or_url_login(
             tty_in.close()
             tty_out.close()
 
-    # 3. CI or an explicit --non-interactive run: never leave a sign-in helper waiting.
-    if (source.get("CI") or "").strip().lower() in ("1", "true", "yes") or (
-        source.get("CC_AGY_NONINTERACTIVE") or ""
-    ).strip() == "1":
-        print("Gemini Enterprise sign-in is still needed. Run `/cc-agy-plugin:login` in Claude Code.")
-        return 0
-
-    # 4. An agent's shell (Claude Code, Cursor, OpenCode): start the 2-step sign-in and print
+    # 3. An agent's shell (Claude Code, Cursor, OpenCode): start the 2-step sign-in and print
     #    the link for the agent to show.
     started = start_two_step_login(source, force=force, browser_already_tried=browser_reason)
     if not started.get("ok"):
