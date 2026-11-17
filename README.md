@@ -9,7 +9,7 @@ to low-cost Gemini workers that run in an isolated git copy of your repo.
 
 [![Validate](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg)](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.9-1a73e8)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.4.0-1a73e8)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20OpenCode%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
@@ -93,9 +93,9 @@ What happens next:
 # Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 # Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.9 bash -s -- --host opencode --auth gemini-enterprise
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.0 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.9 cc-agy-plugin --host claude --auth gemini-enterprise
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.0 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
 </details>
@@ -333,7 +333,7 @@ Run `python3 -m server.install --doctor` to see the seat mode, tier, location, a
 
 ### Installer flags and runtime configuration
 
-Pass `--host codex|claude|cursor|opencode|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--gateway-wire`, `--max-daily-cents`, or `--strict` to `python3 -m server.install`. For a single session without installing, run `claude --plugin-dir /path/to/cc-agy-plugin`.
+Pass `--host codex|claude|cursor|opencode|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--gateway-wire`, `--max-daily-cents`, or `--strict` to `python3 -m server.install`. Codex and Antigravity installs also add the guard hooks (see [Guard hooks on every host](#guard-hooks-on-every-host)); skip them with `--no-codex-hooks` / `--no-agy-hooks`, or remove only ours later with `--host codex|agy --uninstall-hooks`. For a single session without installing, run `claude --plugin-dir /path/to/cc-agy-plugin`.
 
 All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference), or print the grouped public catalog from your terminal with `python3 -m server.install --list-settings`.
 
@@ -474,7 +474,7 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.3.9, Apache 2.0 |
+| **Version** | 0.4.0, Apache 2.0 |
 | **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 
@@ -779,6 +779,23 @@ cc-agy-plugin/
 └── LICENSE                   # Apache License 2.0
 ```
 
+### Guard hooks on every host
+
+The five Claude Code hooks in `hooks/hooks.json` (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) run the same scripts on the other hosts through one adapter, `scripts/hook_adapter.py --host <host> --event <event>`. The adapter turns each host's hook input into the Claude Code shape, runs the script, and turns the answer back into what that host understands (for example, agy blocks with `{"decision":"deny","reason":...}`).
+
+| Host | Where the hooks live | Installed by | What runs |
+|---|---|---|---|
+| Claude Code | `hooks/hooks.json` (plugin) | the plugin itself | all five hooks, all matched tools |
+| OpenCode | `opencode-plugin/hooks.ts` (plugin) | the plugin itself | `tool.execute.before/after`, `chat.message`, `session.created`; `session.idle` cannot block, so Stop only logs |
+| Codex 0.118+ | `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) plus `[features] codex_hooks = true` in `config.toml` | `python3 -m server.install --host codex` | all five events, but Pre/PostToolUse fire only for the shell tool (`^Bash$`) |
+| Antigravity CLI (`agy`) | `~/.gemini/config/hooks.json`, key `cc-agy-plugin` (or the plugin root with `--agy-hooks-scope plugin`) | `python3 -m server.install --host agy` | `SessionStart`, `PreInvocation` (as UserPromptSubmit, once per prompt), `PreToolUse`, `PostToolUse`, `Stop` |
+
+How the install works: the installer reads the template (`plugins/cc-agy-plugin/hooks/codex-hooks.json` or `plugins/antigravity/hooks.json`) and writes each `command` with the absolute, shell-quoted paths of your Python and of `scripts/hook_adapter.py`, because neither Codex nor agy expands variables in `command`. It merges by ownership: in Codex it replaces only handlers that run `hook_adapter.py --host codex`, and in agy only the `cc-agy-plugin` key, so your own hooks stay. A changed file is backed up first as `<file>.bak-<timestamp>`. Re-running is a no-op, and `--dry-run` writes nothing.
+
+Codex limits: Codex 0.118 sends Pre/PostToolUse only for its shell tool, so the read/edit guards, the MCP `delegate_*` pre-checks, and the `delegate_*` hook ledger (`hook_audit.jsonl` and the auto-stop hint) do not run there. Receipts are not affected: the MCP server writes each job's signed receipt itself, and the Stop-hook provenance check still runs. `codex_hooks` is an "under development" Codex feature; the installer turns it on and leaves it on after `--uninstall-hooks`, since other hooks may need it.
+
+All three hosts let a broken or slow hook through (fail open). The adapter itself denies a `PreToolUse` only when strict mode is on and a guard script crashes.
+
 ### Running tests and validation
 
 ```bash
@@ -793,7 +810,7 @@ python3 -m pytest -q tests/test_harness_contracts.py -k opencode  # one host's l
 The same plugin loads in Claude Code, Cursor, Codex, OpenCode, and Antigravity, and each host has its own loader quirks (for example, OpenCode rejects any non-function export from its entry file, and `claude plugin install` does not refresh an installed local-marketplace cache). To keep a fix for one host from breaking another, changes follow three layers:
 
 1. **Shared behaviour lives in `server/`.** Every host starts the same stdio MCP server (`server/main.py`, directly or through `scripts/run_mcp_server.sh`).
-2. **Host quirks live only in that host's adapter folder:** Claude Code (`.claude-plugin/`, `.mcp.json`, `hooks/`), Cursor (`.cursor-plugin/`, `cursor/rules/`), Codex (`plugins/cc-agy-plugin/.codex-plugin/`, `.agents/plugins/`), OpenCode (`opencode-plugin/`, `.opencode/`, `package.json`). Antigravity has no adapter folder; `server/install.py` writes its `~/.gemini/config/` entries. Adapter files never reference another host's folder.
+2. **Host quirks live only in that host's adapter folder:** Claude Code (`.claude-plugin/`, `.mcp.json`, `hooks/`), Cursor (`.cursor-plugin/`, `cursor/rules/`), Codex (`plugins/cc-agy-plugin/.codex-plugin/`, `.agents/plugins/`), OpenCode (`opencode-plugin/`, `.opencode/`, `package.json`), Antigravity (`plugins/antigravity/`, only its hooks template; `server/install.py` writes its `~/.gemini/config/` entries). Adapter files never reference another host's folder.
 3. **`server/install.py --host <h>` writes only that host's config.**
 
 Every quirk gets a contract test in `tests/test_harness_contracts.py`. CI runs it once per host (`-k <host>`) on Linux, plus Claude Code and OpenCode on macOS. The tests use a fake `HOME`, a fake `claude` CLI, no network, and no model calls.

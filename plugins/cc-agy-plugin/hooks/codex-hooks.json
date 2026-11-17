@@ -1,0 +1,62 @@
+{
+  "description": "cc-agy-plugin hooks for Codex (codex_hooks feature). Rendered into $CODEX_HOME/hooks.json by `python3 -m server.install --host codex`; @PYTHON@ and @PLUGIN_ROOT@ are replaced with absolute, shell-quoted paths. Codex 0.118 only runs Pre/PostToolUse for its shell tool, reported as Bash.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@PYTHON@ @PLUGIN_ROOT@/scripts/hook_adapter.py --host codex --event SessionStart",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@PYTHON@ @PLUGIN_ROOT@/scripts/hook_adapter.py --host codex --event UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@PYTHON@ @PLUGIN_ROOT@/scripts/hook_adapter.py --host codex --event PreToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@PYTHON@ @PLUGIN_ROOT@/scripts/hook_adapter.py --host codex --event PostToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@PYTHON@ @PLUGIN_ROOT@/scripts/hook_adapter.py --host codex --event Stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode-ai/plugin";
+import { createHookHandlers } from "./hooks.ts";
 
 export const PROVIDER_ID = "cc-agy";
 export const SERVER_NAME = "agy";
@@ -192,7 +193,58 @@ export function savedWithoutBrowser(credential: SavedCredential, instructions: s
   };
 }
 
-export const CcAgyPlugin: Plugin = async () => ({
+/**
+ * `CC_AGY_*` settings from the `agy` MCP entry in an OpenCode config object.
+ *
+ * Hook processes do not inherit the MCP server's environment, so the guard scripts would
+ * otherwise miss settings such as strict mode or the daily budget. `${...}` placeholders and
+ * non-string values are skipped.
+ */
+export function configSettingsEnvironment(cfg: any): Record<string, string> {
+  const entry = cfg?.mcp?.[SERVER_NAME] || cfg?.mcp?.servers?.[SERVER_NAME];
+  const source = entry?.environment || entry?.env;
+  const settings: Record<string, string> = {};
+  if (!source || typeof source !== "object") return settings;
+  for (const [key, value] of Object.entries(source)) {
+    if (!/^(CC_AGY_|CLAUDE_PLUGIN_OPTION_)/.test(key) || typeof value !== "string") continue;
+    if (!value.trim() || /^\$\{.*\}$/.test(value.trim())) continue;
+    settings[key] = value;
+  }
+  return settings;
+}
+
+/** True unless the user turned the OpenCode guard hooks off with `CC_AGY_OPENCODE_HOOKS=0`. */
+export function hooksEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !/^(0|false|no|off)$/i.test(String(env.CC_AGY_OPENCODE_HOOKS || "").trim());
+}
+
+/**
+ * Add the guard hooks (hooks.json parity, see `./hooks.ts`) to the plugin's own hooks.
+ *
+ * The adapter gets the stored login's environment plus the `CC_AGY_*` settings of the `agy`
+ * MCP entry, which `config` captures after `applyConfig` has run.
+ */
+export function withGuardHooks(input: any, base: Record<string, any>): Record<string, any> {
+  if (!hooksEnabled()) return base;
+  let configSettings: Record<string, string> = {};
+  const guards = createHookHandlers({
+    pluginRoot: PLUGIN_ROOT,
+    directory: input?.directory,
+    client: input?.client,
+    python: resolvePython,
+    settingsEnvironment: () => ({ ...buildServerEnvironment(readStoredAuth()), ...configSettings }),
+  });
+  return {
+    ...guards,
+    ...base,
+    config: async (cfg: any) => {
+      await base.config?.(cfg);
+      configSettings = configSettingsEnvironment(cfg);
+    },
+  };
+}
+
+export const CcAgyPlugin: Plugin = async (input?: any) => withGuardHooks(input, {
   auth: {
     provider: PROVIDER_ID,
     methods: [

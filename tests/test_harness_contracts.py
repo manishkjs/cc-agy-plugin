@@ -63,19 +63,23 @@ def _adapter_files(harness: str) -> list[Path]:
     """Return the Layer 2 files one harness owns.
 
     Shared content folders (`commands/`, `agents/`, `skills/`) are used by more than one
-    host and are not adapter files. Antigravity has no adapter files in the repository:
-    `server/install.py` generates them under `~/.gemini/config/`.
+    host and are not adapter files. Antigravity's only adapter file in the repository is
+    its hooks template: `server/install.py` generates the rest under `~/.gemini/config/`.
     """
     fixed: dict[str, tuple[str, ...]] = {
         "claude": (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", ".mcp.json", "hooks/hooks.json"),
         "cursor": (".cursor-plugin/plugin.json", ".cursor-plugin/mcp.json", ".cursor-plugin/hooks.json"),
-        "codex": ("plugins/cc-agy-plugin/.codex-plugin/plugin.json", ".agents/plugins/marketplace.json"),
-        "opencode": ("package.json", "opencode-plugin/index.ts", "opencode-plugin/internal.ts"),
-        "antigravity": (),
+        "codex": (
+            "plugins/cc-agy-plugin/.codex-plugin/plugin.json",
+            ".agents/plugins/marketplace.json",
+            "plugins/cc-agy-plugin/hooks/codex-hooks.json",
+        ),
+        "opencode": ("package.json",),
+        "antigravity": ("plugins/antigravity/hooks.json",),
     }
     globs: dict[str, tuple[str, ...]] = {
         "cursor": ("cursor/rules/*.mdc",),
-        "opencode": (".opencode/**/*.md",),
+        "opencode": ("opencode-plugin/*.ts", ".opencode/**/*.md"),
     }
     files = [REPO_ROOT / rel for rel in fixed[harness]]
     for pattern in globs.get(harness, ()):
@@ -879,3 +883,92 @@ def test_shared_server_handshake_via_harness_launch_spec(
     assert server_info["version"] == _pyproject_version() == baseline_info["version"]
     assert tools, f"{harness}: tools/list returned no tools"
     assert sorted(tools) == sorted(baseline), f"{harness} sees a different tool set than the shared server"
+
+
+# --------------------------------------------------------------------------------------
+# (h) Every harness wires the five guard hooks to the shared scripts
+# --------------------------------------------------------------------------------------
+
+_CC_HOOK_EVENTS = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+_HOOK_ADAPTER = REPO_ROOT / "scripts" / "hook_adapter.py"
+
+
+def _hook_commands(node: Any) -> list[str]:
+    if isinstance(node, dict):
+        own = [node["command"]] if isinstance(node.get("command"), str) else []
+        return own + [c for value in node.values() for c in _hook_commands(value)]
+    if isinstance(node, list):
+        return [c for item in node for c in _hook_commands(item)]
+    return []
+
+
+def _assert_commands_run_the_adapter(commands: list[str], host: str) -> None:
+    import shlex
+
+    assert commands, f"{host}: no hook commands"
+    for command in commands:
+        argv = shlex.split(command)
+        assert Path(argv[0]).name.startswith("python"), command
+        assert Path(argv[1]).is_absolute() and _resolves_to(argv[1], _HOOK_ADAPTER), command
+        assert argv[2:4] == ["--host", host], command
+    assert _HOOK_ADAPTER.is_file(), "scripts/hook_adapter.py is missing"
+
+
+def _check_claude_hooks(installed: Callable[..., _InstallRun]) -> None:
+    hooks = _read_json(REPO_ROOT / "hooks" / "hooks.json")["hooks"]
+    assert set(hooks) == _CC_HOOK_EVENTS
+
+
+def _check_cursor_hooks(installed: Callable[..., _InstallRun]) -> None:
+    plugin = _read_json(REPO_ROOT / ".cursor-plugin" / "plugin.json")
+    assert (REPO_ROOT / plugin["hooks"]).is_file()
+    json.loads((REPO_ROOT / plugin["hooks"]).read_text(encoding="utf-8"))
+
+
+def _check_codex_hooks(installed: Callable[..., _InstallRun]) -> None:
+    run = installed("codex")
+    codex_home = run.sandbox.home / ".codex"
+    assert run.host["hooks"]["status"] == "installed", run.host.get("hooks")
+    hooks = _read_json(codex_home / "hooks.json")["hooks"]
+    assert set(hooks) == _CC_HOOK_EVENTS == set(install.CODEX_HOOK_EVENTS)
+    for event in ("PreToolUse", "PostToolUse"):
+        assert [g.get("matcher") for g in hooks[event]] == ["^Bash$"], hooks[event]
+    _assert_commands_run_the_adapter(_hook_commands(hooks), "codex")
+    table = _load_toml((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert table["features"]["codex_hooks"] is True
+
+
+def _check_opencode_hooks(installed: Callable[..., _InstallRun]) -> None:
+    # Static only: the node tests in tests/test_opencode_hooks.py exercise the behavior.
+    hooks_ts = REPO_ROOT / "opencode-plugin" / "hooks.ts"
+    assert hooks_ts.is_file(), "opencode-plugin/hooks.ts is missing"
+    source = _strip_ts_comments(hooks_ts.read_text(encoding="utf-8"))
+    for key in ('"tool.execute.before"', '"tool.execute.after"', '"chat.message"', "event:"):
+        assert key in source, f"opencode-plugin/hooks.ts does not register {key}"
+    assert "hook_adapter.py" in source
+    internal = _strip_ts_comments((REPO_ROOT / "opencode-plugin" / "internal.ts").read_text(encoding="utf-8"))
+    assert re.search(r'from\s+"\./hooks(?:\.ts)?"', internal), "internal.ts does not import ./hooks"
+
+
+def _check_antigravity_hooks(installed: Callable[..., _InstallRun]) -> None:
+    run = installed("antigravity")
+    assert run.host["hooks"]["status"] == "installed", run.host.get("hooks")
+    data = _read_json(run.sandbox.home / ".gemini" / "config" / "hooks.json")
+    spec = data[install.AGY_HOOKS_KEY]
+    assert set(spec) == {"SessionStart", "PreInvocation", "PreToolUse", "PostToolUse", "Stop"}
+    for event in ("PreToolUse", "PostToolUse"):
+        for group in spec[event]:
+            re.compile(r"\A(?:" + group["matcher"] + r")\Z")  # agy anchors matchers this way.
+    _assert_commands_run_the_adapter(_hook_commands(spec), "agy")
+
+
+@pytest.mark.parametrize("harness", HARNESSES)
+def test_guard_hooks_are_wired(harness: str, installed: Callable[..., _InstallRun]) -> None:
+    checks: dict[str, Callable[[Callable[..., _InstallRun]], None]] = {
+        "claude": _check_claude_hooks,
+        "cursor": _check_cursor_hooks,
+        "codex": _check_codex_hooks,
+        "opencode": _check_opencode_hooks,
+        "antigravity": _check_antigravity_hooks,
+    }
+    checks[harness](installed)

@@ -844,7 +844,10 @@ def test_opencode_entry_point_registers_server_commands_and_agent_without_secret
     # The API-key method leaves the single key prompt to OpenCode; a blank key enables nothing.
     assert out["apiMethod"]["type"] == "api" and "prompts" not in out["apiMethod"]
     assert out["blankKeyEnv"] == {}
-    assert sorted(out["hooks"]) == ["auth", "config"]
+    assert sorted(out["hooks"]) == sorted([
+        "auth", "config", "chat.message", "event", "experimental.chat.system.transform",
+        "tool.execute.after", "tool.execute.before",
+    ])
     # OpenCode loads every export of the entry file as a plugin factory: exactly one, a function.
     assert out["exportsInfo"] == [["default", "function"]]
     assert package["main"] == "./opencode-plugin/index.ts"

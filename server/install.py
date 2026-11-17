@@ -1138,7 +1138,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.3.9",
+        "version": "0.4.0",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."
@@ -1156,6 +1156,299 @@ def install_agy(
             plugin_skill_path.write_text(skill_text, encoding="utf-8")
 
     result["status"] = "installed" if existing != updated else "unchanged"
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# Host hooks (Codex `codex_hooks`, Antigravity/agy `hooks.json`)
+# --------------------------------------------------------------------------------------
+
+HOOK_ADAPTER = PLUGIN_ROOT / "scripts" / "hook_adapter.py"
+CODEX_HOOKS_TEMPLATE = PLUGIN_ROOT / "plugins" / PLUGIN_NAME / "hooks" / "codex-hooks.json"
+AGY_HOOKS_TEMPLATE = PLUGIN_ROOT / "plugins" / "antigravity" / "hooks.json"
+# Top-level key of our entry in agy's named-map hooks.json (one key per hook).
+AGY_HOOKS_KEY = PLUGIN_NAME
+AGY_HOOK_SCOPES = ("config", "plugin")
+# Events Codex 0.118 `codex-rs/hooks/src/engine/config.rs` deserializes.
+CODEX_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop")
+# Events agy `cortex/customization/hooks/jsonhook/jsonhook.go` JSONHookSpec accepts.
+AGY_HOOK_EVENTS = ("SessionStart", "PreInvocation", "PostInvocation", "Stop", "PreToolUse", "PostToolUse")
+_HOOK_COMMAND_TEMPLATE_RE = re.compile(r"\A@PYTHON@ @PLUGIN_ROOT@/(?P<rel>\S+)(?P<rest>.*)\Z", re.S)
+
+
+class HookConfigError(RuntimeError):
+    """Raised when a host hooks file cannot be merged without risking the user's own hooks."""
+
+
+def render_hook_command(template: str, *, python_bin: str, plugin_root: Path = PLUGIN_ROOT) -> str:
+    """Turn `@PYTHON@ @PLUGIN_ROOT@/rel args` into a shell command with absolute, quoted paths.
+
+    Neither Codex nor agy substitutes environment variables into `command`, so the
+    interpreter and the adapter path are written out in full and shell-quoted.
+    """
+    import shlex
+
+    match = _HOOK_COMMAND_TEMPLATE_RE.match(template)
+    if not match:
+        raise HookConfigError(f"hook command template {template!r} does not start with '@PYTHON@ @PLUGIN_ROOT@/'")
+    target = Path(plugin_root) / match.group("rel")
+    return f"{shlex.quote(python_bin)} {shlex.quote(str(target))}{match.group('rest')}"
+
+
+def _render_hook_tree(node: Any, *, python_bin: str, plugin_root: Path) -> Any:
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "command" and isinstance(value, str):
+                out[key] = render_hook_command(value, python_bin=python_bin, plugin_root=plugin_root)
+            else:
+                out[key] = _render_hook_tree(value, python_bin=python_bin, plugin_root=plugin_root)
+        return out
+    if isinstance(node, list):
+        return [_render_hook_tree(item, python_bin=python_bin, plugin_root=plugin_root) for item in node]
+    return node
+
+
+def load_hook_template(template: Path, *, python_bin: str, plugin_root: Path = PLUGIN_ROOT) -> dict[str, Any]:
+    """Read a hook template and render every `command` for this checkout and interpreter."""
+    data = json.loads(template.read_text(encoding="utf-8"))
+    return _render_hook_tree(data, python_bin=python_bin, plugin_root=plugin_root)
+
+
+def _load_json_object(path: Path, label: str) -> tuple[str, dict[str, Any]]:
+    """Return (raw text, parsed object) for a JSON file that may be missing; refuse anything else."""
+    if not path.is_file():
+        return "", {}
+    raw = path.read_text(encoding="utf-8")
+    body = raw.lstrip("\ufeff")
+    if not body.strip():
+        return raw, {}
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HookConfigError(f"{label} at {path} is not valid JSON ({exc}); fix or move it, then re-run") from exc
+    if not isinstance(data, dict):
+        raise HookConfigError(f"{label} at {path} is not a JSON object; fix or move it, then re-run")
+    return raw, data
+
+
+def _write_hooks_file(path: Path, existing: str, updated: str, result: dict[str, Any]) -> None:
+    """Back up the previous file (when it changes) and write the new one with its old mode."""
+    if existing == updated:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = (path.stat().st_mode & 0o777) if path.is_file() else 0o600
+    if existing:
+        result.setdefault("backup_paths", []).append(str(_write_unique_backup(path, existing, 0o600)))
+    _write_private(path, updated, mode)
+
+
+def _dump_json(data: Mapping[str, Any]) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def is_our_codex_hook(handler: Any) -> bool:
+    """True for a Codex hook handler this installer wrote (any checkout of the adapter)."""
+    if not isinstance(handler, dict):
+        return False
+    command = str(handler.get("command") or "")
+    return "hook_adapter.py" in command and "--host codex" in command
+
+
+def strip_codex_hooks(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of a Codex hooks.json with every handler of ours removed.
+
+    Groups left with no handlers are dropped, and so are events left with no groups.
+    Everything else (other users' groups, matchers, unknown keys) is kept as is.
+    """
+    out = dict(data)
+    events = data.get("hooks")
+    if not isinstance(events, dict):
+        return out
+    new_events: dict[str, Any] = {}
+    for event, groups in events.items():
+        if not isinstance(groups, list):
+            new_events[event] = groups
+            continue
+        kept: list[Any] = []
+        for group in groups:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                kept.append(group)
+                continue
+            remaining = [h for h in handlers if not is_our_codex_hook(h)]
+            if len(remaining) == len(handlers):
+                kept.append(group)
+            elif remaining:
+                kept.append({**group, "hooks": remaining})
+        if kept:
+            new_events[event] = kept
+    out["hooks"] = new_events
+    return out
+
+
+def merge_codex_hooks(existing: Mapping[str, Any], rendered: Mapping[str, Any]) -> dict[str, Any]:
+    """Replace our handlers in a Codex hooks.json with `rendered["hooks"]`, keeping all others."""
+    merged = strip_codex_hooks(existing)
+    events = merged.get("hooks")
+    if events is not None and not isinstance(events, dict):
+        raise HookConfigError("Codex hooks.json has a non-object 'hooks' value; fix or move it, then re-run")
+    events = dict(events or {})
+    for event, groups in (rendered.get("hooks") or {}).items():
+        current = events.get(event)
+        if current is not None and not isinstance(current, list):
+            raise HookConfigError(f"Codex hooks.json event {event!r} is not a list; fix or move it, then re-run")
+        events[event] = [*(current or []), *groups]
+    merged["hooks"] = events
+    return merged
+
+
+_TOML_TABLE_RE = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$")
+_CODEX_HOOKS_KEY_RE = re.compile(r"^(\s*)codex_hooks\s*=.*$")
+_DOTTED_CODEX_HOOKS_RE = re.compile(r"^(\s*)features\s*\.\s*codex_hooks\s*=.*$")
+
+
+def enable_codex_hooks_feature(config_text: str) -> str:
+    """Set `[features] codex_hooks = true` in Codex config.toml text, preserving everything else."""
+    parsed = _parse_toml(config_text) if config_text.strip() else {}
+    features = (parsed or {}).get("features")
+    if isinstance(features, dict) and features.get("codex_hooks") is True:
+        return config_text
+    lines = config_text.splitlines()
+    table: str | None = None
+    features_header: int | None = None
+    for idx, line in enumerate(lines):
+        header = _TOML_TABLE_RE.match(line)
+        if header:
+            table = header.group(1).strip()
+            if table == "features" and not line.lstrip().startswith("[["):
+                features_header = idx
+            continue
+        if table is None and _DOTTED_CODEX_HOOKS_RE.match(line):
+            lines[idx] = _DOTTED_CODEX_HOOKS_RE.sub(r"\1features.codex_hooks = true", line)
+            return "\n".join(lines) + "\n"
+        if table == "features" and _CODEX_HOOKS_KEY_RE.match(line):
+            lines[idx] = _CODEX_HOOKS_KEY_RE.sub(r"\1codex_hooks = true", line)
+            return "\n".join(lines) + "\n"
+    if features_header is not None:
+        lines.insert(features_header + 1, "codex_hooks = true")
+        return "\n".join(lines) + "\n"
+    prefix = config_text if not config_text or config_text.endswith("\n") else config_text + "\n"
+    separator = "\n" if prefix.strip() else ""
+    return f"{prefix}{separator}[features]\ncodex_hooks = true\n"
+
+
+def install_codex_hooks(
+    *,
+    codex_home: Path | None = None,
+    python_bin: str | None = None,
+    dry_run: bool = False,
+    uninstall: bool = False,
+    template: Path = CODEX_HOOKS_TEMPLATE,
+) -> dict[str, Any]:
+    """Merge (or with `uninstall`, remove) our handlers in `$CODEX_HOME/hooks.json`.
+
+    Install also turns on `[features] codex_hooks = true` in config.toml, because Codex
+    0.118 ships hooks behind that "under development" flag. Uninstall leaves the flag,
+    since other hooks may rely on it.
+    """
+    home = codex_home or Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    hooks_path = home / "hooks.json"
+    cfg_path = home / "config.toml"
+    result: dict[str, Any] = {"host": "codex", "hooks_path": str(hooks_path), "config_path": str(cfg_path)}
+    try:
+        existing_hooks, data = _load_json_object(hooks_path, "Codex hooks.json")
+        if uninstall:
+            updated_data = strip_codex_hooks(data)
+        else:
+            rendered = load_hook_template(template, python_bin=python_bin or resolve_python_bin())
+            updated_data = merge_codex_hooks(data, rendered)
+    except HookConfigError as exc:
+        result.update(status="refused", error=str(exc))
+        return result
+    if not existing_hooks and not updated_data.get("hooks"):
+        updated_hooks = ""
+    else:
+        updated_hooks = existing_hooks if updated_data == data and existing_hooks else _dump_json(updated_data)
+    existing_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+    updated_cfg = existing_cfg if uninstall else enable_codex_hooks_feature(existing_cfg)
+    result["feature_flag"] = "unchanged" if updated_cfg == existing_cfg else "enabled"
+    changed = updated_hooks != existing_hooks or updated_cfg != existing_cfg
+    if dry_run:
+        result["status"] = "dry_run"
+        result["would_change"] = changed
+        return result
+    _write_hooks_file(hooks_path, existing_hooks, updated_hooks, result)
+    _write_hooks_file(cfg_path, existing_cfg, updated_cfg, result)
+    if uninstall:
+        result["status"] = "removed" if changed else "absent"
+    else:
+        result["status"] = "installed" if changed else "unchanged"
+    return result
+
+
+def _agy_hooks_paths(cfg_dir: Path) -> dict[str, Path]:
+    """agy reads `<config>/hooks.json` and, per plugin, `<plugin root>/hooks.json`."""
+    return {"config": cfg_dir / "hooks.json", "plugin": cfg_dir / "plugins" / PLUGIN_NAME / "hooks.json"}
+
+
+def install_agy_hooks(
+    *,
+    agy_config_dir: Path | None = None,
+    python_bin: str | None = None,
+    scope: str = "config",
+    dry_run: bool = False,
+    uninstall: bool = False,
+    template: Path = AGY_HOOKS_TEMPLATE,
+) -> dict[str, Any]:
+    """Write (or with `uninstall`, remove) our `cc-agy-plugin` key in an agy hooks.json.
+
+    `scope="config"` targets `~/.gemini/config/hooks.json` (global hooks); `scope="plugin"`
+    targets the plugin root `~/.gemini/config/plugins/cc-agy-plugin/hooks.json`. Our key is
+    removed from the other scope so the hooks never run twice. Other keys are kept.
+    """
+    if scope not in AGY_HOOK_SCOPES:
+        raise ValueError(f"scope must be one of {AGY_HOOK_SCOPES}, got {scope!r}")
+    cfg_dir = agy_config_dir or Path(
+        os.environ.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")
+    ).expanduser()
+    paths = _agy_hooks_paths(cfg_dir)
+    result: dict[str, Any] = {"host": "agy", "scope": None if uninstall else scope, "hooks_path": str(paths[scope])}
+    plans: list[tuple[Path, str, str]] = []
+    try:
+        rendered = None
+        if not uninstall:
+            rendered = load_hook_template(template, python_bin=python_bin or resolve_python_bin())[AGY_HOOKS_KEY]
+        for name, path in paths.items():
+            existing, data = _load_json_object(path, f"agy hooks.json ({name})")
+            updated_data = dict(data)
+            if rendered is not None and name == scope:
+                updated_data[AGY_HOOKS_KEY] = rendered
+            else:
+                updated_data.pop(AGY_HOOKS_KEY, None)
+            if updated_data == data:
+                continue
+            if not updated_data and name == "plugin":
+                plans.append((path, existing, ""))
+            else:
+                plans.append((path, existing, _dump_json(updated_data)))
+    except HookConfigError as exc:
+        result.update(status="refused", error=str(exc))
+        return result
+    changed = bool(plans)
+    if dry_run:
+        result.update(status="dry_run", would_change=changed)
+        return result
+    for path, existing, updated in plans:
+        if updated:
+            _write_hooks_file(path, existing, updated, result)
+        else:
+            result.setdefault("backup_paths", []).append(str(_write_unique_backup(path, existing, 0o600)))
+            path.unlink()
+    if uninstall:
+        result["status"] = "removed" if changed else "absent"
+    else:
+        result["status"] = "installed" if changed else "unchanged"
     return result
 
 
@@ -2991,6 +3284,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Enable or disable OpenCode 2.2.6+ Code Mode (codemode: true/false) on the MCP server entry.")
     parser.add_argument("--opencode-protocol", choices=sorted(_OPENCODE_V2_PROTOCOLS), default=None,
                         help="Optional OpenCode 2.2.6+ MCP protocol negotiation mode ('auto' or 'legacy').")
+    parser.add_argument("--no-codex-hooks", action="store_true",
+                        help="With --host codex: skip $CODEX_HOME/hooks.json and the `[features] codex_hooks` flag.")
+    parser.add_argument("--no-agy-hooks", action="store_true",
+                        help="With --host antigravity: skip the `cc-agy-plugin` entry in agy hooks.json.")
+    parser.add_argument("--agy-hooks-scope", choices=AGY_HOOK_SCOPES, default="config",
+                        help="Where agy hooks go: `config` (~/.gemini/config/hooks.json, default) or `plugin` "
+                             "(~/.gemini/config/plugins/cc-agy-plugin/hooks.json).")
+    parser.add_argument("--uninstall-hooks", action="store_true",
+                        help="Remove only cc-agy-plugin's Codex/agy hook entries for --host and exit; other hooks are kept.")
     parser.add_argument("--non-interactive", action="store_true", help="Never prompt, even when run with no flags in a TTY.")
     parser.add_argument("--doctor", action="store_true", help="Run environment, auth, and telemetry diagnostics and exit.")
     parser.add_argument("--list-settings", action="store_true", help="Print the grouped public CC_AGY_* runtime settings catalog and exit.")
@@ -3011,6 +3313,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_settings_text())
         return 0
+    if args.uninstall_hooks:
+        hook_reports: list[dict[str, Any]] = []
+        if args.host in ("codex", "all"):
+            hook_reports.append(install_codex_hooks(dry_run=args.dry_run, uninstall=True))
+        if args.host in ("agy", "antigravity", "jetski", "all"):
+            hook_reports.append(install_agy_hooks(dry_run=args.dry_run, uninstall=True))
+        if not hook_reports:
+            parser.error("--uninstall-hooks supports --host codex, antigravity (agy/jetski), or all")
+        if args.json:
+            print(json.dumps({"hooks": hook_reports, "requested_host": args.host}, indent=2))
+        else:
+            for item in hook_reports:
+                print(f"[{item['host']}] hooks {item.get('status')}: {item.get('hooks_path')}")
+                if item.get("error"):
+                    print(f"  ! {item['error']}")
+        return 1 if any(item.get("status") == "refused" for item in hook_reports) else 0
     if args.probe_oidc and not args.doctor:
         parser.error("--probe-oidc requires --doctor")
     if args.fix and not args.doctor:
@@ -3182,6 +3500,10 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
             )
         )
+        if not args.no_codex_hooks and report["hosts"][-1].get("status") != "refused":
+            report["hosts"][-1]["hooks"] = install_codex_hooks(
+                python_bin=pre.get("python_bin") or None, dry_run=args.dry_run
+            )
     if args.host in ("claude", "all"):
         report["hosts"].append(
             install_claude(
@@ -3278,6 +3600,10 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
             )
         )
+        if not args.no_agy_hooks and report["hosts"][-1].get("status") != "refused":
+            report["hosts"][-1]["hooks"] = install_agy_hooks(
+                python_bin=pre.get("python_bin") or None, scope=args.agy_hooks_scope, dry_run=args.dry_run
+            )
 
     report["requested_host"] = args.host
     if not args.dry_run:
@@ -3312,6 +3638,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ! codex mcp get failed: {host['codex_verify_error']}")
             if host["status"] == "dry_run":
                 print(host["block"])
+            _print_hook_report(host.get("hooks"))
             print('  Next: run `codex` in your repository and ask: "Run doctor to verify my Gemini setup."')
         elif host["host"] == "cursor":
             print(f"\nCursor: {host['status']} -> {host['config_path']} [mcpServers.{host['server_name']}]")
@@ -3347,6 +3674,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  backup: {host['backup_path']}")
             print(f"  plugin bundle: {host['plugin_dir']}")
             print(f"  or via CLI: $ {host['cli_command']}")
+            _print_hook_report(host.get("hooks"))
             print('  Next: start `agy` in your repository and ask: "Run doctor to verify my Gemini setup."')
         else:
             print(f"\nClaude Code: {host['status']}")
@@ -3366,6 +3694,19 @@ def main(argv: list[str] | None = None) -> int:
             if host.get("status") in ("refused", "failed", "claude_cli_not_found") and host.get("error"):
                 print(f"  ! {host['host']}: {host['error']}")
     return 0 if _report_ok(report) else 1
+
+
+def _print_hook_report(hooks: Mapping[str, Any] | None) -> None:
+    """Print one host's hook install result (Codex or agy) for the human summary."""
+    if not hooks:
+        return
+    print(f"  hooks: {hooks.get('status')} -> {hooks.get('hooks_path')}")
+    if hooks.get("feature_flag") == "enabled":
+        print("  hooks: enabled `[features] codex_hooks = true` (an under-development Codex feature)")
+    for backup in hooks.get("backup_paths") or []:
+        print(f"  hooks backup: {backup}")
+    if hooks.get("error"):
+        print(f"  ! hooks not installed: {hooks['error']}")
 
 
 def _report_ok(report: dict[str, Any]) -> bool:
