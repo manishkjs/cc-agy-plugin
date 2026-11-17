@@ -302,17 +302,21 @@ class TestBinaryDiscoveryAndOfflineReadiness:
         assert "/cc-agy-plugin:login" in s_missing["remediation"]
         assert str(cfg_dir) in s_missing["error"]
 
-        # 2. Onboarding cache
+        # 2. Onboarding cache: proof of sign-in only where agy keeps tokens in the OS keychain.
         (cfg_dir / "cache").mkdir(parents=True)
         (cfg_dir / "cache" / "onboarding.json").write_text(
             json.dumps({"enterpriseOnboardingComplete": True}),
             encoding="utf-8",
         )
         s_onboard = inspect_agy_cli_offline(
-            {"CC_AGY_CLI_BIN": str(ext_bin), "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir)}
+            {"CC_AGY_CLI_BIN": str(ext_bin), "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir), "CC_AGY_TOKEN_IN_KEYCHAIN": "1"}
         )
         assert s_onboard["ok"] is True
         assert s_onboard["credential_source"].startswith("onboarding_cache:")
+        s_linux = inspect_agy_cli_offline(
+            {"CC_AGY_CLI_BIN": str(ext_bin), "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir), "CC_AGY_TOKEN_IN_KEYCHAIN": "0"}
+        )
+        assert s_linux["auth_configured"] is False
 
         # 3. Token file + env token never leak secret values
         secret_tok = "".join(("ya29", ".dummy-enterprise-test-token-999"))
@@ -2281,6 +2285,7 @@ class TestUserControlGuarantees:
             "CC_AGY_CLI_BIN": str(ext_bin),
             "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
             "CC_AGY_WORKER_SANDBOX": "off",
+            "CC_AGY_TOKEN_IN_KEYCHAIN": "1",  # macOS: the token lives in the Keychain.
         }
         status_default = inspect_agy_cli_offline(base_env)
         assert status_default["ok"] is True
@@ -2384,6 +2389,7 @@ class TestUserControlGuarantees:
             "CC_AGY_WORKER_SANDBOX": "off",
             # No network lookup in tests, so the license comes from the configured project/tier.
             "CC_AGY_LICENSE_LOOKUP": "0",
+            "CC_AGY_FORCE_URL_LOGIN": "1",
             "CC_AGY_ENTERPRISE_PROJECT": "acme-ge-seats",
             "CC_AGY_ENTERPRISE_USER_TIER": "gcp-ge-plus-tier",
         }

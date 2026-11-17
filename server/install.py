@@ -869,6 +869,11 @@ def install_claude(
     claude_bin = shutil.which("claude")
     if dry_run or not claude_bin:
         result["status"] = "dry_run" if dry_run else "claude_cli_not_found"
+        if not dry_run:
+            result["error"] = (
+                "Claude Code's `claude` command is not on PATH, so the plugin was not registered. "
+                f"Install Claude Code, or start it with `claude --plugin-dir {PLUGIN_ROOT}`."
+            )
         return result
     outputs: list[dict[str, Any]] = []
     for idx, cmd in enumerate(cmds):
@@ -1112,7 +1117,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.3.0",
+        "version": "0.3.1",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."
@@ -2336,12 +2341,12 @@ def preflight(
             if no_bootstrap and not agy_cli_status.get("binary_found"):
                 rem = (
                     "Re-run without `--no-bootstrap` (or run `python3 -m server.install --install-agy-cli`) "
-                    "to download `agy`, then run it once in a terminal to sign in."
+                    "to download `agy`, then run `/cc-agy-plugin:login` in Claude Code to sign in."
                 )
             msg = f"{err} {rem}".strip()
             if agy_cli_status.get("binary_found") and not agy_cli_status.get("adc_seat_error"):
                 warnings.append(msg)
-                next_steps.append(rem or f"Run `{agy_cli_status.get('agy_bin')}` once in a terminal to sign in.")
+                next_steps.append(rem or "Run `/cc-agy-plugin:login` in Claude Code to sign in.")
             else:
                 issues.append(msg)
     elif norm_auth == "api_key":
@@ -2644,10 +2649,14 @@ def run_interactive_wizard(
         proj_prompt = f"   Google Cloud project ID ({detected_proj}): " if detected_proj else "   Google Cloud project ID: "
         entered_proj = str(input_fn(proj_prompt) or "").strip() or detected_proj
         if entered_proj:
-            project = entered_proj
+            project = entered_proj  # --project already selects Vertex AI.
+        else:
+            auth_flag = "vertex"  # No project yet: pin the mode so setup asks for one, not auto.
     elif auth_raw in ("3", "gateway", "proxy") or (not auth_raw and default_auth_label == "gateway"):
         gw_prompt = f"   AI gateway base URL ({detected_gw}): " if detected_gw else "   AI gateway base URL: "
         entered_gw = str(input_fn(gw_prompt) or "").strip() or detected_gw
+        if not entered_gw:
+            auth_flag = "gateway"  # No URL yet: pin the mode so setup asks for one, not auto.
         if entered_gw:
             base_url = entered_gw
             if not detected_vtx_gw and detected_gem_gw and entered_gw == detected_gem_gw:
@@ -2657,8 +2666,13 @@ def run_interactive_wizard(
                 "   Tip: export CC_AGY_VERTEX_BASE_URL_TOKEN='your-token' or CC_AGY_BIFROST_VIRTUAL_KEY='your-vk' "
                 "in your shell (or pass --gateway-audience for OIDC)."
             )
-    elif not has_key:
-        output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
+    else:
+        # Choice 1 (API key). "auto" already picks the key, unless an ambient GOOGLE_CLOUD_PROJECT
+        # is set: then "auto" would choose pay-as-you-go Vertex instead, so pin the mode.
+        if detected_proj:
+            auth_flag = "api-key"
+        if not has_key:
+            output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
     picked_prof = (
         _tty_select_dropdown(
@@ -3315,7 +3329,7 @@ def main(argv: list[str] | None = None) -> int:
         for issue in pre.get("issues") or []:
             print(f"  ! {issue}")
         for host in report["hosts"]:
-            if host.get("status") in ("refused", "failed") and host.get("error"):
+            if host.get("status") in ("refused", "failed", "claude_cli_not_found") and host.get("error"):
                 print(f"  ! {host['host']}: {host['error']}")
     return 0 if _report_ok(report) else 1
 

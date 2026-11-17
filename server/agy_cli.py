@@ -16,6 +16,7 @@ from collections import OrderedDict
 import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 import queue
 import re
@@ -689,12 +690,12 @@ def ensure_enterprise_seat_ready(env: Mapping[str, str] | None = None) -> None:
 
 
 def stored_token_onboarding_gap(token_file: Path) -> str | None:
-    """Return why `agy` would reject a saved token, or None when it would accept it.
+    """Return why `agy` would reject a saved GCP token for missing onboarding, else None.
 
     Mirrors `keyringAuth.TryAuth` in agy (`cli/backend/auth/keyring.go`): a token saved with
     `auth_method == "gcp"` whose `user_tier` AND `project_id` are both empty is treated as
-    "incomplete GCP onboarding" and agy signs the user out. Non-JSON (legacy) tokens and
-    personal tokens are not affected.
+    "incomplete GCP onboarding" and agy signs the user out. Only this case can be repaired
+    without a new sign-in (see `server.agy_login.heal_enterprise_token`).
     """
     try:
         stored = json.loads(token_file.read_text(encoding="utf-8"))
@@ -710,22 +711,77 @@ def stored_token_onboarding_gap(token_file: Path) -> str | None:
     )
 
 
+def _token_expired_without_refresh(token_obj: Mapping[str, Any]) -> bool:
+    """True when the access token has expired and there is no refresh token to renew it."""
+    if str(token_obj.get("refresh_token") or "").strip():
+        return False
+    expiry_raw = str(token_obj.get("expiry") or "").strip()
+    if not expiry_raw:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        expiry = datetime.fromisoformat(expiry_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return expiry.tzinfo is not None and expiry < datetime.now(timezone.utc)
+
+
+def stored_token_problem(token_file: Path) -> str | None:
+    """Return why a saved `agy` token file cannot sign in, or None when it looks usable.
+
+    Catches every state seen on real first-day machines: an empty or half-written file, a JSON
+    file with no access or refresh token, an expired token that cannot be refreshed, and a GCP
+    token missing its license (`stored_token_onboarding_gap`). Legacy plain-text tokens (not
+    JSON) are accepted, because agy still reads them.
+    """
+    try:
+        raw = token_file.read_bytes()
+    except OSError:
+        return "the saved sign-in token can't be read"
+    text = raw.strip()
+    if not text:
+        return "the saved sign-in token file is empty"
+    if not text.startswith(b"{"):
+        return None  # Legacy plain-text token.
+    try:
+        stored = json.loads(text.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return "the saved sign-in token file is corrupt (half-written JSON)"
+    if not isinstance(stored, dict):
+        return "the saved sign-in token file is corrupt"
+    token_obj = stored.get("token") if "token" in stored else stored
+    if not isinstance(token_obj, Mapping):
+        return "the saved sign-in token file has no token"
+    if not str(token_obj.get("access_token") or "").strip() and not str(token_obj.get("refresh_token") or "").strip():
+        return "the saved sign-in token file has no access or refresh token"
+    if _token_expired_without_refresh(token_obj):
+        return "the saved sign-in token has expired and can't be refreshed"
+    return stored_token_onboarding_gap(token_file)
+
+
+def _platform_keeps_token_in_keychain(source: Mapping[str, str]) -> bool:
+    """True where agy stores its sign-in token in an OS keychain instead of a file.
+
+    agy's CDE and ACP logins use keyring-first storage (`defaultTokenStorage` in
+    `cli/backend/auth/cde_login.go`), so on macOS and Windows a missing token file is normal.
+    On Linux servers there is usually no keyring and the token file is the only copy.
+    """
+    override = _env_flag("CC_AGY_TOKEN_IN_KEYCHAIN", source)
+    if override is not None:
+        return override
+    return sys.platform in ("darwin", "win32")
+
+
 def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bool, str | None]:
     env_tok = _clean_env_str(source, "ANTIGRAVITY_OAUTH_TOKEN")
     if len(env_tok) >= 8:
         return True, "env:ANTIGRAVITY_OAUTH_TOKEN"
 
     token_file = config_dir / "antigravity-oauth-token"
-    token_file_present = False
-    try:
-        if token_file.is_file() and token_file.stat().st_size > 10:
-            raw_head = token_file.read_bytes()[:256].strip()
-            if raw_head:
-                token_file_present = True
-                if stored_token_onboarding_gap(token_file) is None:
-                    return True, f"token_file:{token_file}"
-    except OSError:
-        pass
+    token_file_present = token_file.exists()
+    if token_file_present and stored_token_problem(token_file) is None:
+        return True, f"token_file:{token_file}"
 
     seat = resolve_enterprise_adc_seat(source)
     if seat["active"]:
@@ -736,12 +792,14 @@ def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bo
     if token_file_present:
         return False, None
 
-    # No token file: the token may live in the OS keychain (macOS), and the onboarding
-    # cache is the only offline signal that sign-in finished.
-    onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
-    if onboarding_ok:
-        onboarding_file = config_dir / "cache" / "onboarding.json"
-        return True, f"onboarding_cache:{onboarding_file}"
+    # No token file. Where agy keeps tokens in the OS keychain, the onboarding cache is the
+    # only offline signal that sign-in finished. On Linux it is not: the cache outlives a
+    # deleted token, so trusting it would report "signed in" with nothing to sign in with.
+    if _platform_keeps_token_in_keychain(source):
+        onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
+        if onboarding_ok:
+            onboarding_file = config_dir / "cache" / "onboarding.json"
+            return True, f"onboarding_cache:{onboarding_file}"
 
     return False, None
 
@@ -813,8 +871,9 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         else:
             error = "External Antigravity CLI (`agy`) is not installed yet."
         remediation = (
-            "Run `python3 -m server.install --auth gemini-enterprise` (or `cc-agy-install --install-agy-cli`) "
-            f"to install `agy` to `{managed_bin}`, then run `{managed_bin}` once in a terminal to sign in."
+            "Run the one-line quickstart again (it installs `agy`), or "
+            f"`python3 -m server.install --auth gemini-enterprise` to install `agy` to `{managed_bin}`. "
+            "Then run `/cc-agy-plugin:login` in Claude Code to sign in."
         )
     elif version_mismatch:
         error = (
@@ -826,19 +885,23 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             "or update `CC_AGY_CLI_VERSION`."
         )
     elif not auth_ok:
-        token_gap = stored_token_onboarding_gap(cfg_dir / "antigravity-oauth-token")
+        token_file_path = cfg_dir / "antigravity-oauth-token"
+        token_gap = stored_token_onboarding_gap(token_file_path)
+        token_problem = stored_token_problem(token_file_path) if token_file_path.exists() else None
         if token_gap:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
             remediation = (
-                "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login --heal`). "
-                "It looks up your Gemini Enterprise license with the saved token and repairs it; if the "
-                "token has expired it prints a fresh sign-in link instead."
+                "Run `/cc-agy-plugin:login` in Claude Code. It looks up your Gemini Enterprise license with "
+                "the saved token and repairs it; if the token has expired it prints a fresh sign-in link instead."
             )
+        elif token_problem:
+            error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_problem}."
+            remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
         else:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
             remediation = (
-                "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login`) to get a clickable "
-                "Gemini Enterprise Google OAuth sign-in URL and complete sign-in in one step, or set `ANTIGRAVITY_OAUTH_TOKEN`."
+                "Run `/cc-agy-plugin:login` in Claude Code to get a Gemini Enterprise sign-in link, "
+                "or set `ANTIGRAVITY_OAUTH_TOKEN`."
             )
         if seat["requested"] and seat["error"]:
             error = f"{error} {seat['error']}"
@@ -848,8 +911,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'consumer'}) rather than a licensed Gemini Enterprise seat."
         )
         remediation = (
-            f"Sign out of the consumer account and run `{agy_bin}` (or `{agy_bin} acp --login`) to sign in "
-            "with your licensed Gemini Enterprise work account."
+            "Run `/cc-agy-plugin:login --force` in Claude Code and sign in with your licensed "
+            "Gemini Enterprise work account (not a personal Gmail account)."
         )
     elif unverified_tier_blocked:
         error = (
@@ -857,8 +920,8 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'unknown'}) while CC_AGY_REQUIRE_GE_TIER=1 is set."
         )
         remediation = (
-            f"Run `{agy_bin}` once and choose 'Use a Google Cloud project' (or your enterprise SSO option) "
-            "so `cache/onboarding.json` records `enterpriseOnboardingComplete: true`, or unset `CC_AGY_REQUIRE_GE_TIER`."
+            "Run `/cc-agy-plugin:login --force` in Claude Code so the plugin records your license tier, "
+            "or unset `CC_AGY_REQUIRE_GE_TIER`."
         )
     elif seat_failure:
         error = seat_failure

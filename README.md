@@ -9,7 +9,7 @@ to low-cost Gemini workers that run in an isolated git copy of your repo.
 
 [![Validate](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg)](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-1a73e8)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.3.1-1a73e8)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20OpenCode%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
@@ -78,10 +78,13 @@ curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/script
 
 What happens next:
 1. **Pick from dropdowns.** Inside Claude Code, two dropdowns ask how you connect (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and which model preset you want (`Balanced`, `Quality`, or `Economy`). In a regular terminal, an arrow-key (`↑/↓`) selector opens instead.
-2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens automatically and saves your seat token without copy-pasting. Over SSH or on a remote VM, the sign-in URL is automatically copied to your laptop clipboard (press `Cmd+V` in your browser) and printed as a short 1-line link that never wraps in macOS Terminal: sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat. The plugin then looks up your Gemini Enterprise license and project, so your first `agy` call works right away.
-3. **Automatic `--doctor` check.** Confirms MCP tools, your seat tier (for example `gcp-ge-plus-tier`), and git workspace readiness at 0 tokens. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to change settings or sign in again.
+2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens and `agy` saves your sign-in, with nothing to paste. Over SSH or on a remote VM, you get a sign-in link: open it, sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat. Either way, the plugin then records your Gemini Enterprise license and project, so your first `agy` call works right away. Signing in from a second tab reuses the same link instead of breaking the first one.
+3. **Automatic `--doctor` check.** Confirms MCP tools, your seat tier (for example `gcp-ge-plus-tier`), and git workspace readiness at 0 tokens.
+4. **Run `/reload-plugins`** in the Claude Code session you installed from (and any other open tabs). Then `/cc-agy-plugin:doctor` and `/cc-agy-plugin:agy` are ready. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime to change settings or sign in again.
 
-**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token has expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, set `CC_AGY_ENTERPRISE_PROJECT` to the one you want. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
+**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token is missing, damaged or expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, the plugin tells you which one it picked; set `CC_AGY_ENTERPRISE_PROJECT` to switch. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
+
+**Short sign-in links are opt-in.** Set `CC_AGY_SHORT_URL=1` to also get an `is.gd` / `tinyurl` link that never wraps in macOS Terminal. It is off by default because it sends the sign-in URL to a third-party service.
 
 <details>
 <summary><b>Non-interactive / CI flags & version pinning</b></summary>
@@ -90,9 +93,9 @@ What happens next:
 # Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 # Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.0 bash -s -- --host opencode --auth gemini-enterprise
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.3.1 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.0 cc-agy-plugin --host claude --auth gemini-enterprise
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.3.1 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
 </details>
@@ -471,7 +474,7 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.3.0, Apache 2.0 |
+| **Version** | 0.3.1, Apache 2.0 |
 | **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 

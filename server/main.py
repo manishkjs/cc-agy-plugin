@@ -108,6 +108,14 @@ def _maybe_reexec_into_sdk_venv() -> None:
 
     auto_boot = (os.environ.get("CC_AGY_AUTO_BOOTSTRAP") or "1").strip().lower()
     if auto_boot not in ("0", "false", "no", "off") and "PYTEST_CURRENT_TEST" not in os.environ:
+        if auto_boot != "blocking":
+            # Building the venv downloads packages and can take minutes. Claude Code and other
+            # hosts give up on an MCP server that doesn't answer its handshake within seconds
+            # ("failed to connect"), so build it in the background and start now; the next
+            # start re-execs into the finished venv. CC_AGY_AUTO_BOOTSTRAP=blocking restores
+            # the old wait-then-start behavior.
+            _start_background_sdk_bootstrap()
+            return
         boot = ensure_sdk_venv(
             PLUGIN_ROOT,
             output_fn=lambda msg: sys.stderr.write(f"[cc-agy-plugin] {msg}\n"),
@@ -118,6 +126,46 @@ def _maybe_reexec_into_sdk_venv() -> None:
             os.execv(boot_py, [boot_py, *sys.argv])
         if boot.get("error"):
             sys.stderr.write(f"[cc-agy-plugin] {boot['error']}\n")
+
+
+def _start_background_sdk_bootstrap() -> None:
+    """Start one detached venv build, unless one started in the last 15 minutes."""
+    import subprocess
+    import time
+
+    from server.runtime_env import managed_venv_dir
+
+    venv_dir = managed_venv_dir(os.environ)
+    marker = venv_dir.parent / "venv-bootstrap.started"
+    try:
+        if marker.is_file() and time.time() - marker.stat().st_mtime < 15 * 60:
+            return
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(os.getpid()), encoding="utf-8")
+        log_path = venv_dir.parent / "venv-bootstrap.log"
+        with open(os.devnull, "rb") as devnull, open(log_path, "ab") as log:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                    "from server.runtime_env import ensure_sdk_venv; "
+                    "print(ensure_sdk_venv(Path(sys.argv[1]), output_fn=print), flush=True)",
+                    str(PLUGIN_ROOT),
+                ],
+                cwd=str(PLUGIN_ROOT),
+                stdin=devnull,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+                close_fds=True,
+            )
+        sys.stderr.write(
+            f"[cc-agy-plugin] Setting up the Python SDKs in the background (log: {log_path}); "
+            "SDK-backed modes are ready after the next restart.\n"
+        )
+    except OSError as exc:
+        sys.stderr.write(f"[cc-agy-plugin] Could not start the background SDK setup: {exc}\n")
 
 
 _maybe_reexec_into_sdk_venv()

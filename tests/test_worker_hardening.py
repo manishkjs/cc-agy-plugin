@@ -429,7 +429,13 @@ def test_invalid_requested_seat_fails_closed_before_any_agy_call(tmp_path: Path)
     home = _service_account_home(tmp_path)
     calls = tmp_path / "calls.log"
     fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", f"open({str(calls)!r}, 'a').write('called')\n")
-    env = {"HOME": str(home), "PATH": os.defpath, "CC_AGY_CLI_BIN": str(fake_agy), "CC_AGY_ENTERPRISE_ADC": "true"}
+    env = {
+        "HOME": str(home),
+        "PATH": os.defpath,
+        "CC_AGY_CLI_BIN": str(fake_agy),
+        "CC_AGY_ENTERPRISE_ADC": "true",
+        "CC_AGY_TOKEN_IN_KEYCHAIN": "1",
+    }
 
     with pytest.raises(EnterpriseSeatError, match="Nothing was sent"):
         run_agy_cli_worker({"workspace_dir": str(_workspace(tmp_path)), "prompt": "x", "env": env})

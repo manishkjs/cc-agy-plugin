@@ -1583,7 +1583,7 @@ def probe_writers(
                 fix = "Check GEMINI_API_KEY / userConfig.gemini_api_key."
             elif auth.get("auth_mode") == "gemini_enterprise":
                 fix = (
-                    "Run `~/.local/share/cc-agy-plugin/bin/agy` once in a terminal to sign in with your "
+                    "Run `/cc-agy-plugin:login` in Claude Code to sign in with your "
                     "Gemini Enterprise Google account (or set `ANTIGRAVITY_OAUTH_TOKEN`)."
                 )
             else:

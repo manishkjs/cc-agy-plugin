@@ -3,30 +3,50 @@ name: setup
 description: Configure cc-agy-plugin connection mode, model preset, and Gemini Enterprise sign-in using interactive dropdowns
 ---
 
-Use `AskUserQuestion` immediately (no preamble) to present two dropdown selections:
+Start each command with the `ROOT=...` lines shown below. They find the plugin even when
+`CLAUDE_PLUGIN_ROOT` is unset or it was installed from a source checkout. Run everything through
+`sh "$ROOT/scripts/py.sh"`: it picks a Python 3.10+ (stock macOS `python3` is 3.9).
 
-1. **Auth mode** (`header: "Auth mode"`): *"How should cc-agy-plugin connect to Gemini?"*
-   - `Gemini Enterprise Seat (Recommended)` — Included $0 seat quota via standalone `agy` CLI
-   - `Google AI Studio API Key` — Pay-as-you-go with `GEMINI_API_KEY`
-   - `Google Cloud Vertex AI` — Pay-as-you-go with `GOOGLE_CLOUD_PROJECT` and ADC
-   - `Enterprise AI Gateway` — Route through a LiteLLM or Bifrost gateway URL
+1. Use `AskUserQuestion` immediately (no preamble) with two questions:
+   - **Auth mode** (`header: "Auth mode"`): *"How should cc-agy-plugin connect to Gemini?"*
+     - `Gemini Enterprise Seat (Recommended)` — Included $0 seat quota via standalone `agy` CLI
+     - `Google AI Studio API Key` — Pay-as-you-go with `GEMINI_API_KEY`
+     - `Google Cloud Vertex AI` — Pay-as-you-go with a Google Cloud project and ADC
+     - `Enterprise AI Gateway` — Route through a LiteLLM or Bifrost gateway URL
+   - **Model preset** (`header: "Preset"`): *"Which model routing preset do you want?"*
+     - `Balanced (Recommended)` — Default worker `gemini-4-hydrogen`, escalates to `gemini-4-carbon`
+     - `Quality` — Default worker `gemini-4-carbon`
+     - `Economy` — Lowest-cost worker routing
 
-2. **Model preset** (`header: "Preset"`): *"Which model routing preset do you want?"*
-   - `Balanced (Recommended)` — Default worker `gemini-4-hydrogen`, escalates to `gemini-4-carbon`
-   - `Quality` — Default worker `gemini-4-carbon`
-   - `Economy` — Lowest-cost worker routing
+2. Collect what the chosen mode needs before installing:
+   - **Gemini Enterprise:** nothing.
+   - **AI Studio API key:** the key must be in the shell that starts Claude Code, never in chat. If
+     `GEMINI_API_KEY` is not set, ask the user to add `export GEMINI_API_KEY=...` to their shell
+     profile and restart Claude Code, then continue.
+   - **Vertex AI:** ask for the Google Cloud project ID and pass `--project <ID>`. The user also
+     needs `gcloud auth application-default login` once.
+   - **AI gateway:** ask for the gateway base URL and pass `--base-url <URL>`.
 
-After the user selects their options:
-1. Run `server/install.py` with their mapped `--auth` (`gemini-enterprise`, `api-key`, `vertex`, or `gateway`) and `--profile` (`balanced`, `quality`, or `economy`):
+3. Install (`<AUTH>` is `gemini-enterprise`, `api-key`, `vertex` or `gateway`; `<PROFILE>` is
+   `balanced`, `quality` or `economy`):
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
+   ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
+  [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
+done
+   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
    ```
-2. If `<AUTH>` is `gemini-enterprise`, run:
+   If it prints `! ...` lines, fix what they say (or ask the user) and run it again.
+
+4. **Gemini Enterprise only:** follow `/cc-agy-plugin:login` (run `agy_login.py --start --json` and
+   handle its JSON exactly as that command describes).
+
+5. Verify with the CLI doctor (the MCP `doctor` tool still runs the old settings until reload):
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py"
+   ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
+  [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
+done
+   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --doctor --human --auth <AUTH>
    ```
-   If it prints a sign-in URL, show BOTH the **short 1-line URL** (`https://is.gd/...` on its own line so it never wraps in `Terminal.app`) AND `[Sign in with Google](<full_url>)`, tell the user it is **already copied to their clipboard (`Cmd+V` in browser)**, ask them to click **Copy to Clipboard** on the Antigravity callback page and paste the code, and run:
-   ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/agy_login.py" --complete "<PASTE_CODE>"
-   ```
-3. Run `doctor` on the `vertex` MCP server (or `python3 "${CLAUDE_PLUGIN_ROOT:-$HOME/.local/share/cc-agy-plugin/repo}/server/install.py" --doctor --human --auth <AUTH>`) and tell the user if `/reload-plugins` is needed.
+   Then tell the user to run `/reload-plugins` in this session (and any other open tabs).

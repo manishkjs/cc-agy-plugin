@@ -471,6 +471,7 @@ def test_ftux_doctor_host_config_consumer_block_wheel_assets_and_safe_dirs(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
     monkeypatch.setenv("CC_AGY_CLI_BIN", str(fake_agy))
+    monkeypatch.setenv("CC_AGY_TOKEN_IN_KEYCHAIN", "1")  # Simulates macOS, where the token is in the Keychain.
     monkeypatch.setenv("CC_AGY_CLI_CONFIG_DIR", str(cfg_dir))
     monkeypatch.delenv("CC_AGY_AUTH_MODE", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -1099,7 +1100,7 @@ def test_quickstart_agent_onboarding_text_runs_no_commands(tmp_path: Path):
     start = script.index("emit_agent_dropdown_onboarding() {")
     end = script.index("\n}\n", start) + 3
     marker = tmp_path / "ran"
-    checkout = f"{tmp_path}/my repo/x$y`touch {marker}`"
+    checkout = f"{tmp_path}/R&D repo/x$y`touch {marker}`"
     proc = subprocess.run(
         ["bash", "-c", script[start:end] + '\nemit_agent_dropdown_onboarding "$1" python3 "$2"', "_", checkout, "/w s"],
         capture_output=True,
@@ -1112,6 +1113,7 @@ def test_quickstart_agent_onboarding_text_runs_no_commands(tmp_path: Path):
     assert not marker.exists()
     assert "`agy -p`" in proc.stdout
     assert "Included $0 seat quota" in proc.stdout
-    assert f'python3 "{checkout}/server/agy_login.py" --start --json' in proc.stdout
+    assert f'sh "{checkout}/scripts/py.sh" "{checkout}/server/agy_login.py" --start --json' in proc.stdout
+    assert "python3 \"" not in proc.stdout  # never a bare python3 (3.9 on stock macOS)
     assert '--workspace "/w s"' in proc.stdout
     assert "@CHECKOUT_DIR@" not in proc.stdout

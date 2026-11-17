@@ -178,7 +178,7 @@ def test_heal_reports_failure_when_no_license(tmp_path: Path, monkeypatch: pytes
     result = agy_login.heal_enterprise_token(_env(tmp_path, cfg_dir))
 
     assert result["healed"] is False
-    assert "no license" in result["reason"]
+    assert "no Gemini Enterprise license" in result["reason"]
 
 
 def test_heal_explains_expired_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -282,19 +282,18 @@ def test_ensure_seat_ready_auto_heals(tmp_path: Path, fake_licenses: list[str]):
 
 
 def test_inspect_offline_explains_incomplete_token(tmp_path: Path):
+    from test_agy_cli_backend import _make_mock_external_agy
+
     cfg_dir = tmp_path / ".gemini" / "antigravity-cli"
     _write_token(cfg_dir)
-    fake_agy = tmp_path / "bin" / "agy"
-    fake_agy.parent.mkdir()
-    fake_agy.write_text("#!/bin/sh\necho 1.5.9\n", encoding="utf-8")
-    fake_agy.chmod(0o755)
+    fake_agy = _make_mock_external_agy(tmp_path / "bin" / "agy")
 
     status = agy_cli.inspect_agy_cli_offline(_env(tmp_path, cfg_dir, CC_AGY_CLI_BIN=str(fake_agy)))
 
-    if status["binary_found"]:
-        assert status["auth_configured"] is False
-        assert "incomplete GCP onboarding" in status["error"]
-        assert "/cc-agy-plugin:login" in status["remediation"]
+    assert status["binary_found"] is True
+    assert status["auth_configured"] is False
+    assert "incomplete GCP onboarding" in status["error"]
+    assert "/cc-agy-plugin:login" in status["remediation"]
 
 
 def test_auth_remediation_points_at_login_not_print_mode(tmp_path: Path):
