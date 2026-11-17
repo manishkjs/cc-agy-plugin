@@ -51,20 +51,20 @@
     },
     "cost_profile": {
       "title": "Cost and Quality Profile",
-      "description": "Routing preset: 'economy' (gemini-flash-next only, no automatic model escalation), 'balanced' (default: gemini-flash-next with automatic retry escalation to gemini-4-argon), or 'quality' (gemini-4-argon by default).",
+      "description": "Routing preset: 'economy' (gemini-4-hydrogen only, no automatic model escalation), 'balanced' (default: gemini-4-hydrogen with automatic retry escalation to gemini-4-carbon), or 'quality' (gemini-4-carbon by default).",
       "type": "string",
       "default": "balanced",
       "sensitive": false
     },
     "default_delegate_model": {
       "title": "Default Agentic Worker Model Override",
-      "description": "Optional Gemini model ID override for Antigravity SDK delegations (for example gemini-flash-next or gemini-4-argon). Leave unset to use the active cost_profile default.",
+      "description": "Optional Gemini model ID override for Antigravity SDK delegations (for example gemini-4-hydrogen or gemini-4-carbon). Leave unset to use the active cost_profile default.",
       "type": "string",
       "sensitive": false
     },
     "default_ask_model": {
       "title": "Default Single-Shot Review Model Override",
-      "description": "Optional Gemini model ID override for single-shot google-genai queries (for example gemini-flash-next or gemini-4-argon). Leave unset to use the active cost_profile default.",
+      "description": "Optional Gemini model ID override for single-shot google-genai queries (for example gemini-4-hydrogen or gemini-4-carbon). Leave unset to use the active cost_profile default.",
       "type": "string",
       "sensitive": false
     },

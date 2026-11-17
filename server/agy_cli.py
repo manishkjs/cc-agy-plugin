@@ -761,16 +761,36 @@ def stored_token_problem(token_file: Path) -> str | None:
 
 
 def _platform_keeps_token_in_keychain(source: Mapping[str, str]) -> bool:
-    """True where agy stores its sign-in token in an OS keychain instead of a file.
+    """True where agy stores its sign-in token in an OS keyring instead of a file.
 
-    agy's CDE and ACP logins use keyring-first storage (`defaultTokenStorage` in
-    `cli/backend/auth/cde_login.go`), so on macOS and Windows a missing token file is normal.
-    On Linux servers there is usually no keyring and the token file is the only copy.
+    Mirrors agy's own rule (`shouldBypassKeyring` in `code_assist_client/keyring_detector.go`):
+    agy uses the keyring unless it detects SSH, WSL, a container, or (on Linux) no D-Bus session
+    bus. So a missing token file is normal on a macOS/Windows/Linux desktop, but over SSH or on a
+    headless Linux server the token file is the only copy.
     """
     override = _env_flag("CC_AGY_TOKEN_IN_KEYCHAIN", source)
     if override is not None:
         return override
-    return sys.platform in ("darwin", "win32")
+    if any(_clean_env_str(source, name) for name in ("SSH_TTY", "SSH_CLIENT", "SSH_CONNECTION")):
+        return False
+    if _clean_env_str(source, "WSL_DISTRO_NAME") or _clean_env_str(source, "WSL_INTEROP"):
+        return False
+    if sys.platform in ("darwin", "win32"):
+        return True
+    if sys.platform.startswith("linux"):
+        if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+            return False
+        bus = _clean_env_str(source, "DBUS_SESSION_BUS_ADDRESS")
+        if bus and not bus.startswith("disabled:"):
+            return True
+        runtime_dir = _clean_env_str(source, "XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        try:
+            import stat as _stat
+
+            return _stat.S_ISSOCK(os.stat(Path(runtime_dir) / "bus").st_mode)
+        except OSError:
+            return False
+    return False
 
 
 def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bool, str | None]:

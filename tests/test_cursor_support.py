@@ -318,7 +318,7 @@ def test_install_cli_cursor_and_all_with_env_override_and_wizard(
         output_fn=lambda _m: None,
         env={"GEMINI_API_KEY": "present"},
     )
-    assert built_word == ["--host", "cursor", "--profile", "quality"]
+    assert built_word == ["--host", "cursor", "--profile", "quality", "--auth", "api-key"]
 
     codex_dir = tmp_path / "codex"
     cursor_dir = tmp_path / "cursor"

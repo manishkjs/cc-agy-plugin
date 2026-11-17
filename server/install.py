@@ -2667,10 +2667,9 @@ def run_interactive_wizard(
                 "in your shell (or pass --gateway-audience for OIDC)."
             )
     else:
-        # Choice 1 (API key). "auto" already picks the key, unless an ambient GOOGLE_CLOUD_PROJECT
-        # is set: then "auto" would choose pay-as-you-go Vertex instead, so pin the mode.
-        if detected_proj:
-            auth_flag = "api-key"
+        # Choice 1 (API key): always pin it. Left on "auto", an ambient project, gateway URL or
+        # signed-in agy could silently route this user to another (possibly pay-as-you-go) mode.
+        auth_flag = "api-key"
         if not has_key:
             output_fn("   Tip: export GEMINI_API_KEY='your-key' in your shell (keys are never saved to config files).")
 
@@ -3257,6 +3256,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
+    report["requested_host"] = args.host
+    if not args.dry_run:
+        _record_install_choice(pre.get("auth_mode"))
+        from server.runtime_env import write_plugin_root_pointer
+
+        write_plugin_root_pointer(PLUGIN_ROOT)
+
     if args.json:
         print(json.dumps(report, indent=2))
         return 0 if _report_ok(report) else 1
@@ -3299,7 +3305,7 @@ def main(argv: list[str] | None = None) -> int:
             for asset_bak in host.get("asset_backups") or []:
                 print(f"  asset backup: {asset_bak}")
             print(f"  skill: {host['skill_path']}")
-            print(f"  commands: {host['commands_dir']} (/delegate, /doctor, /jobs, /cost, /agy)")
+            print(f"  commands: {host['commands_dir']} (/delegate, /doctor, /jobs, /cost, /agy, /login)")
             print(f"  subagent: {host['agent_path']}")
             print(
                 '  Next: run `opencode` in your repository and type `/doctor` or `/agy hello` '
@@ -3335,9 +3341,29 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _report_ok(report: dict[str, Any]) -> bool:
-    return bool(report["preflight"]["ready"]) and all(
-        h.get("status") not in ("refused", "failed") for h in report["hosts"]
-    )
+    failing = {"refused", "failed"}
+    if report.get("requested_host") == "claude":
+        # The user asked for Claude Code specifically; without its CLI nothing was registered.
+        failing.add("claude_cli_not_found")
+    return bool(report["preflight"]["ready"]) and all(h.get("status") not in failing for h in report["hosts"])
+
+
+def _record_install_choice(auth_mode: Any) -> None:
+    """Remember the auth mode this install chose, for scripts that run after the wizard.
+
+    quickstart.sh runs the interactive wizard and then doctor/sign-in; it can't see what the user
+    picked, so it reads this file instead of guessing (and running Enterprise sign-in for an
+    API-key user).
+    """
+    if not auth_mode:
+        return
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    target = data_home / "cc-agy-plugin" / "last-install.json"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"auth_mode": str(auth_mode)}) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

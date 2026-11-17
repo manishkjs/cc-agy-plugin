@@ -236,17 +236,21 @@ def test_keychain_token_is_reported_not_faked(tmp_path: Path):
 # --- Sign-in session safety ---------------------------------------------------------------------
 
 
-def test_state_dir_refuses_a_symlink_planted_by_someone_else(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_state_dir_falls_back_when_tmp_name_was_planted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agy_login.tempfile, "gettempdir", lambda: str(tmp_path))
-    env = {"HOME": str(tmp_path / "home")}
-    target = agy_login._login_state_dir(env)
-    target.rmdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"HOME": str(home)}
+    planted = agy_login._login_state_dir(env)
+    planted.rmdir()
     elsewhere = tmp_path / "attacker"
     elsewhere.mkdir()
-    target.symlink_to(elsewhere)
+    planted.symlink_to(elsewhere)
 
-    with pytest.raises(RuntimeError, match="not a directory owned by you"):
-        agy_login._login_state_dir(env)
+    chosen = agy_login._login_state_dir(env)
+
+    assert chosen.parent == home / ".cache"
+    assert chosen.stat().st_mode & 0o777 == 0o700
 
 
 def test_state_dir_permissions_are_tightened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -403,3 +407,165 @@ def test_mcp_server_answers_the_handshake_before_any_venv_setup(tmp_path: Path):
     assert '"result"' in proc.stdout, proc.stderr
     assert elapsed < 20, f"handshake took {elapsed:.1f}s"
     assert (home / ".local" / "share" / "cc-agy-plugin" / "current").resolve() == REPO_ROOT.resolve()
+
+
+# --- Round 2 regressions ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"SSH_CONNECTION": "1 2 3 4"}, False),  # agy uses a file over SSH, even on a Mac.
+        ({"WSL_DISTRO_NAME": "Ubuntu"}, False),
+        ({"CC_AGY_TOKEN_IN_KEYCHAIN": "1"}, True),
+    ],
+)
+def test_keyring_rule_mirrors_agy(env: dict[str, str], expected: bool):
+    assert agy_cli._platform_keeps_token_in_keychain(env) is expected
+
+
+def test_linux_desktop_with_a_session_bus_uses_the_keyring(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(agy_cli.sys, "platform", "linux")
+    assert agy_cli._platform_keeps_token_in_keychain({"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus"}) is True
+    assert agy_cli._platform_keeps_token_in_keychain({"DBUS_SESSION_BUS_ADDRESS": "disabled:", "XDG_RUNTIME_DIR": "/nonexistent"}) is False
+
+
+def test_plugin_pointer_moves_when_the_plugin_moves(tmp_path: Path):
+    """`mv` onto a symlinked directory moves the new link *into* it; the pointer must really move."""
+    from server.runtime_env import write_plugin_root_pointer
+
+    first = tmp_path / "checkout-a"
+    second = tmp_path / "checkout-b"
+    first.mkdir()
+    second.mkdir()
+    env = {"HOME": str(tmp_path / "home")}
+
+    write_plugin_root_pointer(first, env)
+    pointer = write_plugin_root_pointer(second, env)
+
+    assert pointer is not None and pointer.resolve() == second.resolve()
+    assert not list(first.iterdir())  # Nothing was dropped inside the old checkout.
+
+
+def test_browser_sign_in_gives_up_on_a_silent_agy(tmp_path: Path):
+    silent_agy = tmp_path / "agy"
+    silent_agy.write_text(
+        f"#!{sys.executable}\nimport sys, json, time\n"
+        "line = sys.stdin.readline()\n"
+        "print(json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {}}), flush=True)\n"
+        "sys.stdin.readline()\n"
+        "time.sleep(60)\n"
+    )
+    silent_agy.chmod(0o755)
+    started = time.monotonic()
+
+    ok, reason = agy_login.try_acp_business_browser_login(str(silent_agy), env={"HOME": str(tmp_path)}, timeout_seconds=2)
+
+    assert ok is False and "timed out" in reason
+    assert time.monotonic() - started < 15
+
+
+def test_failed_browser_sign_in_on_a_keyring_machine_does_not_fall_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(agy_login, "heal_enterprise_token", lambda _env: {})
+    monkeypatch.setattr(agy_login, "inspect_agy_cli_offline", lambda _env: {"agy_bin": "/x/agy", "auth_configured": False})
+    monkeypatch.setattr(agy_login, "can_use_local_browser_loopback", lambda _env: True)
+    monkeypatch.setattr(agy_login, "try_acp_business_browser_login", lambda *_a, **_k: (False, "window closed"))
+    monkeypatch.setattr(agy_login, "_spawn_cde_login_and_capture_url", lambda *_a, **_k: pytest.fail("no copy-paste fallback"))
+
+    result = agy_login.start_two_step_login({"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "1"})
+
+    assert result["ok"] is False
+    assert "window closed" in result["error"]
+
+
+def test_login_child_env_drops_ambient_projects_and_keys():
+    child = agy_login._login_child_env(
+        {"HOME": "/h", "GOOGLE_CLOUD_PROJECT": "p", "ANTIGRAVITY_PROJECT_ID": "uuid", "GEMINI_API_KEY": "k", "PATH": "/bin"}
+    )
+    assert child == {"HOME": "/h", "PATH": "/bin"}
+
+
+def test_failed_project_switch_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg_dir = tmp_path / "cfg"
+    _write_token(cfg_dir, **_LICENSE_A)
+    _fake_licenses(monkeypatch, [_LICENSE_A])  # No seat in proj-beta; self-assign fails.
+
+    result = agy_login.start_two_step_login(
+        _env(tmp_path, cfg_dir, CC_AGY_ENTERPRISE_PROJECT="proj-beta", CC_AGY_CLI_BIN="/nonexistent/agy")
+    )
+
+    assert result["ok"] is False
+    assert "proj-beta" in result["error"]
+
+
+def test_older_standalone_token_never_replaces_a_working_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg_dir = tmp_path / "cfg"
+    cli_token = _write_token(cfg_dir, **_LICENSE_A)
+    standalone = tmp_path / ".gemini" / "jetski-standalone-oauth-token"
+    standalone.parent.mkdir(parents=True, exist_ok=True)
+    standalone.write_text(json.dumps({"token": {"access_token": "old"}, "auth_method": "gcp"}))
+    os.utime(standalone, (time.time() - 3600, time.time() - 3600))
+    _fake_licenses(monkeypatch, [_LICENSE_A])
+
+    agy_login.finalize_enterprise_onboarding(cfg_dir, tmp_path, had_standalone_token_before=True, env=_env(tmp_path, cfg_dir))
+
+    assert json.loads(cli_token.read_text())["token"]["access_token"] == "acc"
+
+
+def test_reused_session_requires_the_same_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A session started for one seat project must not swallow a sign-in meant for another."""
+
+    class _NewSession(Exception):
+        pass
+
+    def _no_new_session(_state_dir: Path) -> None:
+        raise _NewSession
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--hold-daemon", str(state_dir)])
+    try:
+        (state_dir / "submit.sock").write_text("")
+        (state_dir / "session.json").write_text(
+            json.dumps(
+                {"pid": holder.pid, "auth_url": "https://accounts.google.com/x", "expires_at": time.time() + 300, "enterprise_project": "proj-alpha"}
+            )
+        )
+        monkeypatch.setattr(agy_login, "_login_state_dir", lambda _env: state_dir)
+        monkeypatch.setattr(agy_login, "can_use_local_browser_loopback", lambda _env: False)
+        monkeypatch.setattr(agy_login, "inspect_agy_cli_offline", lambda _env: {"agy_bin": "/x/agy", "auth_configured": False})
+        monkeypatch.setattr(agy_login, "heal_enterprise_token", lambda _env: {"already_complete": True})
+        monkeypatch.setattr(agy_login, "_cleanup_stale_hold_session", _no_new_session)
+
+        same = agy_login.start_two_step_login({"HOME": str(tmp_path), "CC_AGY_ENTERPRISE_PROJECT": "proj-alpha"})
+        assert same.get("reused") is True
+
+        with pytest.raises(_NewSession):
+            agy_login.start_two_step_login({"HOME": str(tmp_path), "CC_AGY_ENTERPRISE_PROJECT": "proj-beta"})
+    finally:
+        holder.kill()
+
+
+def test_doctor_report_ok_fails_when_claude_was_requested_but_missing():
+    report = {"preflight": {"ready": True}, "hosts": [{"host": "claude", "status": "claude_cli_not_found"}]}
+    assert install._report_ok({**report, "requested_host": "claude"}) is False
+    assert install._report_ok({**report, "requested_host": "all"}) is True
+
+
+def test_doctor_does_not_claim_sdks_the_running_server_cannot_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A venv built in the background after startup isn't loaded yet; doctor must say so."""
+    from server import doctor, receipts
+    import server.runtime_env as runtime_env
+
+    monkeypatch.setattr(doctor, "_module_available", lambda name: False)
+    monkeypatch.setattr(runtime_env, "python_has_module", lambda _py, _mod: True)
+    monkeypatch.setattr(runtime_env, "resolve_sdk_python", lambda **_k: str(tmp_path / "venv" / "bin" / "python"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    env = {"HOME": str(tmp_path), "PATH": os.environ.get("PATH", ""), "CC_AGY_AUTH_MODE": "api_key", "GEMINI_API_KEY": "k"}
+
+    report = doctor.run_doctor(workspace_root=repo, env=env, store=receipts.ReceiptStore(tmp_path / "st", workspace_root=repo))
+
+    assert report["sdks"]["google_genai"] is False
+    assert any("started before they were ready" in issue for issue in report["issues"]), report["issues"]

@@ -34,7 +34,7 @@ Start each command with the `ROOT=...` lines shown below. They find the plugin e
 for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
   [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
 done
-   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --host claude --auth <AUTH> --profile <PROFILE>
+   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --host claude --auth <AUTH> --profile <PROFILE> [--project <ID>] [--base-url <URL>]
    ```
    If it prints `! ...` lines, fix what they say (or ask the user) and run it again.
 

@@ -82,7 +82,7 @@ What happens next:
 3. **Automatic `--doctor` check.** Confirms MCP tools, your seat tier (for example `gcp-ge-plus-tier`), and git workspace readiness at 0 tokens.
 4. **Run `/reload-plugins`** in the Claude Code session you installed from (and any other open tabs). Then `/cc-agy-plugin:doctor` and `/cc-agy-plugin:agy` are ready. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime to change settings or sign in again.
 
-**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token is missing, damaged or expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, the plugin tells you which one it picked; set `CC_AGY_ENTERPRISE_PROJECT` to switch. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
+**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token is missing, damaged or expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, the plugin tells you which one it picked; run `/cc-agy-plugin:login --project <ID>` (or set `CC_AGY_ENTERPRISE_PROJECT`) to switch. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
 
 **Short sign-in links are opt-in.** Set `CC_AGY_SHORT_URL=1` to also get an `is.gd` / `tinyurl` link that never wraps in macOS Terminal. It is off by default because it sends the sign-in URL to a third-party service.
 
@@ -242,7 +242,7 @@ Once installed, open your project in Claude Code, Cursor, OpenCode, Codex, or An
 | Claude Code | OpenCode | What it does |
 |:--|:--|:--|
 | `/cc-agy-plugin:setup` | n/a | Opens interactive dropdowns to choose your connection mode and model preset, then runs sign-in and `doctor`. |
-| `/cc-agy-plugin:login` | n/a | Signs in to Gemini Enterprise (auto-opens browser on local desktop, or copies the OAuth link to clipboard and prints a 1-line link over SSH). |
+| `/cc-agy-plugin:login` | `/login` | Signs in to Gemini Enterprise (agy's own browser sign-in on a local desktop, or a sign-in link plus pasted code over SSH), repairs a saved sign-in agy rejects, and records your license. `--force` starts fresh; `--project <ID>` picks the seat project. |
 | `/cc-agy-plugin:agy <question or task>` | `/agy <question or task>` | Talks directly to Antigravity/Gemini: routes questions to `ask_gemini` (with conversation reuse on GE) and code edits to `delegate_to_gemini`. |
 | `/cc-agy-plugin:doctor` | `/doctor` | Offline readiness check for credentials, SDKs, `cost_profile`, git workspace, and test runner (zero token cost). |
 | `/cc-agy-plugin:delegate <task>` | `/delegate <task>` | Hands `<task>` to an isolated Gemini worker, verifies checks, inspects the diff, and applies clean results (you can also mention `@gemini-delegator` in OpenCode). |
@@ -720,7 +720,7 @@ cc-agy-plugin/
 │   └── hooks.json            # Cursor hooks override (prevents scanning Claude hooks)
 ├── .opencode/
 │   ├── skills/cc-agy-plugin/ # Native OpenCode skill (SKILL.md)
-│   ├── commands/             # Native OpenCode /agy, /delegate, /doctor, /jobs, /cost commands
+│   ├── commands/             # Native OpenCode /agy, /delegate, /doctor, /jobs, /cost, /login commands
 │   └── agents/               # Native OpenCode @gemini-delegator subagent
 ├── .agents/plugins/
 │   └── marketplace.json      # Native Codex repository plugin marketplace catalog

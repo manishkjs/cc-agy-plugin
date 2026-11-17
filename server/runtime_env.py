@@ -254,3 +254,30 @@ def ensure_sdk_venv(
         "python_bin": str(target_py),
         "venv_dir": str(target_venv),
     }
+
+
+def write_plugin_root_pointer(plugin_root: Path, env: Mapping[str, str] | None = None) -> Path | None:
+    """Point `<data_home>/cc-agy-plugin/current` at `plugin_root`; return the pointer or None.
+
+    Slash commands run in a shell where CLAUDE_PLUGIN_ROOT is often unset, and a plugin installed
+    from a source checkout has no `~/.local/share/cc-agy-plugin/repo`. Every host starts the MCP
+    server (and the installer) from the real plugin folder, so both refresh this pointer. The
+    swap uses `os.replace`, which atomically replaces an existing symlink; `mv` would instead
+    move the new link *into* the directory the old one points at. Best effort: never raises.
+    """
+    source = env if env is not None else os.environ
+    data_home = Path(source.get("XDG_DATA_HOME") or Path(source.get("HOME") or Path.home()) / ".local" / "share")
+    pointer = data_home / "cc-agy-plugin" / "current"
+    try:
+        target = plugin_root.resolve()
+        if pointer.is_symlink() and Path(os.readlink(pointer)) == target:
+            return pointer
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        tmp = pointer.with_name(f".current.{os.getpid()}")
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(target, tmp)
+        os.replace(tmp, pointer)
+        return pointer
+    except OSError:
+        return None

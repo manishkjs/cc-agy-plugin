@@ -15,16 +15,6 @@ cc_agy_root="${script_dir%/scripts}"
 server_main="${cc_agy_root}/server/main.py"
 . "${script_dir}/lib_pick_python.sh"
 
-# Slash commands run in a shell where CLAUDE_PLUGIN_ROOT is often unset, and a plugin installed
-# from a source checkout has no ~/.local/share/cc-agy-plugin/repo. The MCP server always starts
-# from the real plugin folder, so leave a stable pointer the commands can find. Best effort.
-pointer_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/cc-agy-plugin"
-if mkdir -p "${pointer_dir}" 2>/dev/null; then
-  ln -sfn "${cc_agy_root}" "${pointer_dir}/current.tmp.$$" 2>/dev/null \
-    && mv -f "${pointer_dir}/current.tmp.$$" "${pointer_dir}/current" 2>/dev/null \
-    || rm -f "${pointer_dir}/current.tmp.$$" 2>/dev/null
-fi
-
 if python_bin=$(pick_python); then
   exec "${python_bin}" "${server_main}" "$@"
 fi

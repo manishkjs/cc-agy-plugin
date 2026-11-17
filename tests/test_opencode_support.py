@@ -465,7 +465,7 @@ def test_install_cli_opencode_wizard_and_doctor_host_configs(
         output_fn=lambda _m: None,
         env={"GEMINI_API_KEY": "present"},
     )
-    assert built_word == ["--host", "opencode", "--profile", "quality"]
+    assert built_word == ["--host", "opencode", "--profile", "quality", "--auth", "api-key"]
 
     oc_dir = tmp_path / "opencode"
     monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(oc_dir))

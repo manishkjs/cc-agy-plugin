@@ -150,8 +150,11 @@ def _start_background_sdk_bootstrap() -> None:
                     "-c",
                     "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
                     "from server.runtime_env import ensure_sdk_venv; "
-                    "print(ensure_sdk_venv(Path(sys.argv[1]), output_fn=print), flush=True)",
+                    "result = ensure_sdk_venv(Path(sys.argv[1]), output_fn=print); print(result, flush=True); "
+                    # A failed build must not block the next start's retry for 15 minutes.
+                    "result.get('ok') or Path(sys.argv[2]).unlink(missing_ok=True)",
                     str(PLUGIN_ROOT),
+                    str(marker),
                 ],
                 cwd=str(PLUGIN_ROOT),
                 stdin=devnull,
@@ -162,12 +165,22 @@ def _start_background_sdk_bootstrap() -> None:
             )
         sys.stderr.write(
             f"[cc-agy-plugin] Setting up the Python SDKs in the background (log: {log_path}); "
-            "SDK-backed modes are ready after the next restart.\n"
+            "SDK-backed modes work after `/reload-plugins` (or a restart) once it finishes.\n"
         )
     except OSError as exc:
         sys.stderr.write(f"[cc-agy-plugin] Could not start the background SDK setup: {exc}\n")
 
 
+def _refresh_plugin_root_pointer() -> None:
+    try:
+        from server.runtime_env import write_plugin_root_pointer
+
+        write_plugin_root_pointer(PLUGIN_ROOT)
+    except Exception:  # Never block startup on a convenience pointer.
+        pass
+
+
+_refresh_plugin_root_pointer()
 _maybe_reexec_into_sdk_venv()
 
 import atexit  # noqa: E402

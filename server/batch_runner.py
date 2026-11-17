@@ -56,7 +56,7 @@ from server.writers import (
     symlink_component,
 )
 
-WriterFactory = Callable[[str, BatchSettings, dict[str, Any]], Writer | None]
+WriterFactory = Callable[[str, BatchSettings, dict[str, Any]], "Writer | None"]
 ProgressFn = Callable[[int, int, str], None]
 # Returns a problem description when the written bytes break a tool-specific rule, else None.
 ContentGate = Callable[[FileTask, bytes, Path], "str | None"]

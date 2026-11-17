@@ -3,7 +3,8 @@ name: login
 description: Sign in to Gemini Enterprise, or repair a saved sign-in that agy rejects. Pass --force to always start a fresh sign-in.
 ---
 
-Run the sign-in helper. If the user typed `/cc-agy-plugin:login --force`, keep `--force`:
+Run the sign-in helper. Pass through what the user typed after the command (`--force` for a fresh
+sign-in, `--project <ID>` to pick the seat project):
 
 ```bash
 ROOT="${CLAUDE_PLUGIN_ROOT:-}"

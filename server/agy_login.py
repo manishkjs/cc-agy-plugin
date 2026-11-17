@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -42,7 +43,12 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
-from server.agy_cli import agy_cli_config_dir, inspect_agy_cli_offline, resolve_agy_cli_binary
+from server.agy_cli import (
+    _platform_keeps_token_in_keychain,
+    agy_cli_config_dir,
+    inspect_agy_cli_offline,
+    resolve_agy_cli_binary,
+)
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _OAUTH_URL_RE = re.compile(r"(https://accounts\.google\.com/\S+)")
@@ -370,24 +376,47 @@ def _home_dir(env: Mapping[str, str]) -> Path:
     return Path(raw_home).expanduser() if raw_home else Path.home()
 
 
-def _login_state_dir(env: Mapping[str, str]) -> Path:
-    """Return a short `0700` per-user directory for the UNIX domain socket (<= 100 bytes for `AF_UNIX`)."""
-    home_key = hashlib.sha256(str(_home_dir(env)).encode("utf-8")).hexdigest()[:12]
-    runtime_base = Path(tempfile.gettempdir()) / f"cc-agy-login-{os.getuid()}-{home_key}"
+def _owned_private_dir(path: Path) -> Path | None:
+    """Create or reuse `path` as a 0700 directory owned by this user; None if it isn't safe."""
     try:
-        runtime_base.mkdir(mode=0o700)
+        path.mkdir(mode=0o700, parents=False)
     except FileExistsError:
         pass
-    info = os.lstat(runtime_base)
-    # The name is predictable, so on a shared machine another user could create it first and
-    # swap in their own socket to collect this user's sign-in code. Refuse anything we don't own.
+    except OSError:
+        return None
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        raise RuntimeError(
-            f"Refusing to use {runtime_base}: it is not a directory owned by you. Delete it and retry."
-        )
+        return None
     if stat.S_IMODE(info.st_mode) & 0o077:
-        os.chmod(runtime_base, 0o700)
-    return runtime_base
+        os.chmod(path, 0o700)
+    return path
+
+
+def _login_state_dir(env: Mapping[str, str]) -> Path:
+    """Return a short `0700` per-user directory for the sign-in socket (<= 100 bytes for `AF_UNIX`).
+
+    The /tmp name is predictable, so on a shared machine another user could create it first and
+    swap in their own socket to collect this user's sign-in code. A directory we don't own is
+    never used; the helper falls back to one under the user's home instead.
+    """
+    home_key = hashlib.sha256(str(_home_dir(env)).encode("utf-8")).hexdigest()[:12]
+    candidates = (
+        Path(tempfile.gettempdir()) / f"cc-agy-login-{os.getuid()}-{home_key}",
+        _home_dir(env) / ".cache" / f"cc-agy-login-{home_key}",
+    )
+    for candidate in candidates:
+        if candidate.name.startswith("cc-agy-login-") and candidate.parent.name == ".cache":
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+        owned = _owned_private_dir(candidate)
+        if owned is not None:
+            return owned
+    raise RuntimeError(
+        f"Refusing to use {candidates[0]} (not a directory owned by you) and couldn't create "
+        f"{candidates[1]}. Set TMPDIR to a private directory and retry."
+    )
 
 
 def _atomic_write_private(target: Path, payload_bytes: bytes) -> None:
@@ -432,7 +461,13 @@ def finalize_enterprise_onboarding(
         bak_token_file.unlink(missing_ok=True)
 
     parsed_token: dict[str, Any] | None = None
-    if standalone_token_file.is_file() and standalone_token_file.stat().st_size > 10:
+    # Use the standalone file only when it is the newest sign-in: a leftover from an older
+    # attempt must never replace a working CLI token.
+    standalone_is_newest = standalone_token_file.is_file() and standalone_token_file.stat().st_size > 10 and (
+        not cli_token_file.is_file()
+        or standalone_token_file.stat().st_mtime >= cli_token_file.stat().st_mtime
+    )
+    if standalone_is_newest:
         raw_bytes = standalone_token_file.read_bytes()
         try:
             loaded_tok = json.loads(raw_bytes.decode("utf-8"))
@@ -591,77 +626,131 @@ def can_use_local_browser_loopback(env: Mapping[str, str]) -> bool:
     return False
 
 
+# Variables an ambient shell may carry that must not reach agy's own sign-in. agy's CDE login
+# saves GOOGLE_CLOUD_PROJECT as the token's project with an empty tier, which switches agy to
+# pay-as-you-go Agent Platform billing; ANTIGRAVITY_PROJECT_ID is often a workspace ID, and API
+# keys would change which backend agy picks.
+_LOGIN_ENV_SCRUB = (
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "CLOUDSDK_CORE_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "ANTIGRAVITY_PROJECT_ID",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+)
+
+
+def _login_child_env(env: Mapping[str, str]) -> dict[str, str]:
+    child = dict(env)
+    for name in _LOGIN_ENV_SCRUB:
+        child.pop(name, None)
+    return child
+
+
 def try_acp_business_browser_login(
     agy_bin: str,
     *,
     env: Mapping[str, str],
     timeout_seconds: float = 110.0,
 ) -> tuple[bool, str]:
-    """Attempt zero-copy-paste browser loopback login via `agy acp` `authenticate(oauth-business)`."""
+    """Sign in through agy's own browser flow (`agy acp` authenticate `oauth-business`).
+
+    Every read has a deadline: `agy acp` can stay silent (browser closed, sign-in abandoned),
+    and a blocking `readline()` would hang the caller, which on the agent path is the user's
+    Claude Code session.
+    """
+    import queue
+    import threading
+
     proc = subprocess.Popen(
         [agy_bin, "acp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
-        env=dict(env),
+        env=_login_child_env(env),
     )
-    try:
-        assert proc.stdin is not None and proc.stdout is not None
-        init_req = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": 1,
-                "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.1"},
-            },
-        }
-        proc.stdin.write(json.dumps(init_req) + "\n")
-        proc.stdin.flush()
-        init_line = proc.stdout.readline()
-        if not init_line:
-            return False, "agy acp closed before initialize completed"
+    lines: queue.Queue[str | None] = queue.Queue()
 
-        auth_req = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "authenticate",
-            "params": {"methodId": "oauth-business"},
-        }
-        proc.stdin.write(json.dumps(auth_req) + "\n")
-        proc.stdin.flush()
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            lines.put(raw)
+        lines.put(None)
 
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                return False, "agy acp exited during browser sign-in"
+    threading.Thread(target=_pump, daemon=True).start()
+
+    def _await_reply(request_id: int, deadline: float) -> tuple[dict[str, Any] | None, str]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "timed out waiting for the browser sign-in"
             try:
-                msg = json.loads(line)
+                raw = lines.get(timeout=remaining)
+            except queue.Empty:
+                return None, "timed out waiting for the browser sign-in"
+            if raw is None:
+                return None, "agy acp exited before the sign-in finished"
+            try:
+                msg = json.loads(raw)
             except ValueError:
                 continue
-            if msg.get("id") != 2:
-                continue
-            if "error" in msg and msg["error"]:
-                err_obj = msg["error"]
-                err_msg = err_obj.get("message") if isinstance(err_obj, Mapping) else str(err_obj)
-                return False, str(err_msg or "agy acp authenticate failed")
-            # `agy acp` authenticate(oauth-business) only succeeds after agy's own
-            # resolveEnterpriseLicense found a license, so the sign-in is verified even when the
-            # token went to the OS keychain where this plugin can't read it.
-            config_dir = agy_cli_config_dir(env)
-            onboarding = finalize_enterprise_onboarding(
-                config_dir,
-                _home_dir(env),
-                had_standalone_token_before=True,
-                env=env,
+            if isinstance(msg, dict) and msg.get("id") == request_id:
+                return msg, ""
+
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.1"}},
+                }
             )
-            if not onboarding.get("verified"):
-                _mark_enterprise_onboarding_complete(config_dir)
-            return True, ""
-        return False, "Timed out waiting for browser sign-in"
-    except (OSError, subprocess.SubprocessError) as exc:
+            + "\n"
+        )
+        proc.stdin.flush()
+        reply, reason = _await_reply(1, time.monotonic() + min(20.0, timeout_seconds))
+        if reply is None:
+            return False, reason
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {"methodId": "oauth-business"}})
+            + "\n"
+        )
+        proc.stdin.flush()
+        reply, reason = _await_reply(2, time.monotonic() + timeout_seconds)
+        if reply is None:
+            return False, reason
+        if reply.get("error"):
+            err_obj = reply["error"]
+            err_msg = err_obj.get("message") if isinstance(err_obj, Mapping) else str(err_obj)
+            return False, str(err_msg or "agy acp authenticate failed")
+
+        # authenticate(oauth-business) only succeeds after agy's own resolveEnterpriseLicense
+        # found and saved a license. A leftover broken token file from an earlier attempt would
+        # now shadow that sign-in for doctor, so drop it.
+        config_dir = agy_cli_config_dir(env)
+        token_file = config_dir / "antigravity-oauth-token"
+        from server.agy_cli import stored_token_problem
+
+        if token_file.exists() and stored_token_problem(token_file) is not None:
+            token_file.unlink(missing_ok=True)
+        onboarding = finalize_enterprise_onboarding(
+            config_dir,
+            _home_dir(env),
+            had_standalone_token_before=True,
+            env=env,
+        )
+        if onboarding.get("problem") == "keychain":
+            # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
+            _mark_enterprise_onboarding_complete(config_dir)
+        return True, ""
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return False, str(exc)
     finally:
         try:
@@ -681,7 +770,7 @@ def _spawn_cde_login_and_capture_url(
     timeout_seconds: float = _URL_CAPTURE_TIMEOUT_SECONDS,
 ) -> tuple[subprocess.Popen[str], str]:
     """Start `AGY_CLI_CDE_AUTH_ACTION=login agy` and read stdout until the Google OAuth URL appears."""
-    child_env = {**env, "AGY_CLI_CDE_AUTH_ACTION": "login"}
+    child_env = {**_login_child_env(env), "AGY_CLI_CDE_AUTH_ACTION": "login"}
     child_env.pop("AGY_CDE_ENTERPRISE_AUTH", None)
     proc = subprocess.Popen(
         [agy_bin],
@@ -854,6 +943,7 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
                 "ok": True,
                 "pid": os.getpid(),
                 "auth_url": auth_url,
+                "enterprise_project": _configured_enterprise_project_and_location(config_dir, env)[0],
                 "socket": str(sock_path),
                 "created_at": time.time(),
                 "expires_at": time.time() + timeout_seconds,
@@ -873,6 +963,21 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
                 break
             with conn:
                 raw_req = conn.recv(8192).decode("utf-8", errors="replace").strip()
+                exchange_env = env
+                if raw_req.startswith("{"):
+                    # {"code": ..., "env": {...}}: settings the user changed after this session
+                    # started (e.g. CC_AGY_ENTERPRISE_PROJECT) apply to the license lookup.
+                    try:
+                        payload = json.loads(raw_req)
+                        overrides = payload.get("env") if isinstance(payload, dict) else None
+                        if isinstance(overrides, dict):
+                            exchange_env = {
+                                **env,
+                                **{k: str(v) for k, v in overrides.items() if k in _COMPLETE_ENV_OVERRIDES and v},
+                            }
+                        raw_req = str(payload.get("code") or "") if isinstance(payload, dict) else ""
+                    except ValueError:
+                        raw_req = ""
                 try:
                     extract_oauth_code(raw_req)
                 except ValueError as exc:
@@ -885,7 +990,7 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
                         config_dir=config_dir,
                         home_dir=home_dir,
                         had_standalone_before=had_standalone,
-                        env=env,
+                        env=exchange_env,
                     )
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -982,8 +1087,13 @@ def _process_command_line(pid: int) -> str:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    try:  # Slim containers often have no `ps`.
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
         return ""
-    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def _is_hold_daemon(pid: int, state_dir: Path) -> bool:
@@ -1024,14 +1134,22 @@ def start_two_step_login(
         force: Skip the "already signed in" short-circuit and always start a fresh sign-in.
     """
     source = dict(os.environ if env is None else env)
+    explicit_proj = _configured_enterprise_project_and_location(agy_cli_config_dir(source), source)[0]
     if not force:
-        heal_enterprise_token(source)
+        healed = heal_enterprise_token(source)
+        if explicit_proj and not (healed.get("healed") or healed.get("already_complete")):
+            reason = healed.get("reason") or "the license lookup failed"
+            if "no readable token" not in reason and "not a Gemini Enterprise token" not in reason:
+                # The user asked for a specific seat project and the switch failed: say so
+                # instead of reporting the old sign-in as fine.
+                return {"ok": False, "error": f"Couldn't switch to seat project '{explicit_proj}': {reason}."}
         status = inspect_agy_cli_offline(source)
         if status.get("auth_configured") and not status.get("consumer_account_detected"):
             return {
                 "ok": True,
                 "already_signed_in": True,
                 "tier_id": status.get("tier_id"),
+                "project_id": healed.get("project_id") or status.get("companion_project"),
                 "credential_source": status.get("credential_source"),
             }
     else:
@@ -1040,18 +1158,29 @@ def start_two_step_login(
     if not agy_bin:
         return {"ok": False, "error": status.get("error") or "External `agy` binary is not installed."}
 
-    browser_error = None
     if can_use_local_browser_loopback(source):
         # On a local desktop, agy's own browser sign-in records the license even when the token
         # goes to the OS keychain (macOS), which the copy-paste flow below can't verify.
-        signed_in, browser_error = try_acp_business_browser_login(agy_bin, env=source)
+        # 90s, not longer: agent shells (Claude Code's Bash tool) kill commands after ~120s by
+        # default, and the user must see the error rather than a killed command.
+        signed_in, browser_error = try_acp_business_browser_login(agy_bin, env=source, timeout_seconds=90.0)
         if signed_in:
             return {"ok": True, "signed_in": True, "method": "browser"}
+        if _platform_keeps_token_in_keychain(source):
+            # The copy-paste flow would save the token to the same keychain, where the plugin
+            # can't record the license, so it can't succeed here either. Report the real error.
+            return {
+                "ok": False,
+                "error": (
+                    f"Browser sign-in didn't finish ({browser_error}). Run `/cc-agy-plugin:login` again "
+                    "and complete the sign-in in the browser window that opens."
+                ),
+            }
 
     state_dir = _login_state_dir(source)
     if not force:
         live = _live_hold_session(state_dir)
-        if live is not None:
+        if live is not None and (live.get("enterprise_project") or "") == explicit_proj:
             # A second tab, or the agent showing the link again: hand back the same link instead
             # of killing the session the user may be signing in to right now.
             return {**live, "reused": True}
@@ -1123,7 +1252,8 @@ def complete_two_step_login(
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(35.0)
             client.connect(str(sock_path))
-            client.sendall((clean_code + "\n").encode("utf-8"))
+            overrides = {k: source[k] for k in _COMPLETE_ENV_OVERRIDES if (source.get(k) or "").strip()}
+            client.sendall((json.dumps({"code": clean_code, "env": overrides}) + "\n").encode("utf-8"))
             chunks: list[bytes] = []
             while True:
                 chunk = client.recv(8192)
@@ -1261,7 +1391,15 @@ def copy_url_to_terminal_clipboard_osc52(url: str) -> bool:
     return False
 
 
-_AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CURSOR_TRACE_ID", "OPENCODE", "CODEX_SANDBOX")
+_COMPLETE_ENV_OVERRIDES = (
+    "CC_AGY_ENTERPRISE_PROJECT",
+    "CC_AGY_ENTERPRISE_LOCATION",
+    "CC_AGY_ENTERPRISE_USER_TIER",
+    "CLAUDE_PLUGIN_OPTION_ENTERPRISE_PROJECT",
+    "CC_AGY_USERCFG_ENTERPRISE_PROJECT",
+)
+# CURSOR_TRACE_ID is left out on purpose: Cursor also sets it in terminals a person types in.
+_AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE", "CODEX_SANDBOX")
 
 
 def is_interactive_terminal(env: Mapping[str, str]) -> bool:
@@ -1324,6 +1462,11 @@ def run_interactive_or_url_login(
         if ok:
             print("Signed in to Gemini Enterprise.")
             return 0
+        if _platform_keeps_token_in_keychain(source):
+            # A copy-paste sign-in would also save to the keychain, where the license can't be
+            # recorded, so don't offer one: it would only lead to the same failure.
+            print(f"Browser sign-in didn't finish ({reason}). Run `/cc-agy-plugin:login` to try again.")
+            return 1
         print(f"Browser sign-in didn't finish ({reason}); showing a link instead.", flush=True)
 
     # 2. A person at a terminal (`curl ... | bash` in an SSH shell): print the link, read the code.
@@ -1394,7 +1537,7 @@ def run_interactive_or_url_login(
         return 0
 
     plugin_root = Path(__file__).resolve().parent.parent
-    complete_cmd = f'{sys.executable} "{plugin_root}/server/agy_login.py" --complete \'<PASTE_CODE>\''
+    complete_cmd = f'{shlex.quote(sys.executable)} "{plugin_root}/server/agy_login.py" --complete \'<PASTE_CODE>\''
     auth_url = started["auth_url"]
     short_url = shorten_and_verify_oauth_url(auth_url, source)
     short_line = f"Short link: {short_url}\n" if short_url else ""
@@ -1416,6 +1559,24 @@ def run_interactive_or_url_login(
     return 0
 
 
+def _apply_host_settings_to_environ() -> None:
+    """Fill unset CC_AGY_* settings from the host's saved plugin config (e.g. ~/.claude/settings.json).
+
+    The MCP server gets these from the host; a slash command's shell does not, so without this
+    an enterprise project chosen at install time would be ignored by sign-in.
+    """
+    try:
+        from server.doctor import _discover_installed_host_mcp_env
+
+        discovered = _discover_installed_host_mcp_env(dict(os.environ))
+    except Exception:
+        return
+    for key, value in (discovered or {}).items():
+        if key.startswith(("CC_AGY_", "CLAUDE_PLUGIN_OPTION_")) and value and not os.environ.get(key):
+            if not str(value).startswith("${"):
+                os.environ[key] = str(value)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `python3 -m server.agy_login` and `python3 server/agy_login.py`."""
     parser = argparse.ArgumentParser(description="Interactive Gemini Enterprise OAuth helper for cc-agy-plugin.")
@@ -1434,7 +1595,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Repair a saved token that agy rejects (missing license/project) without a new sign-in.",
     )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Gemini Enterprise seat project to use (same as CC_AGY_ENTERPRISE_PROJECT).",
+    )
     args = parser.parse_args(argv)
+    _apply_host_settings_to_environ()
+    if args.project:
+        os.environ["CC_AGY_ENTERPRISE_PROJECT"] = args.project.strip()
 
     if args.hold_daemon:
         return run_hold_daemon(Path(args.hold_daemon), timeout_seconds=args.timeout)
@@ -1468,14 +1637,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.get("ok") else 1
 
     if args.start:
-        res = start_two_step_login(timeout_seconds=args.timeout, force=args.force)
+        try:
+            res = start_two_step_login(timeout_seconds=args.timeout, force=args.force)
+        except RuntimeError as exc:
+            res = {"ok": False, "error": str(exc)}
         if res.get("ok") and res.get("auth_url"):
             res["short_url"] = shorten_and_verify_oauth_url(res["auth_url"])
             # True only means the clipboard request was written to a terminal; terminals such as
             # macOS Terminal.app ignore it, so callers must word this as "may be on your clipboard".
             res["clipboard_requested"] = copy_url_to_terminal_clipboard_osc52(res["auth_url"])
             res["complete_command"] = (
-                f'{sys.executable} "{Path(__file__).resolve().parent.parent}/server/agy_login.py" '
+                f'{shlex.quote(sys.executable)} "{Path(__file__).resolve().parent.parent}/server/agy_login.py" '
                 "--complete '<PASTE_CODE>'"
             )
         if args.json:

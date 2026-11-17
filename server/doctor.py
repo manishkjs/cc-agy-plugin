@@ -13,6 +13,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import sys
 from typing import Any
 
 from server.install import (
@@ -635,16 +636,33 @@ def run_doctor(
     from server.runtime_env import python_has_module, resolve_sdk_python
 
     sdk_py = resolve_sdk_python(env=active_env)
-    has_genai = _module_available("google.genai") or python_has_module(sdk_py, "google.genai")
-    has_agy = _module_available("google.antigravity") or python_has_module(sdk_py, "google.antigravity")
+    # What matters is what this running process can import: a venv that finished building in the
+    # background after startup isn't loaded until the server restarts.
+    live_genai = _module_available("google.genai")
+    live_agy = _module_available("google.antigravity")
+    disk_genai = live_genai or python_has_module(sdk_py, "google.genai")
+    disk_agy = live_agy or python_has_module(sdk_py, "google.antigravity")
+    has_genai = live_genai or (disk_genai and os.path.realpath(sdk_py) == os.path.realpath(sys.executable))
+    has_agy = live_agy or (disk_agy and os.path.realpath(sdk_py) == os.path.realpath(sys.executable))
     has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")
     cli_only_enterprise = (active_auth_mode == "gemini_enterprise") or cli_detected_unsigned
-    if not has_genai and not cli_only_enterprise:
-        issues.append("Python package `google-genai` is not installed.")
-        remediations.append("Install plugin dependencies: `python3 -m server.install`")
-    if not has_agy and not cli_only_enterprise:
-        issues.append("Python package `google-antigravity` is not installed.")
-        remediations.append("Install Antigravity SDK: `python3 -m server.install`")
+    plugin_root = Path(__file__).resolve().parent.parent
+    install_hint = (
+        f"Run `sh {plugin_root}/scripts/py.sh {plugin_root}/server/install.py` "
+        "(it sets up the Python SDKs), then `/reload-plugins`."
+    )
+    if not cli_only_enterprise and (not has_genai or not has_agy) and disk_genai and disk_agy:
+        issues.append(
+            "The Python SDKs are installed but this MCP server started before they were ready."
+        )
+        remediations.append("Run `/reload-plugins` (or restart Claude Code) to load them.")
+    else:
+        if not has_genai and not cli_only_enterprise:
+            issues.append("Python package `google-genai` is not installed.")
+            remediations.append(install_hint)
+        if not has_agy and not cli_only_enterprise:
+            issues.append("Python package `google-antigravity` is not installed.")
+            remediations.append(install_hint)
     if not has_ctx and not cli_only_enterprise:
         warnings.append(
             "Optional `ctx-harness` (Straitjacket) package is not installed; worker shell output containment will fall back to raw Antigravity tools."

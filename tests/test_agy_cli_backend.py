@@ -1179,14 +1179,15 @@ class TestGauntletRound1Bugs:
         cfg.mkdir(parents=True)
         (cfg / "antigravity-oauth-token").write_text("oauth-token-123456", encoding="utf-8")
 
-        # When GEMINI_API_KEY is set and CC_AGY_AUTH_MODE is unset, wizard must default to api_key (NOT override with gemini-enterprise)
+        # When GEMINI_API_KEY is set and CC_AGY_AUTH_MODE is unset, wizard must default to api_key (NOT override
+        # with gemini-enterprise), and pin it so nothing ambient can reroute the user.
         defaults = iter(["", "", "", ""])
         built = run_interactive_wizard(
             input_fn=lambda _p: next(defaults),
             output_fn=lambda _m: None,
             env={"HOME": str(home), "GEMINI_API_KEY": "present"},
         )
-        assert "--auth" not in built, built
+        assert built[built.index("--auth") + 1] == "api-key", built
 
         # When no key/project/gateway is set and signed-in agy exists under HOME, wizard defaults to gemini-enterprise
         defaults_ent = iter(["", "", "", ""])

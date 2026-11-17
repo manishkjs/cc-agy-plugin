@@ -550,7 +550,7 @@ def test_interactive_wizard_builds_expected_cli_flags() -> None:
         output_fn=printed.append,
         env={"GEMINI_API_KEY": "present"},
     )
-    assert built_default == ["--host", "all", "--profile", "balanced"]
+    assert built_default == ["--host", "all", "--profile", "balanced", "--auth", "api-key"]
 
     agy_answers = iter(["4", "4", "2", "300"])
     built_agy = run_interactive_wizard(

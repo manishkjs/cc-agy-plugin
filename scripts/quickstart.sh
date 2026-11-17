@@ -47,7 +47,8 @@ has_controlling_tty() {
 is_person_at_terminal() {
   [[ -t 1 ]] || return 1
   local marker
-  for marker in CLAUDECODE CLAUDE_CODE_ENTRYPOINT CURSOR_TRACE_ID OPENCODE CODEX_SANDBOX; do
+  # CURSOR_TRACE_ID is left out: Cursor also sets it in terminals a person types in.
+  for marker in CLAUDECODE CLAUDE_CODE_ENTRYPOINT OPENCODE CODEX_SANDBOX; do
     [[ -n "${!marker:-}" ]] && return 1
   done
   has_controlling_tty
@@ -249,10 +250,16 @@ main() {
       (
         cd "${checkout_dir}"
         "${python_bin}" -m server.install </dev/tty >/dev/tty
-        if "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and (not s.get('auth_configured') or s.get('consumer_account_detected')) else 1)" 2>/dev/null; then
+        # The wizard records what the user picked; use it instead of guessing.
+        picked_auth="$("${python_bin}" -c "import json, os, pathlib; p = pathlib.Path(os.environ.get('XDG_DATA_HOME') or pathlib.Path.home() / '.local/share') / 'cc-agy-plugin/last-install.json'; print(json.loads(p.read_text()).get('auth_mode', '') if p.is_file() else '')" 2>/dev/null || true)"
+        if [[ "${picked_auth}" == "gemini_enterprise" ]] && "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and (not s.get('auth_configured') or s.get('consumer_account_detected')) else 1)" 2>/dev/null; then
           PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
         fi
-        "${python_bin}" -m server.install --doctor --human --allow-pending-login --workspace "${orig_cwd}"
+        doctor_args=(--doctor --human --allow-pending-login --workspace "${orig_cwd}")
+        if [[ -n "${picked_auth}" ]]; then
+          doctor_args+=(--auth "${picked_auth//_/-}")
+        fi
+        "${python_bin}" -m server.install "${doctor_args[@]}"
       )
       return 0
     else

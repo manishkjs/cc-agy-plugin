@@ -1241,7 +1241,7 @@ def test_installer_gateway_wire_all_five_hosts_doctor_and_secret_scrubbing(
         input_fn=_ask_default,
         output_fn=lambda _msg: None,
     )
-    assert wizard_argv == ["--host", "all", "--profile", "balanced"]
+    assert wizard_argv == ["--host", "all", "--profile", "balanced", "--auth", "api-key"]
     assert any("(api_key)" in p for p in wizard_prompts)
 
     # Interactive wizard preserves Gemini-CLI style `GOOGLE_GEMINI_BASE_URL` + `GEMINI_API_KEY` pairing (`I2`)
@@ -1254,7 +1254,7 @@ def test_installer_gateway_wire_all_five_hosts_doctor_and_secret_scrubbing(
         input_fn=_ask_default,
         output_fn=lambda _msg: None,
     )
-    assert wizard_cli_pairing == ["--host", "all", "--profile", "balanced"]
+    assert wizard_cli_pairing == ["--host", "all", "--profile", "balanced", "--auth", "api-key"]
     assert any("(api_key)" in p for p in wizard_prompts)
 
     # Interactive wizard with `CC_AGY_GEMINI_BASE_URL` on a path-less Gemini proxy preserves `--gateway-wire gemini` (`J3`)
