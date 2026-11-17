@@ -59,3 +59,37 @@ jobs:
         run: |
           python scripts/lint_ast.py
           python -m pytest -q tests/test_ftux_and_decision_guide.py
+
+  harness-contracts:
+    name: Harness contract (${{ matrix.harness }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        harness: [claude, cursor, codex, opencode, antigravity]
+        include:
+          - os: macos-latest
+            harness: claude
+          - os: macos-latest
+            harness: opencode
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node (OpenCode entry file is loaded with type stripping)
+        if: matrix.harness == 'opencode'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run ${{ matrix.harness }} loading contract
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_harness_contracts.py -k "${{ matrix.harness }}"

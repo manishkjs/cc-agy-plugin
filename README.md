@@ -785,7 +785,18 @@ cc-agy-plugin/
 python3 scripts/run_tests_parallel.py  # run full test suite in parallel across CPU cores (or pytest -n auto -q)
 python3 scripts/lint_ast.py            # static AST check across all server/ and scripts/ modules
 bash scripts/validate.sh               # checks manifests, AST lint, doc sync, badges, and hermetic host installs
+python3 -m pytest -q tests/test_harness_contracts.py -k opencode  # one host's loading contract
 ```
+
+### One plugin, five hosts: the 3-layer rule
+
+The same plugin loads in Claude Code, Cursor, Codex, OpenCode, and Antigravity, and each host has its own loader quirks (for example, OpenCode rejects any non-function export from its entry file, and `claude plugin install` does not refresh an installed local-marketplace cache). To keep a fix for one host from breaking another, changes follow three layers:
+
+1. **Shared behaviour lives in `server/`.** Every host starts the same stdio MCP server (`server/main.py`, directly or through `scripts/run_mcp_server.sh`).
+2. **Host quirks live only in that host's adapter folder:** Claude Code (`.claude-plugin/`, `.mcp.json`, `hooks/`), Cursor (`.cursor-plugin/`, `cursor/rules/`), Codex (`plugins/cc-agy-plugin/.codex-plugin/`, `.agents/plugins/`), OpenCode (`opencode-plugin/`, `.opencode/`, `package.json`). Antigravity has no adapter folder; `server/install.py` writes its `~/.gemini/config/` entries. Adapter files never reference another host's folder.
+3. **`server/install.py --host <h>` writes only that host's config.**
+
+Every quirk gets a contract test in `tests/test_harness_contracts.py`. CI runs it once per host (`-k <host>`) on Linux, plus Claude Code and OpenCode on macOS. The tests use a fake `HOME`, a fake `claude` CLI, no network, and no model calls.
 
 </details>
 
