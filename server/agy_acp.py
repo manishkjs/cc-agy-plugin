@@ -353,7 +353,7 @@ def probe_agy_acp_capabilities(
         "params": {
             "protocolVersion": ACP_PROTOCOL_VERSION,
             "clientCapabilities": {},
-            "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.6"},
+            "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.7"},
         },
     }
     try:
@@ -769,7 +769,7 @@ def run_agy_acp_turn(
                         "params": {
                             "protocolVersion": ACP_PROTOCOL_VERSION,
                             "clientCapabilities": {},
-                            "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.6"},
+                            "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.7"},
                         },
                     }
                 )

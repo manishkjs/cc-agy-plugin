@@ -1205,7 +1205,7 @@ class MCPServer:
                     },
                     "serverInfo": {
                         "name": "cc-agy-plugin-vertex",
-                        "version": "0.3.6",
+                        "version": "0.3.7",
                     },
                 }
                 host_instructions = server_instructions_for_host()

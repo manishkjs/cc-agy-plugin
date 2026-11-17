@@ -799,7 +799,9 @@ def claude_install_commands(
         install_cmd.extend(["--config", f"{key}={rendered}"])
     return [
         ["claude", "plugin", "marketplace", "add", str(PLUGIN_ROOT)],
+        ["claude", "plugin", "marketplace", "update", MARKETPLACE_NAME],
         install_cmd,
+        ["claude", "plugin", "update", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"],
     ]
 
 
@@ -876,7 +878,12 @@ def install_claude(
             )
         return result
     outputs: list[dict[str, Any]] = []
-    for idx, cmd in enumerate(cmds):
+    for cmd in cmds:
+        is_install_cmd = cmd[:3] == ["claude", "plugin", "install"]
+        optional = (
+            cmd[:4] == ["claude", "plugin", "marketplace", "update"]
+            or cmd[:3] == ["claude", "plugin", "update"]
+        )
         proc = subprocess.run([claude_bin, *cmd[1:]], capture_output=True, text=True, check=False, timeout=120)
         combined = (proc.stdout + proc.stderr).strip()
         # Graceful fallback if an older Claude CLI does not accept `--config` on `plugin install`.
@@ -891,7 +898,7 @@ def install_claude(
                 "no such option",
             )
         )
-        if idx == 1 and proc.returncode != 0 and "--config" in cmd and unknown_config_flag:
+        if is_install_cmd and proc.returncode != 0 and "--config" in cmd and unknown_config_flag:
             plain_install = ["plugin", "install", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"]
             proc = subprocess.run(
                 [claude_bin, *plain_install], capture_output=True, text=True, check=False, timeout=120
@@ -903,7 +910,9 @@ def install_claude(
                     "output": (proc.stdout + proc.stderr).strip()[-400:],
                 }
             )
-            if proc.returncode == 0 and user_cfg:
+            if proc.returncode != 0:
+                break
+            if user_cfg:
                 cfg_cmd = ["plugin", "configure", f"{PLUGIN_NAME}@{MARKETPLACE_NAME}", "--values-stdin"]
                 cfg_proc = subprocess.run(
                     [claude_bin, *cfg_cmd],
@@ -920,12 +929,24 @@ def install_claude(
                         "output": (cfg_proc.stdout + cfg_proc.stderr).strip()[-400:],
                     }
                 )
+                if cfg_proc.returncode != 0:
+                    break
+            continue
+        entry: dict[str, Any] = {
+            "command": " ".join(cmd),
+            "exit_code": proc.returncode,
+            "output": combined[-400:],
+        }
+        if optional:
+            entry["optional"] = True
+        outputs.append(entry)
+        if proc.returncode != 0 and not optional:
             break
-        outputs.append({"command": " ".join(cmd), "exit_code": proc.returncode, "output": combined[-400:]})
-        if proc.returncode != 0:
-            break
+    required_runs = [o for o in outputs if not o.get("optional")]
     result["runs"] = outputs
-    result["status"] = "installed" if outputs and all(o["exit_code"] == 0 for o in outputs) else "failed"
+    result["status"] = (
+        "installed" if required_runs and all(o["exit_code"] == 0 for o in required_runs) else "failed"
+    )
     return result
 
 
@@ -1117,7 +1138,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.3.6",
+        "version": "0.3.7",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."

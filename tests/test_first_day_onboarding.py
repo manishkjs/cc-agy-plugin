@@ -935,3 +935,111 @@ def test_bare_auto_mode_missing_credentials_and_doctor_remediation_work_from_any
         and f"{REPO_ROOT / 'server' / 'install.py'} --host claude --auth gemini-enterprise" in rem
         for rem in report["remediations"]
     ), report["remediations"]
+
+
+def _write_fake_claude_cli(tmp_path: Path, body: str) -> tuple[Path, Path]:
+    log_path = tmp_path / "claude_calls.jsonl"
+    bin_path = tmp_path / "claude"
+    script = (
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"log_path = {str(log_path)!r}\n"
+        "argv = sys.argv[1:]\n"
+        "with open(log_path, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(argv) + '\\n')\n"
+        + body
+    )
+    bin_path.write_text(script, encoding="utf-8")
+    bin_path.chmod(0o755)
+    return bin_path, log_path
+
+
+def test_claude_install_commands_include_marketplace_and_plugin_updates() -> None:
+    cmds = install.claude_install_commands(profile="balanced", auth_mode="gemini-enterprise")
+
+    assert len(cmds) == 4
+    assert cmds[0] == ["claude", "plugin", "marketplace", "add", str(install.PLUGIN_ROOT)]
+    assert cmds[1] == ["claude", "plugin", "marketplace", "update", install.MARKETPLACE_NAME]
+    assert cmds[2][:4] == ["claude", "plugin", "install", f"{install.PLUGIN_NAME}@{install.MARKETPLACE_NAME}"]
+    assert "--config" in cmds[2]
+    assert cmds[3] == ["claude", "plugin", "update", f"{install.PLUGIN_NAME}@{install.MARKETPLACE_NAME}"]
+
+
+def test_install_claude_runs_all_four_commands_including_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_claude, log_path = _write_fake_claude_cli(tmp_path, "print('ok')\n")
+    monkeypatch.setattr(install.shutil, "which", lambda name: str(fake_claude) if name == "claude" else None)
+
+    result = install.install_claude(dry_run=False, profile="balanced", auth_mode="gemini-enterprise")
+    calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+    assert result["status"] == "installed"
+    assert len(calls) == 4
+    assert calls[0][:3] == ["plugin", "marketplace", "add"]
+    assert calls[1] == ["plugin", "marketplace", "update", install.MARKETPLACE_NAME]
+    assert calls[2][:3] == ["plugin", "install", f"{install.PLUGIN_NAME}@{install.MARKETPLACE_NAME}"]
+    assert calls[3] == ["plugin", "update", f"{install.PLUGIN_NAME}@{install.MARKETPLACE_NAME}"]
+    assert [bool(run.get("optional")) for run in result["runs"]] == [False, True, False, True]
+
+
+def test_install_claude_tolerates_unsupported_update_commands_and_handles_install_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1) Older Claude CLI rejects both `update` subcommands with exit 2: install still succeeds.
+    old_dir = tmp_path / "old_cli"
+    old_dir.mkdir()
+    old_claude, old_log = _write_fake_claude_cli(
+        old_dir,
+        "if argv[:3] == ['plugin', 'marketplace', 'update'] or argv[:2] == ['plugin', 'update']:\n"
+        "    sys.stderr.write('error: unknown command update\\n')\n"
+        "    raise SystemExit(2)\n"
+        "print('ok')\n",
+    )
+    monkeypatch.setattr(install.shutil, "which", lambda name: str(old_claude) if name == "claude" else None)
+
+    res_old = install.install_claude(dry_run=False, profile="balanced", auth_mode="gemini-enterprise")
+    old_calls = [json.loads(line) for line in old_log.read_text(encoding="utf-8").splitlines()]
+    assert res_old["status"] == "installed"
+    assert len(old_calls) == 4
+    assert res_old["runs"][1]["optional"] is True and res_old["runs"][1]["exit_code"] == 2
+    assert res_old["runs"][3]["optional"] is True and res_old["runs"][3]["exit_code"] == 2
+
+    # 2) Older Claude CLI also rejects `--config` on `plugin install` -> falls back to plain install + configure,
+    #    then still runs optional `plugin update`.
+    legacy_dir = tmp_path / "legacy_cfg"
+    legacy_dir.mkdir()
+    legacy_claude, legacy_log = _write_fake_claude_cli(
+        legacy_dir,
+        "if argv[:3] == ['plugin', 'marketplace', 'update'] or argv[:2] == ['plugin', 'update']:\n"
+        "    sys.stderr.write('unknown command\\n')\n"
+        "    raise SystemExit(2)\n"
+        "if argv[:2] == ['plugin', 'install'] and '--config' in argv:\n"
+        "    sys.stderr.write('error: unknown option --config\\n')\n"
+        "    raise SystemExit(2)\n"
+        "print('ok')\n",
+    )
+    monkeypatch.setattr(install.shutil, "which", lambda name: str(legacy_claude) if name == "claude" else None)
+
+    res_legacy = install.install_claude(dry_run=False, profile="balanced", auth_mode="gemini-enterprise")
+    legacy_calls = [json.loads(line) for line in legacy_log.read_text(encoding="utf-8").splitlines()]
+    assert res_legacy["status"] == "installed"
+    assert any(c[:2] == ["plugin", "configure"] for c in legacy_calls)
+    assert legacy_calls[-1] == ["plugin", "update", f"{install.PLUGIN_NAME}@{install.MARKETPLACE_NAME}"]
+
+    # 3) Failing `plugin install` still fails overall and skips `plugin update`.
+    fail_dir = tmp_path / "fail_install"
+    fail_dir.mkdir()
+    fail_claude, fail_log = _write_fake_claude_cli(
+        fail_dir,
+        "if argv[:2] == ['plugin', 'install']:\n"
+        "    sys.stderr.write('install boom\\n')\n"
+        "    raise SystemExit(1)\n"
+        "print('ok')\n",
+    )
+    monkeypatch.setattr(install.shutil, "which", lambda name: str(fail_claude) if name == "claude" else None)
+
+    res_fail = install.install_claude(dry_run=False, profile="balanced", auth_mode="gemini-enterprise")
+    fail_calls = [json.loads(line) for line in fail_log.read_text(encoding="utf-8").splitlines()]
+    assert res_fail["status"] == "failed"
+    assert not any(c[:2] == ["plugin", "update"] for c in fail_calls)
