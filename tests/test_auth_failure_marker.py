@@ -897,6 +897,7 @@ def test_keychain_browser_login_preserves_new_fallback_token_and_drops_stale_ssh
     )
     acp_keychain.chmod(0o755)
     env_b = _env(tmp_path, cfg_b, acp_keychain, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+    monkeypatch.setattr(agy_login.sys, "platform", "darwin")
 
     ok_b, reason_b = agy_login.try_acp_business_browser_login(str(acp_keychain), env=env_b, timeout_seconds=10)
     assert (ok_b, reason_b) == (True, "")
@@ -905,6 +906,20 @@ def test_keychain_browser_login_preserves_new_fallback_token_and_drops_stale_ssh
     assert onboarding_b["cloudaicompanionProject"] == "proj-beta"
     assert agy_cli.inspect_agy_cli_offline(env_b)["auth_configured"] is True
 
+    # Case C (fable-3 P2-U2): Linux desktop where a healthy pre-existing file token is already on
+    # disk (no failure marker) and agy acp succeeds without rewriting it: preserve the healthy file.
+    cfg_c = tmp_path / "cfg-c"
+    healthy_linux_tok = _write_valid_token(cfg_c)
+    orig_linux_bytes = healthy_linux_tok.read_bytes()
+    env_c = _env(tmp_path, cfg_c, acp_keychain, CC_AGY_TOKEN_IN_KEYCHAIN="1")
+    monkeypatch.setattr(agy_login.sys, "platform", "linux")
+
+    ok_c, reason_c = agy_login.try_acp_business_browser_login(str(acp_keychain), env=env_c, timeout_seconds=10)
+    assert (ok_c, reason_c) == (True, "")
+    assert healthy_linux_tok.is_file()
+    assert healthy_linux_tok.read_bytes() == orig_linux_bytes
+    assert agy_cli.inspect_agy_cli_offline(env_c)["auth_configured"] is True
+
 
 def test_generalized_third_party_http_url_errors_are_excluded():
     for third_party_err in (
@@ -912,6 +927,8 @@ def test_generalized_third_party_http_url_errors_are_excluded():
         "POST https://api.stripe.com/v1/charges failed: HTTP 401 authentication failed",
         "GET https://evilgoogle.com/v1/token returned HTTP 401 Unauthorized",
         "HTTP 403 Forbidden from https://nexus.internal.example:8443/repository/pypi",
+        "GET http://[::1]:8080/api/secret returned HTTP 401 Unauthorized",
+        "POST https://[2001:db8::1]/v1/items failed: HTTP 403 Forbidden",
     ):
         assert agy_cli.is_agy_auth_error(third_party_err) is False, third_party_err
         assert agy_cli.is_agy_oauth_credential_rejected(third_party_err) is False, third_party_err
@@ -924,29 +941,35 @@ def test_remediations_and_host_docs_include_host_neutral_terminal_signin(tmp_pat
     cfg_dir = tmp_path / "cfg"
     fake_agy = _make_fake_agy(tmp_path / "bin" / "agy", mode="ok")
 
-    # Missing token remediation keeps Claude Code command and adds host-neutral terminal script.
+    # 1. Without an installed XDG pointer, fallback resolves dynamically to this repo's scripts/agy_signin.sh.
     env = _env(tmp_path, cfg_dir, fake_agy, CC_AGY_TOKEN_IN_KEYCHAIN="0")
+    repo_signin = str(REPO_ROOT / "scripts" / "agy_signin.sh")
     s_missing = agy_cli.inspect_agy_cli_offline(env)
     assert "Run `/cc-agy-plugin:login` in Claude Code" in (s_missing["remediation"] or "")
-    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in (s_missing["remediation"] or "")
+    assert f"bash {repo_signin}" in (s_missing["remediation"] or "")
 
-    # Active failure marker remediation also includes host-neutral terminal fallback.
+    # 2. When XDG_DATA_HOME/cc-agy-plugin/current/scripts/agy_signin.sh exists, prefer that path.
+    xdg_data = tmp_path / "custom-xdg"
+    xdg_signin = xdg_data / "cc-agy-plugin" / "current" / "scripts" / "agy_signin.sh"
+    xdg_signin.parent.mkdir(parents=True)
+    xdg_signin.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    env_xdg = {**env, "XDG_DATA_HOME": str(xdg_data)}
+
     _write_valid_token(cfg_dir)
     agy_cli.record_auth_failure_marker(cfg_dir)
-    s_marker = agy_cli.inspect_agy_cli_offline(env)
+    s_marker = agy_cli.inspect_agy_cli_offline(env_xdg)
     assert "Run `/cc-agy-plugin:login` in Claude Code" in (s_marker["remediation"] or "")
-    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in (s_marker["remediation"] or "")
+    assert f"bash {xdg_signin}" in (s_marker["remediation"] or "")
 
-    # _format_auth_remediation also includes host-neutral terminal fallback.
-    formatted = agy_cli._format_auth_remediation("HTTP 401 from cloudcode-pa.googleapis.com", str(fake_agy), env=env)
+    formatted = agy_cli._format_auth_remediation("HTTP 401 from cloudcode-pa.googleapis.com", str(fake_agy), env=env_xdg)
     assert "Run `/cc-agy-plugin:login` in Claude Code" in formatted
-    assert "bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh" in formatted
+    assert f"bash {xdg_signin}" in formatted
 
-    # Cursor rule and Codex skill point to host-neutral sign-in helpers without em-dashes.
+    # Cursor rule and Codex skill point to XDG-aware host-neutral sign-in helpers without em-dashes.
     for rel in ("cursor/rules/cc-agy-coexistence.mdc", "plugins/cc-agy-plugin/skills/vertex/SKILL.md"):
         doc_text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-        assert "agy_signin.sh" in doc_text, rel
-        assert "agy_login.py --start --json" in doc_text, rel
+        assert "${XDG_DATA_HOME:-$HOME/.local/share}/cc-agy-plugin/current/scripts/agy_signin.sh" in doc_text, rel
+        assert "agy_login.py" in doc_text and "--start --json" in doc_text, rel
         assert "\u2014" not in doc_text, rel
 
 

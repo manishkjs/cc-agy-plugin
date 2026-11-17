@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 from typing import Any
@@ -634,9 +635,13 @@ def run_doctor(
         except Exception:
             pass
         if not cli_detected_unsigned:
+            resolved_root = Path(__file__).resolve().parent.parent
             remediations.append(
-                "Run `python3 -m server.install --auth gemini-enterprise` and sign in with `agy` "
-                "(Gemini Enterprise seat), export `GEMINI_API_KEY` (AI Studio), or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
+                "Run `/cc-agy-plugin:setup` in Claude Code "
+                f"(or `sh {shlex.quote(str(resolved_root / 'scripts' / 'py.sh'))} "
+                f"{shlex.quote(str(resolved_root / 'server' / 'install.py'))} --auth gemini-enterprise` "
+                "in a terminal) for Gemini Enterprise seat quota, export `GEMINI_API_KEY` (AI Studio), "
+                "or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
             )
         auth_info = {
             "ok": False,

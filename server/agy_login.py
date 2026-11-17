@@ -753,7 +753,7 @@ def try_acp_business_browser_login(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.4"}},
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.5"}},
                 }
             )
             + "\n"
@@ -807,9 +807,15 @@ def try_acp_business_browser_login(
                     _mark_enterprise_onboarding_complete(config_dir, env=env)
                     return True, ""
                 return False, describe_onboarding_problem(onboarding)
-            # Token went to the OS keychain, not the file: drop any stale pre-existing token file
-            # (e.g. from an earlier SSH session) so it cannot shadow the new keychain sign-in.
-            if token_file.exists():
+            # Token went to the OS keychain (or agy reused a healthy Linux desktop file token):
+            # unlink a pre-existing token file only on keychain-only OSes (macOS/Windows, where
+            # agy always saves to the OS keychain and an old SSH file would shadow it) or when
+            # the existing file is broken or invalidated by cc-agy-auth-failed.
+            if token_file.exists() and (
+                _keychain_without_fallback(env)
+                or stored_token_problem(token_file) is not None
+                or _is_auth_failure_marker_active(config_dir, (token_file,))
+            ):
                 token_file.unlink(missing_ok=True)
             _mark_enterprise_onboarding_complete(config_dir, env=env)
             return True, ""

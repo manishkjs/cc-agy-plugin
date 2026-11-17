@@ -2261,8 +2261,9 @@ def resolve_auth_config(
     raise ValueError(
         "Missing credentials. Provide a Google AI Studio Gemini API key "
         "(userConfig.gemini_api_key or GEMINI_API_KEY), a Google Cloud project ID "
-        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT), or sign in with the "
-        "Antigravity CLI (`agy`) for Gemini Enterprise seat quota (CC_AGY_AUTH_MODE=gemini_enterprise)."
+        "(userConfig.google_cloud_project or GOOGLE_CLOUD_PROJECT), or run "
+        "/cc-agy-plugin:setup (or /cc-agy-plugin:login if the Antigravity CLI `agy` is installed) "
+        "for Gemini Enterprise seat quota (CC_AGY_AUTH_MODE=gemini_enterprise)."
     )
 
 

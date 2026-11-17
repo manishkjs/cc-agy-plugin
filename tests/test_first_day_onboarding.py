@@ -904,3 +904,34 @@ def test_first_time_lookup_failure_keeps_unverified_token_for_one_step_retry(
     assert healed["healed"] is True
     assert healed["project_id"] == "proj-alpha"
     assert agy_cli._inspect_auth_files(cfg_dir, env)[0] is True
+
+
+def test_bare_auto_mode_missing_credentials_and_doctor_remediation_work_from_any_cwd(tmp_path: Path):
+    from server import doctor, receipts
+    from server.regions import resolve_auth_config
+
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    clean_env = {"HOME": str(empty_home), "PATH": "/usr/bin:/bin"}
+
+    with pytest.raises(ValueError) as exc_info:
+        resolve_auth_config(env=clean_env)
+    err = str(exc_info.value)
+    assert "Missing credentials. Provide a Google AI Studio Gemini API key" in err
+    assert "/cc-agy-plugin:setup" in err
+    assert "/cc-agy-plugin:login" in err
+
+    repo = tmp_path / "user-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    report = doctor.run_doctor(
+        workspace_root=repo,
+        env=clean_env,
+        store=receipts.ReceiptStore(tmp_path / "st", workspace_root=repo),
+    )
+    assert any(
+        "/cc-agy-plugin:setup" in rem
+        and f"{REPO_ROOT / 'scripts' / 'py.sh'}" in rem
+        and f"{REPO_ROOT / 'server' / 'install.py'} --auth gemini-enterprise" in rem
+        for rem in report["remediations"]
+    ), report["remediations"]

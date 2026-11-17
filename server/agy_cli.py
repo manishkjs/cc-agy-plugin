@@ -21,6 +21,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -183,10 +184,11 @@ _THIRD_PARTY_AUTH_HOST_RE = re.compile(
     re.IGNORECASE,
 )
 
-_EXPLICIT_HTTP_URL_HOST_RE = re.compile(r"https?://(?:[^/\s@]+@)?([a-z0-9.-]+)", re.IGNORECASE)
+_EXPLICIT_HTTP_URL_HOST_RE = re.compile(
+    r"https?://(?:[^/\s@]+@)?(\[[0-9a-f:]+\]|[a-z0-9._-]+)",
+    re.IGNORECASE,
+)
 _GOOGLE_URL_HOST_SUFFIXES = ("google.com", "googleapis.com", "googleusercontent.com", "gstatic.com")
-
-_TERMINAL_SIGNIN_FALLBACK = "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh` in a terminal)"
 
 _GOOGLE_AUTH_HOST_OR_EXPLICIT_RE = re.compile(
     r"\b(?:googleapis\.com|cloudcode|antigravity|sign in with google|incomplete gcp onboarding)\b",
@@ -287,6 +289,24 @@ def _home_dir(env: Mapping[str, str]) -> Path:
     if explicit_home:
         return Path(explicit_home).expanduser()
     return Path.home()
+
+
+def _resolve_agy_signin_script(env: Mapping[str, str] | None = None) -> Path:
+    """Return a runnable path to `scripts/agy_signin.sh`, honoring `XDG_DATA_HOME`."""
+    source = env if env is not None else os.environ
+    xdg_data = _clean_env_str(source, "XDG_DATA_HOME")
+    data_home = Path(xdg_data).expanduser() if xdg_data else (_home_dir(source) / ".local" / "share")
+    installed_script = data_home / "cc-agy-plugin" / "current" / "scripts" / "agy_signin.sh"
+    if installed_script.is_file():
+        return installed_script
+    return DEFAULT_PLUGIN_ROOT / "scripts" / "agy_signin.sh"
+
+
+def _terminal_signin_fallback(env: Mapping[str, str] | None = None, *, force: bool = False) -> str:
+    """Return host-neutral terminal sign-in guidance pointing at the resolved `agy_signin.sh`."""
+    script_path = _resolve_agy_signin_script(env)
+    flag = " --force" if force else ""
+    return f"(or run `bash {shlex.quote(str(script_path))}{flag}` in a terminal)"
 
 
 def managed_agy_bin_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -1188,10 +1208,11 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             )
         else:
             error = "External Antigravity CLI (`agy`) is not installed yet."
+        terminal_signin = _terminal_signin_fallback(source)
         remediation = (
             "Run the one-line quickstart again (it installs `agy`), or "
             f"`python3 -m server.install --auth gemini-enterprise` to install `agy` to `{managed_bin}`. "
-            f"Then run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in."
+            f"Then run `/cc-agy-plugin:login` in Claude Code {terminal_signin} to sign in."
         )
     elif version_mismatch:
         error = (
@@ -1203,23 +1224,24 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             "or update `CC_AGY_CLI_VERSION`."
         )
     elif not auth_ok:
+        terminal_signin = _terminal_signin_fallback(source)
         if token_gap:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
             remediation = (
-                f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK}. "
+                f"Run `/cc-agy-plugin:login` in Claude Code {terminal_signin}. "
                 "It looks up your Gemini Enterprise license with "
                 "the saved token and repairs it; if the token has expired it prints a fresh sign-in link instead."
             )
         elif token_problem:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_problem}."
-            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in again."
+            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {terminal_signin} to sign in again."
         elif auth_failure_marker_active:
             error = f"Antigravity CLI at `{agy_bin}` rejected the saved sign-in on its last call."
-            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} to sign in again."
+            remediation = f"Run `/cc-agy-plugin:login` in Claude Code {terminal_signin} to sign in again."
         else:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
             remediation = (
-                f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK} "
+                f"Run `/cc-agy-plugin:login` in Claude Code {terminal_signin} "
                 "to get a Gemini Enterprise sign-in link, or set `ANTIGRAVITY_OAUTH_TOKEN`."
             )
         if seat["requested"] and seat["error"]:
@@ -1230,8 +1252,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'consumer'}) rather than a licensed Gemini Enterprise seat."
         )
         remediation = (
-            "Run `/cc-agy-plugin:login --force` in Claude Code "
-            "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh --force` in a terminal) "
+            f"Run `/cc-agy-plugin:login --force` in Claude Code {_terminal_signin_fallback(source, force=True)} "
             "and sign in with your licensed Gemini Enterprise work account (not a personal Gmail account)."
         )
     elif unverified_tier_blocked:
@@ -1240,8 +1261,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             f"(tier={tier_id or 'unknown'}) while CC_AGY_REQUIRE_GE_TIER=1 is set."
         )
         remediation = (
-            "Run `/cc-agy-plugin:login --force` in Claude Code "
-            "(or run `bash ~/.local/share/cc-agy-plugin/current/scripts/agy_signin.sh --force` in a terminal) "
+            f"Run `/cc-agy-plugin:login --force` in Claude Code {_terminal_signin_fallback(source, force=True)} "
             "so the plugin records your license tier, or unset `CC_AGY_REQUIRE_GE_TIER`."
         )
     elif seat_failure:
@@ -2323,7 +2343,7 @@ def _format_auth_remediation(raw_err: str, agy_bin: str, env: Mapping[str, str] 
     cfg_dir = agy_cli_config_dir(env)
     return (
         f"Gemini Enterprise `agy` CLI authentication failed: {raw_err.strip()}. "
-        f"Run `/cc-agy-plugin:login` in Claude Code {_TERMINAL_SIGNIN_FALLBACK}: "
+        f"Run `/cc-agy-plugin:login` in Claude Code {_terminal_signin_fallback(env)}: "
         "it repairs a saved token that agy rejects, or prints "
         "a one-click sign-in link (use `/cc-agy-plugin:login --force` or `agy_signin.sh --force` "
         "to always start a fresh sign-in). "
