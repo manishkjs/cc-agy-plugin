@@ -1117,7 +1117,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.3.5",
+        "version": "0.3.6",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."

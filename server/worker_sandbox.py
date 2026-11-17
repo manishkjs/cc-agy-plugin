@@ -13,7 +13,10 @@ only an instruction. This module makes the operating system enforce it instead:
 - macOS uses `sandbox-exec` with a Seatbelt profile that denies writes outside the same
   places (while protecting `agy`'s persistent settings/plugins/MCP subpaths) and denies
   reads of the same credential stores and plugin data/worktree directories (except
-  `~/Library/Keychains`, which stays readable and writable for `agy`'s keyring OAuth token).
+  `~/Library/Keychains`, which stays readable and writable for `agy`'s keyring OAuth token,
+  and `~/.gemini/config/projects`, which stays readable and writable for `agy` project
+  descriptors while `~/.gemini/config` settings/plugins/MCP and `outside-of-project.json`
+  stay protected).
 
 `agy` must reach Google over the network, and neither tool can filter by host, so the
 network stays on. Remote git access is blocked by masking `git-remote-http(s)` and `ssh`
@@ -31,6 +34,7 @@ binaries inside `bwrap` and by `git_guard_environment` as defense in depth.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import contextlib
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -93,6 +97,12 @@ _HIDDEN_HOME_DIRS = (
 # (`~/Library/Keychains` via `/usr/bin/security`), so Seatbelt must keep it
 # readable and writable. Kept in `_HIDDEN_HOME_DIRS` for Linux `bwrap`.
 _SEATBELT_KEYCHAIN_DIRS = ("Library/Keychains",)
+# On macOS Seatbelt, `~/.gemini/config` stays denied so personal plugins/MCP/settings
+# cannot leak into workers, while `agy` still needs `stat` on the parent dirs and
+# read+write on `~/.gemini/config/projects` (except `outside-of-project.json` writes).
+_SEATBELT_PROJECT_PARENT_DIRS = (".gemini", ".gemini/config")
+_SEATBELT_PROJECTS_DIR = ".gemini/config/projects"
+_SEATBELT_READONLY_PROJECT_FILES = ("outside-of-project.json",)
 _HIDDEN_HOME_FILES = (
     ".netrc",
     ".git-credentials",
@@ -740,12 +750,21 @@ def build_seatbelt_profile(
 
     hidden_dirs: list[Path] = list(_foreign_brain_dirs(config_dir, conversation_id))
     keychain_dirs: list[Path] = []
+    project_parent_dirs: list[Path] = []
+    project_dirs: list[Path] = []
     for base in (home, resolved_home):
         hidden_dirs.append(base / ".cache")
         hidden_dirs.append(base / "Library" / "Caches")
         for rel in _SEATBELT_KEYCHAIN_DIRS:
             keychain_dirs.append(base / rel)
             keychain_dirs.extend(_resolve_existing_dir(base, rel))
+        for rel in _SEATBELT_PROJECT_PARENT_DIRS:
+            project_parent_dirs.append(base / rel)
+            project_parent_dirs.extend(_resolve_existing_dir(base, rel))
+        project_dirs.append(base / _SEATBELT_PROJECTS_DIR)
+        for resolved_cfg in _resolve_existing_dir(base, ".gemini/config"):
+            project_dirs.append(resolved_cfg / "projects")
+        project_dirs.extend(_resolve_existing_dir(base, _SEATBELT_PROJECTS_DIR))
         for rel in _HIDDEN_HOME_DIRS:
             if rel in _SEATBELT_KEYCHAIN_DIRS:
                 continue
@@ -774,6 +793,8 @@ def build_seatbelt_profile(
     dedup_dirs = list(dict.fromkeys(hidden_dirs))
     dedup_files = list(dict.fromkeys(hidden_files))
     dedup_keychain_dirs = list(dict.fromkeys(keychain_dirs))
+    dedup_project_parent_dirs = list(dict.fromkeys(project_parent_dirs))
+    dedup_project_dirs = list(dict.fromkeys(project_dirs))
     lines.append(
         "(deny file-read* file-write* "
         + " ".join(f"(subpath {_sbpl_string(p)})" for p in dedup_dirs)
@@ -787,6 +808,33 @@ def build_seatbelt_profile(
         lines.append(
             "(allow file-read* file-write* "
             + " ".join(f"(subpath {_sbpl_string(p)})" for p in dedup_keychain_dirs)
+            + ")"
+        )
+    if dedup_project_parent_dirs:
+        # Allow metadata-only `stat` on `~/.gemini` and `~/.gemini/config` so Go's
+        # `os.MkdirAll("~/.gemini/config/projects")` succeeds without exposing siblings.
+        lines.append(
+            "(allow file-read-metadata "
+            + " ".join(f"(literal {_sbpl_string(p)})" for p in dedup_project_parent_dirs)
+            + ")"
+        )
+    if dedup_project_dirs:
+        # Allow read+write on `~/.gemini/config/projects` for `default-cli-project.json`
+        # and `--new-project` descriptors, while keeping `outside-of-project.json` read-only.
+        lines.append(
+            "(allow file-read* file-write* "
+            + " ".join(f"(subpath {_sbpl_string(p)})" for p in dedup_project_dirs)
+            + ")"
+        )
+        readonly_project_files: list[Path] = []
+        for proj_dir in dedup_project_dirs:
+            for filename in _SEATBELT_READONLY_PROJECT_FILES:
+                readonly_project_files.append(proj_dir / filename)
+                readonly_project_files.extend(_resolve_existing_file(proj_dir, filename))
+        dedup_readonly_project_files = list(dict.fromkeys(readonly_project_files))
+        lines.append(
+            "(deny file-write* "
+            + " ".join(f"(literal {_sbpl_string(p)})" for p in dedup_readonly_project_files)
             + ")"
         )
     reopen = [workspace]
@@ -873,6 +921,9 @@ def plan_worker_sandbox(
             conversation_id=conversation_id,
         )
     else:
+        if home.is_dir():
+            with contextlib.suppress(OSError):
+                (home / ".gemini" / "config" / "projects").mkdir(parents=True, exist_ok=True)
         profile = build_seatbelt_profile(
             workspace=workspace,
             config_dir=config,

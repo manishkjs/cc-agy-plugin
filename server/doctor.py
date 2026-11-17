@@ -639,7 +639,7 @@ def run_doctor(
             remediations.append(
                 "Run `/cc-agy-plugin:setup` in Claude Code "
                 f"(or `sh {shlex.quote(str(resolved_root / 'scripts' / 'py.sh'))} "
-                f"{shlex.quote(str(resolved_root / 'server' / 'install.py'))} --auth gemini-enterprise` "
+                f"{shlex.quote(str(resolved_root / 'server' / 'install.py'))} --host claude --auth gemini-enterprise` "
                 "in a terminal) for Gemini Enterprise seat quota, export `GEMINI_API_KEY` (AI Studio), "
                 "or export `GOOGLE_CLOUD_PROJECT` (Vertex AI)."
             )

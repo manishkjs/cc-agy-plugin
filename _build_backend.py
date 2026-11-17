@@ -16,7 +16,7 @@ import zipfile
 _REPO_ROOT = Path(__file__).resolve().parent
 _DIST_NAME = "cc_agy_plugin"
 _PROJECT_NAME = "cc-agy-plugin"
-_VERSION = "0.3.5"
+_VERSION = "0.3.6"
 _DIST_INFO = f"{_DIST_NAME}-{_VERSION}.dist-info"
 
 _BUNDLED_ASSET_DIRS: tuple[str, ...] = (

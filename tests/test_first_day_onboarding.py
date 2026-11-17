@@ -932,6 +932,6 @@ def test_bare_auto_mode_missing_credentials_and_doctor_remediation_work_from_any
     assert any(
         "/cc-agy-plugin:setup" in rem
         and f"{REPO_ROOT / 'scripts' / 'py.sh'}" in rem
-        and f"{REPO_ROOT / 'server' / 'install.py'} --auth gemini-enterprise" in rem
+        and f"{REPO_ROOT / 'server' / 'install.py'} --host claude --auth gemini-enterprise" in rem
         for rem in report["remediations"]
     ), report["remediations"]
