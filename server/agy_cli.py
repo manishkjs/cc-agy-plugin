@@ -659,8 +659,25 @@ def enterprise_seat_failure(env: Mapping[str, str] | None = None) -> str | None:
     )
 
 
+def _auto_heal_enterprise_token(env: Mapping[str, str] | None = None) -> None:
+    """Repair a saved GCP token that agy would reject, before spawning agy (no-op when complete)."""
+    source = env if env is not None else os.environ
+    token_file = agy_cli_config_dir(source) / "antigravity-oauth-token"
+    if stored_token_onboarding_gap(token_file) is None:
+        return
+    try:
+        from server.agy_login import heal_enterprise_token  # Lazy: agy_login imports this module.
+
+        heal_enterprise_token(source)
+    except Exception:  # Never block a call on the repair attempt; agy reports auth errors itself.
+        pass
+
+
 def ensure_enterprise_seat_ready(env: Mapping[str, str] | None = None) -> None:
     """Stop at 0 tokens when ADC seat mode was requested but is invalid, instead of falling back.
+
+    Also repairs a saved Gemini Enterprise token that is missing its license tier and project,
+    which agy would otherwise reject as "incomplete GCP onboarding".
 
     Raises:
         EnterpriseSeatError: With the reason and how to fix it.
@@ -668,6 +685,29 @@ def ensure_enterprise_seat_ready(env: Mapping[str, str] | None = None) -> None:
     failure = enterprise_seat_failure(env)
     if failure:
         raise EnterpriseSeatError(failure)
+    _auto_heal_enterprise_token(env)
+
+
+def stored_token_onboarding_gap(token_file: Path) -> str | None:
+    """Return why `agy` would reject a saved token, or None when it would accept it.
+
+    Mirrors `keyringAuth.TryAuth` in agy (`cli/backend/auth/keyring.go`): a token saved with
+    `auth_method == "gcp"` whose `user_tier` AND `project_id` are both empty is treated as
+    "incomplete GCP onboarding" and agy signs the user out. Non-JSON (legacy) tokens and
+    personal tokens are not affected.
+    """
+    try:
+        stored = json.loads(token_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(stored, dict) or stored.get("auth_method") != "gcp":
+        return None
+    if str(stored.get("user_tier") or "").strip() or str(stored.get("project_id") or "").strip():
+        return None
+    return (
+        "the saved Gemini Enterprise token has no license tier or project "
+        "(agy rejects it as 'incomplete GCP onboarding')"
+    )
 
 
 def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bool, str | None]:
@@ -676,22 +716,32 @@ def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bo
         return True, "env:ANTIGRAVITY_OAUTH_TOKEN"
 
     token_file = config_dir / "antigravity-oauth-token"
+    token_file_present = False
     try:
         if token_file.is_file() and token_file.stat().st_size > 10:
             raw_head = token_file.read_bytes()[:256].strip()
             if raw_head:
-                return True, f"token_file:{token_file}"
+                token_file_present = True
+                if stored_token_onboarding_gap(token_file) is None:
+                    return True, f"token_file:{token_file}"
     except OSError:
         pass
-
-    onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
-    if onboarding_ok:
-        onboarding_file = config_dir / "cache" / "onboarding.json"
-        return True, f"onboarding_cache:{onboarding_file}"
 
     seat = resolve_enterprise_adc_seat(source)
     if seat["active"]:
         return True, f"enterprise_adc:{seat['adc_path']}"
+
+    # A token file that agy would reject must not be rescued by the onboarding cache:
+    # agy reads the token file first, so the cache says nothing about a usable sign-in.
+    if token_file_present:
+        return False, None
+
+    # No token file: the token may live in the OS keychain (macOS), and the onboarding
+    # cache is the only offline signal that sign-in finished.
+    onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
+    if onboarding_ok:
+        onboarding_file = config_dir / "cache" / "onboarding.json"
+        return True, f"onboarding_cache:{onboarding_file}"
 
     return False, None
 
@@ -776,11 +826,20 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             "or update `CC_AGY_CLI_VERSION`."
         )
     elif not auth_ok:
-        error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
-        remediation = (
-            "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login`) to get a clickable "
-            "Gemini Enterprise Google OAuth sign-in URL and complete sign-in in one step, or set `ANTIGRAVITY_OAUTH_TOKEN`."
-        )
+        token_gap = stored_token_onboarding_gap(cfg_dir / "antigravity-oauth-token")
+        if token_gap:
+            error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
+            remediation = (
+                "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login --heal`). "
+                "It looks up your Gemini Enterprise license with the saved token and repairs it; if the "
+                "token has expired it prints a fresh sign-in link instead."
+            )
+        else:
+            error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
+            remediation = (
+                "Run `/cc-agy-plugin:login` in Claude Code (or `python3 -m server.agy_login`) to get a clickable "
+                "Gemini Enterprise Google OAuth sign-in URL and complete sign-in in one step, or set `ANTIGRAVITY_OAUTH_TOKEN`."
+            )
         if seat["requested"] and seat["error"]:
             error = f"{error} {seat['error']}"
     elif consumer_blocked:
@@ -1838,8 +1897,10 @@ def _format_auth_remediation(raw_err: str, agy_bin: str, env: Mapping[str, str] 
     cfg_dir = agy_cli_config_dir(env)
     return (
         f"Gemini Enterprise `agy` CLI authentication failed: {raw_err.strip()}. "
-        f"Run `{agy_bin}` once in a terminal to complete Google sign-in (credentials stored in `{cfg_dir}`), "
-        "or set `ANTIGRAVITY_OAUTH_TOKEN`."
+        "Run `/cc-agy-plugin:login` in Claude Code: it repairs a saved token that agy rejects, or prints "
+        "a one-click sign-in link (use `/cc-agy-plugin:login --force` to always start a fresh sign-in). "
+        f"Credentials are stored in `{cfg_dir}`. Do not use `{agy_bin} -p` to sign in: print mode gives "
+        "up after 60 seconds on a headless machine."
     )
 
 

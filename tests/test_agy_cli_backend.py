@@ -299,7 +299,8 @@ class TestBinaryDiscoveryAndOfflineReadiness:
         assert s_missing["ok"] is False
         assert s_missing["binary_found"] is True
         assert s_missing["auth_configured"] is False
-        assert str(ext_bin) in s_missing["remediation"]
+        assert "/cc-agy-plugin:login" in s_missing["remediation"]
+        assert str(cfg_dir) in s_missing["error"]
 
         # 2. Onboarding cache
         (cfg_dir / "cache").mkdir(parents=True)
@@ -2381,6 +2382,10 @@ class TestUserControlGuarantees:
             "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir),
             "CC_AGY_AUTH_MODE": "gemini_enterprise",
             "CC_AGY_WORKER_SANDBOX": "off",
+            # No network lookup in tests, so the license comes from the configured project/tier.
+            "CC_AGY_LICENSE_LOOKUP": "0",
+            "CC_AGY_ENTERPRISE_PROJECT": "acme-ge-seats",
+            "CC_AGY_ENTERPRISE_USER_TIER": "gcp-ge-plus-tier",
         }
         login_env.pop("PYTEST_CURRENT_TEST", None)
 
@@ -2394,9 +2399,13 @@ class TestUserControlGuarantees:
         )
         assert completed["ok"] is True, completed
         assert completed["email"] == "alice@corp.example.com"
-        assert completed["tier_id"] == "gcp-enterprise"
+        assert completed["tier_id"] == "gcp-ge-plus-tier"
+        assert completed["project_id"] == "acme-ge-seats"
         assert (cfg_dir / "antigravity-oauth-token").is_file()
         assert not (fake_home / ".gemini" / "jetski-standalone-oauth-token").exists()
+        saved = json.loads((cfg_dir / "antigravity-oauth-token").read_text(encoding="utf-8"))
+        assert saved["user_tier"] == "gcp-ge-plus-tier"
+        assert saved["project_id"] == "acme-ge-seats"
 
         repo = tmp_path / "repo"
         _init_git_repo(repo)
@@ -2405,7 +2414,7 @@ class TestUserControlGuarantees:
         assert doc["healthy"] is True
         assert doc["auth"]["agy_cli"]["auth_configured"] is True
         assert doc["auth"]["agy_cli"]["tier_verified_enterprise"] is True
-        assert doc["auth"]["agy_cli"]["tier_id"] == "gcp-enterprise"
+        assert doc["auth"]["agy_cli"]["tier_id"] == "gcp-ge-plus-tier"
 
 
 

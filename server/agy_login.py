@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -47,6 +48,251 @@ _OAUTH_URL_RE = re.compile(r"(https://accounts\.google\.com/\S+)")
 _EMAIL_RE = re.compile(r"Successfully authenticated as\s+(\S+?)\.?\s*$", re.MULTILINE)
 _DEFAULT_HOLD_TIMEOUT_SECONDS = 600
 _URL_CAPTURE_TIMEOUT_SECONDS = 15.0
+BAIC_FETCH_LICENSES_URL = "https://businessaicode.googleapis.com/v1beta:fetchLicenses"
+
+
+def _baic_host_for_location(location: str) -> str:
+    loc = (location or "global").strip().lower()
+    if not loc or loc == "global":
+        return "businessaicode.googleapis.com"
+    return f"{loc}-businessaicode.googleapis.com"
+
+
+def fetch_enterprise_licenses(
+    access_token: str,
+    *,
+    timeout_seconds: float = 8.0,
+) -> list[dict[str, str]]:
+    """Query `GET https://businessaicode.googleapis.com/v1beta:fetchLicenses` with `access_token`."""
+    tok = (access_token or "").strip()
+    if not tok:
+        return []
+    req = urllib.request.Request(
+        BAIC_FETCH_LICENSES_URL,
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/json",
+            "User-Agent": "cc-agy-plugin/0.3",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    raw_items = payload.get("licenses") if isinstance(payload, Mapping) else None
+    if not isinstance(raw_items, list):
+        return []
+    licenses: list[dict[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, Mapping):
+            continue
+        user_tier = str(item.get("userTier") or "").strip()
+        project_id = str(item.get("projectId") or "").strip()
+        if not user_tier and not project_id:
+            continue
+        licenses.append(
+            {
+                "user_tier": user_tier,
+                "tier_display_name": str(item.get("tierDisplayName") or user_tier).strip(),
+                "project_id": project_id,
+                "region": str(item.get("location") or "global").strip() or "global",
+            }
+        )
+    return licenses
+
+
+def self_assign_enterprise_license(
+    access_token: str,
+    project_id: str,
+    location: str = "global",
+    *,
+    timeout_seconds: float = 8.0,
+) -> dict[str, str] | None:
+    """Attempt `POST /v1beta/projects/{project}/locations/{loc}:selfAssignLicense` on BAIC."""
+    tok = (access_token or "").strip()
+    proj = (project_id or "").strip()
+    loc = (location or "global").strip().lower() or "global"
+    if not tok or not proj or "-" in loc:
+        return None
+    host = _baic_host_for_location(loc)
+    url = f"https://{host}/v1beta/projects/{proj}/locations/{loc}:selfAssignLicense"
+    body = json.dumps({"parent": f"projects/{proj}/locations/{loc}"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "cc-agy-plugin/0.3",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    lic = payload.get("license") if isinstance(payload, Mapping) else None
+    if not isinstance(lic, Mapping):
+        return None
+    user_tier = str(lic.get("userTier") or "").strip()
+    if not user_tier:
+        return None
+    return {
+        "user_tier": user_tier,
+        "tier_display_name": str(lic.get("tierDisplayName") or user_tier).strip(),
+        "project_id": str(lic.get("projectId") or proj).strip(),
+        "region": str(lic.get("location") or loc).strip() or "global",
+    }
+
+
+def _configured_enterprise_project_and_location(
+    config_dir: Path,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, str, str]:
+    """Return `(project, location, user_tier)` from env vars or `<config_dir>/settings.json`."""
+    source = os.environ if env is None else env
+    project = ""
+    # Only explicit plugin settings. Ambient variables such as GOOGLE_CLOUD_PROJECT or
+    # ANTIGRAVITY_PROJECT_ID often name an unrelated project (or an Antigravity workspace ID),
+    # and matching against them would pick the wrong license.
+    for key in (
+        "CC_AGY_ENTERPRISE_PROJECT",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_PROJECT",
+        "CC_AGY_USERCFG_ENTERPRISE_PROJECT",
+    ):
+        val = (source.get(key) or "").strip()
+        if val:
+            project = val
+            break
+    location = ""
+    for key in (
+        "CC_AGY_ENTERPRISE_LOCATION",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_LOCATION",
+        "CC_AGY_USERCFG_ENTERPRISE_LOCATION",
+    ):
+        val = (source.get(key) or "").strip()
+        if val:
+            location = val
+            break
+    user_tier = ""
+    for key in (
+        "CC_AGY_ENTERPRISE_USER_TIER",
+        "CLAUDE_PLUGIN_OPTION_ENTERPRISE_USER_TIER",
+        "CC_AGY_USERCFG_ENTERPRISE_USER_TIER",
+        "BAICODE_USER_TIER",
+    ):
+        val = (source.get(key) or "").strip()
+        if val:
+            user_tier = val
+            break
+
+    settings_file = config_dir / "settings.json"
+    if settings_file.is_file():
+        try:
+            settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
+            gcp_cfg = settings_data.get("gcp") if isinstance(settings_data, Mapping) else None
+            if isinstance(gcp_cfg, Mapping):
+                if not project:
+                    project = str(gcp_cfg.get("project") or "").strip()
+                if not location:
+                    location = str(gcp_cfg.get("location") or "").strip()
+        except (OSError, ValueError):
+            pass
+    return project, location, user_tier
+
+
+def resolve_enterprise_license_for_token(
+    stored_token: Mapping[str, Any],
+    *,
+    config_dir: Path,
+    env: Mapping[str, str] | None = None,
+    timeout_seconds: float = 8.0,
+) -> dict[str, str]:
+    """Resolve `user_tier`, `tier_display_name`, `project_id`, and `region` for a GCP OAuth token.
+
+    Matches `Manager.resolveEnterpriseLicense` in `agy` (`acpauth/manager.go`):
+    1. Queries `GET https://businessaicode.googleapis.com/v1beta:fetchLicenses` with the bearer token.
+    2. Selects the license matching any configured project/location (or calls `selfAssignLicense` when
+       a project is configured and not yet assigned, or picks `licenses[0]`).
+    """
+    existing_tier = str(stored_token.get("user_tier") or "").strip()
+    existing_display = str(stored_token.get("tier_display_name") or existing_tier).strip()
+    existing_proj = str(stored_token.get("project_id") or "").strip()
+    existing_region = str(stored_token.get("region") or "").strip()
+    if existing_tier and existing_proj:
+        return {
+            "user_tier": existing_tier,
+            "tier_display_name": existing_display or existing_tier,
+            "project_id": existing_proj,
+            "region": existing_region or "global",
+        }
+
+    cfg_proj, cfg_loc, cfg_tier = _configured_enterprise_project_and_location(config_dir, env)
+    want_proj = existing_proj or cfg_proj
+    want_loc = existing_region or cfg_loc
+
+    tok_obj = stored_token.get("token")
+    access_token = str(tok_obj.get("access_token") or "").strip() if isinstance(tok_obj, Mapping) else ""
+    source = os.environ if env is None else env
+    lookup_disabled = (source.get("CC_AGY_LICENSE_LOOKUP") or "").strip().lower() in ("0", "false", "off", "no")
+    allow_network = not lookup_disabled and (
+        not bool(source.get("PYTEST_CURRENT_TEST"))
+        or (source.get("CC_AGY_ALLOW_TEST_LICENSE_FETCH") or "").strip() == "1"
+    )
+
+    chosen: dict[str, str] | None = None
+    if access_token and allow_network:
+        licenses = fetch_enterprise_licenses(access_token, timeout_seconds=timeout_seconds)
+        if want_proj and want_loc:
+            for lic in licenses:
+                if lic["project_id"] == want_proj and lic["region"] in (want_loc, "", "global"):
+                    chosen = lic
+                    break
+            if chosen is None:
+                chosen = self_assign_enterprise_license(
+                    access_token,
+                    want_proj,
+                    want_loc,
+                    timeout_seconds=timeout_seconds,
+                )
+        elif want_proj:
+            for lic in licenses:
+                if lic["project_id"] == want_proj:
+                    chosen = lic
+                    break
+            if chosen is None:
+                chosen = self_assign_enterprise_license(
+                    access_token,
+                    want_proj,
+                    want_loc or "global",
+                    timeout_seconds=timeout_seconds,
+                )
+        elif licenses:
+            chosen = licenses[0]
+
+    if chosen is not None and (chosen["user_tier"] or cfg_tier):
+        return {
+            "user_tier": chosen["user_tier"] or cfg_tier,
+            "tier_display_name": chosen["tier_display_name"] or chosen["user_tier"] or cfg_tier,
+            "project_id": chosen["project_id"] or want_proj,
+            "region": chosen["region"] or want_loc or "global",
+        }
+
+    # Fallback when the lookup found nothing: only if the user configured BOTH a tier and a
+    # project. A project without a tier would switch agy to pay-as-you-go Agent Platform
+    # billing (`ResolveAuthMode` -> `AuthModeBusinessAgentPlatformPayGo`), so never save one.
+    if cfg_tier and want_proj:
+        return {
+            "user_tier": cfg_tier,
+            "tier_display_name": cfg_tier,
+            "project_id": want_proj,
+            "region": want_loc or "global",
+        }
+    return {"user_tier": "", "tier_display_name": "", "project_id": "", "region": ""}
 
 
 def strip_ansi(text: str) -> str:
@@ -112,28 +358,68 @@ def finalize_enterprise_onboarding(
     home_dir: Path,
     *,
     had_standalone_token_before: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Sync standalone CDE token into `agy`'s CLI token file and record enterprise `onboarding.json`.
+    """Sync standalone CDE token into `agy`'s CLI token file, resolve BAIC license/project, and update `onboarding.json`.
 
     When `AGY_CLI_CDE_AUTH_ACTION=login` runs on a headless host without an OS keyring, it writes
-    `~/.gemini/jetski-standalone-oauth-token` whereas `agy` CLI reads `<config_dir>/antigravity-oauth-token`.
-    Both files use the identical `codeassistclient.StoredToken` JSON format.
+    `~/.gemini/jetski-standalone-oauth-token` with empty `user_tier` and `project_id`, whereas
+    `agy` CLI (`keyringAuth.TryAuth` in `keyring.go`) reads `<config_dir>/antigravity-oauth-token`
+    and requires at least one of `user_tier` or `project_id` to be non-empty for `auth_method="gcp"`.
     """
     standalone_token_file = home_dir / ".gemini" / "jetski-standalone-oauth-token"
     cli_token_file = config_dir / "antigravity-oauth-token"
+    bak_token_file = config_dir / "antigravity-oauth-token.bak"
     prev_auth_method = "gcp"
 
+    if not cli_token_file.is_file() and bak_token_file.is_file() and bak_token_file.stat().st_size > 10:
+        _atomic_write_private(cli_token_file, bak_token_file.read_bytes())
+        bak_token_file.unlink(missing_ok=True)
+
+    parsed_token: dict[str, Any] | None = None
     if standalone_token_file.is_file() and standalone_token_file.stat().st_size > 10:
         raw_bytes = standalone_token_file.read_bytes()
         try:
-            parsed = json.loads(raw_bytes.decode("utf-8"))
-            if isinstance(parsed, dict) and parsed.get("wif_provider"):
-                prev_auth_method = "wif"
+            loaded_tok = json.loads(raw_bytes.decode("utf-8"))
+            if isinstance(loaded_tok, dict):
+                parsed_token = loaded_tok
+                if parsed_token.get("wif_provider"):
+                    prev_auth_method = "wif"
         except (UnicodeDecodeError, ValueError):
-            pass
-        _atomic_write_private(cli_token_file, raw_bytes)
+            parsed_token = None
+        if parsed_token is None:
+            _atomic_write_private(cli_token_file, raw_bytes)
         if not had_standalone_token_before:
             standalone_token_file.unlink(missing_ok=True)
+    elif cli_token_file.is_file() and cli_token_file.stat().st_size > 10:
+        try:
+            loaded_tok = json.loads(cli_token_file.read_text(encoding="utf-8"))
+            if isinstance(loaded_tok, dict):
+                parsed_token = loaded_tok
+                if parsed_token.get("wif_provider"):
+                    prev_auth_method = "wif"
+        except (OSError, ValueError):
+            parsed_token = None
+
+    resolved_license = {"user_tier": "", "tier_display_name": "", "project_id": "", "region": ""}
+    if isinstance(parsed_token, dict):
+        resolved_license = resolve_enterprise_license_for_token(
+            parsed_token,
+            config_dir=config_dir,
+            env=env,
+        )
+        if resolved_license["user_tier"]:
+            parsed_token["user_tier"] = resolved_license["user_tier"]
+        if resolved_license["tier_display_name"]:
+            parsed_token["tier_display_name"] = resolved_license["tier_display_name"]
+        if resolved_license["project_id"]:
+            parsed_token["project_id"] = resolved_license["project_id"]
+        if resolved_license["region"]:
+            parsed_token["region"] = resolved_license["region"]
+        _atomic_write_private(
+            cli_token_file,
+            json.dumps(parsed_token).encode("utf-8"),
+        )
 
     onboarding_file = config_dir / "cache" / "onboarding.json"
     existing_onboarding: dict[str, Any] = {}
@@ -145,18 +431,66 @@ def finalize_enterprise_onboarding(
         except (OSError, ValueError):
             existing_onboarding = {}
 
-    updated_onboarding = {
+    effective_tier = (
+        resolved_license["user_tier"]
+        or str(existing_onboarding.get("tierId") or "").strip()
+    )
+    effective_display = (
+        resolved_license["tier_display_name"]
+        or str(existing_onboarding.get("tierName") or "").strip()
+    )
+    effective_proj = (
+        resolved_license["project_id"]
+        or str(existing_onboarding.get("cloudaicompanionProject") or "").strip()
+    )
+    effective_region = resolved_license["region"] or "global"
+
+    updated_onboarding: dict[str, Any] = {
         **existing_onboarding,
         "consumerOnboardingComplete": False,
         "enterpriseOnboardingComplete": True,
         "onboardingComplete": bool(existing_onboarding.get("onboardingComplete", False)),
         "previousAuthMethod": prev_auth_method,
     }
+    if effective_proj:
+        updated_onboarding["cloudaicompanionProject"] = effective_proj
+    if effective_tier:
+        updated_onboarding["tierId"] = effective_tier
+    if effective_display:
+        updated_onboarding["tierName"] = effective_display
     _atomic_write_private(
         onboarding_file,
         (json.dumps(updated_onboarding, indent=2) + "\n").encode("utf-8"),
     )
-    return {"config_dir": str(config_dir), "previous_auth_method": prev_auth_method}
+
+    if effective_proj:
+        settings_file = config_dir / "settings.json"
+        existing_settings: dict[str, Any] = {}
+        if settings_file.is_file():
+            try:
+                loaded_settings = json.loads(settings_file.read_text(encoding="utf-8"))
+                if isinstance(loaded_settings, dict):
+                    existing_settings = loaded_settings
+            except (OSError, ValueError):
+                existing_settings = {}
+        existing_gcp = existing_settings.get("gcp")
+        gcp_dict = dict(existing_gcp) if isinstance(existing_gcp, Mapping) else {}
+        gcp_dict["project"] = effective_proj
+        gcp_dict["location"] = gcp_dict.get("location") or effective_region
+        existing_settings["gcp"] = gcp_dict
+        _atomic_write_private(
+            settings_file,
+            (json.dumps(existing_settings, indent=2) + "\n").encode("utf-8"),
+        )
+
+    return {
+        "config_dir": str(config_dir),
+        "previous_auth_method": prev_auth_method,
+        "user_tier": effective_tier or "gcp-enterprise",
+        "tier_display_name": effective_display or effective_tier or "Gemini Enterprise",
+        "project_id": effective_proj or None,
+        "region": effective_region if effective_proj else None,
+    }
 
 
 def can_use_local_browser_loopback(env: Mapping[str, str]) -> bool:
@@ -231,7 +565,12 @@ def try_acp_business_browser_login(
                 err_obj = msg["error"]
                 err_msg = err_obj.get("message") if isinstance(err_obj, Mapping) else str(err_obj)
                 return False, str(err_msg or "agy acp authenticate failed")
-            finalize_enterprise_onboarding(agy_cli_config_dir(env), _home_dir(env), had_standalone_token_before=True)
+            finalize_enterprise_onboarding(
+                agy_cli_config_dir(env),
+                _home_dir(env),
+                had_standalone_token_before=True,
+                env=env,
+            )
             return True, ""
         return False, "Timed out waiting for browser sign-in"
     except (OSError, subprocess.SubprocessError) as exc:
@@ -296,6 +635,7 @@ def _exchange_code_with_running_cde_proc(
     home_dir: Path,
     had_standalone_before: bool,
     timeout_seconds: float = 30.0,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Feed the extracted authorization code to the waiting `agy` login process and finalize credentials."""
     code = extract_oauth_code(raw_code_or_url)
@@ -312,19 +652,29 @@ def _exchange_code_with_running_cde_proc(
             "ok": False,
             "error": clean_out.strip() or f"agy login exited with status {proc.returncode}",
         }
-    finalize_enterprise_onboarding(
+    onboarding = finalize_enterprise_onboarding(
         config_dir,
         home_dir,
         had_standalone_token_before=had_standalone_before,
+        env=env,
     )
     email_match = _EMAIL_RE.search(clean_out)
     email = email_match.group(1) if email_match else None
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "email": email,
-        "tier_id": "gcp-enterprise",
+        "tier_id": onboarding.get("user_tier") or "gcp-enterprise",
+        "tier_display_name": onboarding.get("tier_display_name"),
+        "project_id": onboarding.get("project_id"),
         "message": clean_out.strip(),
     }
+    if not onboarding.get("project_id"):
+        result["warning"] = (
+            "Signed in, but no Gemini Enterprise license was found for this account. "
+            "Set CC_AGY_ENTERPRISE_PROJECT=<project with your seats> and run "
+            "`/cc-agy-plugin:login --force` again."
+        )
+    return result
 
 
 def _cleanup_stale_hold_session(state_dir: Path) -> None:
@@ -418,6 +768,7 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
                         config_dir=config_dir,
                         home_dir=home_dir,
                         had_standalone_before=had_standalone,
+                        env=env,
                     )
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -435,21 +786,93 @@ def run_hold_daemon(state_dir: Path, *, timeout_seconds: int = _DEFAULT_HOLD_TIM
         (state_dir / "session.json").unlink(missing_ok=True)
 
 
+def heal_enterprise_token(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Repair a saved `auth_method="gcp"` token that `agy`'s `keyringAuth` would reject.
+
+    `keyringAuth.TryAuth` treats a GCP token with empty `user_tier` AND empty `project_id` as
+    "incomplete GCP onboarding" and signs the user out. If the token's access token can still
+    reach `businessaicode.googleapis.com/v1beta:fetchLicenses`, this fills in the license so no
+    new browser sign-in is needed.
+
+    Returns:
+        A dict with `healed` (bool), `already_complete` (bool), and the resolved fields.
+    """
+    source = dict(os.environ if env is None else env)
+    config_dir = agy_cli_config_dir(source)
+    token_file = config_dir / "antigravity-oauth-token"
+    bak_file = config_dir / "antigravity-oauth-token.bak"
+    if not token_file.is_file() and bak_file.is_file() and bak_file.stat().st_size > 10:
+        _atomic_write_private(token_file, bak_file.read_bytes())
+        bak_file.unlink(missing_ok=True)
+    try:
+        stored = json.loads(token_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"healed": False, "already_complete": False, "reason": "no readable token file"}
+    if not isinstance(stored, dict) or stored.get("auth_method") != "gcp":
+        return {"healed": False, "already_complete": False, "reason": "not a Gemini Enterprise token"}
+    if stored.get("user_tier") or stored.get("project_id"):
+        return {
+            "healed": False,
+            "already_complete": True,
+            "user_tier": stored.get("user_tier"),
+            "project_id": stored.get("project_id"),
+        }
+    onboarding = finalize_enterprise_onboarding(
+        config_dir,
+        _home_dir(source),
+        had_standalone_token_before=True,
+        env=source,
+    )
+    healed = bool(onboarding.get("project_id"))
+    reason = None
+    if not healed:
+        reason = "fetchLicenses returned no license for this account (no seat, or the saved token expired)"
+        tok_obj = stored.get("token")
+        expiry_raw = str(tok_obj.get("expiry") or "") if isinstance(tok_obj, Mapping) else ""
+        try:
+            expiry = datetime.fromisoformat(expiry_raw.replace("Z", "+00:00"))
+            if expiry.tzinfo is not None and expiry < datetime.now(timezone.utc):
+                reason = (
+                    "the saved access token expired, so the license can't be looked up offline; "
+                    "run `/cc-agy-plugin:login` to sign in again"
+                )
+        except ValueError:
+            pass
+    return {
+        "healed": healed,
+        "already_complete": False,
+        "user_tier": onboarding.get("user_tier") if healed else None,
+        "project_id": onboarding.get("project_id"),
+        "reason": reason,
+    }
+
+
 def start_two_step_login(
     env: Mapping[str, str] | None = None,
     *,
     timeout_seconds: int = _DEFAULT_HOLD_TIMEOUT_SECONDS,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Launch the detached PKCE holder daemon and return the clickable Google OAuth URL."""
+    """Launch the detached PKCE holder daemon and return the clickable Google OAuth URL.
+
+    Args:
+        env: Environment to use (defaults to `os.environ`).
+        timeout_seconds: How long the holder waits for the pasted code.
+        force: Skip the "already signed in" short-circuit and always start a fresh sign-in.
+    """
     source = dict(os.environ if env is None else env)
-    status = inspect_agy_cli_offline(source)
-    if status.get("auth_configured") and not status.get("consumer_account_detected"):
-        return {
-            "ok": True,
-            "already_signed_in": True,
-            "tier_id": status.get("tier_id"),
-            "credential_source": status.get("credential_source"),
-        }
+    if not force:
+        heal_enterprise_token(source)
+        status = inspect_agy_cli_offline(source)
+        if status.get("auth_configured") and not status.get("consumer_account_detected"):
+            return {
+                "ok": True,
+                "already_signed_in": True,
+                "tier_id": status.get("tier_id"),
+                "credential_source": status.get("credential_source"),
+            }
+    else:
+        status = inspect_agy_cli_offline(source)
     if not status.get("agy_bin"):
         return {"ok": False, "error": status.get("error") or "External `agy` binary is not installed."}
 
@@ -663,14 +1086,19 @@ def run_interactive_or_url_login(
     env: Mapping[str, str] | None = None,
     *,
     browser_timeout_seconds: float = 110.0,
+    force: bool = False,
 ) -> int:
     """Automatic onboarding entrypoint used by `quickstart.sh` and `/cc-agy-plugin:login`."""
     source = dict(os.environ if env is None else env)
     if (source.get("CC_AGY_SKIP_SIGNIN") or "").strip() == "1" or source.get("PYTEST_CURRENT_TEST"):
         return 0
 
+    if not force:
+        healed = heal_enterprise_token(source)
+        if healed.get("healed"):
+            print(f"Repaired saved Gemini Enterprise sign-in (project={healed.get('project_id')}).")
     status = inspect_agy_cli_offline(source)
-    if status.get("auth_configured") and not status.get("consumer_account_detected"):
+    if not force and status.get("auth_configured") and not status.get("consumer_account_detected"):
         print(f"Gemini Enterprise sign-in verified ({status.get('tier_id') or 'enterprise'}).")
         return 0
 
@@ -724,10 +1152,16 @@ def run_interactive_or_url_login(
                 config_dir=config_dir,
                 home_dir=home_dir,
                 had_standalone_before=had_standalone,
+                env=source,
             )
             if result.get("ok"):
                 who = f" as {result['email']}" if result.get("email") else ""
-                tty_out.write(f"\nSigned in to Gemini Enterprise{who} (tier=gcp-enterprise)!\n\n")
+                tty_out.write(
+                    f"\nSigned in to Gemini Enterprise{who} "
+                    f"(tier={result.get('tier_id')}, project={result.get('project_id') or 'unknown'})!\n\n"
+                )
+                if result.get("warning"):
+                    tty_out.write(f"Warning: {result['warning']}\n")
                 return 0
             tty_out.write(f"\nSign-in failed: {result.get('error')}\n")
             return 1
@@ -737,7 +1171,7 @@ def run_interactive_or_url_login(
 
     # 3. Non-interactive host (e.g. Claude Code / Cursor over SSH with no `/dev/tty`):
     #    Start the 2-step PKCE session immediately and print the clickable OAuth URL!
-    started = start_two_step_login(source)
+    started = start_two_step_login(source, force=force)
     if not started.get("ok"):
         print(f"Could not start Gemini Enterprise sign-in: {started.get('error')}", file=sys.stderr)
         return 1
@@ -783,10 +1217,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Format `--start` or `--complete` output as JSON.")
     parser.add_argument("--hold-daemon", metavar="STATE_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=int, default=_DEFAULT_HOLD_TIMEOUT_SECONDS, help="Session timeout in seconds.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore any saved sign-in and always start a fresh Gemini Enterprise sign-in.",
+    )
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help="Repair a saved token that agy rejects (missing license/project) without a new sign-in.",
+    )
     args = parser.parse_args(argv)
 
     if args.hold_daemon:
         return run_hold_daemon(Path(args.hold_daemon), timeout_seconds=args.timeout)
+
+    if args.heal:
+        res = heal_enterprise_token()
+        if args.json:
+            print(json.dumps(res, indent=2))
+        elif res.get("healed"):
+            print(f"[OK] Repaired saved sign-in (tier={res.get('user_tier')}, project={res.get('project_id')}).")
+        elif res.get("already_complete"):
+            print(f"[OK] Saved sign-in is already complete (project={res.get('project_id')}).")
+        else:
+            print(f"[FAIL] {res.get('reason')}", file=sys.stderr)
+        return 0 if (res.get("healed") or res.get("already_complete")) else 1
 
     if args.complete is not None:
         res = complete_two_step_login(args.complete)
@@ -794,24 +1250,34 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(res, indent=2))
         elif res.get("ok"):
             who = f" as {res['email']}" if res.get("email") else ""
-            print(f"[OK] Signed in to Gemini Enterprise{who} (tier={res.get('tier_id', 'gcp-enterprise')}).")
+            print(
+                f"[OK] Signed in to Gemini Enterprise{who} "
+                f"(tier={res.get('tier_id', 'gcp-enterprise')}, project={res.get('project_id') or 'unknown'})."
+            )
+            if res.get("warning"):
+                print(f"[WARN] {res['warning']}", file=sys.stderr)
         else:
             print(f"[FAIL] {res.get('error')}", file=sys.stderr)
         return 0 if res.get("ok") else 1
 
     if args.start:
-        res = start_two_step_login(timeout_seconds=args.timeout)
+        res = start_two_step_login(timeout_seconds=args.timeout, force=args.force)
+        if res.get("ok") and res.get("auth_url"):
+            res["short_url"] = shorten_and_verify_oauth_url(res["auth_url"])
+            res["copied_to_clipboard"] = copy_url_to_terminal_clipboard_osc52(res["auth_url"])
         if args.json:
             print(json.dumps(res, indent=2))
         elif res.get("already_signed_in"):
             print(f"[OK] Already signed in to Gemini Enterprise (tier={res.get('tier_id')}).")
         elif res.get("ok"):
+            if res.get("short_url"):
+                print(res["short_url"])
             print(res["auth_url"])
         else:
             print(f"[FAIL] {res.get('error')}", file=sys.stderr)
         return 0 if res.get("ok") else 1
 
-    return run_interactive_or_url_login()
+    return run_interactive_or_url_login(force=args.force)
 
 
 if __name__ == "__main__":

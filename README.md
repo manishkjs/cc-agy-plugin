@@ -78,8 +78,10 @@ curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/script
 
 What happens next:
 1. **Pick from dropdowns.** Inside Claude Code, two dropdowns ask how you connect (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and which model preset you want (`Balanced`, `Quality`, or `Economy`). In a regular terminal, an arrow-key (`↑/↓`) selector opens instead.
-2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens automatically and saves your seat token without copy-pasting. Over SSH or on a remote VM, the sign-in URL is automatically copied to your laptop clipboard (press `Cmd+V` in your browser) and printed as a short 1-line link that never wraps in macOS Terminal: sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat.
-3. **Automatic `--doctor` check.** Confirms MCP tools, your `gcp-enterprise` seat tier, and git workspace readiness at 0 tokens. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to change settings or sign in again.
+2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens automatically and saves your seat token without copy-pasting. Over SSH or on a remote VM, the sign-in URL is automatically copied to your laptop clipboard (press `Cmd+V` in your browser) and printed as a short 1-line link that never wraps in macOS Terminal: sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat. The plugin then looks up your Gemini Enterprise license and project, so your first `agy` call works right away.
+3. **Automatic `--doctor` check.** Confirms MCP tools, your seat tier (for example `gcp-ge-plus-tier`), and git workspace readiness at 0 tokens. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime inside Claude Code to change settings or sign in again.
+
+**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token has expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, set `CC_AGY_ENTERPRISE_PROJECT` to the one you want. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
 
 <details>
 <summary><b>Non-interactive / CI flags & version pinning</b></summary>
