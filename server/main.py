@@ -180,6 +180,7 @@ def _refresh_plugin_root_pointer() -> None:
         pass
 
 
+os.environ["CC_AGY_IN_MCP_SERVER"] = "1"  # Lets doctor tell the live server from a one-shot CLI run.
 _refresh_plugin_root_pointer()
 _maybe_reexec_into_sdk_venv()
 

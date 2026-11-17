@@ -780,6 +780,11 @@ def _platform_keeps_token_in_keychain(source: Mapping[str, str]) -> bool:
     if sys.platform.startswith("linux"):
         if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
             return False
+        # systemd gives headless sessions (Cloudtop, tmux, remote tunnels) a D-Bus bus too, but
+        # with no Secret Service there agy's keyring write fails and it falls back to the file.
+        # Only a desktop session reliably has a keyring.
+        if not (_clean_env_str(source, "DISPLAY") or _clean_env_str(source, "WAYLAND_DISPLAY")):
+            return False
         bus = _clean_env_str(source, "DBUS_SESSION_BUS_ADDRESS")
         if bus and not bus.startswith("disabled:"):
             return True

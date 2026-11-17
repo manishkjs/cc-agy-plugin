@@ -6,7 +6,8 @@ Run the sign-in helper (keep `--force` if the user asked for a fresh sign-in):
 
 ```bash
 ROOT="${CC_AGY_INSTALL_REPO_DIR:-}"
-for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+for candidate in "$ROOT" "$DATA/cc-agy-plugin/current" "$DATA/cc-agy-plugin/repo"; do
   [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
 done
 sh "$ROOT/scripts/py.sh" "$ROOT/server/agy_login.py" --start --json $ARGUMENTS

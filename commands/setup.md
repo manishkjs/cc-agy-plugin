@@ -20,9 +20,9 @@ Start each command with the `ROOT=...` lines shown below. They find the plugin e
 
 2. Collect what the chosen mode needs before installing:
    - **Gemini Enterprise:** nothing.
-   - **AI Studio API key:** the key must be in the shell that starts Claude Code, never in chat. If
-     `GEMINI_API_KEY` is not set, ask the user to add `export GEMINI_API_KEY=...` to their shell
-     profile and restart Claude Code, then continue.
+   - **AI Studio API key:** the key must be in the shell that starts Claude Code, never in chat.
+     Install first (step 3). Then, if `GEMINI_API_KEY` is not set, ask the user to add
+     `export GEMINI_API_KEY=...` to their shell profile and restart Claude Code.
    - **Vertex AI:** ask for the Google Cloud project ID and pass `--project <ID>`. The user also
      needs `gcloud auth application-default login` once.
    - **AI gateway:** ask for the gateway base URL and pass `--base-url <URL>`.
@@ -31,7 +31,8 @@ Start each command with the `ROOT=...` lines shown below. They find the plugin e
    `balanced`, `quality` or `economy`):
    ```bash
    ROOT="${CLAUDE_PLUGIN_ROOT:-}"
-for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+for candidate in "$ROOT" "$DATA/cc-agy-plugin/current" "$DATA/cc-agy-plugin/repo"; do
   [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
 done
    sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --host claude --auth <AUTH> --profile <PROFILE> [--project <ID>] [--base-url <URL>]
@@ -44,7 +45,8 @@ done
 5. Verify with the CLI doctor (the MCP `doctor` tool still runs the old settings until reload):
    ```bash
    ROOT="${CLAUDE_PLUGIN_ROOT:-}"
-for candidate in "$ROOT" "$HOME/.local/share/cc-agy-plugin/current" "$HOME/.local/share/cc-agy-plugin/repo"; do
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+for candidate in "$ROOT" "$DATA/cc-agy-plugin/current" "$DATA/cc-agy-plugin/repo"; do
   [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
 done
    sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --doctor --human --auth <AUTH>

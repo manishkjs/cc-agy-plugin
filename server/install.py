@@ -1117,7 +1117,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.3.1",
+        "version": "0.3.2",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."
@@ -3258,7 +3258,12 @@ def main(argv: list[str] | None = None) -> int:
 
     report["requested_host"] = args.host
     if not args.dry_run:
-        _record_install_choice(pre.get("auth_mode"))
+        chosen_auth = _normalize_auth_choice(args.auth)
+        _record_install_choice(
+            chosen_auth if chosen_auth not in ("", "auto") else pre.get("auth_mode"),
+            project=getattr(args, "project", None),
+            base_url=getattr(args, "base_url", None),
+        )
         from server.runtime_env import write_plugin_root_pointer
 
         write_plugin_root_pointer(PLUGIN_ROOT)
@@ -3348,20 +3353,25 @@ def _report_ok(report: dict[str, Any]) -> bool:
     return bool(report["preflight"]["ready"]) and all(h.get("status") not in failing for h in report["hosts"])
 
 
-def _record_install_choice(auth_mode: Any) -> None:
+def _record_install_choice(auth_mode: Any, *, project: str | None = None, base_url: str | None = None) -> None:
     """Remember the auth mode this install chose, for scripts that run after the wizard.
 
     quickstart.sh runs the interactive wizard and then doctor/sign-in; it can't see what the user
     picked, so it reads this file instead of guessing (and running Enterprise sign-in for an
     API-key user).
     """
-    if not auth_mode:
+    if not auth_mode or str(auth_mode) in ("missing", "auto", "unconfigured"):
         return
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     target = data_home / "cc-agy-plugin" / "last-install.json"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps({"auth_mode": str(auth_mode)}) + "\n", encoding="utf-8")
+        record: dict[str, str] = {"auth_mode": str(auth_mode)}
+        if project:
+            record["project"] = project
+        if base_url:
+            record["base_url"] = base_url
+        target.write_text(json.dumps(record) + "\n", encoding="utf-8")
     except OSError:
         pass
 

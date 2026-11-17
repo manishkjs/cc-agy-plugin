@@ -642,8 +642,11 @@ def run_doctor(
     live_agy = _module_available("google.antigravity")
     disk_genai = live_genai or python_has_module(sdk_py, "google.genai")
     disk_agy = live_agy or python_has_module(sdk_py, "google.antigravity")
-    has_genai = live_genai or (disk_genai and os.path.realpath(sdk_py) == os.path.realpath(sys.executable))
-    has_agy = live_agy or (disk_agy and os.path.realpath(sdk_py) == os.path.realpath(sys.executable))
+    # Inside the MCP server only imports count. A one-shot CLI doctor isn't the server: the next
+    # server start re-execs into `sdk_py`, so packages present there count too.
+    in_mcp_server = (active_env.get("CC_AGY_IN_MCP_SERVER") or os.environ.get("CC_AGY_IN_MCP_SERVER") or "") == "1"
+    has_genai = live_genai or (disk_genai and not in_mcp_server)
+    has_agy = live_agy or (disk_agy and not in_mcp_server)
     has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")
     cli_only_enterprise = (active_auth_mode == "gemini_enterprise") or cli_detected_unsigned
     plugin_root = Path(__file__).resolve().parent.parent

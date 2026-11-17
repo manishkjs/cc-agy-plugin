@@ -277,7 +277,11 @@ def write_plugin_root_pointer(plugin_root: Path, env: Mapping[str, str] | None =
         if tmp.is_symlink() or tmp.exists():
             tmp.unlink()
         os.symlink(target, tmp)
-        os.replace(tmp, pointer)
+        try:
+            os.replace(tmp, pointer)
+        except OSError:
+            tmp.unlink(missing_ok=True)  # e.g. `current` is a real directory: leave no litter.
+            raise
         return pointer
     except OSError:
         return None

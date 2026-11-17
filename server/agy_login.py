@@ -216,14 +216,14 @@ def _configured_enterprise_project_and_location(
         "CC_AGY_USERCFG_ENTERPRISE_USER_TIER",
         "BAICODE_USER_TIER",
     )
-    settings_project = ""
+    settings_project = _first_env(source, "CC_AGY_HOST_ENTERPRISE_PROJECT")
     settings_file = config_dir / "settings.json"
     if settings_file.is_file():
         try:
             settings_data = json.loads(settings_file.read_text(encoding="utf-8"))
             gcp_cfg = settings_data.get("gcp") if isinstance(settings_data, Mapping) else None
             if isinstance(gcp_cfg, Mapping):
-                settings_project = str(gcp_cfg.get("project") or "").strip()
+                settings_project = str(gcp_cfg.get("project") or "").strip() or settings_project
                 if not location:
                     location = str(gcp_cfg.get("location") or "").strip()
         except (OSError, ValueError):
@@ -465,7 +465,7 @@ def finalize_enterprise_onboarding(
     # attempt must never replace a working CLI token.
     standalone_is_newest = standalone_token_file.is_file() and standalone_token_file.stat().st_size > 10 and (
         not cli_token_file.is_file()
-        or standalone_token_file.stat().st_mtime >= cli_token_file.stat().st_mtime
+        or standalone_token_file.stat().st_mtime_ns > cli_token_file.stat().st_mtime_ns
     )
     if standalone_is_newest:
         raw_bytes = standalone_token_file.read_bytes()
@@ -595,8 +595,10 @@ def describe_onboarding_problem(onboarding: Mapping[str, Any]) -> str:
     if problem == "keychain":
         return (
             "Signed in, but agy saved the token in your OS keychain, so the plugin can't check "
-            "your license. Run `/cc-agy-plugin:login --force` on this computer: it uses agy's own "
-            "browser sign-in, which records the license."
+            "your license from a pasted code. Run `/cc-agy-plugin:login --force` on this computer and "
+            "finish the sign-in in the browser window it opens (agy then records the license itself). "
+            "If no browser window appears on your screen, set CC_AGY_TOKEN_IN_KEYCHAIN=0 only if agy "
+            "keeps its token in ~/.gemini/antigravity-cli on this machine."
         )
     if problem == "lookup_failed":
         return (
@@ -709,7 +711,7 @@ def try_acp_business_browser_login(
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.1"}},
+                    "params": {"protocolVersion": 1, "clientInfo": {"name": "cc-agy-plugin", "version": "0.3.2"}},
                 }
             )
             + "\n"
@@ -862,6 +864,28 @@ def _exchange_code_with_running_cde_proc(
     return result
 
 
+def _env_truthy(source: Mapping[str, str], name: str) -> bool:
+    return (source.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _set_agy_settings_project(config_dir: Path, project: str) -> None:
+    """Write `gcp.project` into agy's settings.json, which agy's own license lookup reads."""
+    settings_file = config_dir / "settings.json"
+    data: dict[str, Any] = {}
+    if settings_file.is_file():
+        try:
+            loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+    gcp = dict(data.get("gcp")) if isinstance(data.get("gcp"), Mapping) else {}
+    gcp["project"] = project
+    gcp.setdefault("location", "global")
+    data["gcp"] = gcp
+    _atomic_write_private(settings_file, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+
+
 def _mark_enterprise_onboarding_complete(config_dir: Path) -> None:
     """Record that agy itself confirmed the enterprise sign-in (token kept in the OS keychain)."""
     onboarding_file = config_dir / "cache" / "onboarding.json"
@@ -880,6 +904,14 @@ def _mark_enterprise_onboarding_complete(config_dir: Path) -> None:
             "previousAuthMethod": "gcp",
         }
     )
+    # agy resolved the license for the project in its settings.json; record it, not an older one.
+    try:
+        settings = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+        project = settings.get("gcp", {}).get("project") if isinstance(settings, dict) else None
+        if project:
+            existing["cloudaicompanionProject"] = str(project)
+    except (OSError, ValueError, AttributeError):
+        pass
     _atomic_write_private(onboarding_file, (json.dumps(existing, indent=2) + "\n").encode("utf-8"))
 
 
@@ -1144,7 +1176,12 @@ def start_two_step_login(
                 # instead of reporting the old sign-in as fine.
                 return {"ok": False, "error": f"Couldn't switch to seat project '{explicit_proj}': {reason}."}
         status = inspect_agy_cli_offline(source)
-        if status.get("auth_configured") and not status.get("consumer_account_detected"):
+        project_change_pending = bool(
+            explicit_proj
+            and not healed.get("healed")
+            and explicit_proj != (healed.get("project_id") or status.get("companion_project") or "")
+        )
+        if status.get("auth_configured") and not status.get("consumer_account_detected") and not project_change_pending:
             return {
                 "ok": True,
                 "already_signed_in": True,
@@ -1158,24 +1195,26 @@ def start_two_step_login(
     if not agy_bin:
         return {"ok": False, "error": status.get("error") or "External `agy` binary is not installed."}
 
-    if can_use_local_browser_loopback(source):
+    keyring_machine = _platform_keeps_token_in_keychain(source)
+    fallback_note = ""
+    if can_use_local_browser_loopback(source) or (keyring_machine and _env_truthy(source, "CC_AGY_FORCE_URL_LOGIN")):
         # On a local desktop, agy's own browser sign-in records the license even when the token
-        # goes to the OS keychain (macOS), which the copy-paste flow below can't verify.
+        # goes to the OS keychain (macOS), which the copy-paste flow below can't verify; so on such
+        # a machine the browser is tried first even when the link flow was requested.
+        if explicit_proj:
+            # agy's resolveEnterpriseLicense reads gcp.project from its own settings.json.
+            _set_agy_settings_project(agy_cli_config_dir(source), explicit_proj)
         # 90s, not longer: agent shells (Claude Code's Bash tool) kill commands after ~120s by
         # default, and the user must see the error rather than a killed command.
         signed_in, browser_error = try_acp_business_browser_login(agy_bin, env=source, timeout_seconds=90.0)
         if signed_in:
             return {"ok": True, "signed_in": True, "method": "browser"}
-        if _platform_keeps_token_in_keychain(source):
-            # The copy-paste flow would save the token to the same keychain, where the plugin
-            # can't record the license, so it can't succeed here either. Report the real error.
-            return {
-                "ok": False,
-                "error": (
-                    f"Browser sign-in didn't finish ({browser_error}). Run `/cc-agy-plugin:login` again "
-                    "and complete the sign-in in the browser window that opens."
-                ),
-            }
+        # Browser sign-in didn't finish (window on a display the user can't see, SSO took longer
+        # than the wait, tab closed). Fall back to the link: if agy then saves the token to a
+        # keychain the plugin can't read, --complete says so plainly.
+        fallback_note = f"The browser sign-in didn't finish ({browser_error}), so here is a link instead."
+    else:
+        fallback_note = ""
 
     state_dir = _login_state_dir(source)
     if not force:
@@ -1183,7 +1222,7 @@ def start_two_step_login(
         if live is not None and (live.get("enterprise_project") or "") == explicit_proj:
             # A second tab, or the agent showing the link again: hand back the same link instead
             # of killing the session the user may be signing in to right now.
-            return {**live, "reused": True}
+            return {**live, "reused": True, **({"note": fallback_note} if fallback_note else {})}
     _cleanup_stale_hold_session(state_dir)
     session_file = state_dir / "session.json"
     daemon_log = state_dir / "daemon.log"
@@ -1219,6 +1258,8 @@ def start_two_step_login(
             try:
                 data = json.loads(session_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and ("auth_url" in data or "error" in data):
+                    if fallback_note and data.get("auth_url"):
+                        data["note"] = fallback_note
                     return data
             except (OSError, ValueError):
                 pass
@@ -1462,11 +1503,6 @@ def run_interactive_or_url_login(
         if ok:
             print("Signed in to Gemini Enterprise.")
             return 0
-        if _platform_keeps_token_in_keychain(source):
-            # A copy-paste sign-in would also save to the keychain, where the license can't be
-            # recorded, so don't offer one: it would only lead to the same failure.
-            print(f"Browser sign-in didn't finish ({reason}). Run `/cc-agy-plugin:login` to try again.")
-            return 1
         print(f"Browser sign-in didn't finish ({reason}); showing a link instead.", flush=True)
 
     # 2. A person at a terminal (`curl ... | bash` in an SSH shell): print the link, read the code.
@@ -1572,9 +1608,15 @@ def _apply_host_settings_to_environ() -> None:
     except Exception:
         return
     for key, value in (discovered or {}).items():
-        if key.startswith(("CC_AGY_", "CLAUDE_PLUGIN_OPTION_")) and value and not os.environ.get(key):
-            if not str(value).startswith("${"):
-                os.environ[key] = str(value)
+        if not value or str(value).startswith("${"):
+            continue
+        if key in ("CC_AGY_USERCFG_ENTERPRISE_PROJECT", "CLAUDE_PLUGIN_OPTION_ENTERPRISE_PROJECT", "CC_AGY_ENTERPRISE_PROJECT"):
+            # A project saved at install time is a preference: it must not override a later
+            # `/login --project` switch, and on a machine with several hosts it may be another
+            # host's setting.
+            os.environ.setdefault("CC_AGY_HOST_ENTERPRISE_PROJECT", str(value))
+        elif key.startswith(("CC_AGY_", "CLAUDE_PLUGIN_OPTION_")) and not os.environ.get(key):
+            os.environ[key] = str(value)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -113,8 +113,9 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
 2. Collect what the chosen mode needs BEFORE installing:
    - Gemini Enterprise: nothing.
    - Google AI Studio API Key: the key must be in the shell that starts Claude Code, never in chat.
-     If GEMINI_API_KEY is not set, ask the user to add `export GEMINI_API_KEY=...` to their shell
-     profile and restart Claude Code, then run step 3.
+     Run step 3 first (it registers the plugin even before the key is set). Then, if GEMINI_API_KEY
+     is not set, ask the user to add `export GEMINI_API_KEY=...` to their shell profile and restart
+     Claude Code; the plugin picks the key up on the next start.
    - Vertex AI: ask (free text) for the Google Cloud project ID, and add `--project <ID>` in step 3.
      It also needs `gcloud auth application-default login` done once by the user.
    - Enterprise AI Gateway: ask (free text) for the gateway base URL, and add `--base-url <URL>`.
@@ -249,9 +250,17 @@ main() {
     if [[ -z "${PYTEST_CURRENT_TEST:-}" ]] && is_person_at_terminal; then
       (
         cd "${checkout_dir}"
-        "${python_bin}" -m server.install </dev/tty >/dev/tty
+        # An install that reports issues (e.g. a key not exported yet) must still reach doctor,
+        # which explains them; `set -e` would otherwise end the script silently here.
+        install_rc=0
+        "${python_bin}" -m server.install </dev/tty >/dev/tty || install_rc=$?
         # The wizard records what the user picked; use it instead of guessing.
-        picked_auth="$("${python_bin}" -c "import json, os, pathlib; p = pathlib.Path(os.environ.get('XDG_DATA_HOME') or pathlib.Path.home() / '.local/share') / 'cc-agy-plugin/last-install.json'; print(json.loads(p.read_text()).get('auth_mode', '') if p.is_file() else '')" 2>/dev/null || true)"
+        last_install() {
+          "${python_bin}" -c "import json, os, pathlib, sys; p = pathlib.Path(os.environ.get('XDG_DATA_HOME') or pathlib.Path.home() / '.local/share') / 'cc-agy-plugin/last-install.json'; print(json.loads(p.read_text()).get(sys.argv[1], '') if p.is_file() else '')" "$1" 2>/dev/null || true
+        }
+        picked_auth="$(last_install auth_mode)"
+        picked_project="$(last_install project)"
+        picked_base_url="$(last_install base_url)"
         if [[ "${picked_auth}" == "gemini_enterprise" ]] && "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and (not s.get('auth_configured') or s.get('consumer_account_detected')) else 1)" 2>/dev/null; then
           PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
         fi
@@ -259,7 +268,14 @@ main() {
         if [[ -n "${picked_auth}" ]]; then
           doctor_args+=(--auth "${picked_auth//_/-}")
         fi
-        "${python_bin}" -m server.install "${doctor_args[@]}"
+        if [[ -n "${picked_project}" ]]; then
+          doctor_args+=(--project "${picked_project}")
+        fi
+        if [[ -n "${picked_base_url}" ]]; then
+          doctor_args+=(--base-url "${picked_base_url}")
+        fi
+        "${python_bin}" -m server.install "${doctor_args[@]}" || true
+        exit "${install_rc}"
       )
       return 0
     else
@@ -268,12 +284,15 @@ main() {
     fi
   fi
 
-  local chosen_auth chosen_agy
+  local chosen_auth chosen_agy chosen_project chosen_base_url
   chosen_auth="$(auth_arg "$@")"
   chosen_agy="$(flag_value --agy-cli-path "$@")"
+  chosen_project="$(flag_value --project "$@")"
+  chosen_base_url="$(flag_value --base-url "$@")"
   (
     cd "${checkout_dir}"
-    "${python_bin}" -m server.install "$@"
+    install_rc=0
+    "${python_bin}" -m server.install "$@" || install_rc=$?
     if wants_enterprise_signin "$@"; then
       if has_arg --non-interactive "$@"; then
         export CC_AGY_NONINTERACTIVE=1
@@ -288,8 +307,15 @@ main() {
       if [[ -n "${chosen_agy}" ]]; then
         doctor_args+=(--agy-cli-path "${chosen_agy}")
       fi
-      "${python_bin}" -m server.install "${doctor_args[@]}"
+      if [[ -n "${chosen_project}" ]]; then
+        doctor_args+=(--project "${chosen_project}")
+      fi
+      if [[ -n "${chosen_base_url}" ]]; then
+        doctor_args+=(--base-url "${chosen_base_url}")
+      fi
+      "${python_bin}" -m server.install "${doctor_args[@]}" || install_rc=$?
     fi
+    exit "${install_rc}"
   )
 }
 
