@@ -1,11 +1,10 @@
 /**
  * Native OpenCode entry point for cc-agy-plugin.
  *
- * Install with `opencode plugin <cc-agy-plugin> -g`, then run `opencode auth login`,
- * choose "Other", and enter the provider id `cc-agy` (custom plugin providers are not in
- * OpenCode's built-in catalog, so searching for "cc-agy" shows no matches). OpenCode then
- * shows the login methods: Gemini Enterprise seat, Gemini API key, Google Cloud Vertex AI
- * project, or AI Gateway. The plugin:
+ * Install with `opencode plugin <cc-agy-plugin> -g`, then run `opencode auth login` and
+ * pick `cc-agy` (login methods: Gemini Enterprise seat, Gemini API key, Google Cloud
+ * Vertex AI project, or AI Gateway). If `cc-agy` is not listed, the plugin failed to load;
+ * `opencode --print-logs mcp list` shows why. The plugin:
  *
  * - stores what you enter in OpenCode's own `auth.json` (mode 0600), never in a config file;
  * - registers the `agy` MCP server, which launches this repository's existing stdio server

@@ -200,7 +200,7 @@ The plugin detects the wire format from the gateway path: Gemini `/v1beta/models
 - Installed asset hashes are tracked in `.cc-agy-plugin-assets.json`. Any pre-existing or user-edited file is backed up to `*.bak-*` before it is replaced.
 - Symlinked asset files are unlinked before writing, so the external dotfiles target is never modified. Symlinked directories are written through.
 - The same skill, commands, and subagent are bundled in this repository under `.opencode/`.
-- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login`, choose **Other**, and enter the provider id `cc-agy` (searching for `cc-agy` in the provider list shows no matches, because plugin providers are not in OpenCode's built-in catalog). OpenCode then offers the four login methods: Gemini Enterprise seat, Gemini API key, Google Cloud Vertex AI project, or AI Gateway. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
+- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login` and pick `cc-agy`, which offers four login methods: Gemini Enterprise seat, Gemini API key, Google Cloud Vertex AI project, or AI Gateway. If `cc-agy` is missing from the provider list, the plugin did not load: run `opencode --print-logs mcp list` and look for `failed to load plugin`. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
 
 **Cursor**
 
