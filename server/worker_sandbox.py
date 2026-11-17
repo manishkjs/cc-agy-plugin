@@ -12,7 +12,8 @@ only an instruction. This module makes the operating system enforce it instead:
   mounts, and credential stores (including symlinked dotfiles) are hidden.
 - macOS uses `sandbox-exec` with a Seatbelt profile that denies writes outside the same
   places (while protecting `agy`'s persistent settings/plugins/MCP subpaths) and denies
-  reads of the same credential stores and plugin data/worktree directories.
+  reads of the same credential stores and plugin data/worktree directories (except
+  `~/Library/Keychains`, which stays readable and writable for `agy`'s keyring OAuth token).
 
 `agy` must reach Google over the network, and neither tool can filter by host, so the
 network stays on. Remote git access is blocked by masking `git-remote-http(s)` and `ssh`
@@ -88,6 +89,10 @@ _HIDDEN_HOME_DIRS = (
     ".gem",
     "Library/Keychains",
 )
+# macOS `agy` stores and refreshes its OAuth token in the login keychain
+# (`~/Library/Keychains` via `/usr/bin/security`), so Seatbelt must keep it
+# readable and writable. Kept in `_HIDDEN_HOME_DIRS` for Linux `bwrap`.
+_SEATBELT_KEYCHAIN_DIRS = ("Library/Keychains",)
 _HIDDEN_HOME_FILES = (
     ".netrc",
     ".git-credentials",
@@ -734,10 +739,16 @@ def build_seatbelt_profile(
     )
 
     hidden_dirs: list[Path] = list(_foreign_brain_dirs(config_dir, conversation_id))
+    keychain_dirs: list[Path] = []
     for base in (home, resolved_home):
         hidden_dirs.append(base / ".cache")
         hidden_dirs.append(base / "Library" / "Caches")
+        for rel in _SEATBELT_KEYCHAIN_DIRS:
+            keychain_dirs.append(base / rel)
+            keychain_dirs.extend(_resolve_existing_dir(base, rel))
         for rel in _HIDDEN_HOME_DIRS:
+            if rel in _SEATBELT_KEYCHAIN_DIRS:
+                continue
             cand = base / rel
             if cand != config_dir and cand not in config_dir.parents:
                 hidden_dirs.append(cand)
@@ -762,6 +773,7 @@ def build_seatbelt_profile(
 
     dedup_dirs = list(dict.fromkeys(hidden_dirs))
     dedup_files = list(dict.fromkeys(hidden_files))
+    dedup_keychain_dirs = list(dict.fromkeys(keychain_dirs))
     lines.append(
         "(deny file-read* file-write* "
         + " ".join(f"(subpath {_sbpl_string(p)})" for p in dedup_dirs)
@@ -769,6 +781,14 @@ def build_seatbelt_profile(
         + " ".join(f"(literal {_sbpl_string(p)})" for p in dedup_files)
         + ")"
     )
+    if dedup_keychain_dirs:
+        # Allow macOS keychain read+write after `(deny file-write*)` and the hidden-path
+        # deny rule so `agy` can read and refresh its keyring OAuth token (last rule wins).
+        lines.append(
+            "(allow file-read* file-write* "
+            + " ".join(f"(subpath {_sbpl_string(p)})" for p in dedup_keychain_dirs)
+            + ")"
+        )
     reopen = [workspace]
     if adc_path is not None:
         reopen.append(adc_path)

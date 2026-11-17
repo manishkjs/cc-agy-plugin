@@ -469,21 +469,80 @@ def test_browser_sign_in_gives_up_on_a_silent_agy(tmp_path: Path):
     assert time.monotonic() - started < 15
 
 
-def test_failed_browser_sign_in_falls_back_to_a_link_and_says_why(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Remote desktops and slow SSO can't finish in the browser; they still need a way in."""
+def _stub_new_link(monkeypatch: pytest.MonkeyPatch, state_dir: Path) -> None:
+    """Make start_two_step_login 'start' a holder that immediately publishes a link."""
+    state_dir.mkdir(exist_ok=True)
+
+    class _FakeHolder:
+        def __init__(self, *_a: Any, **_k: Any) -> None:
+            (state_dir / "session.json").write_text(json.dumps({"ok": True, "auth_url": "https://accounts.google.com/new"}))
+
+    monkeypatch.setattr(agy_login, "_login_state_dir", lambda _env: state_dir)
+    monkeypatch.setattr(agy_login, "_live_hold_session", lambda _d: None)
+    monkeypatch.setattr(agy_login, "_cleanup_stale_hold_session", lambda _d: None)
+    monkeypatch.setattr(agy_login.subprocess, "Popen", _FakeHolder)
+
+
+def _stub_browser_failure(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
+    def _fail(*_a: Any, **_k: Any) -> tuple[bool, str]:
+        calls.append("browser")
+        return False, "window closed"
+
     monkeypatch.setattr(agy_login, "heal_enterprise_token", lambda _env: {})
     monkeypatch.setattr(agy_login, "inspect_agy_cli_offline", lambda _env: {"agy_bin": "/x/agy", "auth_configured": False})
     monkeypatch.setattr(agy_login, "can_use_local_browser_loopback", lambda _env: True)
-    monkeypatch.setattr(agy_login, "try_acp_business_browser_login", lambda *_a, **_k: (False, "window closed"))
-    monkeypatch.setattr(agy_login, "_login_state_dir", lambda _env: tmp_path)
-    monkeypatch.setattr(
-        agy_login, "_live_hold_session", lambda _d: {"auth_url": "https://accounts.google.com/x", "enterprise_project": ""}
-    )
+    monkeypatch.setattr(agy_login, "try_acp_business_browser_login", _fail)
+
+
+def test_linux_desktop_browser_failure_falls_back_to_a_link_and_says_why(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Remote desktops and slow SSO can't finish in the browser; agy writes a file there, so a link works."""
+    calls: list[str] = []
+    _stub_browser_failure(monkeypatch, calls)
+    _stub_new_link(monkeypatch, tmp_path / "state")
+    monkeypatch.setattr(agy_login.sys, "platform", "linux")
 
     result = agy_login.start_two_step_login({"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "1"})
 
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert result["auth_url"] == "https://accounts.google.com/new"
     assert "window closed" in result["note"]
+
+
+def test_mac_browser_failure_gives_no_link_that_cannot_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+    _stub_browser_failure(monkeypatch, calls)
+    _stub_new_link(monkeypatch, tmp_path / "state")
+    monkeypatch.setattr(agy_login.sys, "platform", "darwin")
+
+    result = agy_login.start_two_step_login({"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "1"})
+
+    assert result["ok"] is False and "window closed" in result["error"]
+    assert "auth_url" not in result
+
+
+def test_browser_is_tried_once_on_the_terminal_entrypoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+    _stub_browser_failure(monkeypatch, calls)
+    _stub_new_link(monkeypatch, tmp_path / "state")
+    monkeypatch.setattr(agy_login.sys, "platform", "linux")
+    monkeypatch.setattr(agy_login, "is_interactive_terminal", lambda _env: False)
+
+    rc = agy_login.run_interactive_or_url_login({"HOME": str(tmp_path), "CC_AGY_TOKEN_IN_KEYCHAIN": "0"})
+
+    assert rc == 0
+    assert calls == ["browser"]
+
+
+def test_failed_project_switch_restores_agys_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    original = {"theme": "dark", "gcp": {"project": "team-proj", "location": "us-central1"}}
+    (cfg_dir / "settings.json").write_text(json.dumps(original))
+    monkeypatch.setattr(agy_login, "try_acp_business_browser_login", lambda *_a, **_k: (False, "no seat in typo-proj"))
+
+    ok, _ = agy_login._browser_sign_in("/x/agy", {"HOME": str(tmp_path), "CC_AGY_CLI_CONFIG_DIR": str(cfg_dir)}, "typo-proj", 5)
+
+    assert ok is False
+    assert json.loads((cfg_dir / "settings.json").read_text()) == original
 
 
 def test_login_child_env_drops_ambient_projects_and_keys():
@@ -683,3 +742,27 @@ def test_same_second_standalone_token_does_not_win(tmp_path: Path, monkeypatch: 
     agy_login.finalize_enterprise_onboarding(cfg_dir, tmp_path, had_standalone_token_before=True, env=_env(tmp_path, cfg_dir))
 
     assert json.loads(cli_token.read_text())["token"]["access_token"] == "acc"
+
+
+def test_cancelled_install_clears_the_previous_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    install._record_install_choice("vertex", project="day-1")
+    install._record_install_choice("auto")
+    assert not (tmp_path / "cc-agy-plugin" / "last-install.json").exists()
+
+
+def test_doctor_with_explicit_auth_still_uses_the_saved_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from server import doctor, receipts
+
+    monkeypatch.setattr(doctor, "_discover_installed_host_mcp_env", lambda _env: {"GOOGLE_CLOUD_PROJECT": "acme-vtx", "CC_AGY_AUTH_MODE": "api_key"})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    env = {"HOME": str(tmp_path), "PATH": os.environ.get("PATH", ""), "CC_AGY_AUTH_MODE": "vertex"}
+
+    report = doctor.run_doctor(
+        workspace_root=repo, env=env, allow_pending_login=True, store=receipts.ReceiptStore(tmp_path / "st", workspace_root=repo)
+    )
+
+    assert not any("Missing Google Cloud project ID" in issue for issue in report["issues"]), report["issues"]
+    assert report["auth"]["auth_mode"] == "vertex"

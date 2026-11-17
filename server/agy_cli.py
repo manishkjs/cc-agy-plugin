@@ -159,6 +159,13 @@ _CONV_LEDGER_LOCK = threading.Lock()
 _CONVERSATION_USAGE_LEDGER: _BoundedLedger = _BoundedLedger(max_entries=512)
 _MIN_ATTEMPT_SECONDS = 1.0
 
+_AUTH_FAILED_MARKER_NAME = "cc-agy-auth-failed"
+_AUTH_STATE_LOCK = threading.Lock()
+_LAST_AUTH_FINGERPRINTS: dict[
+    str,
+    tuple[tuple[int, int, int] | None, tuple[int, int, int] | None, tuple[int, int, int] | None],
+] = {}
+
 _QUOTA_OR_TRANSIENT_PATTERNS = (
     "429",
     "resource_exhausted",
@@ -798,15 +805,229 @@ def _platform_keeps_token_in_keychain(source: Mapping[str, str]) -> bool:
     return False
 
 
+def auth_failure_marker_path(config_dir: Path) -> Path:
+    """Return the path of the auth-failure marker under `<config_dir>/cache/`."""
+    return config_dir / "cache" / _AUTH_FAILED_MARKER_NAME
+
+
+def record_auth_failure_marker(
+    config_dir: Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Write `<config_dir>/cache/cc-agy-auth-failed` with the current timestamp (best-effort, never raises)."""
+    try:
+        cfg_dir = config_dir if config_dir is not None else agy_cli_config_dir(env)
+        marker = auth_failure_marker_path(cfg_dir)
+        if marker.is_symlink():
+            return None
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        now_ns = time.time_ns()
+        payload = f"{now_ns / 1_000_000_000:.6f}\n".encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{marker.name}.", dir=str(marker.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with contextlib.suppress(OSError):
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            tmp_path.replace(marker)
+        finally:
+            if tmp_path.exists():
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+        # Coarse filesystem timestamps (e.g. ~4ms Linux kernel ticks) can give the marker and a
+        # just-written onboarding.json or token file identical mtime_ns; bump strictly past them.
+        ref_mtime_ns = 0
+        for ref in (cfg_dir / "cache" / "onboarding.json", cfg_dir / "antigravity-oauth-token"):
+            with contextlib.suppress(OSError):
+                st = ref.stat()
+                if st.st_mtime_ns <= now_ns + 1_000_000_000:
+                    ref_mtime_ns = max(ref_mtime_ns, st.st_mtime_ns)
+        if ref_mtime_ns > 0:
+            with contextlib.suppress(OSError):
+                if marker.stat().st_mtime_ns <= ref_mtime_ns:
+                    target_ns = max(now_ns, ref_mtime_ns + 1_000_000)
+                    os.utime(marker, ns=(target_ns, target_ns))
+        return marker
+    except Exception:
+        return None
+
+
+def clear_auth_failure_marker(
+    config_dir: Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Remove `<config_dir>/cache/cc-agy-auth-failed` if present (best-effort, never raises)."""
+    try:
+        cfg_dir = config_dir if config_dir is not None else agy_cli_config_dir(env)
+        marker = auth_failure_marker_path(cfg_dir)
+        if marker.exists() or marker.is_symlink():
+            marker.unlink(missing_ok=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_auth_failure_marker_active(
+    config_dir: Path,
+    reference_files: Sequence[Path] | None = None,
+) -> bool:
+    """Return True when `cc-agy-auth-failed` exists and is newer than all existing `reference_files`."""
+    marker = auth_failure_marker_path(config_dir)
+    try:
+        marker_mtime_ns = marker.stat().st_mtime_ns
+    except OSError:
+        return False
+    refs = reference_files if reference_files is not None else (config_dir / "cache" / "onboarding.json",)
+    newest_ref_ns = 0
+    for ref in refs:
+        try:
+            ref_ns = ref.stat().st_mtime_ns
+            if ref_ns > newest_ref_ns:
+                newest_ref_ns = ref_ns
+        except OSError:
+            continue
+    if newest_ref_ns == 0:
+        return True
+    return marker_mtime_ns > newest_ref_ns
+
+
+def _stat_sig(path: Path) -> tuple[int, int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _auth_state_fingerprint(
+    config_dir: Path,
+) -> tuple[tuple[int, int, int] | None, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+    return (
+        _stat_sig(config_dir / "cache" / "onboarding.json"),
+        _stat_sig(config_dir / "antigravity-oauth-token"),
+        _stat_sig(auth_failure_marker_path(config_dir)),
+    )
+
+
+def invalidate_agy_auth_caches(
+    env: Mapping[str, str] | None = None,
+    *,
+    config_dir: Path | None = None,
+    clear_disk_caches: bool = True,
+    update_fingerprint: bool = True,
+) -> dict[str, int]:
+    """Invalidate in-process and on-disk `agy` model caches after auth changes.
+
+    Clears `_MODEL_FALLBACK_CACHE`, `agy_state`'s in-memory model catalog (`_CATALOG_MEMORY`,
+    which caches failed `agy models` lookups for 60s), and on-disk `agy_model_catalog.json`.
+    Leaves active ACP sessions (`agy_acp._WARM_ACP_POOL`) and conversation state
+    (`_CONVERSATION_USAGE_LEDGER`, `agy_conversations.json`) untouched so routine hourly
+    token refreshes or an auth error in one call never disrupt parallel jobs or usage accounting.
+    Best-effort; never raises.
+    """
+    cfg_dir = config_dir if config_dir is not None else (agy_cli_config_dir(env) if env is not None else None)
+    cfg_key = str(cfg_dir) if cfg_dir is not None else None
+
+    fallbacks_cleared = 0
+    with _MODEL_FALLBACK_LOCK:
+        if cfg_key is None:
+            fallbacks_cleared = len(_MODEL_FALLBACK_CACHE)
+            _MODEL_FALLBACK_CACHE.clear()
+        else:
+            drop_keys = [k for k in _MODEL_FALLBACK_CACHE if k[1] == cfg_key]
+            for k in drop_keys:
+                _MODEL_FALLBACK_CACHE.pop(k, None)
+            fallbacks_cleared = len(drop_keys)
+
+    try:
+        from server import agy_state
+
+        agy_state.clear_memory_caches()
+        if clear_disk_caches:
+            catalog_path = agy_state.state_dir(env) / "agy_model_catalog.json"
+            with contextlib.suppress(OSError):
+                if not catalog_path.is_symlink() and catalog_path.exists():
+                    catalog_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if update_fingerprint:
+        try:
+            fp_dir = cfg_dir if cfg_dir is not None else agy_cli_config_dir(env)
+            fp = _auth_state_fingerprint(fp_dir)
+            with _AUTH_STATE_LOCK:
+                _LAST_AUTH_FINGERPRINTS[str(fp_dir)] = fp
+        except Exception:
+            pass
+
+    return {
+        "model_fallbacks_cleared": fallbacks_cleared,
+    }
+
+
+def _sync_agy_auth_state(
+    env: Mapping[str, str] | None = None,
+    *,
+    config_dir: Path | None = None,
+) -> bool:
+    """Invalidate stale model caches if auth files (`onboarding.json`, token, marker) changed on disk.
+
+    Handles cross-process sign-ins where `agy_login.py` updates `onboarding.json` in a separate
+    process while the MCP server keeps running. Returns True when a change triggered invalidation.
+    """
+    try:
+        cfg_dir = config_dir if config_dir is not None else agy_cli_config_dir(env)
+        cfg_key = str(cfg_dir)
+        current = _auth_state_fingerprint(cfg_dir)
+        with _AUTH_STATE_LOCK:
+            prev = _LAST_AUTH_FINGERPRINTS.get(cfg_key)
+            _LAST_AUTH_FINGERPRINTS[cfg_key] = current
+        if prev is not None and prev != current:
+            invalidate_agy_auth_caches(
+                env=env,
+                config_dir=cfg_dir,
+                clear_disk_caches=True,
+                update_fingerprint=False,
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _note_agy_auth_failure(env: Mapping[str, str] | None = None) -> None:
+    """Record the auth-failure marker and invalidate stale model caches."""
+    record_auth_failure_marker(env=env)
+    invalidate_agy_auth_caches(env=env, clear_disk_caches=True, update_fingerprint=True)
+
+
+def _note_agy_call_succeeded(env: Mapping[str, str] | None = None) -> None:
+    """Clear any auth-failure marker after a real `agy` call succeeds."""
+    if clear_auth_failure_marker(env=env):
+        try:
+            cfg_dir = agy_cli_config_dir(env)
+            fp = _auth_state_fingerprint(cfg_dir)
+            with _AUTH_STATE_LOCK:
+                _LAST_AUTH_FINGERPRINTS[str(cfg_dir)] = fp
+        except Exception:
+            pass
+
+
 def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bool, str | None]:
     env_tok = _clean_env_str(source, "ANTIGRAVITY_OAUTH_TOKEN")
     if len(env_tok) >= 8:
         return True, "env:ANTIGRAVITY_OAUTH_TOKEN"
 
+    onboarding_file = config_dir / "cache" / "onboarding.json"
     token_file = config_dir / "antigravity-oauth-token"
     token_file_present = token_file.exists()
     if token_file_present and stored_token_problem(token_file) is None:
-        return True, f"token_file:{token_file}"
+        if not _is_auth_failure_marker_active(config_dir, (token_file, onboarding_file)):
+            return True, f"token_file:{token_file}"
 
     seat = resolve_enterprise_adc_seat(source)
     if seat["active"]:
@@ -822,8 +1043,7 @@ def _inspect_auth_files(config_dir: Path, source: Mapping[str, str]) -> tuple[bo
     # deleted token, so trusting it would report "signed in" with nothing to sign in with.
     if _platform_keeps_token_in_keychain(source):
         onboarding_ok, _comp_proj, _tier_id = _read_onboarding_metadata(config_dir)
-        if onboarding_ok:
-            onboarding_file = config_dir / "cache" / "onboarding.json"
+        if onboarding_ok and not _is_auth_failure_marker_active(config_dir, (onboarding_file,)):
             return True, f"onboarding_cache:{onboarding_file}"
 
     return False, None
@@ -834,6 +1054,7 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
     source = env if env is not None else os.environ
     agy_bin, skipped_internal = resolve_agy_cli_binary(source)
     cfg_dir = agy_cli_config_dir(source)
+    _sync_agy_auth_state(source, config_dir=cfg_dir)
     auth_ok, cred_source = _inspect_auth_files(cfg_dir, source)
     seat = resolve_enterprise_adc_seat(source)
     _onboarding_ok, companion_project, tier_id, consumer_only = _read_onboarding_metadata_ext(cfg_dir)
@@ -911,8 +1132,10 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
         )
     elif not auth_ok:
         token_file_path = cfg_dir / "antigravity-oauth-token"
+        onboarding_file_path = cfg_dir / "cache" / "onboarding.json"
         token_gap = stored_token_onboarding_gap(token_file_path)
         token_problem = stored_token_problem(token_file_path) if token_file_path.exists() else None
+        marker_refs = (token_file_path, onboarding_file_path) if token_file_path.exists() else (onboarding_file_path,)
         if token_gap:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_gap}."
             remediation = (
@@ -921,6 +1144,9 @@ def inspect_agy_cli_offline(env: Mapping[str, str] | None = None) -> dict[str, A
             )
         elif token_problem:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but {token_problem}."
+            remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
+        elif _is_auth_failure_marker_active(cfg_dir, marker_refs):
+            error = f"Antigravity CLI at `{agy_bin}` rejected the saved sign-in on its last call."
             remediation = "Run `/cc-agy-plugin:login` in Claude Code to sign in again."
         else:
             error = f"Antigravity CLI is installed at `{agy_bin}`, but no Google sign-in token was found in `{cfg_dir}`."
@@ -2513,6 +2739,7 @@ def _resolve_cached_model_for_cli(
     from server.agy_state import catalog_offers, load_agy_model_catalog
     from server.bifrost_policy import POLICY_ROUTED_MODEL, BifrostPolicyError, enforce_agy_model_policy
 
+    _sync_agy_auth_state(env)
     cfg_key = str(agy_cli_config_dir(env))
     cache_key = (agy_bin, cfg_key, requested_model, effort or "")
     with _MODEL_FALLBACK_LOCK:
@@ -2621,6 +2848,7 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
     from server.worker_sandbox import plan_worker_sandbox
 
     env = request.get("env") if isinstance(request.get("env"), Mapping) else None
+    _sync_agy_auth_state(env)
     ensure_enterprise_seat_ready(env)
     agy_bin = _resolve_or_bootstrap_agy_bin(env)
     cfg_key = str(agy_cli_config_dir(env))
@@ -2973,6 +3201,7 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
         if not turn_out["ok"]:
             err_msg = str(turn_out["error"])
             if is_agy_auth_error(err_msg):
+                _note_agy_auth_failure(env)
                 err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
             exc = RuntimeError(err_msg)
             exc.partial_usage = agg_usage  # type: ignore[attr-defined]
@@ -2984,6 +3213,8 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
                 exc.partial_agy_conversation_usage = dict(base_conv_usage)  # type: ignore[attr-defined]
                 exc.partial_agy_conversation_turns = max(1, base_conv_turns)  # type: ignore[attr-defined]
             raise exc
+
+        _note_agy_call_succeeded(env)
 
         if prewalk_meta is not None:
             record_model_phase_usage(
@@ -3361,6 +3592,7 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
     )
 
     env = request.get("env") if isinstance(request.get("env"), Mapping) else None
+    _sync_agy_auth_state(env)
     ensure_enterprise_seat_ready(env)
     agy_bin = _resolve_or_bootstrap_agy_bin(env)
 
@@ -3518,12 +3750,15 @@ def run_agy_cli_ask(request: dict[str, Any]) -> dict[str, Any]:
         if not out["ok"]:
             err_msg = str(out["error"])
             if is_agy_auth_error(err_msg):
+                _note_agy_auth_failure(env)
                 err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
             exc = RuntimeError(err_msg)
             partial = dict(out["usage"])
             _merge_usage(partial, failed_attempts_usage)
             exc.partial_usage = partial  # type: ignore[attr-defined]
             raise exc
+
+        _note_agy_call_succeeded(env)
 
         turn_usage: dict[str, int] = dict(out["usage"])
         cumulative_usage = dict(out["usage"])
@@ -3582,6 +3817,7 @@ def run_agy_cli_structured_writer(
     env: Mapping[str, str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """Run a structured JSON-schema batch writer turn via `agy --output-format json`."""
+    _sync_agy_auth_state(env)
     ensure_enterprise_seat_ready(env)
     agy_bin = _resolve_or_bootstrap_agy_bin(env)
     effort = map_thinking_level_to_effort(thinking_level, model)
@@ -3626,11 +3862,13 @@ def run_agy_cli_structured_writer(
     if not out["ok"]:
         err_msg = str(out["error"])
         if is_agy_auth_error(err_msg):
+            _note_agy_auth_failure(env)
             err_msg = _format_auth_remediation(err_msg, agy_bin, env=env)
         exc = RuntimeError(err_msg)
         exc.partial_usage = out["usage"]  # type: ignore[attr-defined]
         raise exc
 
+    _note_agy_call_succeeded(env)
     return str(out.get("text") or ""), out["usage"]
 
 

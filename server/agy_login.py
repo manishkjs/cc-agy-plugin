@@ -44,9 +44,12 @@ if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
 from server.agy_cli import (
+    _is_auth_failure_marker_active,
     _platform_keeps_token_in_keychain,
     agy_cli_config_dir,
+    clear_auth_failure_marker,
     inspect_agy_cli_offline,
+    invalidate_agy_auth_caches,
     resolve_agy_cli_binary,
 )
 
@@ -565,6 +568,8 @@ def finalize_enterprise_onboarding(
             settings_file,
             (json.dumps(existing_settings, indent=2) + "\n").encode("utf-8"),
         )
+        clear_auth_failure_marker(config_dir)
+        invalidate_agy_auth_caches(env=env, config_dir=config_dir)
 
     if verified:
         problem = None
@@ -740,7 +745,10 @@ def try_acp_business_browser_login(
         token_file = config_dir / "antigravity-oauth-token"
         from server.agy_cli import stored_token_problem
 
-        if token_file.exists() and stored_token_problem(token_file) is not None:
+        if token_file.exists() and (
+            stored_token_problem(token_file) is not None
+            or (_platform_keeps_token_in_keychain(env) and _is_auth_failure_marker_active(config_dir, (token_file,)))
+        ):
             token_file.unlink(missing_ok=True)
         onboarding = finalize_enterprise_onboarding(
             config_dir,
@@ -750,7 +758,7 @@ def try_acp_business_browser_login(
         )
         if onboarding.get("problem") == "keychain":
             # The token went to the OS keychain, which this plugin can't read; agy confirmed it.
-            _mark_enterprise_onboarding_complete(config_dir)
+            _mark_enterprise_onboarding_complete(config_dir, env=env)
         return True, ""
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return False, str(exc)
@@ -864,6 +872,35 @@ def _exchange_code_with_running_cde_proc(
     return result
 
 
+def _browser_sign_in(agy_bin: str, source: Mapping[str, str], explicit_proj: str, timeout_seconds: float) -> tuple[bool, str]:
+    """agy's own browser sign-in, optionally for a specific seat project.
+
+    agy's license lookup reads gcp.project from its settings.json, so a requested project is
+    written there first. If the sign-in fails (typo, no seat, closed window) the previous
+    settings are put back, so a working setup is never left pointing at the wrong project.
+    """
+    settings_file = agy_cli_config_dir(source) / "settings.json"
+    previous = settings_file.read_bytes() if settings_file.is_file() else None
+    if explicit_proj:
+        _set_agy_settings_project(settings_file.parent, explicit_proj)
+    signed_in, error = try_acp_business_browser_login(agy_bin, env=source, timeout_seconds=timeout_seconds)
+    if not signed_in and explicit_proj:
+        if previous is None:
+            settings_file.unlink(missing_ok=True)
+        else:
+            _atomic_write_private(settings_file, previous)
+    return signed_in, error
+
+
+def _keychain_without_fallback(source: Mapping[str, str]) -> bool:
+    """True on macOS/Windows keychains: a pasted-code sign-in there can never be verified.
+
+    On a Linux desktop agy falls back to the token file when its keyring write fails, so a link
+    can still work there.
+    """
+    return sys.platform in ("darwin", "win32") and _platform_keeps_token_in_keychain(source)
+
+
 def _env_truthy(source: Mapping[str, str], name: str) -> bool:
     return (source.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -886,7 +923,7 @@ def _set_agy_settings_project(config_dir: Path, project: str) -> None:
     _atomic_write_private(settings_file, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
 
 
-def _mark_enterprise_onboarding_complete(config_dir: Path) -> None:
+def _mark_enterprise_onboarding_complete(config_dir: Path, *, env: Mapping[str, str] | None = None) -> None:
     """Record that agy itself confirmed the enterprise sign-in (token kept in the OS keychain)."""
     onboarding_file = config_dir / "cache" / "onboarding.json"
     existing: dict[str, Any] = {}
@@ -913,6 +950,8 @@ def _mark_enterprise_onboarding_complete(config_dir: Path) -> None:
     except (OSError, ValueError, AttributeError):
         pass
     _atomic_write_private(onboarding_file, (json.dumps(existing, indent=2) + "\n").encode("utf-8"))
+    clear_auth_failure_marker(config_dir)
+    invalidate_agy_auth_caches(env=env, config_dir=config_dir)
 
 
 def _cleanup_stale_hold_session(state_dir: Path) -> None:
@@ -1157,6 +1196,7 @@ def start_two_step_login(
     *,
     timeout_seconds: int = _DEFAULT_HOLD_TIMEOUT_SECONDS,
     force: bool = False,
+    browser_already_tried: str | None = None,
 ) -> dict[str, Any]:
     """Launch the detached PKCE holder daemon and return the clickable Google OAuth URL.
 
@@ -1195,26 +1235,38 @@ def start_two_step_login(
     if not agy_bin:
         return {"ok": False, "error": status.get("error") or "External `agy` binary is not installed."}
 
-    keyring_machine = _platform_keeps_token_in_keychain(source)
     fallback_note = ""
-    if can_use_local_browser_loopback(source) or (keyring_machine and _env_truthy(source, "CC_AGY_FORCE_URL_LOGIN")):
+    if browser_already_tried is not None:
+        fallback_note = f"The browser sign-in didn't finish ({browser_already_tried}), so here is a link instead."
+    else:
+        # A link the user may already be signing in with beats another browser wait.
+        live = None if force else _live_hold_session(_login_state_dir(source))
+        if live is not None and (live.get("enterprise_project") or "") == explicit_proj:
+            return {**live, "reused": True}
+    no_fallback = _keychain_without_fallback(source)
+    if browser_already_tried is None and (
+        no_fallback or (can_use_local_browser_loopback(source) and not _env_truthy(source, "CC_AGY_FORCE_URL_LOGIN"))
+    ):
         # On a local desktop, agy's own browser sign-in records the license even when the token
-        # goes to the OS keychain (macOS), which the copy-paste flow below can't verify; so on such
-        # a machine the browser is tried first even when the link flow was requested.
-        if explicit_proj:
-            # agy's resolveEnterpriseLicense reads gcp.project from its own settings.json.
-            _set_agy_settings_project(agy_cli_config_dir(source), explicit_proj)
-        # 90s, not longer: agent shells (Claude Code's Bash tool) kill commands after ~120s by
-        # default, and the user must see the error rather than a killed command.
-        signed_in, browser_error = try_acp_business_browser_login(agy_bin, env=source, timeout_seconds=90.0)
+        # goes to the OS keychain. 90s, not longer: agent shells (Claude Code's Bash tool) kill
+        # commands after ~120s by default, and the user must see the error, not a killed command.
+        signed_in, browser_error = _browser_sign_in(agy_bin, source, explicit_proj, 90.0)
         if signed_in:
             return {"ok": True, "signed_in": True, "method": "browser"}
-        # Browser sign-in didn't finish (window on a display the user can't see, SSO took longer
-        # than the wait, tab closed). Fall back to the link: if agy then saves the token to a
-        # keychain the plugin can't read, --complete says so plainly.
+        if no_fallback:
+            # macOS/Windows: a pasted code would save to the same keychain, where the license
+            # can't be recorded, so a link could only fail. Say what went wrong instead.
+            return {
+                "ok": False,
+                "error": (
+                    f"Browser sign-in didn't finish ({browser_error}). Run `/cc-agy-plugin:login` again and "
+                    "complete the sign-in in the browser window that opens"
+                    + (f" (seat project '{explicit_proj}' unchanged until it succeeds)." if explicit_proj else ".")
+                ),
+            }
+        # Linux desktop (remote display, slow SSO): fall back to the link; agy falls back to the
+        # token file there, which the plugin can check.
         fallback_note = f"The browser sign-in didn't finish ({browser_error}), so here is a link instead."
-    else:
-        fallback_note = ""
 
     state_dir = _login_state_dir(source)
     if not force:
@@ -1469,12 +1521,13 @@ def _print_login_result(result: Mapping[str, Any], write: Any) -> None:
             write(f"{result['note']}\n")
     else:
         write(f"\nSign-in did not finish: {result.get('error')}\n")
+        write("Run `/cc-agy-plugin:login` in Claude Code (or this script again) for a new sign-in link.\n")
 
 
 def run_interactive_or_url_login(
     env: Mapping[str, str] | None = None,
     *,
-    browser_timeout_seconds: float = 110.0,
+    browser_timeout_seconds: float = 90.0,  # Stays under agent shells' ~120s command limit.
     force: bool = False,
 ) -> int:
     """Automatic onboarding entrypoint used by `quickstart.sh` and `agy_signin.sh`."""
@@ -1482,12 +1535,24 @@ def run_interactive_or_url_login(
     if (source.get("CC_AGY_SKIP_SIGNIN") or "").strip() == "1" or source.get("PYTEST_CURRENT_TEST"):
         return 0
 
+    explicit_proj = _configured_enterprise_project_and_location(agy_cli_config_dir(source), source)[0]
+    healed: dict[str, Any] = {}
     if not force:
         healed = heal_enterprise_token(source)
         if healed.get("healed"):
             print(f"Repaired saved Gemini Enterprise sign-in (project={healed.get('project_id')}).")
     status = inspect_agy_cli_offline(source)
-    if not force and status.get("auth_configured") and not status.get("consumer_account_detected"):
+    project_change_pending = bool(
+        explicit_proj
+        and not healed.get("healed")
+        and explicit_proj != (healed.get("project_id") or status.get("companion_project") or "")
+    )
+    if (
+        not force
+        and not project_change_pending
+        and status.get("auth_configured")
+        and not status.get("consumer_account_detected")
+    ):
         print(f"Gemini Enterprise sign-in verified ({status.get('tier_id') or 'enterprise'}).")
         return 0
 
@@ -1497,12 +1562,18 @@ def run_interactive_or_url_login(
         return 0
 
     # 1. Local desktop with a browser (not SSH): agy's own browser sign-in, no copy-paste.
-    if can_use_local_browser_loopback(source):
+    browser_reason: str | None = None
+    no_fallback = _keychain_without_fallback(source)
+    if no_fallback or (can_use_local_browser_loopback(source) and not _env_truthy(source, "CC_AGY_FORCE_URL_LOGIN")):
         print("Opening your browser for Gemini Enterprise sign-in...", flush=True)
-        ok, reason = try_acp_business_browser_login(agy_bin, env=source, timeout_seconds=browser_timeout_seconds)
+        ok, reason = _browser_sign_in(agy_bin, source, explicit_proj, browser_timeout_seconds)
+        browser_reason = reason
         if ok:
             print("Signed in to Gemini Enterprise.")
             return 0
+        if no_fallback:
+            print(f"Browser sign-in didn't finish ({reason}). Run `/cc-agy-plugin:login` to try again.")
+            return 1
         print(f"Browser sign-in didn't finish ({reason}); showing a link instead.", flush=True)
 
     # 2. A person at a terminal (`curl ... | bash` in an SSH shell): print the link, read the code.
@@ -1564,7 +1635,7 @@ def run_interactive_or_url_login(
 
     # 4. An agent's shell (Claude Code, Cursor, OpenCode): start the 2-step sign-in and print
     #    the link for the agent to show.
-    started = start_two_step_login(source, force=force)
+    started = start_two_step_login(source, force=force, browser_already_tried=browser_reason)
     if not started.get("ok"):
         print(f"Could not start Gemini Enterprise sign-in: {started.get('error')}", file=sys.stderr)
         return 1

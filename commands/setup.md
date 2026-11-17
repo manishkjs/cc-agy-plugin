@@ -49,6 +49,6 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 for candidate in "$ROOT" "$DATA/cc-agy-plugin/current" "$DATA/cc-agy-plugin/repo"; do
   [ -f "$candidate/scripts/py.sh" ] && ROOT="$candidate" && break
 done
-   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --doctor --human --auth <AUTH>
+   sh "$ROOT/scripts/py.sh" "$ROOT/server/install.py" --doctor --human --auth <AUTH> [--project <ID>] [--base-url <URL>]
    ```
    Then tell the user to run `/reload-plugins` in this session (and any other open tabs).

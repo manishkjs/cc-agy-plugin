@@ -124,15 +124,18 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
      sh "@CHECKOUT_DIR@/scripts/py.sh" "@CHECKOUT_DIR@/server/install.py" --host claude --auth <AUTH> --profile <PROFILE> [--project <ID>] [--base-url <URL>]
    If it prints "! ..." lines, fix what they say (or ask the user) and run it again.
 
-4. Gemini Enterprise only — sign in:
+4. Gemini Enterprise only: sign in.
+   Before running the command below, tell the user:
+   "A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+   Then run:
      sh "@CHECKOUT_DIR@/scripts/py.sh" "@CHECKOUT_DIR@/server/agy_login.py" --start --json
-   - "already_signed_in" or "signed_in": true -> go to step 5. (On a Mac a browser window may
-     open for sign-in; the command waits for it.)
+   - "already_signed_in" or "signed_in": true -> go to step 5.
    - "auth_url" present: show "short_url" on its own line first if it is set, then the full
      "auth_url" on its own line, then [Sign in with Google](<auth_url>). Only if
      "clipboard_requested" is true, add: "it may also be on your clipboard". Ask the user to sign
      in with their Gemini Enterprise work account, click 'Copy to Clipboard' on the Antigravity
      page, and paste the code. "reused": true means an earlier link is still valid; show it again.
+     If the JSON has a "note", show it first (it says why the browser step was skipped).
    - When they paste the code, run the "complete_command" from the JSON with the code in place of
      <PASTE_CODE>. It looks up their license, so the first agy call works.
    - If it prints [FAIL], show the message: it says exactly what to do (for example, sign in with
@@ -140,7 +143,7 @@ AGENT / CLAUDE CODE — RUN THIS INTERACTIVE DROPDOWN ONBOARDING NOW:
    - Never tell the user to sign in with `agy -p`: print mode gives up after 60 seconds.
 
 5. Verify:
-     sh "@CHECKOUT_DIR@/scripts/py.sh" "@CHECKOUT_DIR@/server/install.py" --doctor --human --auth <AUTH> --workspace "@ORIG_CWD@"
+     sh "@CHECKOUT_DIR@/scripts/py.sh" "@CHECKOUT_DIR@/server/install.py" --doctor --human --auth <AUTH> [--project <ID>] [--base-url <URL>] --workspace "@ORIG_CWD@"
    Then tell the user to run /reload-plugins in THIS Claude Code session (and any other open
    tabs) before using /cc-agy-plugin:agy or /cc-agy-plugin:doctor.
 EOF
@@ -252,8 +255,15 @@ main() {
         cd "${checkout_dir}"
         # An install that reports issues (e.g. a key not exported yet) must still reach doctor,
         # which explains them; `set -e` would otherwise end the script silently here.
+        # A record from an earlier run must never drive this one (e.g. after Ctrl+C in the wizard).
+        record_file="${XDG_DATA_HOME:-${HOME}/.local/share}/cc-agy-plugin/last-install.json"
+        rm -f "${record_file}"
         install_rc=0
         "${python_bin}" -m server.install </dev/tty >/dev/tty || install_rc=$?
+        if [[ ! -f "${record_file}" ]]; then
+          # Wizard cancelled or nothing chosen: stop here instead of signing in or diagnosing.
+          exit "${install_rc}"
+        fi
         # The wizard records what the user picked; use it instead of guessing.
         last_install() {
           "${python_bin}" -c "import json, os, pathlib, sys; p = pathlib.Path(os.environ.get('XDG_DATA_HOME') or pathlib.Path.home() / '.local/share') / 'cc-agy-plugin/last-install.json'; print(json.loads(p.read_text()).get(sys.argv[1], '') if p.is_file() else '')" "$1" 2>/dev/null || true
@@ -262,7 +272,7 @@ main() {
         picked_project="$(last_install project)"
         picked_base_url="$(last_install base_url)"
         if [[ "${picked_auth}" == "gemini_enterprise" ]] && "${python_bin}" -c "from server.agy_cli import inspect_agy_cli_offline; s=inspect_agy_cli_offline(); raise SystemExit(0 if s.get('binary_found') and (not s.get('auth_configured') or s.get('consumer_account_detected')) else 1)" 2>/dev/null; then
-          PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
+          PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || true  # Doctor below says what's left.
         fi
         doctor_args=(--doctor --human --allow-pending-login --workspace "${orig_cwd}")
         if [[ -n "${picked_auth}" ]]; then
@@ -274,7 +284,7 @@ main() {
         if [[ -n "${picked_base_url}" ]]; then
           doctor_args+=(--base-url "${picked_base_url}")
         fi
-        "${python_bin}" -m server.install "${doctor_args[@]}" || true
+        "${python_bin}" -m server.install "${doctor_args[@]}" || install_rc=$?
         exit "${install_rc}"
       )
       return 0
@@ -293,11 +303,14 @@ main() {
     cd "${checkout_dir}"
     install_rc=0
     "${python_bin}" -m server.install "$@" || install_rc=$?
+    if [[ "${install_rc}" -eq 2 ]]; then
+      exit 2  # Bad command-line flags: nothing was installed, so there is nothing to sign in to.
+    fi
     if wants_enterprise_signin "$@"; then
       if has_arg --non-interactive "$@"; then
         export CC_AGY_NONINTERACTIVE=1
       fi
-      PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh"
+      PYTHON_BIN="${python_bin}" bash "${checkout_dir}/scripts/agy_signin.sh" || true  # Doctor below says what's left.
     fi
     if ! is_dry_run "$@"; then
       doctor_args=(--doctor --human --allow-pending-login --workspace "${orig_cwd}")

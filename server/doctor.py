@@ -241,6 +241,23 @@ def run_doctor(
             used_host_cfg_env = True
         else:
             active_env = raw_env
+    elif (
+        (env is None or has_isolated_cfg_override or allow_pending_login)
+        and raw_auth_val not in ("", "auto")
+        and not in_unisolated_pytest
+    ):
+        # An explicit --auth still needs the project / gateway URL the installer just saved for
+        # the host (e.g. quickstart's final `--doctor --auth vertex`). Fill only what is missing;
+        # the explicit mode and anything already set always win.
+        discovered_cfg_env = _discover_installed_host_mcp_env(raw_env)
+        filled = {k: v for k, v in (discovered_cfg_env or {}).items() if k != "CC_AGY_AUTH_MODE" and v}
+        if filled:
+            active_env = {**filled, **{k: v for k, v in raw_env.items() if v is not None}}
+            used_host_cfg_env = True
+        else:
+            active_env = raw_env
+        if "CC_AGY_AUTH_MODE" in raw_env:
+            active_env = {**active_env, "CC_AGY_AUTH_MODE": raw_env["CC_AGY_AUTH_MODE"]}
     else:
         active_env = raw_env
     issues: list[str] = []
@@ -644,7 +661,7 @@ def run_doctor(
     disk_agy = live_agy or python_has_module(sdk_py, "google.antigravity")
     # Inside the MCP server only imports count. A one-shot CLI doctor isn't the server: the next
     # server start re-execs into `sdk_py`, so packages present there count too.
-    in_mcp_server = (active_env.get("CC_AGY_IN_MCP_SERVER") or os.environ.get("CC_AGY_IN_MCP_SERVER") or "") == "1"
+    in_mcp_server = (active_env.get("CC_AGY_IN_MCP_SERVER") or "") == "1"
     has_genai = live_genai or (disk_genai and not in_mcp_server)
     has_agy = live_agy or (disk_agy and not in_mcp_server)
     has_ctx = _module_available("ctx.sdk") or python_has_module(sdk_py, "ctx.sdk")

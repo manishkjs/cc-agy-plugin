@@ -2876,6 +2876,8 @@ def _materialize_persistent_checkout(persistent_repo: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Set by the MCP server for itself; a CLI run started from inside it is not the server.
+    os.environ.pop("CC_AGY_IN_MCP_SERVER", None)
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if not raw_argv and argv is None:
         if sys.stdin.isatty() and sys.stdout.isatty():
@@ -3360,10 +3362,11 @@ def _record_install_choice(auth_mode: Any, *, project: str | None = None, base_u
     picked, so it reads this file instead of guessing (and running Enterprise sign-in for an
     API-key user).
     """
-    if not auth_mode or str(auth_mode) in ("missing", "auto", "unconfigured"):
-        return
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     target = data_home / "cc-agy-plugin" / "last-install.json"
+    if not auth_mode or str(auth_mode) in ("missing", "auto", "unconfigured"):
+        target.unlink(missing_ok=True)  # Never leave an older run's choice behind.
+        return
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         record: dict[str, str] = {"auth_mode": str(auth_mode)}

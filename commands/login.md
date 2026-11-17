@@ -3,8 +3,11 @@ name: login
 description: Sign in to Gemini Enterprise, or repair a saved sign-in that agy rejects. Pass --force to always start a fresh sign-in.
 ---
 
-Run the sign-in helper. Pass through what the user typed after the command (`--force` for a fresh
-sign-in, `--project <ID>` to pick the seat project):
+Before running the command below, tell the user:
+"A browser window will open for Google sign-in; finish it there. This waits up to 90 seconds."
+
+Then run the sign-in helper. Pass through what the user typed after the command (`--force` for a
+fresh sign-in, `--project <ID>` to pick the seat project):
 
 ```bash
 ROOT="${CLAUDE_PLUGIN_ROOT:-}"
@@ -14,8 +17,6 @@ for candidate in "$ROOT" "$DATA/cc-agy-plugin/current" "$DATA/cc-agy-plugin/repo
 done
 sh "$ROOT/scripts/py.sh" "$ROOT/server/agy_login.py" --start --json $ARGUMENTS
 ```
-
-On a local Mac or desktop this may open a browser window and wait for the user to sign in there.
 
 Handle the JSON:
 
@@ -27,6 +28,7 @@ Handle the JSON:
    - Only if `clipboard_requested` is true, add "it may also be on your clipboard" (some terminals,
      such as macOS Terminal.app, ignore clipboard requests).
    - `"reused": true` means the link from earlier is still valid; show it again.
+   - If there is a `note`, show it first: it says why the browser sign-in was skipped.
    - Ask the user to sign in with their Gemini Enterprise work account, click **Copy to Clipboard**
      on the Antigravity page, and paste the code here.
    - When they paste it, run the `complete_command` from the JSON with the code in place of
