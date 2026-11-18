@@ -3165,6 +3165,11 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
                 keep_warm=prewalk_active,
                 allowed_paths=request.get("allowed_paths"),
                 stop_on_first_edit=stop_on_first_edit,
+                permission_prompter=(
+                    request.get("permission_prompter")
+                    if callable(request.get("permission_prompter"))
+                    else None
+                ),
             )
         return _run_stream_json_turn(
             agy_bin=agy_bin,

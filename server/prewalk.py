@@ -429,6 +429,7 @@ def evaluate_acp_permission_policy(
                 "tool": clean_name,
                 "path": raw_path,
                 "reason": esc_err,
+                "hard_deny": True,
             }
         if rel_posix and is_protected_path(rel_posix):
             return False, {
@@ -436,6 +437,7 @@ def evaluate_acp_permission_policy(
                 "tool": clean_name,
                 "path": rel_posix,
                 "reason": f"Access to protected or secret file '{rel_posix}' is denied by policy.",
+                "hard_deny": True,
             }
         if is_write and rel_posix and allowed_paths and not _matches_allowed_paths(rel_posix, list(allowed_paths)):
             return False, {
@@ -443,6 +445,7 @@ def evaluate_acp_permission_policy(
                 "tool": clean_name,
                 "path": rel_posix,
                 "reason": f"Edit target '{rel_posix}' is outside allowed_paths {list(allowed_paths)}.",
+                "hard_deny": False,
             }
 
     # 2. Check shell command strings for secret file access.
@@ -461,6 +464,7 @@ def evaluate_acp_permission_policy(
                 "tool": clean_name,
                 "command": cmd_text[:200],
                 "reason": "Command references a protected secret or credential path.",
+                "hard_deny": True,
             }
 
     if read_only and (is_write or is_exec):
@@ -468,12 +472,14 @@ def evaluate_acp_permission_policy(
             "kind": "command" if is_exec else "write",
             "tool": clean_name,
             "reason": "Blocked in read-only ACP worker session.",
+            "hard_deny": True,
         }
 
     if not skip_permissions and (is_write or is_exec):
         return False, {
             "kind": "command" if is_exec else "write",
             "tool": clean_name,
+            "hard_deny": False,
             **(
                 {"path": candidate_paths[0]}
                 if candidate_paths

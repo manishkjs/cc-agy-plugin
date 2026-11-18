@@ -307,11 +307,12 @@ def _spawn_acp_session_process(
     ]
     if use_agy_sandbox:
         cmd.append("--sandbox")
-    # Notice: when allowed_paths or read_only is active, we still enforce policy in
-    # `session/request_permission`; passing `--dangerously-skip-permissions` suppresses
-    # `session/request_permission` callbacks inside `agy`, so omit it whenever `allowed_paths`
-    # requires per-file callback enforcement!
-    if skip_permissions and not read_only:
+    # Omit `--dangerously-skip-permissions` on ACP by default so GE App Console MDM / sandbox
+    # rules emit `session/request_permission` callbacks to our policy + elicitation handler.
+    # Safe in-workspace actions are still auto-approved inline in <1ms when `skip_permissions=True`.
+    src_env = os.environ if env is None else env
+    explicit_skip_flag = str(src_env.get("CC_AGY_ACP_SKIP_PERMISSIONS") or "").strip().lower() in ("1", "true", "yes")
+    if explicit_skip_flag and skip_permissions and not read_only:
         cmd.append("--dangerously-skip-permissions")
 
     spawn_cookie = secrets.token_hex(16)
@@ -556,6 +557,7 @@ def run_agy_acp_turn(
     keep_warm: bool = False,
     allowed_paths: Sequence[str] | None = None,
     stop_on_first_edit: bool = False,
+    permission_prompter: Callable[[Mapping[str, Any], str], bool | None] | None = None,
 ) -> dict[str, Any]:
     """Execute one worker turn over `agy acp --stdio`, reusing a warm session when `keep_warm=True`."""
     from server.agy_cli import convert_agy_usage_to_vertex
@@ -763,6 +765,25 @@ def run_agy_acp_turn(
                         read_only=read_only,
                         skip_permissions=skip_permissions,
                     )
+                    if (
+                        not allowed_by_policy
+                        and allow_opt
+                        and callable(permission_prompter)
+                        and not (isinstance(denied_entry, Mapping) and denied_entry.get("hard_deny"))
+                    ):
+                        elicit_reason = (
+                            str(denied_entry.get("reason") or "")
+                            if isinstance(denied_entry, Mapping)
+                            else "Approval required by workspace or MDM policy."
+                        )
+                        try:
+                            elicit_ok = permission_prompter(tc, elicit_reason)
+                        except Exception:
+                            elicit_ok = None
+                        if elicit_ok is True:
+                            allowed_by_policy = True
+                        elif elicit_ok is False and isinstance(denied_entry, dict):
+                            denied_entry["user_declined"] = True
                     if allowed_by_policy and allow_opt:
                         warm_sess.send_rpc(
                             {

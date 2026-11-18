@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Any, BinaryIO
 
 from server.doctor import run_doctor
@@ -1037,10 +1039,147 @@ class MCPServer:
         self.batch_writer_factory = batch_writer_factory
         # Set by serve_stdio: writes a JSON-RPC notification (e.g. notifications/progress) to the client.
         self.notify: Any = None
+        # Client capabilities negotiated during `initialize` (used for MCP elicitation).
+        self.client_capabilities: dict[str, Any] = {}
+        self._pending_client_requests: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._client_req_lock = threading.Lock()
+        self._client_req_seq = 0
         # notifications/cancelled flips the stop event and runs registered cancel hooks for in-flight requests.
         self._active_stops: dict[Any, threading.Event] = {}
         self._active_cancels: dict[Any, list[Any]] = {}
         self._cancel_lock = threading.Lock()
+
+    def supports_elicitation(self) -> bool:
+        """Return True when the connected MCP client advertised `capabilities.elicitation`."""
+        return isinstance(self.client_capabilities.get("elicitation"), dict) and callable(self.notify)
+
+    def resolve_client_response(self, message: Mapping[str, Any]) -> bool:
+        """Deliver a client JSON-RPC response to a waiting server-initiated request."""
+        if "id" not in message:
+            return False
+        key = str(message.get("id"))
+        with self._client_req_lock:
+            entry = self._pending_client_requests.pop(key, None)
+        if entry is None:
+            return False
+        ev, holder = entry
+        holder["response"] = dict(message)
+        ev.set()
+        return True
+
+    def cancel_pending_client_requests(self) -> None:
+        """Wake all threads waiting on client JSON-RPC responses during server shutdown."""
+        with self._client_req_lock:
+            entries = list(self._pending_client_requests.values())
+            self._pending_client_requests.clear()
+        for ev, holder in entries:
+            holder["cancelled"] = True
+            ev.set()
+
+    def request_permission_elicitation(
+        self,
+        tool_call: Mapping[str, Any],
+        reason: str = "",
+        *,
+        timeout_seconds: float = 90.0,
+        stop_event: threading.Event | None = None,
+    ) -> bool | None:
+        """Ask the MCP client to approve or decline an ACP worker action via `elicitation/create`.
+
+        Returns True if the user accepted and approved, False if declined/cancelled, or None if
+        elicitation is unavailable, failed, or timed out (caller falls back to `needs_input`).
+        """
+        if not self.supports_elicitation():
+            return None
+        tool_name = str(
+            tool_call.get("name") or tool_call.get("title") or tool_call.get("kind") or "tool"
+        ).strip()
+        raw_input = tool_call.get("rawInput") if isinstance(tool_call.get("rawInput"), Mapping) else {}
+        if not raw_input and isinstance(tool_call.get("args"), Mapping):
+            raw_input = tool_call["args"]
+        target = ""
+        for field_key in ("CommandLine", "command", "cmd", "path", "Path", "file_path", "targetFile"):
+            val = raw_input.get(field_key)
+            if isinstance(val, str) and val.strip():
+                target = val.strip()[:200]
+                break
+        detail = f"`{tool_name}` on `{target}`" if target else f"`{tool_name}`"
+        why = f" ({reason.strip()[:200]})" if reason.strip() else ""
+        message = f"Antigravity worker requested approval to run {detail}{why}. Allow this action?"
+
+        with self._client_req_lock:
+            self._client_req_seq += 1
+            req_id = f"cc-agy-elicit-{self._client_req_seq}"
+            ev = threading.Event()
+            holder: dict[str, Any] = {}
+            self._pending_client_requests[req_id] = (ev, holder)
+
+        payload: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "elicitation/create",
+            "params": {
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approve": {
+                            "type": "boolean",
+                            "title": "Allow action",
+                            "description": "Approve this single action inside the isolated worker copy.",
+                            "default": False,
+                        }
+                    },
+                    "required": ["approve"],
+                },
+            },
+        }
+        try:
+            self.notify(payload)
+        except Exception:
+            with self._client_req_lock:
+                self._pending_client_requests.pop(req_id, None)
+            return None
+
+        deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+        while not ev.is_set():
+            if stop_event is not None and stop_event.is_set():
+                break
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            ev.wait(timeout=min(0.1, rem))
+
+        with self._client_req_lock:
+            self._pending_client_requests.pop(req_id, None)
+
+        if holder.get("cancelled") or "response" not in holder:
+            return None
+        resp = holder["response"]
+        if not isinstance(resp, Mapping) or "error" in resp:
+            return None
+        result = resp.get("result")
+        if not isinstance(result, Mapping):
+            return None
+        action = str(result.get("action") or "").strip().lower()
+        if action == "accept":
+            content = result.get("content")
+            if isinstance(content, Mapping):
+                return bool(content.get("approve"))
+            return False
+        if action in ("decline", "cancel"):
+            return False
+        return None
+
+    def _make_permission_prompter(
+        self,
+        *,
+        wait: bool,
+        stop_event: threading.Event | None,
+    ) -> Callable[[Mapping[str, Any], str], bool | None] | None:
+        if not wait or not self.supports_elicitation():
+            return None
+        return lambda tc, why: self.request_permission_elicitation(tc, why, stop_event=stop_event)
 
     def _register_request_guard(
         self,
@@ -1192,6 +1331,9 @@ class MCPServer:
 
         try:
             if method == "initialize":
+                raw_client_caps = params.get("capabilities")
+                if isinstance(raw_client_caps, dict):
+                    self.client_capabilities = dict(raw_client_caps)
                 requested_version = str(params.get("protocolVersion") or "")
                 negotiated = (
                     requested_version
@@ -1635,6 +1777,7 @@ class MCPServer:
                     on_job_allocated=lambda jid: reg_cancel_cont(lambda: self.job_manager.delegate_cancel(jid)),
                     progress_callback=report_cont,
                     stop_event=stop_cont,
+                    permission_prompter=self._make_permission_prompter(wait=wait_b, stop_event=stop_cont),
                 )
             finally:
                 cleanup_cont()
@@ -1788,6 +1931,7 @@ class MCPServer:
                 stop_event=stop_del if wait_b else None,
                 _skip_balanced_qa=will_run_qa,
                 prewalk=prewalk_arg,
+                permission_prompter=self._make_permission_prompter(wait=wait_b, stop_event=stop_del),
             )
         finally:
             cleanup_del()
@@ -2238,6 +2382,14 @@ def serve_stdio(
             # Route fast control/status calls to control_pool, long result waits to wait_pool, and
             # heavy worker/batch calls to rpc_pool so cancellation and status never starve behind 8 workers.
             for msg in parsed_messages:
+                if (
+                    isinstance(msg, dict)
+                    and "id" in msg
+                    and "method" not in msg
+                    and ("result" in msg or "error" in msg)
+                ):
+                    active_server.resolve_client_response(msg)
+                    continue
                 if isinstance(msg, dict) and msg.get("method") == "notifications/cancelled":
                     params_c = msg.get("params")
                     target_req_id = params_c.get("requestId") if isinstance(params_c, dict) else None
@@ -2322,6 +2474,7 @@ def serve_stdio(
             for p in pools:
                 p.shutdown(wait=True)
     finally:
+        active_server.cancel_pending_client_requests()
         if is_live_process_stdin:
             for p in pools:
                 p.shutdown(wait=False, cancel_futures=True)

@@ -2479,6 +2479,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         agy_prior_conversation_turns: int | None = None,
         turn_instructions: Mapping[str, str] | None = None,
         prewalk: bool | None = None,
+        permission_prompter: Callable[[Mapping[str, Any], str], bool | None] | None = None,
     ) -> dict[str, Any]:
         token_keys = (
             "prompt_token_count",
@@ -2656,6 +2657,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 isolated_worktree=(not in_place),
                 turn_instructions=turn_instructions,
                 prewalk=prewalk,
+                permission_prompter=permission_prompter,
             )
             if isinstance(worker_out.get("prewalk"), dict):
                 worker_prewalk_meta = dict(worker_out["prewalk"])
@@ -3926,6 +3928,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         stop_event: threading.Event | None = None,
         _skip_balanced_qa: bool = False,
         prewalk: bool | None = None,
+        permission_prompter: Callable[[Mapping[str, Any], str], bool | None] | None = None,
     ) -> dict[str, Any]:
         """Start an Antigravity worker job.
 
@@ -4399,6 +4402,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 baseline_acceptance_probe=baseline_probe,
                 acceptance_remapped=acceptance_remapped,
                 prewalk=prewalk,
+                permission_prompter=permission_prompter if wait else None,
             )
             self._futures[job_id] = fut
             self._owned_job_ids.add(job_id)
@@ -4905,6 +4909,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
         _wait_elapsed: float = 0.0,
         _wait_budget: float | None = None,
         _prompt_source: str = "lead",
+        permission_prompter: Callable[[Mapping[str, Any], str], bool | None] | None = None,
     ) -> dict[str, Any]:
         """Send a follow-up prompt into the same job's isolated worktree without re-running prior prompts."""
         cont_started_mono = time.monotonic()
@@ -5671,6 +5676,7 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                 agy_prior_conversation_usage=prior_agy_conv_usage,
                 agy_prior_conversation_turns=prior_agy_conv_turns,
                 turn_instructions=turn_reminders,
+                permission_prompter=permission_prompter if wait else None,
             )
             self._futures[safe_id] = fut
             self._owned_job_ids.add(safe_id)

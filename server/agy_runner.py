@@ -3593,6 +3593,7 @@ def run_antigravity_worker(
     isolated_worktree: bool = False,
     turn_instructions: Mapping[str, str] | None = None,
     prewalk: bool | None = None,
+    permission_prompter: Callable[[Mapping[str, Any], str], bool | None] | None = None,
 ) -> dict[str, Any]:
     """Run an Antigravity worker synchronously or via custom test backend.
 
@@ -3648,6 +3649,7 @@ def run_antigravity_worker(
         "max_tool_calls": max_tool_calls,
         "max_total_tokens": max_total_tokens,
         "progress_path": str(progress_path) if progress_path else None,
+        "permission_prompter": permission_prompter if callable(permission_prompter) else None,
         "extra_tools": list(extra_tools) if extra_tools else None,
         "system_prompt": system_prompt,
         "acceptance": list(acceptance) if acceptance else [],
