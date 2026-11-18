@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml"><img src="https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg" alt="Validate"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License: Apache 2.0"></a>
-  <a href=".claude-plugin/plugin.json"><img src="https://img.shields.io/badge/version-0.4.2-1a73e8" alt="Version"></a>
+  <a href=".claude-plugin/plugin.json"><img src="https://img.shields.io/badge/version-0.4.3-1a73e8" alt="Version"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab" alt="Python 3.10+"></a>
 </p>
 
@@ -167,7 +167,7 @@ Prefer video? Watch the [4m 30s walkthrough](assets/walkthrough.mp4).
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.4.2, Apache 2.0 |
+| **Version** | 0.4.3, Apache 2.0 |
 | **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 

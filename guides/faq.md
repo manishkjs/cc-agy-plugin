@@ -40,4 +40,12 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 
 `gemini-4-hydrogen` by default. Under `balanced`, a failed check moves the job to `gemini-4-carbon-zero` (and `prewalk=true` runs Turn 1 planning plus the first edit on `gemini-4-carbon` before handing off to `gemini-4-hydrogen`). Under `quality`, jobs start on `gemini-4-carbon`. You can override the model per call or with `CC_AGY_DEFAULT_DELEGATE_MODEL` and `CC_AGY_DEFAULT_ASK_MODEL`.
 
+## Why is the plugin's token total higher than the one `agy` prints?
+
+The plugin counts cached prompt tokens and `agy` doesn't. In `agy`'s JSON output, `input_tokens` leaves out cached tokens and `total_tokens` is input plus output only, so a turn that read 8,113 tokens from the prompt cache shows 8,113 fewer tokens there. The plugin's total is uncached input + cached input + output (thinking included once), the same way the Gemini API counts `usage_metadata`. Cached tokens are listed on their own (`cached_content_token_count`) and are priced at the lower cached rate, so the cost in cents is not inflated.
+
+## Why does the plugin skip untracked files in my home folder?
+
+When Claude Code or another host starts in your home folder and that folder is a git repo, every file under it counts as untracked. Listing them all would take longer than the host waits for the plugin to start, so in the home folder (or a drive root) the plugin's baseline and provenance checks look at tracked files only. Start your host from a project folder to get the full checks, and to give delegated jobs code to work on.
+
 [Back to the README](../README.md)

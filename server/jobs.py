@@ -172,6 +172,24 @@ from server.job_apply_mixin import JobApplyMixin
 from server.job_qa_mixin import JobQAMixin
 from server.job_salvage_mixin import JobSalvageMixin
 
+def skips_untracked_scan(workspace_root: Path) -> bool:
+    """Return True when listing untracked files under `workspace_root` would walk a whole disk.
+
+    That happens when the host was started in the user's home folder (or a filesystem root)
+    and that folder is a git repo: every file under it is "untracked", so `git add -N .`
+    takes far longer than a host waits for the MCP handshake. Tracked changes are still diffed.
+    """
+    from server.runtime_env import user_home
+
+    try:
+        resolved = Path(workspace_root).resolve()
+        if resolved == Path(resolved.anchor):
+            return True
+        return resolved == user_home().resolve()
+    except OSError:
+        return False
+
+
 def capture_live_workspace_diff(
     workspace_root: Path,
     *,
@@ -180,7 +198,7 @@ def capture_live_workspace_diff(
     """Capture the unified diff of workspace_root against baseline_head_sha (or HEAD) including untracked files.
 
     Uses a temporary GIT_INDEX_FILE copy so the host repository's real git index is
-    never mutated.
+    never mutated. Untracked files are left out when `skips_untracked_scan` is True.
     """
     git_dir_res = _run_git(["rev-parse", "--git-dir"], cwd=workspace_root, check=False)
     if git_dir_res.returncode != 0:
@@ -203,16 +221,17 @@ def capture_live_workspace_diff(
         else:
             tmp_index_path.unlink(missing_ok=True)
         index_env = {"GIT_INDEX_FILE": str(tmp_index_path)}
-        _git_raw(
-            ["-c", "core.quotePath=false", "add", "-N", "."],
-            cwd=str(workspace_root),
-            env_overrides=index_env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        if not skips_untracked_scan(workspace_root):
+            _git_raw(
+                ["-c", "core.quotePath=false", "add", "-N", "."],
+                cwd=str(workspace_root),
+                env_overrides=index_env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
         diff_res = _git_raw(
             ["-c", "core.quotePath=false", "diff", "--binary", "--no-renames", target_ref],
             cwd=str(workspace_root),
@@ -1505,12 +1524,16 @@ class JobManager(JobApplyMixin, JobQAMixin, JobSalvageMixin):
                             if actual_h != expected_h:
                                 return
 
-                untracked_res = _run_git(
-                    ["ls-files", "--others", "--exclude-standard"],
-                    cwd=self.workspace_root,
-                    check=False,
+                untracked_res = (
+                    _run_git(
+                        ["ls-files", "--others", "--exclude-standard"],
+                        cwd=self.workspace_root,
+                        check=False,
+                    )
+                    if not skips_untracked_scan(self.workspace_root)
+                    else None
                 )
-                if untracked_res.returncode == 0 and untracked_res.stdout.strip():
+                if untracked_res is not None and untracked_res.returncode == 0 and untracked_res.stdout.strip():
                     for line in untracked_res.stdout.splitlines():
                         rel_u = line.strip()
                         if (

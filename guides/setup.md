@@ -31,9 +31,9 @@ What happens next:
 # Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 # Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.2 bash -s -- --host opencode --auth gemini-enterprise
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.3 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.2 cc-agy-plugin --host claude --auth gemini-enterprise
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.3 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
 </details>
