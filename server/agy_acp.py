@@ -58,9 +58,12 @@ def _extract_acp_turn_error(
         not tool_calls
         and int(usage_out.get("candidates_token_count", 0) or 0) == 0
         and final_text
-        and _ACP_UPSTREAM_API_ERROR_RE.search(final_text)
     ):
-        return final_text.strip()
+        stripped = final_text.strip()
+        # agy formats every fatal step error as "\n⚠ <message>\n" (cli/acp/server/updates.go),
+        # with or without an upstream "(code NNN):" status.
+        if stripped.startswith("⚠") or _ACP_UPSTREAM_API_ERROR_RE.search(final_text):
+            return stripped
     return ""
 
 
@@ -423,7 +426,7 @@ def probe_agy_acp_capabilities(
         "params": {
             "protocolVersion": ACP_PROTOCOL_VERSION,
             "clientCapabilities": {},
-            "clientInfo": {"name": "cc-agy-plugin", "version": "0.4.1"},
+            "clientInfo": {"name": "cc-agy-plugin", "version": "0.4.2"},
         },
     }
     try:
@@ -674,6 +677,11 @@ def run_agy_acp_turn(
             if isinstance(method, str):
                 params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
                 if method == "session/update":
+                    if not is_prompt_turn:
+                        # `session/load` replays prior turns as `session/update` notifications
+                        # before returning `load_res`; ignore them so Turn 2 does not duplicate
+                        # Turn 1's text, thoughts, or tool-call counts.
+                        continue
                     upd = params.get("update") if isinstance(params.get("update"), dict) else params
                     kind = str(upd.get("sessionUpdate") or upd.get("type") or "").strip()
                     if kind == "agent_message_chunk":
@@ -859,7 +867,7 @@ def run_agy_acp_turn(
                         "params": {
                             "protocolVersion": ACP_PROTOCOL_VERSION,
                             "clientCapabilities": {},
-                            "clientInfo": {"name": "cc-agy-plugin", "version": "0.4.1"},
+                            "clientInfo": {"name": "cc-agy-plugin", "version": "0.4.2"},
                         },
                     }
                 )

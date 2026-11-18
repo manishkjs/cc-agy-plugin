@@ -1686,11 +1686,17 @@ def convert_agy_usage_to_vertex(agy_usage: Mapping[str, Any] | None) -> dict[str
         }
 
     uncached_in = _first_nonneg("input_tokens", "inputTokens")
-    cached_in = _first_nonneg("cache_read_tokens", "cacheReadTokens")
+    cached_in = _first_nonneg("cache_read_tokens", "cacheReadTokens", "cached_read_tokens", "cachedReadTokens")
+    cache_write_in = _first_nonneg(
+        "cache_write_tokens",
+        "cacheWriteTokens",
+        "cached_write_tokens",
+        "cachedWriteTokens",
+    )
     raw_out = _first_nonneg("output_tokens", "outputTokens")
-    think_out = _first_nonneg("thinking_tokens", "thinkingTokens")
+    think_out = _first_nonneg("thinking_tokens", "thinkingTokens", "thought_tokens", "thoughtTokens")
 
-    prompt_tokens = uncached_in + cached_in
+    prompt_tokens = uncached_in + cached_in + cache_write_in
     candidates_tokens = max(0, raw_out - think_out)
     thoughts_tokens = think_out
     total_tokens = prompt_tokens + candidates_tokens + thoughts_tokens

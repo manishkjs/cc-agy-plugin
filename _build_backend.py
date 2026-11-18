@@ -16,7 +16,7 @@ import zipfile
 _REPO_ROOT = Path(__file__).resolve().parent
 _DIST_NAME = "cc_agy_plugin"
 _PROJECT_NAME = "cc-agy-plugin"
-_VERSION = "0.4.1"
+_VERSION = "0.4.2"
 _DIST_INFO = f"{_DIST_NAME}-{_VERSION}.dist-info"
 
 _BUNDLED_ASSET_DIRS: tuple[str, ...] = (
@@ -30,6 +30,7 @@ _BUNDLED_ASSET_DIRS: tuple[str, ...] = (
     "skills",
     "agents",
     "hooks",
+    "guides",
 )
 _BUNDLED_ASSET_FILES: tuple[str, ...] = (
     ".mcp.json",
