@@ -1,626 +1,94 @@
-<div align="center">
-
-# cc-agy-plugin
-
-### Your coding agent plans and reviews. Gemini workers do the typing.
-
-Delegate file edits and test loops from Claude Code, Cursor, OpenCode, Antigravity (`agy`), and Codex<br>
-to low-cost Gemini workers that run in an isolated git copy of your repo.
-
-[![Validate](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg)](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.1-1a73e8)](.claude-plugin/plugin.json)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
-[![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20OpenCode%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
-
-[Why use it](#why-use-it) · [How it works](#how-it-works) · [Quick start](#quick-start) · [How to use it](#how-to-use-it) · [Configuration](#configuration) · [Benchmark results](#benchmark-results) · [FAQ](#faq) · [Technical reference](#technical-reference)
-
-</div>
-
 <p align="center">
   <img src="assets/overview.svg" alt="The Lead agent sends a brief to cc-agy-plugin, which runs a Gemini worker in an isolated copy, tests the result, and returns a signed, costed diff" width="100%">
 </p>
 
-## Why use it
+# cc-agy-plugin
 
-You already work inside Claude Code (`claude`), Cursor, OpenCode (`opencode`), Antigravity (`agy` CLI or the Antigravity IDE), or Codex (`codex`). In all of them, the most expensive model in the session also does the cheap work: reading files, typing boilerplate, and re-running a failing test until it passes.
+<p align="center">
+  <a href="https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml"><img src="https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg" alt="Validate"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License: Apache 2.0"></a>
+  <a href=".claude-plugin/plugin.json"><img src="https://img.shields.io/badge/version-0.4.1-1a73e8" alt="Version"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776ab" alt="Python 3.10+"></a>
+</p>
 
-`cc-agy-plugin` moves that work to Gemini. Your main agent stays in charge of planning and code review. When files need to be written, refactored, or debugged, it hands a short brief to a Gemini worker that runs inside a separate git copy of your repo. The plugin checks that the result compiles and passes tests, merges only verified changes back into your workspace, and writes a signed cost receipt with a one-call undo.
+**Your coding agent plans and reviews. Gemini workers do the typing.** cc-agy-plugin works inside Claude Code, Cursor, OpenCode, Codex, and Antigravity. When files need to be written, refactored, or debugged, your agent hands a short brief to a Gemini worker that runs in a separate git copy of your repo. The plugin runs your tests on the result, merges only what passes, and writes a signed receipt with the cost in cents.
 
-You keep typing prompts and reviewing diffs the same way you do today. In our 26-task benchmark, the cheapest Claude Code setup cost 31% less per task than Opus alone, and Gemini Flash running in Antigravity with the plugin harness cost 46% less. The default `balanced` profile saved 7% and solved more tasks than `economy`. The [benchmark section](#benchmark-results) has every setup, including the ones where the cheaper route solved fewer tasks.
+You keep typing prompts and reviewing diffs the way you do today. In our 26-task benchmark, the cheapest Claude Code setup cost 31% less per task than Opus alone, and it also solved fewer tasks. The [benchmarks](#benchmarks) show every setup, including the ones where the cheaper route solved fewer tasks.
 
-### What changes when you install it
+<table>
+<tr><td><b>Lower cost per task</b></td><td>Everyday reads, edits, and test retries run on <code>gemini-4-hydrogen</code>. A stronger Gemini model steps in only when a check fails or a retry is needed.</td></tr>
+<tr><td><b>A working tree that stays clean</b></td><td>Workers edit a disposable git copy. Nothing reaches your repo until the checks pass and the diff is applied.</td></tr>
+<tr><td><b>Checks on every job</b></td><td>The plugin runs your tests when it finds them. With no tests, it falls back to syntax and compile checks for Python, TypeScript/JS, Go, Rust, Bash, and JSON.</td></tr>
+<tr><td><b>Receipts you can audit</b></td><td>Every run writes an HMAC-SHA256 signed receipt with token counts and cost in cents. Set a daily spend cap with <code>--max-daily-cents</code>.</td></tr>
+<tr><td><b>One-call undo</b></td><td>Each applied job keeps backups of the files it touched, so you can revert that job alone.</td></tr>
+<tr><td><b>Four ways to connect</b></td><td>A Gemini Enterprise seat, a Google AI Studio API key, a Vertex AI project, or an AI gateway such as LiteLLM or Bifrost.</td></tr>
+<tr><td><b>A free preflight</b></td><td><code>doctor</code> checks credentials, SDKs, git state, and your test runner offline, at 0 tokens.</td></tr>
+</table>
 
-| Without `cc-agy-plugin` | With `cc-agy-plugin` |
-|:--|:--|
-| Your lead model (Opus at `400¢`/`2,000¢` or Argon/Carbon at `200¢`/`1,200¢` per 1M tokens) pays top-tier rates to read files, type boilerplate, and retry failing tests | Your lead model plans and reviews while Gemini Flash (`50¢`/`300¢`) handles everyday edits. A stronger model is used only on hard failures (`-31%` in Claude Code, `-20%` to `-50%` in Antigravity, and `-24%` even with Argon on both Lead and Worker) |
-| Failed or interrupted edits leave half-finished changes in your working tree | Workers edit an isolated git copy. Broken builds and failed checks never auto-apply |
-| Projects without unit tests get no safety net before edits land | Built-in syntax and compile smoke checks still gate Python, TypeScript/JS, Go, Rust, Bash, and JSON changes |
-| Monthly API bills arrive as a surprise with no per-task cap | Per-job receipts in US cents, lead plus worker session totals, and an optional daily spend cap (`--max-daily-cents`) |
-| No easy way to roll back just one agent run | Every applied job saves pre-edit file backups for a clean one-call revert |
+---
 
-### What you get
+## Quick install
 
-- **Lower cost per task.** Everyday reads, edits, and test retries run on `gemini-4-hydrogen` (`150¢` in / `750¢` out per 1M tokens, `7.5¢` cached). Under the default profile the worker moves to Gemini Carbon with zero thinking (`200¢` / `1,200¢`) only when a check fails or a retry is needed. Pass `prewalk=true` on hard tasks so `gemini-4-carbon` plans and lands the first edit before handing off the same session to `gemini-4-hydrogen`.
-- **A working tree that stays clean.** Workers run in a disposable git copy. Nothing reaches your repo until the checks pass and the diff is applied.
-- **Verification on every job.** The plugin runs your tests when it finds them, and falls back to syntax and compile checks when it does not.
-- **Receipts you can audit.** Every run writes an HMAC-SHA256 signed receipt with token counts and cost in cents.
-- **One-call undo.** Each applied job keeps pre-apply backups, so you can revert that job alone.
-- **Four ways to connect.** A Gemini Enterprise seat, a Google AI Studio API key, a Vertex AI project, or an AI gateway such as LiteLLM or Bifrost.
-- **A free preflight.** `doctor` checks credentials, SDKs, git state, and your test runner offline, at 0 tokens.
-
-## How it works
-
-1. **You ask for a change the usual way.** Your lead agent reads the request, looks at the key interfaces, and writes a short outcome-only brief with ordered plan steps and read-only acceptance checks such as `pytest` or `go test`.
-2. **The plugin makes an isolated copy.** Tracked and non-ignored files are copied into a standalone git repository with a baseline commit. Several jobs can run in parallel, and a failed run leaves your working tree untouched.
-3. **A Gemini worker does the edits there.** It reads, writes, and runs commands inside the copy. Noisy test and build output is stored in a local evidence store, so one failing test suite does not flood the worker's context window.
-4. **The plugin verifies the result.** It runs the acceptance commands, or compile and syntax smoke checks when the project has no tests, and returns pass and fail counts with a token-bounded diff.
-5. **Your lead agent reviews and applies.** It inspects the diff with `get_diff`, merges verified work with `delegate_apply`, or sends follow-up instructions with `delegate_continue`. The receipt records what was applied, and `delegate_revert` undoes it.
-
-Which backend runs the worker depends on how you connect. Gemini Enterprise seats run through the standalone Antigravity CLI (`agy`). AI Studio keys, Vertex AI projects, and gateways run through the Google Antigravity Python SDK. The plugin picks the right one for you.
-
-The longer version, with hooks, MCP dispatch, isolation details, and provenance checks, is in the [Technical reference](#technical-reference).
-
-## Quick start
-
-Setup takes about a minute in a normal terminal shell.
-
-The installer sets up either the standalone Antigravity CLI (`~/.local/share/cc-agy-plugin/bin/agy`) for Gemini Enterprise seats or an isolated Python environment (`~/.local/share/cc-agy-plugin/venv`) for AI Studio and Vertex AI. That keeps you clear of `externally-managed-environment` (PEP 668) errors on Debian, Ubuntu, and macOS Homebrew. Secrets are never written to config files.
-
-### 1. One-command interactive setup (recommended)
-
-Paste this single command into **Claude Code** or a **terminal**:
+Paste this into Claude Code or a terminal. It needs Python 3.10 or newer.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash
 ```
 
-What happens next:
-1. **Pick from dropdowns.** Inside Claude Code, two dropdowns ask how you connect (`Gemini Enterprise Seat`, `Google AI Studio API Key`, `Vertex AI`, or `AI Gateway`) and which model preset you want (`Balanced`, `Quality`, or `Economy`). In a regular terminal, an arrow-key (`↑/↓`) selector opens instead.
-2. **Sign in to Gemini Enterprise in one step.** On a local Mac or desktop, your browser opens and `agy` saves your sign-in, with nothing to paste. Over SSH or on a remote VM, you get a sign-in link: open it, sign in, click **Copy to Clipboard** on the Antigravity page, and paste the code back into chat. Either way, the plugin then records your Gemini Enterprise license and project, so your first `agy` call works right away. Signing in from a second tab reuses the same link instead of breaking the first one.
-3. **Automatic `--doctor` check.** Confirms MCP tools, your seat tier (for example `gcp-ge-plus-tier`), and git workspace readiness at 0 tokens.
-4. **Run `/reload-plugins`** in the Claude Code session you installed from (and any other open tabs). Then `/cc-agy-plugin:doctor` and `/cc-agy-plugin:agy` are ready. Run `/cc-agy-plugin:setup` or `/cc-agy-plugin:login` anytime to change settings or sign in again.
+The installer asks how you connect and which model preset you want, handles the Gemini Enterprise sign-in if you chose a seat, and runs `doctor`. In Claude Code, run `/reload-plugins` afterwards.
 
-**If calls fail with "authentication failed".** Run `/cc-agy-plugin:login`. It repairs a saved sign-in that `agy` rejects (a token saved without a license tier or project) without opening the browser, or prints a fresh link if the token is missing, damaged or expired. `/cc-agy-plugin:login --force` always starts a new sign-in. If your account holds seats in more than one project, the plugin tells you which one it picked; run `/cc-agy-plugin:login --project <ID>` (or set `CC_AGY_ENTERPRISE_PROJECT`) to switch. Don't try to sign in with `agy -p`: print mode gives up after 60 seconds on a headless machine.
-
-**Short sign-in links are opt-in.** Set `CC_AGY_SHORT_URL=1` to also get an `is.gd` / `tinyurl` link that never wraps in macOS Terminal. It is off by default because it sends the sign-in URL to a third-party service.
-
-<details>
-<summary><b>Non-interactive / CI flags & version pinning</b></summary>
+To skip the questions, pass the host and connection yourself:
 
 ```bash
-# Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
-# Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.1 bash -s -- --host opencode --auth gemini-enterprise
-# Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.1 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
-</details>
+`--host` takes `claude`, `cursor`, `opencode`, `codex`, `agy`, or `all`. `--auth` takes `gemini-enterprise`, `api-key`, `vertex`, or `gateway`. Manual installs, version pinning, and sign-in fixes are in the [setup guide](guides/setup.md).
 
-Or clone manually if you prefer working from your own directory:
+---
 
-```bash
-git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin
+## Getting started
+
+Open your project and work normally. All five hosts load the plugin's routing skill, so you do not need to learn tool names. These prompts work as written:
+
+```text
+Run doctor to verify my Gemini setup.
+Delegate adding input validation to api/orders.py with unit tests, review the diff, and apply it.
+Ask Gemini to review my current git diff for edge cases and race conditions.
+Revert worker job <job_id>.
 ```
 
-### 2. Manual setup by host and connection (optional)
-
-If you cloned the repository manually (`git clone https://github.com/manishkjs/cc-agy-plugin && cd cc-agy-plugin`) and want to pass flags directly instead of using the dropdown wizard (`python3 -m server.install`), expand your connection type below:
-
-<details>
-<summary><b>Option A: Gemini Enterprise work subscription</b> (uses your included monthly seat)</summary>
-
-```bash
-# Install for Claude Code and download ~/.local/share/cc-agy-plugin/bin/agy:
-python3 -m server.install --host claude --auth gemini-enterprise
-
-# Or install into Cursor (~/.cursor/mcp.json + ~/.cursor/skills/):
-python3 -m server.install --host cursor --auth gemini-enterprise
-
-# Or install into OpenCode (~/.config/opencode/opencode.json + skill, /commands, and @gemini-delegator):
-python3 -m server.install --host opencode --auth gemini-enterprise
-
-# Or install into Codex (~/.codex/config.toml):
-python3 -m server.install --host codex --auth gemini-enterprise
-
-# Or install into Antigravity CLI / IDE (~/.gemini/config/):
-python3 -m server.install --host agy --auth gemini-enterprise
-
-# Or run with no flags for the arrow-key dropdown wizard:
-python3 -m server.install
-
-# Sign in with a clickable Google OAuth link (opens browser automatically on desktop, or prints URL over SSH):
-python3 -m server.agy_login
-```
-
-</details>
-
-<details>
-<summary><b>Option B: Google AI Studio API key</b> (fastest personal setup, pay-as-you-go)</summary>
-
-```bash
-export GEMINI_API_KEY="your-key"
-python3 -m server.install --host claude   # or --host cursor, --host opencode, --host codex, --host agy, or --host all
-```
-
-</details>
-
-<details>
-<summary><b>Option C: Google Cloud Vertex AI project</b> (pay-as-you-go)</summary>
-
-```bash
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-python3 -m server.install --host claude   # or --host cursor, --host opencode, --host codex, --host agy, or --host all
-```
-
-</details>
-
-<details>
-<summary><b>Option D: LiteLLM or Bifrost AI gateway</b></summary>
-
-```bash
-# LiteLLM proxy (Vertex pass-through at /vertex_ai or Gemini pass-through at /gemini):
-export CC_AGY_VERTEX_BASE_URL="https://litellm.example.com/vertex_ai"   # or https://litellm.example.com/gemini
-export CC_AGY_VERTEX_BASE_URL_TOKEN="sk-litellm-virtual-key"
-python3 -m server.install --host claude --auth gateway --base-url "$CC_AGY_VERTEX_BASE_URL"
-
-# Bifrost gateway (maximhq/bifrost native /genai provider + optional virtual key):
-export CC_AGY_VERTEX_BASE_URL="http://localhost:8080/genai"
-export CC_AGY_BIFROST_VIRTUAL_KEY="bf-vk-team-budget"   # sent as x-bf-vk (works alongside Cloud Run OIDC too)
-python3 -m server.install --host claude --auth gateway --base-url "$CC_AGY_VERTEX_BASE_URL"
-```
-
-The plugin detects the wire format from the gateway path: Gemini `/v1beta/models/...` for `/genai` and `/gemini` paths, and Vertex `/v1beta1/projects/...` otherwise. To set it yourself, pass `--gateway-wire auto|vertex|gemini|litellm-vertex|litellm-gemini|bifrost`.
-
-</details>
-
-#### What `--host` sets up
-
-| Host | Flag | What the installer writes |
-|:--|:--|:--|
-| Claude Code | `--host claude` | The Claude Code plugin, with your non-secret settings forwarded as plugin `userConfig` |
-| Cursor | `--host cursor` | The `agy` MCP server in `~/.cursor/mcp.json` and the routing skill in `~/.cursor/skills/cc-agy-plugin/SKILL.md` |
-| OpenCode | `--host opencode` | `mcp.agy` in `~/.config/opencode/opencode.json`, the global skill, the `/agy`, `/delegate`, `/doctor`, `/jobs`, and `/cost` slash commands, and the `@gemini-delegator` subagent |
-| Codex | `--host codex` | Non-secret plugin settings in `~/.codex/config.toml` |
-| Antigravity | `--host agy` | `~/.gemini/config/mcp_config.json`, `~/.gemini/config/skills/cc-agy-plugin/SKILL.md`, and `~/.gemini/config/plugins/cc-agy-plugin/` |
-| Every host | `--host all` | All of the above (this is the default) |
-
-<details>
-<summary><b>Notes for OpenCode and Cursor</b></summary>
-
-**OpenCode**
-
-- The installer honours `$OPENCODE_CONFIG_DIR` and `$OPENCODE_CONFIG`.
-- Fresh config files use OpenCode's legacy-compatible `mcp.<name>` format with a 30-minute tool timeout. An existing V2 `mcp.servers` layout is preserved as it is, and a commented `opencode.jsonc` next to `opencode.json` is left intact.
-- For OpenCode 2.2.6 and later, add `--opencode-v2` to write the `mcp.servers.agy` envelope. Related flags: `--[no-]opencode-codemode`, `--opencode-protocol auto`, and `--[no-]opencode-pool`.
-- Installed asset hashes are tracked in `.cc-agy-plugin-assets.json`. Any pre-existing or user-edited file is backed up to `*.bak-*` before it is replaced.
-- Symlinked asset files are unlinked before writing, so the external dotfiles target is never modified. Symlinked directories are written through.
-- The same skill, commands, and subagent are bundled in this repository under `.opencode/`.
-- Optional native plugin: run `opencode plugin /path/to/cc-agy-plugin -g`, then `opencode auth login` and pick `cc-agy`, which offers four login methods: Gemini Enterprise seat, Gemini API key, Google Cloud Vertex AI project, or AI Gateway. If `cc-agy` is missing from the provider list, the plugin did not load: run `opencode --print-logs mcp list` and look for `failed to load plugin`. It registers the same `agy` MCP server, commands, and subagent without editing `opencode.json`, and keeps anything you enter in OpenCode's own `auth.json`. It opens no network port. Use either this or `--host opencode`, not both.
-
-**Cursor**
-
-- This repository also includes a native `.cursor-plugin/plugin.json` manifest.
-
-</details>
-
-> [!TIP]
-> If `claude` is already open in another terminal tab, run `/reload-plugins` inside that session (or restart with `claude --continue`), or prefix shell commands inside Claude Code with `!`.
-
-For every flag and fallback rule, see [Configuration](#configuration), [Authentication precedence](#authentication-precedence), and the [Configuration reference](#configuration-reference).
-
-### 3. Verify your setup (free, 0 tokens)
-
-| Host | How to check |
-|:--|:--|
-| Claude Code | Type `/cc-agy-plugin:doctor` |
-| Cursor | Open your project, check **Cursor Settings -> Tools & MCP** to see `agy`, and ask in Agent chat: `"Run doctor to verify my Gemini setup."` |
-| OpenCode | Start `opencode` in your project and type `/doctor` (or run `opencode mcp list` to confirm `agy` is enabled) |
-| Codex | Start `codex` in your project and ask: `"Run doctor to verify my Gemini setup."` |
-| Antigravity | Start `agy` in your project (or run `agy mcp list` to confirm `agy` is registered) and ask: `"Run doctor to verify my Gemini setup."` |
-
-## How to use it
-
-Once installed, open your project in Claude Code, Cursor, OpenCode, Codex, or Antigravity and work normally. All five hosts load the plugin's routing skill automatically, so you do not need to memorize internal MCP tool names.
-
-### Plain-English prompts you can type right away
-
-| What you want to do | Example prompt | What happens behind the scenes |
-|:--|:--|:--|
-| **Check your setup (free)** | *"Run doctor to verify my Gemini setup."* (or `/cc-agy-plugin:doctor` in Claude Code, `/doctor` in OpenCode) | Verifies credentials, active `cost_profile`, installed SDKs, git status, and detected test runner offline at **0 tokens**. |
-| **Fix a bug or build a feature** | *"Delegate adding input validation to `api/orders.py` with unit tests, review the diff, and apply it."* | Runs `gemini-4-hydrogen` in an isolated git copy (`delegate_start`), runs checks, lets your lead agent inspect `get_diff`, and merges with `delegate_apply`. |
-| **Edit many files from one plan (6+ files)** | *"Plan the new webhook handlers across all 8 files and write them with `delegate_file_batch`."* | Validates the plan locally, writes files in parallel with per-file verification, retries failures automatically, and returns one combined diff. |
-| **Get a fast second opinion** | *"Ask Gemini to review my current git diff for edge cases and race conditions."* | Sends a single-shot `ask_gemini` query without spinning up a worker copy or touching files. |
-| **Undo an applied worker job** | *"Revert worker job `<job_id>`."* | Restores every file touched by that job from its signed pre-apply backup (`delegate_revert`) if no newer manual edits conflict. |
-
-### Slash commands in Claude Code and OpenCode
+Claude Code and OpenCode also get slash commands:
 
 | Claude Code | OpenCode | What it does |
 |:--|:--|:--|
-| `/cc-agy-plugin:setup` | n/a | Opens interactive dropdowns to choose your connection mode and model preset, then runs sign-in and `doctor`. |
-| `/cc-agy-plugin:login` | `/login` | Signs in to Gemini Enterprise (agy's own browser sign-in on a local desktop, or a sign-in link plus pasted code over SSH), repairs a saved sign-in agy rejects, and records your license. `--force` starts fresh; `--project <ID>` picks the seat project. |
-| `/cc-agy-plugin:agy <question or task>` | `/agy <question or task>` | Talks directly to Antigravity/Gemini: routes questions to `ask_gemini` (with conversation reuse on GE) and code edits to `delegate_to_gemini`. |
-| `/cc-agy-plugin:doctor` | `/doctor` | Offline readiness check for credentials, SDKs, `cost_profile`, git workspace, and test runner (zero token cost). |
-| `/cc-agy-plugin:delegate <task>` | `/delegate <task>` | Hands `<task>` to an isolated Gemini worker, verifies checks, inspects the diff, and applies clean results (you can also mention `@gemini-delegator` in OpenCode). |
-| `/cc-agy-plugin:jobs` | `/jobs` | Shows running and recent worker jobs, modified files, token counts, and cost in cents. |
-| `/cc-agy-plugin:cost` | `/cost` | Reports workspace Gemini spend in cents (pass `--true-total` to compare dispatched worker spend with lead session transcripts). |
-
-### What if my project does not have tests yet?
-
-Every worker digest reports a `verification` mode, so you always know how a change was checked.
-
-**Projects with tests (`verification: "acceptance_tests"`).** The plugin detects and runs scoped tests across Python (`pytest`, `unittest`), TypeScript/JavaScript (`vitest`, `jest`, `node --test`), Go (`go test`), Rust (`cargo test`), Java/Kotlin (`gradlew`, `mvnw`, `mvn`), and `Makefile`.
-
-**Projects without tests (`verification: "smoke_only"`).** When no test command is given or detected, the plugin runs fast read-only syntax and compile checks on every changed file: Python parse and import, `tsc --noEmit` with your repo's TypeScript, `node --check`, `go build`, `cargo check --offline`, `bash -n`, and JSON validation.
-
-Files that fail to parse or compile are rejected and escalated to `gemini-4-carbon-zero` under `balanced` (`gemini-4-carbon` under `quality`). When the smoke checks pass, the digest tells your lead agent to review the diff line by line against your request before finishing.
-
-<a id="options"></a>
-
-## Configuration
-
-Three choices cover most setups: how you connect, which cost profile you run, and how much the plugin may do without asking.
-
-### Connection modes
-
-| How you connect | Backend | Enterprise seat? | Billing | Best fit |
-|:--|:--:|:--:|:--|:--|
-| **Gemini Enterprise** (`--auth gemini-enterprise`) | Standalone `agy` CLI | **Yes** | Included in monthly Enterprise Standard/Plus seat | Work accounts with assigned Gemini Enterprise seats. |
-| **AI Studio key** (`GEMINI_API_KEY`) | Python SDK | No | Pay-as-you-go on AI Studio | Individual developers without Google Cloud setup. |
-| **Vertex AI** (`GOOGLE_CLOUD_PROJECT`) | Python SDK | No | Pay-as-you-go on GCP (`aiplatform.googleapis.com`) | Cloud teams, Service Accounts, and CI/CD pipelines. |
-| **AI gateway** (`--base-url`) | Python SDK | Gateway-defined | Managed by your gateway (`LiteLLM`, `Portkey`, `Bifrost`, Apigee) | Enterprises routing model traffic through a central proxy. |
-
-See [Authentication precedence](#authentication-precedence) for exact credential selection order when multiple variables are set.
-
-### Model and cost profiles (`--profile` or `CC_AGY_COST_PROFILE`)
-
-| Profile | How models are chosen | Best when |
-|:--|:--|:--|
-| **`balanced`** *(default)* | Starts on fast **`gemini-4-hydrogen`**. Steps up automatically to **`gemini-4-carbon-zero`** (Carbon, zero thinking) on the same git copy if a check fails or a retry is needed, then returns to Hydrogen on the next new task. Pass `prewalk=true` on difficult tasks for a `gemini-4-carbon` -> `gemini-4-hydrogen` intra-worker handoff. Quota errors (`429` / `503`) stop automatic retries and hand control back to your lead agent. | Everyday engineering where you want Hydrogen speed with Carbon backup on hard bugs. |
-| **`economy`** | Keeps all worker and `ask_gemini` calls on **`gemini-4-hydrogen`** and turns off automatic step-up to Carbon Zero-Think. | Tight budgets, boilerplate generation, docs, and well-scoped tasks. |
-| **`quality`** | Starts all worker and `ask_gemini` calls directly on **`gemini-4-carbon`** with deeper reasoning from turn one. | Complex multi-file architecture bugs, subtle concurrency fixes, or tricky math/logic changes. |
-
-### You stay in full control
-
-Every model call, file edit, and spend ceiling is governed by explicit settings you control:
-
-| Control | How to set it | Guarantee |
-|:--|:--|:--|
-| **1. Lock connection & billing mode** | `--auth gemini-enterprise\|api-key\|vertex\|gateway` (`CC_AGY_AUTH_MODE`) | Explicit `--auth` never falls back to another backend; if `auto` picks Vertex AI from a shell env var, `doctor` warns you upfront. |
-| **2. Allow or block GCP projects** | `--allowed-projects` / `--blocked-projects` (`CC_AGY_ALLOWED_PROJECTS`, `CC_AGY_BLOCKED_PROJECTS`) | Blocks unapproved GCP projects at **0 tokens** across Vertex AI, `gcloud` ADC `quota_project_id`, and `agy` CLI `onboarding.json` (`cloudaicompanionProject`), and scrubs ambient `GOOGLE_CLOUD_PROJECT` vars from `agy` subprocesses. |
-| **3. Hard spend ceiling & model tier** | `--max-daily-cents 500` + `--profile economy\|balanced\|quality` | Enforces a UTC daily spend cap in cents and stops automatic retries immediately on `429` / `503` quota errors. |
-| **4. Isolated git copy + review before apply** | Default outside `--strict`, or force everywhere with `--no-auto-apply` (`CC_AGY_AUTO_APPLY_ON_PASS=0`) | Workers run in disposable git copies, `in_place=true` and shutdown salvage are disabled when `--no-auto-apply` is set, and nothing touches your repo until `delegate_apply`. |
-| **5. File scope & one-call undo** | `allowed_paths=[...]` + `delegate_revert` / `delegate_cancel` | Rejects out-of-scope file edits and restores every touched file from its HMAC-signed pre-apply backup in one call. |
-| **6. Zero-token preflight audit** | `/cc-agy-plugin:doctor` (or `"Run doctor"`) | Reports active auth mode, pinned status, active/companion GCP project, allow/block lists, spend cap, and manual-apply policy offline at **0 tokens**. |
-
-### Gemini Enterprise seats in a governed organization
-
-These three settings are optional and only apply to the Gemini Enterprise (`agy` CLI) connection. Leave them unset and nothing changes.
-
-**Sign in with your own Google Cloud credential.** If your organization onboards developers with `gcloud auth application-default login`, pass `--enterprise-adc` (or set `CC_AGY_ENTERPRISE_ADC=true`). The plugin then starts `agy` with `AGY_ADC_AUTH=true` and your seat project and location. It also turns on by itself when `agy` already has `userSettings.enableAdc` set and your credential file belongs to a person. A service account is refused, because it is not a licensed seat. The seat project is checked against `--allowed-projects` and `--blocked-projects` before `agy` starts. Add `--enterprise-user-tier gcp-ge-plus-tier` (or `gcp-ge-standard-tier`) so the usage shows up in Google Cloud Console under Gemini Enterprise, Developer tools metrics. Use the tier you were assigned; there is no default.
-
-```bash
-gcloud auth application-default login --project "$GE_PROJECT"
-python3 -m server.install --host all --auth gemini-enterprise \
-  --enterprise-adc --enterprise-project "$GE_PROJECT" --enterprise-user-tier gcp-ge-plus-tier
-```
-
-**Verify licensed Gemini Enterprise tiers and pin CLI releases.** By default, Gemini Enterprise mode blocks known consumer Google accounts (`free-tier`, `@gmail.com` personal tiers) and prints a `--doctor` warning if `cache/onboarding.json` has not recorded `enterpriseOnboardingComplete: true` (or an explicit `gcp-ge-*` enterprise tier) yet. Set `CC_AGY_REQUIRE_GE_TIER=1` to require verified enterprise onboarding at 0 tokens before any `agy` run starts. To pin exact binary versions across a fleet, set `CC_AGY_CLI_VERSION=<version from doctor>` and `CC_AGY_CLI_SHA512=<128-hex sha512>`. Because Google's public `agy` manifest serves a rolling latest release, pair older version pins with `CC_AGY_CLI_MANIFEST_URL=https://mirror.internal.example.com/agy-manifest.json`. On Windows, the plugin installs `agy.exe` through a pure-Python SHA-512 verified downloader (`server/agy_cli.py`) when `bash` is absent.
-
-**Write workers run in an OS sandbox.** A Gemini Enterprise write worker runs `agy` without permission prompts, so the plugin confines it at the operating system level instead of trusting the prompt. On Linux it uses bubblewrap (`bwrap`): the whole disk is read-only except the job's own copy of the repo and `agy`'s state folder, `/tmp` and `~/.cache` are private and empty, and `~/.ssh`, `~/.gnupg`, cloud credential folders, `.netrc`, and `.git-credentials` are hidden. On macOS it uses `sandbox-exec` with the same rules. Other files in your home folder that are not on the hidden-credential list remain readable to the worker, so keep secrets in standard credential stores or `.env` files. The network stays on because `agy` must reach Google; instead, SSH agents, git credential helpers, and askpass programs are removed from the worker's environment, and inside the Linux `bwrap` sandbox `ssh`, `scp`, `sftp`, and git's remote HTTP/HTTPS/FTP helpers are masked with `/dev/null` alongside git config guards (outbound HTTPS from other tools remains open so `agy` can reach Google). On Windows (or whenever neither OS sandbox tool is available), the worker drops `--dangerously-skip-permissions`, enables `agy --sandbox`, and returns any action that needs approval as `denied_actions`. Set `CC_AGY_WORKER_SANDBOX=required` to refuse to run without an OS sandbox, or `off` to go back to the old behavior. `--doctor` shows which one is active. Tools that need to write outside the repo copy, such as `npm install` into a global cache, will fail inside the sandbox.
-
-**When your organization blocks an action.** An admin can require review for terminal commands or for files outside the project. When `agy` hits one of those rules, the job pauses with `status: "needs_input"` and a `denied_actions` list that names each blocked command or file. Nothing is applied to your working tree. Your lead agent asks you what to do, runs the approved step inside the job's isolated copy of the repo, and resumes the same `agy` conversation with `delegate_continue`. This works the same way in Claude Code, Cursor, OpenCode, Codex, and Antigravity.
-
-**Let a central Bifrost gateway decide who can run `agy`.** Seat traffic goes from the `agy` CLI straight to Google, so it cannot pass through a gateway. A central Bifrost can still control it. Set the gateway URL and a Virtual Key that is allowed to use `agy-cli/*` models:
-
-```bash
-export CC_AGY_BIFROST_POLICY_URL="https://bifrost.internal.example.com"
-export CC_AGY_BIFROST_AGY_VIRTUAL_KEY="sk-bf-agy-..."          # falls back to CC_AGY_BIFROST_VIRTUAL_KEY
-export CC_AGY_BIFROST_AGY_POLICY_MODEL="gemini-4-hydrogen-medium" # used for policy-routed when rules cannot be read
-```
-
-Before each `agy` run the plugin asks the gateway which `agy-cli/<model>` entries the key may use. A revoked key or a model that is not on the list stops the run at 0 tokens. Ask for the model `policy-routed` to run whatever model the gateway's routing rule currently selects. The laptop only makes outbound HTTPS calls, so no inbound port is needed. Two limits to know: the allowlist must contain the `agy` model names you actually run (or `policy-routed`), and Bifrost does not see the tokens these runs use. The check runs on the developer's machine, so treat it as a guard against mistakes and revoked keys, not a security boundary: someone with full control of the machine can skip it. Token counts stay in the plugin's receipts and in the Gemini Enterprise console.
-
-**Follow-up questions reuse the same conversation.** When you ask `ask_gemini` a second question about the same files in the same session, the plugin resumes the earlier `agy` conversation and sends only the new question. The files are not sent again, so Gemini can reuse what it already cached. A conversation is reused only for the same session, model, workspace, and files, and only for 15 minutes (`CC_AGY_CONVERSATION_TTL_SECONDS`, `0` turns this off). If the resume fails, the full prompt is sent in a new conversation. Only conversation IDs and token counts are stored on disk, never prompts.
-
-**Model names are checked before the first run.** The plugin caches the output of `agy models` for 60 seconds. If the model you asked for is not offered to your seat, it picks the closest offered one up front instead of failing a first turn. With a Bifrost policy URL set, it only picks models the gateway also allows.
-
-Run `python3 -m server.install --doctor` to see the seat mode, tier, location, and Bifrost policy status. Add `--probe-oidc` to also query the gateway once and print how many `agy` models the key may use.
-
-### Installer flags and runtime configuration
-
-Pass `--host codex|claude|cursor|opencode|agy|all`, `--auth`, `--profile`, `--project`, `--allowed-projects`, `--blocked-projects`, `--no-auto-apply`, `--location`, `--base-url`, `--gateway-wire`, `--max-daily-cents`, or `--strict` to `python3 -m server.install`. Codex and Antigravity installs also add the guard hooks (see [Guard hooks on every host](#guard-hooks-on-every-host)); skip them with `--no-codex-hooks` / `--no-agy-hooks`, or remove only ours later with `--host codex|agy --uninstall-hooks`. For a single session without installing, run `claude --plugin-dir /path/to/cc-agy-plugin`.
-
-All CLI flags, `userConfig` keys, and `CC_AGY_*` environment variables are listed in one place in the [Configuration reference](#configuration-reference), or print the grouped public catalog from your terminal with `python3 -m server.install --list-settings`.
-
-## Benchmark results
-
-We ran a paired cross-language benchmark on 26 real repository tasks:
-
-- 10 Python tasks from DeepSWE repos
-- 10 Go tasks from Aider Polyglot and Multi-SWE-bench `cli/cli`
-- 6 TypeScript tasks from Multi-SWE-bench and DeepSWE
-
-That is 208 runs across 8 setups, with each setup running each task once (`n=1`).
-
-Prices per 1M tokens: Opus 5.5 at `400¢` in / `20¢` cached / `2,000¢` out, Gemini 4 Argon and Carbon at `200¢` / `20¢` / `1,200¢`, and Gemini Flash at `50¢` / `5¢` / `300¢`. "Flash" below means `gemini-flash-next`; only the `balanced` row still uses `gemini-3.8-flash`.
-
-| Setup | Tasks solved | Hidden tests passed | Avg cost / task | vs Opus solo | Avg time | Best fit |
-|:--|:--:|:--:|:--:|:--:|:--:|:--|
-| Claude Code · Opus 5.5 (solo) | 22 / 26 | 806 / 891 | 87.6¢ | baseline | 4m 12s | Baseline · All-Opus in Claude Code (TypeScript generics 6 / 6 at 71.3¢) |
-| Claude Code + plugin · Opus + Flash (`economy`) | 15 / 26 | 797 / 891 | 60.6¢ (22¢ + 39¢) | -31% | 5m 37s | Stay in CC, cut spend 31% (5 / 6 TS, 7 / 10 Go, 797 / 891 tests) |
-| Antigravity · Flash -> Carbon Low | 18 / 26 | 810 / 891 | 74.9¢ ($0 Claude) | -14% | 7m 15s | Pure AGY 2-tier (18 / 26, 810 / 891 tests vs 806 Opus, 7 / 10 Py & Go, -14%) |
-| Antigravity · Carbon Zero-Think (solo) | 20 / 26 | 846 / 891 | 93.9¢ ($0 Claude) | +7% | 7m 31s | Pure AGY Carbon 0-Think (94.9% tests vs 90.5% Opus; 9 / 10 Python, 7 / 10 Go) |
-| Claude Code + plugin · Flash 3.8 -> Argon (`balanced`) | 21 / 26 | 855 / 891 | 81.1¢ (21¢ + 61¢) | -7% | 7m 45s | Highest CC + plugin pass rate (10 / 10 Python at -14% cost; Go -15%) |
-| Claude Code + plugin · Opus + Argon (`quality`) | 20 / 26 | 865 / 891 | 80.0¢ (22¢ + 58¢) | -9% | 5m 37s | Highest holdout test pass rate (97.1% overall; 99.8% on Python) |
-| Antigravity · Flash (solo) | 18 / 26 | 841 / 891 | 47.7¢ ($0 Claude) | -46% | 6m 39s | Pure AGY Flash + plugin harness (18 / 26, 841 / 891 tests, 9 / 10 Python -53%, 6 / 10 Go -52%) |
-| Antigravity + plugin · Argon + Flash (`economy`) | 15 / 26 | 673 / 891 | 83.2¢ (49¢ + 34¢, $0 Claude) | -5% | 8m 34s | Interactive Argon Lead + Flash worker in AGY (4 / 6 TS, 7 / 10 Go, -45% Python avg vs Argon solo, -3 solves overall) |
-
-### The short version
-
-Claude Opus 5.5 alone costs 87.6¢ per task on this suite. Against that baseline:
-
-- **Staying in Claude Code?** Add the plugin. Opus plans, Gemini Flash writes the code: **31% cheaper** (60.6¢ vs 87.6¢ per task). That `economy` setup solved 15 of 26 tasks against 22 for Opus alone. The `balanced` profile solved 21 of 26 at 81.1¢ (-7%).
-- **Moving to Antigravity?** Gemini Flash alone solves 18 of 26 and passes **more hidden tests than Opus** (841 vs 806) at **about half the cost** (47.7¢, -46%).
-- **Need the most solves on Gemini?** Gemini Carbon with zero thinking solves **20 of 26** and passes 846 hidden tests (Opus: 806), at roughly Opus price (93.9¢, +7%).
-- **Opus still solves the most tasks** (22 of 26). Each setup ran each task once, so differences of 1 to 3 tasks are within normal run-to-run noise.
-
-<details>
-<summary><b>Using <code>cc-agy-plugin</code> inside Antigravity: before vs. after</b></summary>
-
-Installing `cc-agy-plugin` directly into Antigravity (`python3 -m server.install --host agy`) delivers four measured setups without paying any Claude Code lead overhead (`$0.00` Claude tokens):
-
-| Antigravity scenario | Without `cc-agy-plugin` | With `cc-agy-plugin` | Measured gain |
-|:--|:--|:--|:--|
-| **1. `gemini-flash-next` across 26 tasks (`v10` raw vs. `v12` plugin harness)** | `7 / 26` solved (`26.9%`), `173 / 891` holdout tests (`19.4%`), `0 / 10` on Python, `103.5¢` per solved task | **`18 / 26` solved (`69.2%`)**, **`841 / 891` holdout tests (`94.4%`)**, **`9 / 10` on Python**, `47.7¢` avg (`68.9¢` per solve) | **+11 tasks (+157% solves), +668 tests, -33% cost per solve** (`-49%` avg cost vs. standalone Carbon Zero-Think's `93.9¢`, and **`-61%` on Python** at `72.4¢` vs. `186.1¢`) |
-| **2. 2-tier `Flash -> Carbon Low` (`v12`) vs. standalone `Carbon Zero-Think` (`v9`, 26 tasks)** | `93.9¢` avg / task (`186.1¢` on Python, `45.7¢` on Go, `7 / 10` Go solves) | **`74.9¢` avg / task** (`118.7¢` on Python, **`32.6¢` on Go**, `7 / 10` Go solves, `5 / 5` Aider Go at `3.1¢`), `18 / 26` solved (`810 / 891` tests = `90.9%`) | **-20% average cost across 26 tasks** (`-36%` on Python, **`-29%` on Go**, and `-80%` on Aider Go) by keeping first-pass edits on Flash and stepping up to Carbon Low only when checks fail |
-| **3. `Antigravity · Argon` Lead delegating to isolated worker vs. standalone `Argon` (16 Python DeepSWE tasks)** | `10 / 16` solved (`62.5%`), `580` total turns, `3,084¢` total (`192.8¢` / task, `308.4¢` / solve) | **`11–12 / 16` solved (`68.8%–75.0%`)**, `433` total turns, **`2,352¢` total (`147.0¢` / task**, `196.0¢–213.8¢` / solve) | **-24% total cost, -30% to -36% cost per solve, -25% turns, and +1 to +2 extra tasks solved** purely from isolated git worktree delegation and Straitjacket log containment |
-| **4. `Antigravity · Argon` Lead + Flash worker (`economy` `v13`) vs. standalone `Argon` (`docs/live_r1_iter2`, `docs/live_r6_go`, `docs/live_r7_ts`, 2026-10-21..23, 26 tasks)** | `18 / 26` solved (`69.2%`), `785 / 891` holdout tests, `81.1¢` avg / task (`155.0¢` Python [`193.8¢`/solve], `27.1¢` Go, `47.8¢` TypeScript), `5m 17s` avg | **`15 / 26` solved (`57.7%`)**, `673 / 891` holdout tests, **`83.2¢` avg / task** (`49.0¢` Lead + `34.2¢` Worker, `144.2¢` / solve; **`85.3¢` on Python** [`213.3¢`/solve], `62.3¢` on Go, `114.5¢` on TypeScript [`4 / 6`]), `8m 34s` avg | **-45% avg cost on Python DeepSWE** (`85.3¢` vs. `155.0¢`, `+10%` per solve) and **+1 extra TypeScript solve** (`4 / 6` vs. `3 / 6`, adding `vuejs-10161` while retaining `darkreader-6747`, `darkreader-7241`, and `vuejs-11694`), with **-3 solves (`15 / 26` vs. `18 / 26`, -112 net holdout tests: -115 across 4 short-Lead-loop Python runs [`2-7` Lead turns, `4.1¢-10.3¢` Lead each], +15 on `tomlkit`, -12 on `koota`) where the run failed the new holdout suite (`aiomonitor` `2/54`, `psd-tools` `7/45`, `mobly` `61/83`, `httpx` `119/122`)**, while **7 long Lead loops (`5` solved, `2` unsolved; `1,009¢` of `1,273¢` Lead spend) drove +2.6% avg cost (`+130%` Go, `+140%` TS) and +62% wall time**, making autonomous `AGY · Flash (solo)` (`47.7¢`, `18 / 26`) the cheaper Antigravity default |
-
-</details>
-
-<details>
-<summary><b>How the runs were routed and priced</b></summary>
-
-All `cc-agy-plugin` worker calls, Claude Code proxy runs, and `v9`/`v10`/`v12` Antigravity runs route through free internal Cloud Code PA with `0` BAIC calls; only `v13`'s standalone `agy` CLI Argon Lead authenticated via Gemini Enterprise BAIC (`businessaicode.googleapis.com`, `0` `aiplatform.googleapis.com` calls, Vertex billing status `Unverified`), while the older standalone `AGY · Argon (solo)` baseline has no CLI logs on disk (routing `Unverified`).
-
-> [!NOTE]
-> Each setup ran once per task (`n=1`) in the 26-task cross-language suite, so 1-to-3 task solve differences sit within single-run variance (`v13`'s -3 net solves vs. standalone Argon solo came from 4 short-Lead-loop Python runs [`aiomonitor` `2/54`, `psd-tools` `7/45`, `mobly` `61/83`, `httpx` `119/122`: `2-7` Lead turns] where the run failed the new holdout suite, offset by `+1` TypeScript solve [`vuejs-10161`], while multi-turn Lead loops on 7 long tasks drove the extra cost and wall time). All Flash worker calls, Claude Code proxy runs, and `v9`/`v10`/`v12` Antigravity runs are wire-reconciled against free internal Cloud Code PA token logs with `0` BAIC calls and `0` post-exit orphan calls (on `cli__cli-6578`, the `v13` Argon Lead ran `rm -rf api/queries_user_test.go .cc-agy-data` before receipt copy, so its 37 worker calls / `37.06¢` were backfilled directly from the CCPA wire log with `0.00¢` delta by construction). Only `v13`'s standalone `agy` CLI Argon Lead ran over Gemini Enterprise BAIC (`businessaicode.googleapis.com`, `0` `aiplatform.googleapis.com` calls, Vertex billing status `Unverified`) and is priced from transcripts (`374` priced turns out of `405` BAIC HTTP requests; `31` requests have no matching usage record), while the older standalone `AGY · Argon (solo)` baseline (`live_r1_iter2`, `live_r6_go`, `live_r7_ts`) has no CLI logs on disk (routing `Unverified`).
-
-</details>
-
-## Video walkthrough
-
-Click the preview below to open the **4m 30s voiced 3D walkthrough** ([`assets/walkthrough.mp4`](assets/walkthrough.mp4), 1080p with audio and burned-in captions):
-
-<p align="center">
-  <a href="assets/walkthrough.mp4">
-    <img src="assets/walkthrough-poster.png" alt="Watch the 4m 30s voiced 3D walkthrough: Claude and Gemini explain Gemini Enterprise seats via agy CLI vs pay-as-you-go and isolated git worktree delegation" width="100%">
-  </a>
-</p>
-
-## FAQ
-
-<details>
-<summary><b>Do I have to change how I prompt?</b></summary>
-
-No. All five hosts load the plugin's routing skill automatically, so you describe the change in plain English and your lead agent decides when to delegate. The [example prompts](#plain-english-prompts-you-can-type-right-away) show what that looks like.
-
-</details>
-
-<details>
-<summary><b>Is the isolated copy a sandbox?</b></summary>
-
-Two layers protect your machine:
-1. **Git worktree isolation (every backend):** Workers edit a standalone git copy of your repository so unverified edits never touch your working tree. Credential environment variables, SSH agent sockets, and git credential helpers are scrubbed from the child environment, and HMAC-SHA256 receipts protect provenance and pre-apply backups.
-2. **OS-level filesystem sandbox (`agy` CLI workers):** On Linux (`bwrap`) and macOS (`sandbox-exec`), `agy` workers run inside an OS filesystem sandbox where `/` is read-only, `/tmp` and `~/.cache` are private tmpfs mounts, `~/.ssh`, `~/.gnupg`, cloud credential folders, `.netrc`, `.git-credentials`, sibling worktrees, and the plugin receipt store (`.hmac_key`) are masked (including symlink targets), and `~/.gemini/antigravity-cli` config/MCP/plugin files are mounted read-only. Pass `--worker-sandbox required` (`CC_AGY_WORKER_SANDBOX=required`) to refuse execution when neither OS sandbox backend is available.
-
-</details>
-
-<details>
-<summary><b>What if I do not want anything applied without my review?</b></summary>
-
-Pass `--no-auto-apply` (or set `CC_AGY_AUTO_APPLY_ON_PASS=0`). Workers still run in disposable git copies, `in_place=true` and shutdown salvage are disabled, and nothing touches your repo until `delegate_apply`.
-
-</details>
-
-<details>
-<summary><b>How do I undo a job?</b></summary>
-
-Ask your agent to revert it by `job_id`, which calls `delegate_revert`. It restores every file the job touched from its signed pre-apply backup. If any of those files changed after the apply, it refuses without writing. `skip_dirty=true` reverts only the clean files, and `dry_run=true` previews the result.
-
-</details>
-
-<details>
-<summary><b>How do I cap spend?</b></summary>
-
-Set `--max-daily-cents` (for example `500` for 500¢ a day) to enforce a UTC daily spend cap for the workspace. Use `--profile economy` to keep every worker call on `gemini-4-hydrogen`. `/cc-agy-plugin:cost` in Claude Code and `/cost` in OpenCode report what has been spent.
-
-</details>
-
-<details>
-<summary><b>What happens when Gemini returns a quota error?</b></summary>
-
-Worker `429` and `503` quota errors stop automatic retries immediately and hand control back to your lead agent without burning retry turns.
-
-</details>
-
-<details>
-<summary><b>Are my API keys written to disk?</b></summary>
-
-No. Secrets are never written to config files, and API keys and gateway tokens are redacted from receipts.
-
-</details>
-
-<details>
-<summary><b>Where do receipts live?</b></summary>
-
-In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-plugin/<workspace-slug>/receipts/<job_id>.json`.
-
-</details>
-
-<details>
-<summary><b>Which Gemini models does it use?</b></summary>
-
-`gemini-4-hydrogen` by default. Under `balanced`, a failed check moves the job to `gemini-4-carbon-zero` (and `prewalk=true` runs Turn 1 planning plus the first edit on `gemini-4-carbon` before handing off to `gemini-4-hydrogen`). Under `quality`, jobs start on `gemini-4-carbon`. You can override the model per call or with `CC_AGY_DEFAULT_DELEGATE_MODEL` and `CC_AGY_DEFAULT_ASK_MODEL`.
-
-</details>
-
-## Status
-
-| Item | Detail |
-|:--|:--|
-| **Version** | 0.4.1, Apache 2.0 |
-| **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
-| **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
+| `/cc-agy-plugin:setup` | n/a | Pick your connection and model preset, then sign in |
+| `/cc-agy-plugin:login` | `/login` | Sign in to Gemini Enterprise, or repair a saved sign-in |
+| `/cc-agy-plugin:doctor` | `/doctor` | Readiness check at 0 tokens |
+| `/cc-agy-plugin:agy <task>` | `/agy <task>` | Ask Gemini a question or hand it a code edit |
+| `/cc-agy-plugin:delegate <task>` | `/delegate <task>` | Run a worker, check the result, apply clean diffs |
+| `/cc-agy-plugin:jobs` | `/jobs` | Running and recent jobs with token counts and cost |
+| `/cc-agy-plugin:cost` | `/cost` | Gemini spend for this workspace, in cents |
+
+More prompts, and what happens in a project with no tests, are in the [usage guide](guides/usage.md).
 
 ---
 
-## Technical reference
+## How it works
 
-Internals, rate cards, and full tool documentation for engineers. Click any section below to expand it.
+1. You ask for a change the usual way. Your lead agent writes a short brief with plan steps and read-only checks such as `pytest` or `go test`.
+2. The plugin copies your tracked and non-ignored files into a standalone git repository. A failed run leaves your working tree untouched.
+3. A Gemini worker reads, edits, and runs commands inside that copy.
+4. The plugin runs the checks and returns pass and fail counts with a diff.
+5. Your lead agent reviews the diff and applies it, or sends follow-up instructions. A receipt records what was applied, and one call undoes it.
 
-<details>
-<summary><b>Architecture and rate card</b></summary>
-
-![Technical architecture](assets/architecture.svg)
-
-`cc-agy-plugin` connects Claude Code, Cursor, OpenCode, Codex, and MCP clients to the standalone Antigravity CLI (`agy`) or Google Antigravity Python SDK so one workspace combines a lead planner/reviewer with Gemini workers:
-
-1. **Your lead agent plans and reviews**:
-   - Reads the user prompt, inspects key interfaces, and writes a short outcome-only task brief with ordered `plan` steps and read-only `acceptance` checks (`pytest`, `ruff`, `mypy`, `go test`, `vitest`).
-   - Reviews the token-paginated git diff returned by the worker and decides whether to merge it (`delegate_apply`) or send follow-up instructions (`delegate_continue`).
-2. **Antigravity (`agy` CLI or Python SDK) + Straitjacket executes the task**:
-   - Spins up a headless Antigravity worker inside an isolated git copy (see *End-to-end flow* below for isolation and `in_place=true` details).
-   - **Straitjacket (`ctx-harness`) shell containment** intercepts noisy test and build outputs (>400 lines or >6,000 tokens), stores them in a local evidence store (`run:<id>#stdout`), and gives the worker `ctx_get` and `ctx_search` tools so a single failing test suite does not flood the worker's context window.
-
-### Configured rate card
-
-Configured Gemini model rates in `server/regions.py` and Claude lead rates in `server/true_cost.py` per 1M tokens (for single model calls exceeding `200,000` prompt tokens on Pro/Argon models, such as `ask_gemini` with `single_request=True` or an individual per-step call, input rates scale by `2.0x` and output rates by `1.5x`; multi-call worker turns accumulate smaller per-step prompts at the standard rate):
-
-| Model | Role | Uncached Input / 1M | Cached Input / 1M | Output / 1M |
-|---|---|---|---|---|
-| **Claude Opus 5.5** | Lead Planner & Reviewer (`server/true_cost.py`, override via `CC_AGY_LEAD_RATES`; legacy Opus 4.x/5.0 at 500¢ / 50¢ / 2,500¢) | 400¢ | 20¢ | 2,000¢ |
-| **Gemini 4 Hydrogen** (`gemini-4-hydrogen`) | Default Worker & Review Model (`balanced` / `economy`) | 150¢ | 7.5¢ | 750¢ |
-| **Gemini 4 Carbon** (`gemini-4-carbon`) | `balanced` Retry Escalation (`gemini-4-carbon-zero`), Opt-in `/prewalk` Guide, & `quality` Profile Reasoning Worker (`gemini-4-carbon`) | 200¢ | 20¢ | 1,200¢ |
-| **Gemini 3.1 Pro** | Supported Pro Preview Model | 200¢ | 20¢ | 1,200¢ |
-| **Gemini 2.5 Flash** | Supported Regional Review Model | 30¢ | 3¢ | 250¢ |
+Gemini Enterprise seats run through the standalone Antigravity CLI (`agy`). AI Studio keys, Vertex AI projects, and gateways run through the Google Antigravity Python SDK. The plugin picks the right one for you.
 
 ---
 
-</details>
+## When to delegate
 
-<details>
-<summary><b>Authentication precedence and retry rules</b></summary>
-
-<a id="authentication-precedence"></a>
-
-### Authentication precedence
-
-Google's Cloud Code server guardrail permits Gemini Enterprise business OAuth seats on the standalone Antigravity CLI (`agy`) while rejecting direct SDK traffic (`"The Antigravity SDK is not available on an enterprise account. Use a Vertex AI API key instead."`). `resolve_auth_config()` in `server/regions.py` selects credentials in this exact order:
-1. **Pinned Gemini Enterprise subscription mode** (`CC_AGY_AUTH_MODE=gemini_enterprise`, `--auth gemini-enterprise` / `agy-cli`, `CC_AGY_GEMINI_ENTERPRISE=true`, or `userConfig.auth_mode="gemini_enterprise"`) -> **Standalone Antigravity CLI (`agy`)** (`auth_mode="gemini_enterprise"`, **fail-closed**). Rejects per-call `api_key` and unapproved `project` overrides at 0 tokens, omits pay-as-you-go override properties from MCP `tools/list`, disables Attempt-3 Claude Opus batch escalation (`claude_writer=false`), refuses starting `cc-agy-gateway`, verifies licensed GE sign-in (blocking consumer Gmail accounts), and runs `agy` subprocesses (`--output-format stream-json` or `CC_AGY_CLI_PROTOCOL=acp` via `agy acp --stdio`).
-2. Explicit `api_key` argument on the tool call (when Gemini Enterprise mode is not pinned) -> **Google AI Studio** (`auth_mode="api_key"`, Python SDK).
-3. Explicit `project` argument on the tool call -> **Vertex AI** (`auth_mode="vertex"`, Python SDK).
-4. Custom AI gateway base URL (`CC_AGY_VERTEX_BASE_URL`, `GOOGLE_VERTEX_BASE_URL`, `CC_AGY_GEMINI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, or `userConfig.vertex_base_url`) -> **Vertex- or Gemini-wire AI Gateway** (`resolve_gateway_wire()` auto-selects Gemini `/v1beta/models/...` wire format for `/genai` and `/gemini` URL paths, `CC_AGY_GEMINI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL`, or `CC_AGY_BIFROST_VIRTUAL_KEY`, and Vertex `/v1beta1/projects/...` wire format otherwise; override via `--gateway-wire auto|vertex|gemini|litellm-vertex|litellm-gemini|bifrost` or `CC_AGY_GATEWAY_WIRE`). Sends `CC_AGY_VERTEX_BASE_URL_TOKEN` (as `Authorization: Bearer` and `x-goog-api-key`) and optional `CC_AGY_BIFROST_VIRTUAL_KEY` (`x-bf-vk`, composable alongside Cloud Run OIDC). `CC_AGY_VERTEX_BASE_URL` / `GOOGLE_VERTEX_BASE_URL` takes priority over an ambient shell `GEMINI_API_KEY`, while in `auto` or `gateway` mode `GOOGLE_GEMINI_BASE_URL` and `CC_AGY_GEMINI_BASE_URL` pair with `GEMINI_API_KEY` when no gateway bearer token or Bifrost virtual key is set.
-5. `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `userConfig.gemini_api_key` in the environment -> **Google AI Studio** (`auth_mode="api_key"`, even if `GOOGLE_CLOUD_PROJECT` is also exported in the shell).
-6. `GOOGLE_CLOUD_PROJECT`, `VERTEX_PROJECT`, `GCLOUD_PROJECT`, `CLOUD_ML_PROJECT_ID`, or `userConfig.google_cloud_project` in the environment -> **Vertex AI** (`auth_mode="vertex"`).
-7. Automatic `agy` CLI fallback (`auto` mode when none of 1 to 6 are set) -> **Standalone Antigravity CLI (`agy`)** (`auth_mode="gemini_enterprise"`) when an external `agy` binary and local Google sign-in are present.
-
-### Retry, thinking-level, and override mechanics
-
-Profile goals (`balanced`, `economy`, `quality`) are summarized in [Options](#options). Additional runtime mechanics:
-- **Default reasoning depth**: Mutating worker turns use `LOW` thinking on `gemini-4-hydrogen`, zero thinking on escalated `gemini-4-carbon-zero` turns in `balanced`, `MEDIUM` on `gemini-4-carbon` in `quality`, and `HIGH` on read-only worker turns (override via `thinking_level` or `CC_AGY_DELEGATE_THINKING_LEVEL`).
-- **Quota short-circuit**: Worker `429` or `503` quota errors set `escalation.escalate_to_lead=true` (`reason="quota_or_rate_limit"`) immediately without burning retry turns unless `force_retry=true` is passed.
-- **Per-call overrides**: Pass `model="gemini-4-hydrogen"` or `model="gemini-4-carbon"` per call, or set `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL`.
-
----
-
-</details>
-
-<details>
-<summary><b>End-to-end flow (hooks, MCP, isolation, provenance)</b></summary>
-
-1. **Hook pre-flight check (`scripts/pre_tool_guard.py`)**:
-   - A pre-flight linter rejects delegation prompts (or `plan` steps) containing more than 8 consecutive lines of code so the lead agent writes concise outcome briefs instead of pasting full implementations into the prompt.
-   - When strict mode is enabled (`CC_AGY_STRICT_MODE=true` or `userConfig.strict_delegation_mode=true`), Claude Code's direct `Edit`/`Write`/`MultiEdit`/`NotebookEdit` tools and mutating `Bash` commands on workspace files are blocked so implementation work goes through Gemini workers.
-2. **MCP stdio request (`server/mcp_stdio.py`)**:
-   - The host sends JSON-RPC 2.0 `tools/call` messages over `stdin` to the plugin's persistent Python process (negotiating MCP `2024-11-05`, `2025-03-26`, `2025-06-18`, or `2025-11-25`).
-   - Three dedicated thread-pool lanes (`control_pool=4` for `delegate_cancel`/`delegate_status`/`doctor`, `wait_pool=8` for `delegate_result`, and `rpc_pool=8` for worker/batch execution) prevent long-running workers from starving cancellation or status calls. Pressing `Esc` (`notifications/cancelled`) immediately invokes `delegate_cancel` on the active worker job, and `_meta.progressToken` streams live step updates (`notifications/progress`).
-3. **Working-copy isolation vs. `in_place` execution (`server/jobs.py`, `server/agy_runner.py`, `server/worker_sandbox.py`)**:
-   - **Isolated copy (default, `in_place=false`)**: `JobManager` copies tracked and non-ignored files (`git ls-files -co --exclude-standard -z`) into a standalone git repository under `<data_dir parent>/.cc-agy-worktrees-<slug>/<job_id>` (falling back to `/tmp/cc-agy-worktrees-<slug>/<job_id>`) and creates a baseline commit (`git init -b main`). Multiple jobs can run in parallel and failed runs leave your working tree untouched. Host `.git/hooks` and `.git/config` are snapshot-verified around every run. For TypeScript, Node, and Python workspaces, isolated copies populate `node_modules` via copy-on-write clones or bounded package copies (`<= 10,000` entries and `<= 128 MiB`) and expose `<workspace>/.venv/bin` read-only on `PATH`.
-   - **Direct working-tree mode (`in_place=true`)**: Edits your live checkout directly when tests depend on large gitignored `.venv/` or `node_modules/` directories without copying them. Requires a clean tracked tree, allows one `in_place` job at a time, cannot be combined with `allowed_paths`, unwinds any worker git commits (`git reset --mixed`) back to your baseline branch while keeping file edits on disk, and returns a shell-quoted `undo_hint`.
-   - *Security boundary*: On Gemini Enterprise (`agy` CLI), mutating workers are confined by an OS sandbox (`bwrap` on Linux, `sandbox-exec` on macOS, or `agy --sandbox` fallback on Windows/unprivileged containers; enforce strictly with `CC_AGY_WORKER_SANDBOX=required`). On the Python SDK (`api_key`/`vertex`/`gateway`), Straitjacket (`ctx-harness`) confines tool calls to the job checkout while child-env credential scrubbing and HMAC receipts enforce secret hygiene.
-   - **Worker runtime budgets**: `run_antigravity_worker()` launches either `agy --output-format stream-json` (`containment: "agy_cli"`) or `google.antigravity.Agent` (`types.BudgetConfig` + Straitjacket `run_command`/`ctx_get`/`ctx_search`, or `containment: "none"` if `ctx-harness` is absent) with per-turn caps (default: `55` tool calls on Flash in `balanced`, `100` in `economy` and on Argon/Pro, and `5,000,000` total tokens).
-4. **Acceptance checks, compile smoke checks, and token-bounded diffs (`server/verification_policy.py`)**:
-   - When the worker finishes, the plugin executes any explicit or auto-discovered `acceptance` commands (`verification: "acceptance_tests"` or `"related_tests"`), or falls back to fast read-only compile/syntax smoke checks (`verification: "smoke_only"`), cleans up untracked test artifacts and background child processes, and returns pass/fail counts with a 600-token output tail.
-   - The lead agent inspects changes via `get_diff` (paginated at `4,000` tokens per page, up to `8,000` max, so large diffs never exceed MCP token limits) and merges verified work with `delegate_apply`.
-5. **Cryptographic provenance check (`scripts/provenance_check.py`)**:
-   - Every run writes an HMAC-SHA256 signed receipt in `$CC_AGY_DATA_DIR` / `$CLAUDE_PLUGIN_DATA` (defaulting to `~/.cache/cc-agy-plugin/<workspace-slug>/receipts/<job_id>.json`), with API keys and gateway tokens unconditionally redacted and `.hmac_key` stored outside the worker's worktree hierarchy.
-   - When strict mode (`CC_AGY_STRICT_MODE=true`) is enabled, the `Stop` hook verifies that every modified line in the workspace matches a signed worker receipt (or pre-existing session baseline).
-
----
-
-</details>
-
-<details>
-<summary><b>MCP tools reference (18 tools)</b></summary>
-
-| Tool | Purpose |
-|---|---|
-| `ask_gemini` | Fast single-shot query via `google-genai` (or `agy --mode plan` in `gemini_enterprise` mode) without spinning up a workspace copy. Best for code reviews, architecture checks, and second opinions. Default model: `gemini-4-hydrogen` (`gemini-4-carbon` when `cost_profile="quality"`). |
-| `delegate_start` | Start an Antigravity worker in a standalone repo copy (or `in_place=true`). Supports `plan`, `acceptance`, `max_tool_calls`, `max_total_tokens`, `thinking_level`, and `prewalk` (`api_key`/`project` available only when GE mode is not pinned). Default model: `gemini-4-hydrogen` (auto-escalating to `gemini-4-carbon-zero` on retries under `balanced`, or starting on `gemini-4-carbon` under `quality`). |
-| `delegate_result` | Wait for a background job to finish (default `240s` wait cap so Claude Code's 5-minute prompt cache stays warm) and return its compact digest. |
-| `delegate_status` | Inspect live progress signals (`report_to_lead`), token usage, and USD/cents cost (broken out by `by_auth_mode`: `$0.00` billed for included GE seats vs pay-as-you-go) for a single `job_id`, or omit `job_id` to list recent jobs and cumulative totals. |
-| `get_diff` | Retrieve the unified git diff from a job's worktree, filtered by file or glob and paginated by token budget (`default: 4000`, `max: 8000` tokens per page). |
-| `delegate_apply` | Verify host file SHA-256 hashes against the job's baseline, apply the diff (using `git merge-file -p` 3-way merge when host files drifted cleanly and re-running acceptance/smoke checks on merged files before writing), back up pre-apply and post-apply snapshots under `<data_dir>/backups/<job_id>/`, record provenance hashes on the HMAC receipt, and clean up the worktree. |
-| `delegate_revert` | Undo an applied job (isolated or `in_place`) from its signed `<data_dir>/backups/<job_id>/` snapshot (using 3-way reverse merge when a later job edited non-overlapping lines of the same file). Refuses overlapping edits without writing unless `skip_dirty=true`; `dry_run=true` previews. |
-| `delegate_continue` | Send a follow-up instruction into an existing job's worktree (preserving `auth_mode`, `plan`, `acceptance`, and budget caps). Under `balanced`, a failed Flash turn steps up to `gemini-4-carbon-zero`; after two consecutive failures on the active model (`CC_AGY_ESCALATE_AFTER_FAILURES`) or immediately on a `429`/`503` quota error, sets `escalation.escalate_to_lead=true` unless `force_retry=true`. |
-| `cost_report` | Dispatched Gemini cost from signed receipts (`$0.00` billed for included Gemini Enterprise seat runs, with `by_auth_mode` token and list-equivalent breakdown) side-by-side with full session cost (Lead session rebuilt from Claude Code `~/.claude/projects/<hash>/` and OpenCode XDG storage). Also runs as `python -m server.true_cost --workspace .`. |
-| `delegate_cancel` | Cancel an in-flight worker job (also triggered automatically on MCP `Esc` / `notifications/cancelled`) and remove its temporary worktree. |
-| `delegate_file_batch` | Write many files from one Lead-authored plan in a single call: single-shot writers (no exploration), per-task checks in an isolated job copy, retry with the failure output, Claude as the third attempt (disabled automatically when Gemini Enterprise is pinned), compact per-task digest, resumable. Land with `get_diff` + `delegate_apply`. |
-| `batch_task_log` | Retrieve stored check output, writer prompt excerpt, or raw writer response for one task in a `delegate_file_batch` job (`attempt` optional). |
-| `draft_document` | One new doc from purpose, audience, sections and facts whose quotes are verified word-for-word; must contain every section and link only to existing paths. |
-| `write_tests_from_cases` | One new test file from named cases; every case and expected value must appear as written and the test command must pass. |
-| `replicate_edit` | Repeat a change you made by hand in one file across other files as exact edits, then run one check. |
-| `probe_writers` | Preflight each configured writer with a tiny call; fails fast with the exact fix. |
-| `doctor` | Zero-network readiness check: verifies MCP tools, `cost_profile`, auth config (redacting keys and tokens), daily budget status, installed SDKs, git workspace status, detected language test runner, and receipt store writability. |
-| `delegate_to_gemini` | Synchronous convenience wrapper: runs `delegate_start(..., wait=true)` and automatically calls `delegate_apply` when `status == "ok"` and behavioral checks pass (leaving `checkpoint`, `needs_input`, and escalated jobs unapplied without flagging `is_error`). |
-
----
-
-</details>
-
-<details>
-<summary><b>Batch file writing</b></summary>
-
-Large changes usually cost the most where the Lead types file after file. `delegate_file_batch` moves only the typing: the Lead still explores, plans, and reviews, then hands the plan over as one JSON file.
-
-```mermaid
-flowchart LR
-  L["Lead writes plan JSON"] --> V["validate_batch_plan<br/>(no model call)"]
-  V -->|problems with JSON paths| L
-  V --> G["dependency graph<br/>bounded parallel"]
-  G --> W1["writer: Gemini Flash<br/>attempt 1"]
-  W1 -->|checks fail| W2["attempt 2<br/>+ failure output"]
-  W2 -->|checks fail| W3["attempt 3: Claude<br/>claude -p, no tools"]
-  W1 & W2 & W3 -->|checks pass| C["isolated job copy"]
-  C --> D["digest + signed receipt"]
-  D --> A["get_diff / delegate_apply<br/>3-way merge, revert"]
-```
-
-**How a task runs**
-- A writer gets one task, the files it needs, and the shared context, and must answer with one JSON object: the whole file, or exact `find`/`replace` edits. Nothing is silently patched: a wrong path, an empty file, or a `find` block that does not match once is rejected and costs an attempt. CRLF files stay CRLF.
-- The plugin writes the answer into the job copy and runs the task's checks (own process group, killed whole on timeout, no vendor credentials in the environment). Only a passing file lands.
-- Attempts 1 and 2 use the routed writer (`gemini-4-hydrogen`, LOW thinking by default; `writer="agent"` uses a writer-only Antigravity agent with a short custom system prompt, FINISH as its only tool, and 3 model calls). Attempt 3 uses Claude. Rate limits and 5xx (`408`, `429`, `5xx`, `529`) wait with jittered backoff capped at 60 s and do not count as failed attempts; a reply cut off at the output limit moves to the next writer for free; `401`/`403` stops the batch with the fix.
-- Files needed by every task are sent once as a Gemini context cache (1 hour TTL) or as Claude's cached system prompt, and the first task runs alone to warm the cache.
-- Every landed task is journaled with its fingerprint and file hash, so re-sending the same plan after an interruption resumes and skips finished tasks at zero cost.
-- One HMAC-signed receipt per batch records each task's state, attempts, writer, and added-line hashes. `delegate_apply`, `delegate_revert`, and the Stop-hook provenance check work identically to agent jobs.
-
-**When to use what**
+The routing skill follows this table, so you rarely need to think about it.
 
 <!-- SHARED:ROUTING_TABLE:BEGIN -->
 | Change | Route |
@@ -631,194 +99,77 @@ flowchart LR
 | One new doc, tests from named cases, or one edit repeated across files | Call `draft_document`, `write_tests_from_cases`, or `replicate_edit`. |
 <!-- SHARED:ROUTING_TABLE:END -->
 
-Settings: `writer`, `model`, `thinking_level`, `claude_writer`, `claude_model`, `max_parallel` per call, or `CC_AGY_BATCH_WRITER`, `CC_AGY_BATCH_MODEL`, `CC_AGY_BATCH_THINKING`, `CC_AGY_BATCH_CLAUDE_MODEL`, `CC_AGY_BATCH_MAX_PARALLEL`.
-
-Inspired by the architect/editor split popularized by Aider and by cheap-first model cascades (FrugalGPT).
+A Flash worker turn is capped at `55` tool calls under `balanced` and `100` under `economy`. Change it with `CC_AGY_FLASH_MAX_TOOL_CALLS`.
 
 ---
 
-</details>
+## Connecting and choosing a profile
 
-<details>
-<summary><b>Configuration reference (CLI flags, userConfig, and environment variables)</b></summary>
+| How you connect | Billing | Best fit |
+|:--|:--|:--|
+| Gemini Enterprise (`--auth gemini-enterprise`) | Included in your monthly Enterprise seat | Work accounts with assigned seats |
+| AI Studio key (`GEMINI_API_KEY`) | Pay-as-you-go on AI Studio | Individual developers |
+| Vertex AI (`GOOGLE_CLOUD_PROJECT`) | Pay-as-you-go on GCP | Cloud teams and CI/CD pipelines |
+| AI gateway (`--base-url`) | Managed by your gateway | Enterprises with a central proxy |
 
-<a id="configuration-reference"></a>
+| Profile | How models are chosen | Best when |
+|:--|:--|:--|
+| `balanced` (default) | Starts on `gemini-4-hydrogen` and moves to `gemini-4-carbon-zero` if a check fails or a retry is needed | Everyday engineering |
+| `economy` | Keeps every call on `gemini-4-hydrogen` | Tight budgets and well-scoped tasks |
+| `quality` | Starts on `gemini-4-carbon` | Hard multi-file bugs and tricky logic |
 
-Strict mode means `--strict`, `CC_AGY_STRICT_MODE=true`, or `userConfig.strict_delegation_mode=true`.
+Set the profile with `--profile` or `CC_AGY_COST_PROFILE`. A few flags keep you in charge:
 
-| Setting (`install` flag / `userConfig` / env var) | Default | What it controls |
-|---|---|---|
-| `--host codex\|claude\|cursor\|opencode\|agy\|all` | `all` | Target host(s) for `python3 -m server.install` (`cursor` installs into `~/.cursor/mcp.json` and `~/.cursor/skills/`; `opencode` writes legacy-compatible `mcp.<name>` into `~/.config/opencode/opencode.json` [`$OPENCODE_CONFIG_DIR` / `$XDG_CONFIG_HOME/opencode` / absolute `$OPENCODE_CONFIG`, preserving V2 `mcp.servers` configs in place and leaving commented `opencode.jsonc` files untouched next to `opencode.json`] plus `skills/`, `commands/`, and `agents/` with `0o600` `.bak-*` backups for any pre-existing or user-modified files; `agy` / `antigravity` / `jetski` installs into `~/.gemini/config/`; or pass `claude --plugin-dir /path/to/cc-agy-plugin` / `codex plugin marketplace add manishkjs/cc-agy-plugin --ref main`). |
-| `--auth` / `userConfig.auth_mode` / `CC_AGY_AUTH_MODE` | `auto` | Connection mode (`gemini_enterprise`, `agy_cli`, `api_key`, `vertex`, `gateway`, or `auto`; alias `CC_AGY_GEMINI_ENTERPRISE=true`). Explicit `api_key` mode always connects directly to Google AI Studio and ignores gateway URLs; use `auto` or `gateway` for custom gateways (explicit `vertex` mode also honors a configured gateway URL when a gateway token, Bifrost virtual key, or OIDC audience is present). |
-| `--agy-cli-path`, `--install-agy-cli` / `userConfig.agy_cli_path` / `CC_AGY_CLI_BIN`, `CC_AGY_CLI_CONFIG_DIR` | `~/.local/share/cc-agy-plugin/bin/agy` / `~/.gemini/antigravity-cli` | External `agy` binary and OAuth config directory (`ANTIGRAVITY_OAUTH_TOKEN` is also supported and scrubbed from receipts). |
-| `userConfig.gemini_api_key` / `GEMINI_API_KEY` (`GOOGLE_API_KEY`) | unset | Google AI Studio API key (redacted from child shells and receipts). |
-| `--project` / `userConfig.google_cloud_project` / `GOOGLE_CLOUD_PROJECT` | unset (required on Vertex) | Google Cloud project ID for pay-as-you-go Vertex AI (`aiplatform.googleapis.com`). |
-| `--location` / `userConfig.google_cloud_location` / `GOOGLE_CLOUD_LOCATION` | `us-central1` | Preferred Vertex AI region (`gemini-4-hydrogen` and `gemini-4-carbon` route to `global` automatically). |
-| `--base-url` / `userConfig.vertex_base_url` / `CC_AGY_VERTEX_BASE_URL` (`GOOGLE_VERTEX_BASE_URL`, `CC_AGY_GEMINI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) | unset | Custom AI gateway URL for LiteLLM (`/vertex_ai` or `/gemini`), Bifrost (`/genai`), Portkey, Apigee, or Cloud Run proxies (`CC_AGY_VERTEX_BASE_URL` takes priority over an ambient shell `GEMINI_API_KEY`; in `auto` or `gateway` mode, `GOOGLE_GEMINI_BASE_URL` and `CC_AGY_GEMINI_BASE_URL` also accept `GEMINI_API_KEY` when no gateway bearer token or Bifrost virtual key is set; Windows PowerShell bootstrap in `scripts/bootstrap-gateway.ps1`). |
-| `--gateway-wire` / `userConfig.gateway_wire` / `CC_AGY_GATEWAY_WIRE` | `auto` | Gateway wire protocol (`auto`, `vertex`, `gemini`, `litellm-vertex`, `litellm-gemini`, or `bifrost`). `auto` selects `gemini` (`/v1beta/models/...`, `GeminiAPIEndpoint`) when the gateway path ends in `/genai` or `/gemini`, when `CC_AGY_GEMINI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL` is used, or when `CC_AGY_BIFROST_VIRTUAL_KEY` is set, and selects `vertex` (`/v1beta1/projects/...`, `VertexEndpoint`) otherwise; an explicit trailing `/v1`, `/v1alpha`, `/v1beta`, or `/v1beta1` on `--base-url` sets the SDK API version without doubling the path segment. |
-| `userConfig.vertex_base_url_token` / `CC_AGY_VERTEX_BASE_URL_TOKEN` | unset | Bearer token or virtual key sent to the custom gateway as `Authorization: Bearer` and `x-goog-api-key` (redacted from child shells and receipts). |
-| `userConfig.bifrost_virtual_key` / `CC_AGY_BIFROST_VIRTUAL_KEY` | unset | Optional Bifrost (`maximhq/bifrost`) virtual key sent in the `x-bf-vk` header for governance and budget limits; works standalone or alongside Cloud Run OIDC `Authorization: Bearer` tokens (redacted from child shells and receipts). |
-| `--gateway-audience` / `userConfig.vertex_base_url_audience` / `CC_AGY_VERTEX_BASE_URL_AUDIENCE` (`CC_AGY_VERTEX_OIDC=1`, `CC_AGY_VERTEX_OIDC_SOURCE`) | unset | OIDC target audience URL (or `auto`) for zero-key Cloud Run and Workload Identity Federation gateway auth. Mints and caches refreshing OIDC identity tokens (up to ~55 minutes per single worker job) via WIF/SA JSON, `gcloud` with `CC_AGY_VERTEX_IMPERSONATE_SERVICE_ACCOUNT`, human `gcloud auth login` on developer machines (failing closed on expired sessions or `gcloud` timeouts rather than swapping to a VM service account), or Cloud Run/GCE metadata (`CC_AGY_VERTEX_OIDC_SOURCE=auto\|gac\|gcloud\|metadata`; GKE pods without `K_SERVICE` can set `metadata` explicitly). When a custom gateway verifies an exact custom `aud` claim, use SA impersonation, WIF, or `CC_AGY_VERTEX_OIDC_SOURCE=metadata`. |
-| `--telemetry-sink` / `userConfig.telemetry_sink` / `CC_AGY_TELEMETRY_SINK` (`CC_AGY_TELEMETRY_TOKEN`) | unset (off) | Opt-in absolute/`~`/`file://` local NDJSON file path (`0o600`) or `https://` collector URL for sanitized receipt telemetry (deterministic `event_id`, delta and cumulative token counts and cents, model, verification mode, ISO `timestamp`, and IAP/OIDC/self-reported caller provenance; never sends prompts, diffs, or secrets; aggregate spend across process restarts via `max(cumulative_cost_cents)` per `job_id`, with 256 KiB tail delta recovery on local NDJSON sinks). |
-| `--doctor` (`python3 -m server.install --doctor [--probe-oidc]` or `python3 -m server.doctor [--probe-oidc]`) | off | Runs offline environment, gateway/OIDC, SDK, receipt-store, and telemetry-sink diagnostics as JSON (pass `--probe-oidc` to live-mint once and verify the OIDC principal claim) and exits non-zero when unhealthy. |
-| `CC_AGY_LEAD_RATES` (alias `CC_AGY_LEAD_RATES_JSON`) | `server/rate_card.json` | Optional JSON override table `{model_substring: [in, cache_read, cache_5m, cache_1h, out]}` in USD per 1M tokens for Lead cost reporting; matching substrings apply longest-key-first across matching model IDs. |
-| `--profile` / `userConfig.cost_profile` / `CC_AGY_COST_PROFILE` | `balanced` | Model routing profile (`balanced`, `economy`, or `quality`). |
-| `CC_AGY_DEFAULT_DELEGATE_MODEL` / `CC_AGY_DEFAULT_ASK_MODEL` | from `--profile` | Default Gemini model override for worker jobs or `ask_gemini` calls (overridden by `model=` per call). |
-| `--max-daily-cents` / `userConfig.max_daily_cents` / `CC_AGY_MAX_DAILY_CENTS` | unset (unlimited) | UTC daily workspace spend cap in US cents (for example `500` for 500¢/day). |
-| `--allowed-projects` / `userConfig.allowed_projects` / `CC_AGY_ALLOWED_PROJECTS` | unset | Comma-separated allowlist of GCP project IDs permitted for Vertex AI or Gemini Enterprise (`agy` CLI `cloudaicompanionProject`). Any other project is rejected at 0 tokens. |
-| `--blocked-projects` / `userConfig.blocked_projects` / `CC_AGY_BLOCKED_PROJECTS` | unset | Comma-separated blocklist of GCP project IDs that must never be used or billed (checked across Vertex AI, ADC `quota_project_id`, and `agy` CLI `onboarding.json`). |
-| `--enterprise-adc` / `userConfig.enterprise_adc` / `CC_AGY_ENTERPRISE_ADC` | auto-detect | Runs `agy` on your Gemini Enterprise seat with your own `gcloud` ADC login (`AGY_ADC_AUTH=true`). Auto-detected from `userSettings.enableAdc` plus an `authorized_user` ADC file; `false` turns it off. Service accounts are refused. |
-| `--enterprise-project` / `userConfig.enterprise_project` / `CC_AGY_ENTERPRISE_PROJECT` | ADC `quota_project_id` | Project that holds the Gemini Enterprise seats. Checked against the allowed and blocked project lists before `agy` starts. |
-| `--enterprise-location` / `userConfig.enterprise_location` / `CC_AGY_ENTERPRISE_LOCATION` | `global` | Gemini Enterprise location for ADC seat mode (`global`, `us`, or `eu`). |
-| `--enterprise-user-tier` / `userConfig.enterprise_user_tier` / `CC_AGY_ENTERPRISE_USER_TIER` | unset | Seat tier passed to `agy` as `BAICODE_USER_TIER` (`gcp-ge-plus-tier` or `gcp-ge-standard-tier`) so usage appears in Developer tools metrics. |
-| `--bifrost-policy-url` / `userConfig.bifrost_policy_url` / `CC_AGY_BIFROST_POLICY_URL` | unset | Central Bifrost URL (`https://`, or loopback) that decides which `agy-cli/<model>` entries a Virtual Key may run. Policy lookups only; no prompts are sent. |
-| `userConfig.bifrost_agy_virtual_key` / `CC_AGY_BIFROST_AGY_VIRTUAL_KEY` | `CC_AGY_BIFROST_VIRTUAL_KEY` | Bifrost Virtual Key used for the `agy` policy lookup. Never passed to the `agy` process. |
-| `userConfig.bifrost_policy_user`, `userConfig.bifrost_policy_password` / `CC_AGY_BIFROST_POLICY_USER`, `CC_AGY_BIFROST_POLICY_PASSWORD` | unset | Optional read-only Bifrost login used to read routing rules and resolve `policy-routed`. |
-| `--bifrost-agy-policy-model` / `userConfig.bifrost_agy_policy_model` / `CC_AGY_BIFROST_AGY_POLICY_MODEL` | unset | `agy` model to run for `policy-routed` when routing rules cannot be read. |
-| `--worker-sandbox` / `userConfig.worker_sandbox` / `CC_AGY_WORKER_SANDBOX` | `auto` | OS sandbox for Gemini Enterprise write workers (bubblewrap on Linux, `sandbox-exec` on macOS). `auto` falls back to permission prompts when no sandbox works, `required` refuses to run, `off` disables it. `CC_AGY_BWRAP_BIN` overrides the `bwrap` path. |
-| `CC_AGY_CONVERSATION_TTL_SECONDS` | `900` | How long an `ask_gemini` conversation on a Gemini Enterprise seat can be resumed for a follow-up question. `0` always sends the full prompt. |
-| `CC_AGY_MODEL_CATALOG` / `CC_AGY_MODEL_CATALOG_TTL_SECONDS` | on / `60` | Checks requested models against the cached `agy models` list before a run. Set `CC_AGY_MODEL_CATALOG=0` to turn the check off. |
-| `CC_AGY_STATE_DIR` | next to the managed `agy` binary | Where the model list and conversation IDs are cached (files are `0600`). |
-| `CC_AGY_BIFROST_POLICY_TTL_SECONDS` | `60` | How long a Bifrost policy answer is reused before it is fetched again. |
-| `--no-auto-apply` / `userConfig.auto_apply_on_pass=false` / `CC_AGY_AUTO_APPLY_ON_PASS=0` | `false` outside strict mode, `true` in strict mode | Enforces manual diff review (`get_diff` then `delegate_apply`) across all tools, disables shutdown salvage, and blocks `in_place=true` unless `CC_AGY_ALLOW_IN_PLACE=1`. |
-| `CC_AGY_ALLOW_IN_PLACE` | `true` (`false` when `--no-auto-apply` is set) | Set to `0` to forbid `in_place=true` direct working-tree edits so every worker runs inside a disposable git copy. |
-| `--no-bootstrap` / `CC_AGY_VENV_DIR` / `CC_AGY_PYTHON_BIN` | `~/.local/share/cc-agy-plugin/venv` | Per-user virtualenv directory or explicit Python interpreter path used on PEP 668 systems. |
-| `--strict` / `userConfig.strict_delegation_mode` / `CC_AGY_STRICT_MODE` | `false` | Blocks direct host edits in Claude Code so every modified line traces to a signed worker receipt. |
-| `CC_AGY_CHECK_ENV_ALLOW` | unset | Comma-separated env var names allowed into acceptance checks, batch checks, and worker commands (credentials, tokens, `*_DSN`, password URLs, and `SSH_AUTH_SOCK` are scrubbed by default; removed names appear under `credential_env_removed` on failure). |
-| `CC_AGY_AUTO_APPLY_ON_PASS` | on in strict mode, off otherwise | Auto-applies a finished worker diff when status is `ok`, behavioral checks pass, and `scope_violations` is empty (`0` disables). |
-| `CC_AGY_SALVAGE_ON_SHUTDOWN` | on in bounded Lead sessions | Applies the best verified unapplied worker edits on MCP server shutdown when no job was applied yet. |
-| `CC_AGY_AUTO_CONTINUE_DIRTY_WORKTREE` | on in strict mode | Routes a second `delegate_start` to `delegate_continue` on the latest paused (`timeout`, `checkpoint`, `needs_input`, failed acceptance) job when scopes overlap. |
-| `CC_AGY_SPARSE_WORKTREE` | off (`1` or `CC_AGY_SPARSE_THRESHOLD_FILES=<N>`) | Materializes only scoped directories, 2-hop local imports, configs, and matching tests when `allowed_paths` is set on large monorepos. |
-| `CC_AGY_MIN_VIEW_LINES` | `250` | Widens small `view_file` reads to at least this many lines (`0` disables). |
-| `CC_AGY_COMPACTION_THRESHOLD` / `CC_AGY_COMPACTION_BUFFER` | `120000` tokens | Worker context-compaction trigger (`0` disables; accepts integer token counts like `120000` or window percentages like `85%`, or set `CC_AGY_COMPACTION_BUFFER=15%` to reserve 15% of the model context window with a 16,000-token floor; `CC_AGY_TOOL_OUTPUT_MAX_TOKENS=4000` caps per-tool output). |
-| `CC_AGY_INPUT_MODALITIES` | from `server/rate_card.json` | Comma-separated input modalities declared for the active worker model (`text,image,pdf,audio,video` on Gemini models); `view_file` is always a text-only line reader that refuses binary media files cleanly and cites unsupported modalities when excluded here. |
-| `CC_AGY_QA_REVIEW_MODEL` | unset | Runs a blocker-only spec-vs-diff QA check with this model before auto-apply (also `qa_review_model` per call). |
-| `CC_AGY_TOOL_PROFILE` | `core` in strict mode, `full` otherwise | `core` exposes only the 9 core delegation and diagnostic tools, cutting the MCP tool schema from about 7,200 tokens to under 1,250 tokens. |
-| `CC_AGY_LEAD_READ_LIMIT` (alias `CC_AGY_MAX_LEAD_READS`) | `2` (strict mode) | Caps direct Lead file/search reads before delegation (up to 6 review reads are added when a worker finishes without auto-apply; `0` allows none, `off` or `<0` removes the cap). |
-| `CC_AGY_FLASH_MAX_TOOL_CALLS` | `100` in economy, `55` otherwise | Per-turn tool-call cap for Flash workers (`55` in `balanced`, `100` in `economy`, matching Pro/Argon's `CC_AGY_MAX_TOOL_CALLS=100`). |
-| `CC_AGY_SAME_MODEL_RETRIES` | `1` in economy, `0` otherwise | Automatic same-model fix turns in bounded Lead sessions when a voluntary `status="ok"` turn edited files under 60% of its tool budget and failed checks. |
-| `--list-settings` | off | Prints the 6-category public `CC_AGY_*` settings catalog (`--json` outputs machine-readable JSON). Internal `CC_AGY_USERCFG_*` variables are `.mcp.json` passthroughs managed automatically by `server.install`. |
+- `--no-auto-apply` holds every diff until you approve it.
+- `--max-daily-cents 500` sets a UTC daily spend cap.
+- `--allowed-projects` and `--blocked-projects` decide which GCP projects may be billed.
+- `--strict` blocks direct edits in Claude Code so every changed line traces to a signed worker receipt.
 
-</details>
+Every flag and environment variable is in the [configuration guide](guides/configuration.md).
 
-<details>
-<summary><b>Repository layout and running tests</b></summary>
+---
 
-```text
-cc-agy-plugin/
-├── assets/
-│   ├── walkthrough.mp4       # 4m 30s voiced 3D walkthrough (1080p H.264 + AAC)
-│   ├── walkthrough-poster.png # Clickable preview poster for the README walkthrough
-│   ├── overview.svg          # High-level 4-step workflow diagram
-│   └── architecture.svg      # Cross-harness MCP architecture diagram
-├── .claude-plugin/
-│   ├── plugin.json           # Claude Code plugin manifest + userConfig schema
-│   └── marketplace.json      # Local Claude Code plugin marketplace catalog
-├── .cursor-plugin/
-│   ├── plugin.json           # Native Cursor plugin manifest
-│   ├── mcp.json              # Cursor stdio MCP config (${CURSOR_PLUGIN_ROOT})
-│   └── hooks.json            # Cursor hooks override (prevents scanning Claude hooks)
-├── .opencode/
-│   ├── skills/cc-agy-plugin/ # Native OpenCode skill (SKILL.md)
-│   ├── commands/             # Native OpenCode /agy, /delegate, /doctor, /jobs, /cost, /login commands
-│   └── agents/               # Native OpenCode @gemini-delegator subagent
-├── .agents/plugins/
-│   └── marketplace.json      # Native Codex repository plugin marketplace catalog
-├── plugins/cc-agy-plugin/    # Native Codex plugin bundle (.codex-plugin/plugin.json + skill)
-├── .mcp.json                 # Long-lived stdio MCP server definition (30-minute / 1,800,000 ms timeout)
-├── server/
-│   ├── main.py               # MCP stdio entry point + managed venv re-exec
-│   ├── runtime_env.py        # PEP 668-safe per-user virtualenv discovery and bootstrap
-│   ├── agy_cli.py            # Standalone Antigravity CLI (`agy`) discovery, OAuth check & runner
-│   ├── agy_login.py          # Automatic browser loopback & 2-step SSH PKCE OAuth login (1-line link + OSC 52)
-│   ├── install.py            # Arrow-key dropdown wizard + Codex/Claude/Cursor/OpenCode/Antigravity installer (cc-agy-install)
-│   ├── mcp_stdio.py          # Concurrent JSON-RPC 2.0 MCP protocol dispatcher
-│   ├── rate_card.json        # Declarative Gemini & Claude pricing rate card + promo-expiry metadata
-│   ├── rate_card.py          # Rate-card validator, promo-expiry check & per-model thinkingLevel clamping
-│   ├── regions.py            # Auth (`agy` CLI / API key / Vertex / OIDC gateway), routing, pricing, daily cap
-│   ├── receipts.py           # Atomic HMAC receipt store, secret redaction & diff hashing
-│   ├── telemetry.py          # Opt-in non-blocking NDJSON / HTTPS receipt sink + verified identity tiers
-│   ├── genai_client.py       # Shared google-genai client factory, cleanup & usage normalization
-│   ├── genai_ask.py          # Single-shot google-genai / `agy` plan-mode helper
-│   ├── agy_runner.py         # Antigravity SDK / `agy` CLI worker runner + Straitjacket containment
-│   ├── verification_policy.py # Unified verification classifier for reporting, auto-apply & hooks
-│   ├── jobs.py               # Isolated repo copy, acceptance + smoke checks, 3-way apply, salvage
-│   ├── repo_map.py           # Commit-keyed repository map ("scout cache") for worker prompts
-│   ├── review_bundle.py      # File-backed review evidence bundle and symbol-level diff slicer
-│   ├── model_routes.py       # Shared routing table, worker budgets & batch writer settings
-│   ├── batch_plan.py         # Validates the Lead's file-by-file batch plan (no model call)
-│   ├── batch_runner.py       # Runs a batch plan inside an isolated job copy
-│   ├── batch_journal.py      # Append-only journal so a re-sent batch skips finished files
-│   ├── task_graph.py         # Dependency-ordered, bounded-parallel file tasks
-│   ├── writers.py            # Single-shot file writers and their fallback ladder
-│   ├── verify.py             # Runs verification commands for file tasks
-│   ├── assist_tools.py       # Small bounded helper tools for normal chat
-│   ├── true_cost.py          # Dispatched worker cost vs. full session cost
-│   ├── doctor.py             # Offline readiness diagnostics (auth, SDKs, git, test runner, receipts)
-│   └── harness_validator.py  # Pre-flight check of prompt budgets, skills, scripts, hooks & doc sync
-├── skills/vertex/SKILL.md    # Routing skill instructions for Claude Code and Codex
-├── agents/gemini-delegator.md # Orchestrator subagent definition
-├── commands/                 # /cc-agy-plugin:{setup,login,agy,delegate,doctor,jobs,cost} slash commands
-├── hooks/hooks.json          # SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks
-├── scripts/
-│   ├── quickstart.sh         # 1-command clone/update + dropdown setup + OAuth login + --doctor bootstrap
-│   ├── agy_signin.sh         # Thin shell wrapper invoking server.agy_login
-│   ├── run_mcp_server.sh     # Python 3.10+ MCP launcher (avoids macOS /usr/bin/python3 3.9 crashes)
-│   ├── install_agy_cli.sh    # SHA-512 verified standalone Antigravity CLI (`agy`) installer
-│   ├── bootstrap-gateway.ps1 # Windows PowerShell enterprise gateway + OIDC setup script
-│   ├── sync_docs.py          # Shared routing table & budget constant synchronizer
-│   ├── lint_ast.py           # Zero-dependency AST static linter (syntax, bare except, mutable defaults)
-│   ├── run_tests_parallel.py # Multi-core parallel pytest runner across all test modules
-│   ├── validate.sh           # Manifest, AST lint, badge, doc-sync, and dry-run installer validator
-│   ├── session_start.py      # SessionStart hook: records the per-session baseline and --doctor CLI
-│   ├── user_prompt_submit.py # UserPromptSubmit hook: records prompt timestamp and resets read budgets
-│   ├── pre_tool_guard.py     # Fast-path (<100ms) strict mode PreToolUse guard + prompt linter router
-│   ├── post_tool_ledger.py   # PostToolUse MCP audit logger
-│   └── provenance_check.py   # Stop-hook git diff vs HMAC-receipt provenance verifier
-├── tests/                    # Pytest unit, integration, portability, and guardrail suite
-└── LICENSE                   # Apache License 2.0
-```
+## Benchmarks
 
-### Guard hooks on every host
+We ran 26 real repository tasks (10 Python, 10 Go, 6 TypeScript) across 8 setups. Each setup ran each task once, so differences of 1 to 3 tasks are within normal run-to-run noise.
 
-The five Claude Code hooks in `hooks/hooks.json` (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) run the same scripts on the other hosts through one adapter, `scripts/hook_adapter.py --host <host> --event <event>`. The adapter turns each host's hook input into the Claude Code shape, runs the script, and turns the answer back into what that host understands (for example, agy blocks with `{"decision":"deny","reason":...}`).
+| Setup | Tasks solved | Avg cost / task | vs Opus solo |
+|:--|:--:|:--:|:--:|
+| Claude Code · Opus 5.5 (solo) | 22 / 26 | 87.6¢ | baseline |
+| Claude Code + plugin · Opus + Flash (`economy`) | 15 / 26 | 60.6¢ | -31% |
+| Claude Code + plugin · Flash 3.8 -> Argon (`balanced`) | 21 / 26 | 81.1¢ | -7% |
+| Claude Code + plugin · Opus + Argon (`quality`) | 20 / 26 | 80.0¢ | -9% |
+| Antigravity · Flash (solo) | 18 / 26 | 47.7¢ | -46% |
+| Antigravity · Flash -> Carbon Low | 18 / 26 | 74.9¢ | -14% |
+| Antigravity · Carbon Zero-Think (solo) | 20 / 26 | 93.9¢ | +7% |
+| Antigravity + plugin · Argon + Flash (`economy`) | 15 / 26 | 83.2¢ | -5% |
 
-| Host | Where the hooks live | Installed by | What runs |
-|---|---|---|---|
-| Claude Code | `hooks/hooks.json` (plugin) | the plugin itself | all five hooks, all matched tools |
-| OpenCode | `opencode-plugin/hooks.ts` (plugin) | the plugin itself | `tool.execute.before/after`, `chat.message`, `session.created`; `session.idle` cannot block, so Stop only logs |
-| Codex 0.118+ | `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) plus `[features] codex_hooks = true` in `config.toml` | `python3 -m server.install --host codex` | `SessionStart`, `UserPromptSubmit`, `PreToolUse` (shell tool `^Bash$` only), `Stop` |
-| Antigravity CLI (`agy`) | `~/.gemini/config/hooks.json`, key `cc-agy-plugin` (or the plugin root with `--agy-hooks-scope plugin`) | `python3 -m server.install --host agy` | `SessionStart`, `PreInvocation` (as UserPromptSubmit, once per prompt), `PreToolUse`, `PostToolUse`, `Stop` |
-| Cursor | `.cursor-plugin/hooks.json` (plugin) | the plugin itself | nothing yet: Cursor ships no guard hooks, so the read/edit guards and the Stop provenance check do not run there |
+Opus alone still solves the most tasks. Hidden-test pass counts, per-language splits, and how the runs were priced are in the [full results](guides/benchmarks.md).
 
-How the install works: the installer reads the template (`plugins/cc-agy-plugin/hooks/codex-hooks.json` or `plugins/antigravity/hooks.json`) and writes each `command` with the absolute, shell-quoted paths of your Python and of `scripts/hook_adapter.py`, because neither Codex nor agy expands variables in `command`. It merges by ownership: in Codex it replaces only handlers that run `hook_adapter.py --host codex`, and in agy only the `cc-agy-plugin` key, so your own hooks stay. A changed file is backed up first as `<file>.bak-<timestamp>`. Re-running is a no-op, and `--dry-run` writes nothing.
+Prefer video? Watch the [4m 30s walkthrough](assets/walkthrough.mp4).
 
-Codex limits: Codex 0.118 sends `PreToolUse` only for its shell tool, so only shell commands are guarded; the read/edit guards and the MCP `delegate_*` pre-checks do not run there. The installer does not add `PostToolUse` for Codex (it could never match a `delegate_*` call) and removes the one older versions added, so the `delegate_*` hook ledger (`hook_audit.jsonl` and the auto-stop hint) does not run there either. Receipts are not affected: the MCP server writes each job's signed receipt itself, and the Stop-hook provenance check still runs. `codex_hooks` is an "under development" Codex feature; the installer turns it on and leaves it on after `--uninstall-hooks`, since other hooks may need it.
+---
 
-All three hosts let a broken or slow hook through (fail open). The adapter itself denies a `PreToolUse`, or blocks a `Stop` once, only when strict mode is on and a guard script crashes or times out.
+## Documentation
 
-The plugin's own workers are never guarded. Every `agy` process the plugin starts gets `CC_AGY_IN_WORKER=1` (set by `build_agy_subprocess_env` in `server/agy_cli.py`), and the adapter returns the host's no-op allow at once when it sees that marker, or when the hook's `cwd` is inside a `.cc-agy-worktrees-` folder. Without this, a worker running with no OS sandbox would load your `~/.gemini/config/hooks.json` and, in strict mode, be denied the very edits it was delegated.
+| Guide | What it covers |
+|:--|:--|
+| [Setup](guides/setup.md) | One-command install, manual flags for each host, sign-in fixes, verifying the install |
+| [Usage](guides/usage.md) | Example prompts, slash commands, projects without tests |
+| [Configuration](guides/configuration.md) | Connection modes, profiles, spend and project controls, Gemini Enterprise options, every flag and env var |
+| [Benchmarks](guides/benchmarks.md) | All 8 setups, the Antigravity before and after, pricing and routing notes |
+| [FAQ](guides/faq.md) | Sandboxing, undo, spend caps, quota errors, where receipts live |
+| [Technical reference](guides/reference.md) | Architecture, rate card, the 18 MCP tools, batch file writing, guard hooks, repository layout, running tests |
 
-### Running tests and validation
+---
 
-```bash
-python3 scripts/run_tests_parallel.py  # run full test suite in parallel across CPU cores (or pytest -n auto -q)
-python3 scripts/lint_ast.py            # static AST check across all server/ and scripts/ modules
-bash scripts/validate.sh               # checks manifests, AST lint, doc sync, badges, and hermetic host installs
-python3 -m pytest -q tests/test_harness_contracts.py -k opencode  # one host's loading contract
-```
+## Status
 
-### One plugin, five hosts: the 3-layer rule
-
-The same plugin loads in Claude Code, Cursor, Codex, OpenCode, and Antigravity, and each host has its own loader quirks (for example, OpenCode rejects any non-function export from its entry file, and `claude plugin install` does not refresh an installed local-marketplace cache). To keep a fix for one host from breaking another, changes follow three layers:
-
-1. **Shared behaviour lives in `server/`.** Every host starts the same stdio MCP server (`server/main.py`, directly or through `scripts/run_mcp_server.sh`).
-2. **Host quirks live only in that host's adapter folder:** Claude Code (`.claude-plugin/`, `.mcp.json`, `hooks/`), Cursor (`.cursor-plugin/`, `cursor/rules/`), Codex (`plugins/cc-agy-plugin/.codex-plugin/`, `.agents/plugins/`), OpenCode (`opencode-plugin/`, `.opencode/`, `package.json`), Antigravity (`plugins/antigravity/`, only its hooks template; `server/install.py` writes its `~/.gemini/config/` entries). Adapter files never reference another host's folder.
-3. **`server/install.py --host <h>` writes only that host's config.**
-
-Every quirk gets a contract test in `tests/test_harness_contracts.py`. CI runs it once per host (`-k <host>`) on Linux, plus Claude Code and OpenCode on macOS. The tests use a fake `HOME`, a fake `claude` CLI, no network, and no model calls.
-
-</details>
+| Item | Detail |
+|:--|:--|
+| **Version** | 0.4.1, Apache 2.0 |
+| **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
+| **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 
 ## License
 
