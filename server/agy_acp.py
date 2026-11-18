@@ -65,7 +65,7 @@ def _extract_acp_turn_error(
 
 
 def resolve_cli_protocol(env: Mapping[str, str] | None = None) -> str:
-    """Return `'acp'` when `CC_AGY_CLI_PROTOCOL=acp`, else default `'stream-json'`."""
+    """Return `'stream-json'` only when explicitly requested, else default `'acp'`."""
     src = os.environ if env is None else env
     raw = (
         src.get("CC_AGY_CLI_PROTOCOL")
@@ -73,9 +73,74 @@ def resolve_cli_protocol(env: Mapping[str, str] | None = None) -> str:
         or src.get("CC_AGY_USERCFG_CLI_PROTOCOL")
         or ""
     ).strip().lower()
-    if raw == "acp":
-        return "acp"
-    return "stream-json"
+    if raw in ("stream-json", "stream_json"):
+        return "stream-json"
+    return "acp"
+
+
+def is_cli_protocol_explicit(env: Mapping[str, str] | None = None) -> bool:
+    """Return True when the caller explicitly configured `CC_AGY_CLI_PROTOCOL`."""
+    src = os.environ if env is None else env
+    raw = (
+        src.get("CC_AGY_CLI_PROTOCOL")
+        or src.get("CLAUDE_PLUGIN_OPTION_CLI_PROTOCOL")
+        or src.get("CC_AGY_USERCFG_CLI_PROTOCOL")
+        or ""
+    ).strip().lower()
+    return raw in ("acp", "stream-json", "stream_json")
+
+
+_ACP_SUPPORT_CACHE_LOCK = threading.Lock()
+_ACP_SUPPORT_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
+_ACP_HELP_SUBCOMMAND_RE = re.compile(r"^\s+acp\b", re.MULTILINE)
+
+
+def supports_agy_acp(
+    agy_bin: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_seconds: float = 3.0,
+) -> bool:
+    """Return True when `agy_bin` advertises `acp` in `--help` and passes ACP `initialize` (cached)."""
+    try:
+        resolved = str(Path(agy_bin).resolve())
+        st = os.stat(resolved)
+        cache_key = (resolved, int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        cache_key = (str(agy_bin), 0, 0)
+    with _ACP_SUPPORT_CACHE_LOCK:
+        cached = _ACP_SUPPORT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    from server.agy_cli import build_agy_subprocess_env
+    import tempfile
+
+    try:
+        help_proc = subprocess.run(
+            [str(agy_bin), "--help"],
+            cwd=tempfile.gettempdir(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=min(5.0, max(1.0, float(timeout_seconds))),
+            env=build_agy_subprocess_env(env),
+        )
+        help_text = f"{help_proc.stdout or ''}\n{help_proc.stderr or ''}"
+        has_acp_cmd = help_proc.returncode == 0 and bool(_ACP_HELP_SUBCOMMAND_RE.search(help_text))
+    except (OSError, subprocess.SubprocessError):
+        has_acp_cmd = False
+    if not has_acp_cmd:
+        with _ACP_SUPPORT_CACHE_LOCK:
+            _ACP_SUPPORT_CACHE[cache_key] = False
+        return False
+    probe = probe_agy_acp_capabilities(agy_bin, env=env, timeout_seconds=timeout_seconds)
+    supported = bool(probe.get("supported"))
+    with _ACP_SUPPORT_CACHE_LOCK:
+        _ACP_SUPPORT_CACHE[cache_key] = supported
+    return supported
 
 
 @dataclass

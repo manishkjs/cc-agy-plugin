@@ -3026,9 +3026,17 @@ def _run_agy_cli_worker_impl(request: dict[str, Any], *, warm_pool_key: str) -> 
     use_agy_sandbox = bool(not sandbox_prefix and sandbox is not None and sandbox.mode != "off")
     progress_path = request.get("progress_path")
     host_ws_root = request.get("host_workspace_root")
-    from server.agy_acp import resolve_cli_protocol, run_agy_acp_turn
+    from server.agy_acp import (
+        is_cli_protocol_explicit,
+        resolve_cli_protocol,
+        run_agy_acp_turn,
+        supports_agy_acp,
+    )
 
     cli_protocol = resolve_cli_protocol(env)
+    if cli_protocol == "acp" and not is_cli_protocol_explicit(env):
+        if not supports_agy_acp(agy_bin, env=env):
+            cli_protocol = "stream-json"
 
     from server.prewalk import (
         build_prewalk_continuation_prompt,

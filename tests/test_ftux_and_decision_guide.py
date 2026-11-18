@@ -725,7 +725,9 @@ def test_wheel_bundles_plugin_assets_and_acp_and_cross_platform_helpers(
     acp_caps = probe_agy_acp_capabilities(py_inst["agy_bin"])
     assert acp_caps["supported"] is True
     assert acp_caps["agent_version"] == "1.5.8"
+    assert resolve_cli_protocol({}) == "acp"
     assert resolve_cli_protocol({"CC_AGY_CLI_PROTOCOL": "acp"}) == "acp"
+    assert resolve_cli_protocol({"CC_AGY_CLI_PROTOCOL": "stream-json"}) == "stream-json"
 
     prog_file = tmp_path / "acp_progress.jsonl"
     acp_turn = run_agy_acp_turn(

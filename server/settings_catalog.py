@@ -63,8 +63,8 @@ PUBLIC_SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec(
         "CC_AGY_CLI_PROTOCOL",
         "Connection & Auth",
-        "stream-json",
-        "Wire protocol for `agy` workers: `stream-json` (default) or experimental `acp` (`agy acp --stdio`).",
+        "acp",
+        "Wire protocol for `agy` workers: `acp` (`agy acp --stdio`, default; falls back to `stream-json` on older `agy` binaries) or `stream-json`.",
     ),
     SettingSpec(
         "CC_AGY_CLI_MANIFEST_URL",
