@@ -7,9 +7,10 @@
  * the default factory, and tests import the helpers from this file.
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode-ai/plugin";
 import { createHookHandlers } from "./hooks.ts";
@@ -76,12 +77,42 @@ export function buildServerEnvironment(auth: StoredAuth): Record<string, string>
   return environment;
 }
 
-/** Picks the Python interpreter: `CC_AGY_PYTHON_BIN`/`CC_AGY_PYTHON`, managed user venv, plugin `.venv`, then `python3`. */
+const PYTHON_310_CHECK = "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)";
+const PYTHON_CANDIDATE_NAMES = ["python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3"];
+
+function isPython310Plus(binPath: string): boolean {
+  try {
+    execFileSync(binPath, ["-c", PYTHON_310_CHECK], {
+      stdio: "ignore",
+      timeout: 3000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function macFrameworkPythons(): string[] {
+  const versionsDir = "/Library/Frameworks/Python.framework/Versions";
+  if (!existsSync(versionsDir)) return [];
+  try {
+    return readdirSync(versionsDir)
+      .filter((entry) => entry.startsWith("3."))
+      .sort()
+      .reverse()
+      .map((entry) => join(versionsDir, entry, "bin", "python3"));
+  } catch {
+    return [];
+  }
+}
+
+/** Picks a Python 3.10+ interpreter: explicit env pin, managed/plugin venv, PATH/GUI prefixes, then fallback. */
 export function resolvePython(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = (env.CC_AGY_PYTHON_BIN || env.CC_AGY_PYTHON || "").trim();
-  if (explicit) return explicit;
+  if (explicit && !explicit.startsWith("${")) return explicit;
   const customVenv = (env.CC_AGY_VENV_DIR || "").trim();
-  const dataHome = (env.XDG_DATA_HOME || "").trim() || join(env.HOME || homedir(), ".local", "share");
+  const home = env.HOME || homedir();
+  const dataHome = (env.XDG_DATA_HOME || "").trim() || join(home, ".local", "share");
   const managedVenv = customVenv || join(dataHome, "cc-agy-plugin", "venv");
   for (const venv of [managedVenv, join(PLUGIN_ROOT, ".venv")]) {
     const candidates =
@@ -92,7 +123,32 @@ export function resolvePython(env: NodeJS.ProcessEnv = process.env): string {
       if (existsSync(candidate)) return candidate;
     }
   }
-  return process.platform === "win32" ? "python" : "python3";
+  if (process.platform === "win32") return "python";
+  // Mirror scripts/lib_pick_python.sh when no managed venv exists (e.g. Gemini Enterprise on macOS,
+  // where bare `python3` may resolve to stock /usr/bin/python3 3.9).
+  const pathDirs = (env.PATH || "").split(delimiter).filter(Boolean);
+  const guiDirs = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", join(home, ".local", "bin")];
+  const seen = new Set<string>();
+  const searchCandidates: string[] = [];
+  for (const dir of [...pathDirs, ...guiDirs]) {
+    for (const name of PYTHON_CANDIDATE_NAMES) {
+      const full = join(dir, name);
+      if (!seen.has(full)) {
+        seen.add(full);
+        searchCandidates.push(full);
+      }
+    }
+  }
+  for (const full of macFrameworkPythons()) {
+    if (!seen.has(full)) {
+      seen.add(full);
+      searchCandidates.push(full);
+    }
+  }
+  for (const candidate of searchCandidates) {
+    if (existsSync(candidate) && isPython310Plus(candidate)) return candidate;
+  }
+  return "python3";
 }
 
 /** Split a Markdown file into simple `key: value` frontmatter (one nested level) and its body. */

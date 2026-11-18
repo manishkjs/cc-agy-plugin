@@ -748,11 +748,12 @@ def test_wheel_bundles_plugin_assets_and_acp_and_cross_platform_helpers(
     assert Path(f"{prog_file}.live").is_file()
 
     host_ws = tmp_path / "host_ws"
-    (host_ws / ".venv" / "bin").mkdir(parents=True)
+    venv_bin_name = "Scripts" if os.name == "nt" else "bin"
+    (host_ws / ".venv" / venv_bin_name).mkdir(parents=True)
     wt_ws = tmp_path / "wt_ws"
     wt_ws.mkdir()
     sub_env = build_agy_subprocess_env({}, workspace_dir=wt_ws, host_workspace_root=host_ws)
-    assert str((host_ws / ".venv" / "bin").resolve()) in sub_env["PATH"].split(os.pathsep)
+    assert str((host_ws / ".venv" / venv_bin_name).resolve()) in sub_env["PATH"].split(os.pathsep)
 
     # Verify file_lock works both natively and when _fcntl is None
     lock_target = tmp_path / "portable.lock"
@@ -789,11 +790,21 @@ def test_cli_doctor_host_discovery_quickstart_repo_guard_ge_auth_mode_override_a
             env={},
         )
 
+    win_base_env = (
+        {
+            k: os.environ[k]
+            for k in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE", "TEMP", "TMP")
+            if k in os.environ
+        }
+        if os.name == "nt"
+        else {}
+    )
+
     # 2. `--fix` without `--doctor` is rejected immediately instead of triggering a 4-minute full install
     fix_proc = subprocess.run(
         [sys.executable, "-m", "server.install", "--fix"],
         cwd=str(repo_root),
-        env={"HOME": str(fake_home), "PATH": os.environ.get("PATH", os.defpath)},
+        env={**win_base_env, "HOME": str(fake_home), "PATH": os.environ.get("PATH", os.defpath)},
         capture_output=True,
         text=True,
         check=False,
@@ -805,6 +816,7 @@ def test_cli_doctor_host_discovery_quickstart_repo_guard_ge_auth_mode_override_a
     user_proj = tmp_path / "user_app"
     _init_git_repo(user_proj, {"main.py": "x = 1\n"})
     clean_cli_env = {
+        **win_base_env,
         "CC_AGY_SKIP_SIGNIN": "1",
         "HOME": str(fake_home),
         "XDG_CONFIG_HOME": str(fake_home / ".config"),

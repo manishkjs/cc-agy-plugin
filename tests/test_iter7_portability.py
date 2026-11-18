@@ -928,3 +928,20 @@ def test_acceptance_allows_a_quoted_literal_interpreter_path(command: str, tmp_p
 def test_acceptance_still_blocks_obfuscated_or_mutating_heads(command: str, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="refused because it can modify the workspace"):
         validate_acceptance([command], tmp_path)
+
+
+def test_execute_check_process_works_without_os_set_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server import verify as verify_mod
+
+    monkeypatch.delattr(verify_mod.os, "set_blocking", raising=False)
+    rc, timed_out, out, _dur = verify_mod.execute_check_process(
+        "echo win-blocking-drain-ok",
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=10.0,
+    )
+    assert rc == 0
+    assert timed_out is False
+    assert "win-blocking-drain-ok" in out

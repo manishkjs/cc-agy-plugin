@@ -1914,6 +1914,24 @@ def vacuous_test_run(output: str, returncode: int | None, timed_out: bool, count
 
 
 def _kill_group(pid: int) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            os.kill(pid, getattr(signal, "SIGTERM", 15))
+        except OSError:
+            pass
+        return
     try:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -2531,8 +2549,24 @@ def _python_subreaper_ok() -> bool:
         return _PY_SUBREAPER_AVAILABLE
 
 
+def _resolve_check_bash(proc_env: Mapping[str, str]) -> str:
+    bash_bin = shutil.which("bash", path=proc_env.get("PATH")) or shutil.which("bash")
+    if os.name == "nt":
+        if bash_bin and Path(bash_bin).resolve().as_posix().lower().endswith("/system32/bash.exe"):
+            bash_bin = None
+        if not bash_bin:
+            for candidate in (
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+                r"C:\Program Files (x86)\Git\bin\bash.exe",
+            ):
+                if Path(candidate).is_file():
+                    return candidate
+    return bash_bin or "/bin/bash"
+
+
 def _build_check_launch_argv(cmd: str, proc_env: Mapping[str, str]) -> tuple[list[str], bool]:
-    bash_bin = shutil.which("bash", path=proc_env.get("PATH")) or shutil.which("bash") or "/bin/bash"
+    bash_bin = _resolve_check_bash(proc_env)
     c_bin = _ensure_c_subreaper_bin()
     if c_bin is not None:
         return [c_bin, bash_bin, "-c", cmd], True
@@ -2584,10 +2618,42 @@ def execute_check_process(
     raw_fd = proc.stdout.fileno()
     pipe_st = os.fstat(raw_fd)
     pipe_dev, pipe_ino = pipe_st.st_dev, pipe_st.st_ino
-    os.set_blocking(raw_fd, False)
+    use_nonblocking = os.name != "nt" and hasattr(os, "set_blocking")
+    if use_nonblocking:
+        os.set_blocking(raw_fd, False)
 
     def _drain_fd() -> None:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        if not use_nonblocking:
+            while True:
+                try:
+                    data = os.read(raw_fd, 65_536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                text_part = decoder.decode(data, final=False)
+                _append_bounded_chunk(
+                    text_part,
+                    log_handle=log_handle,
+                    tail=tail,
+                    kept_ref=kept_ref,
+                    max_chars=max_tail_chars,
+                    io_lock=io_lock,
+                    io_closed=io_closed,
+                )
+            rem_text = decoder.decode(b"", final=True)
+            if rem_text:
+                _append_bounded_chunk(
+                    rem_text,
+                    log_handle=log_handle,
+                    tail=tail,
+                    kept_ref=kept_ref,
+                    max_chars=max_tail_chars,
+                    io_lock=io_lock,
+                    io_closed=io_closed,
+                )
+            return
         sel = selectors.DefaultSelector()
         eof = False
         leaked_writer = False
@@ -2672,7 +2738,8 @@ def execute_check_process(
                 except subprocess.TimeoutExpired:
                     subreaper_cleaned = False
         if not subreaper_cleaned:
-            _kill_group(proc.pid)
+            if os.name != "nt" or proc.poll() is None:
+                _kill_group(proc.pid)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:

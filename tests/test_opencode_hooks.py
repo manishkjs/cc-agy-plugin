@@ -313,3 +313,36 @@ def test_real_adapter_denies_a_video_read_through_the_opencode_hook(harness: Har
 
     assert out["denied"] and "cannot inspect video file" in out["denied"]
     assert out["allowed"] is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX PATH shim test for macOS/Linux 3.9 vs 3.10+ selection")
+def test_resolve_python_skips_python39_and_picks_python310_plus(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    py39 = bin_dir / "python3"
+    py39.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    py39.chmod(0o755)
+    py312 = bin_dir / "python3.12"
+    py312.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    py312.chmod(0o755)
+
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    script = (
+        f"import {{ resolvePython }} from {json.dumps(INTERNAL_URL)};\n"
+        f"const picked = resolvePython({{\n"
+        f"  HOME: {json.dumps(str(empty_home))},\n"
+        f"  XDG_DATA_HOME: {json.dumps(str(empty_home / 'data'))},\n"
+        f"  CC_AGY_VENV_DIR: {json.dumps(str(empty_home / 'no-venv'))},\n"
+        f"  CC_AGY_PYTHON_BIN: '${{user_config.python_bin}}',\n"
+        f"  PATH: {json.dumps(str(bin_dir))},\n"
+        f"}});\n"
+        f"console.log(picked);\n"
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == str(py312)
