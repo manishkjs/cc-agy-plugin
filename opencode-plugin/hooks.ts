@@ -41,15 +41,15 @@ export const HOOK_TIMEOUTS_MS: Record<HookEvent, number> = {
   Stop: 15_000,
 };
 
-/** OpenCode built-in tools that correspond to the hooks.json PreToolUse matcher (Read/Edit/Write/Grep/Glob/Bash). */
-const PRE_TOOL_BUILTINS = new Set(["read", "edit", "write", "apply_patch", "grep", "glob", "bash"]);
+/** OpenCode built-in tools that correspond to the hooks.json PreToolUse matcher (Read/Edit/MultiEdit/Write/Grep/Glob/Bash; patch tools map to Edit). */
+const PRE_TOOL_BUILTINS = new Set(["read", "edit", "multiedit", "write", "patch", "apply_patch", "grep", "glob", "bash"]);
 /**
  * OpenCode names MCP tools `sanitize(server) + "_" + sanitize(tool)` (non `[A-Za-z0-9_-]` -> `_`),
  * so Claude Code's `mcp__<server>__delegate_*` becomes `<server>_delegate_*`.
  */
 const PRE_TOOL_MCP = /^[A-Za-z0-9_-]+?_delegate_[A-Za-z0-9_-]*$/;
 /** hooks.json PostToolUse: every tool of the vertex/agy server, or a delegate lifecycle tool of any server. */
-const POST_TOOL_SERVER = /^(?:vertex|agy|plugin_cc-agy-plugin_vertex)_[A-Za-z0-9_-]+$/;
+const POST_TOOL_SERVER = /^(?:vertex|agy|cc-agy-plugin|cc_agy_plugin|plugin_cc-agy-plugin_vertex)_[A-Za-z0-9_-]+$/;
 const POST_TOOL_DELEGATE = /^[A-Za-z0-9_-]+?_(?:delegate_start|delegate_continue|delegate_result|delegate_to_gemini|delegate_apply)$/;
 
 const STRICT_MODE_KEYS = ["CLAUDE_PLUGIN_OPTION_STRICT_DELEGATION_MODE", "CC_AGY_STRICT_MODE", "CC_AGY_USERCFG_STRICT_MODE"];

@@ -9,7 +9,7 @@ to low-cost Gemini workers that run in an isolated git copy of your repo.
 
 [![Validate](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml/badge.svg)](https://github.com/manishkjs/cc-agy-plugin/actions/workflows/validate.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-1a73e8)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.4.1-1a73e8)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](pyproject.toml)
 [![Tests](https://img.shields.io/badge/tests-pytest%20suite-1e8e3e)](tests/)
 [![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%7C%20Cursor%20%7C%20OpenCode%20%7C%20Antigravity%20%7C%20Codex-f9ab00)](#quick-start)
@@ -93,9 +93,9 @@ What happens next:
 # Skip the dropdowns by passing --host and --auth directly:
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 # Pin a specific release tag or 40-char commit SHA:
-curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.0 bash -s -- --host opencode --auth gemini-enterprise
+curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | CC_AGY_REPO_REF=v0.4.1 bash -s -- --host opencode --auth gemini-enterprise
 # Or via uvx (bundles plugin assets directly inside the wheel, offline-safe after download):
-uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.0 cc-agy-plugin --host claude --auth gemini-enterprise
+uvx --from git+https://github.com/manishkjs/cc-agy-plugin@v0.4.1 cc-agy-plugin --host claude --auth gemini-enterprise
 ```
 
 </details>
@@ -474,7 +474,7 @@ In `$CC_AGY_DATA_DIR` or `$CLAUDE_PLUGIN_DATA`, defaulting to `~/.cache/cc-agy-p
 
 | Item | Detail |
 |:--|:--|
-| **Version** | 0.4.0, Apache 2.0 |
+| **Version** | 0.4.1, Apache 2.0 |
 | **Quality** | Automated unit, integration, portability, and guardrail suite (`pytest tests/ -q`; `scripts/validate.sh` checks manifests and synced docs) |
 | **Known gap** | If another process force-kills the plugin server (`SIGKILL`), unapplied worker edits in temporary copies are not auto-applied |
 
@@ -787,14 +787,17 @@ The five Claude Code hooks in `hooks/hooks.json` (`SessionStart`, `UserPromptSub
 |---|---|---|---|
 | Claude Code | `hooks/hooks.json` (plugin) | the plugin itself | all five hooks, all matched tools |
 | OpenCode | `opencode-plugin/hooks.ts` (plugin) | the plugin itself | `tool.execute.before/after`, `chat.message`, `session.created`; `session.idle` cannot block, so Stop only logs |
-| Codex 0.118+ | `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) plus `[features] codex_hooks = true` in `config.toml` | `python3 -m server.install --host codex` | all five events, but Pre/PostToolUse fire only for the shell tool (`^Bash$`) |
+| Codex 0.118+ | `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) plus `[features] codex_hooks = true` in `config.toml` | `python3 -m server.install --host codex` | `SessionStart`, `UserPromptSubmit`, `PreToolUse` (shell tool `^Bash$` only), `Stop` |
 | Antigravity CLI (`agy`) | `~/.gemini/config/hooks.json`, key `cc-agy-plugin` (or the plugin root with `--agy-hooks-scope plugin`) | `python3 -m server.install --host agy` | `SessionStart`, `PreInvocation` (as UserPromptSubmit, once per prompt), `PreToolUse`, `PostToolUse`, `Stop` |
+| Cursor | `.cursor-plugin/hooks.json` (plugin) | the plugin itself | nothing yet: Cursor ships no guard hooks, so the read/edit guards and the Stop provenance check do not run there |
 
 How the install works: the installer reads the template (`plugins/cc-agy-plugin/hooks/codex-hooks.json` or `plugins/antigravity/hooks.json`) and writes each `command` with the absolute, shell-quoted paths of your Python and of `scripts/hook_adapter.py`, because neither Codex nor agy expands variables in `command`. It merges by ownership: in Codex it replaces only handlers that run `hook_adapter.py --host codex`, and in agy only the `cc-agy-plugin` key, so your own hooks stay. A changed file is backed up first as `<file>.bak-<timestamp>`. Re-running is a no-op, and `--dry-run` writes nothing.
 
-Codex limits: Codex 0.118 sends Pre/PostToolUse only for its shell tool, so the read/edit guards, the MCP `delegate_*` pre-checks, and the `delegate_*` hook ledger (`hook_audit.jsonl` and the auto-stop hint) do not run there. Receipts are not affected: the MCP server writes each job's signed receipt itself, and the Stop-hook provenance check still runs. `codex_hooks` is an "under development" Codex feature; the installer turns it on and leaves it on after `--uninstall-hooks`, since other hooks may need it.
+Codex limits: Codex 0.118 sends `PreToolUse` only for its shell tool, so only shell commands are guarded; the read/edit guards and the MCP `delegate_*` pre-checks do not run there. The installer does not add `PostToolUse` for Codex (it could never match a `delegate_*` call) and removes the one older versions added, so the `delegate_*` hook ledger (`hook_audit.jsonl` and the auto-stop hint) does not run there either. Receipts are not affected: the MCP server writes each job's signed receipt itself, and the Stop-hook provenance check still runs. `codex_hooks` is an "under development" Codex feature; the installer turns it on and leaves it on after `--uninstall-hooks`, since other hooks may need it.
 
-All three hosts let a broken or slow hook through (fail open). The adapter itself denies a `PreToolUse` only when strict mode is on and a guard script crashes.
+All three hosts let a broken or slow hook through (fail open). The adapter itself denies a `PreToolUse`, or blocks a `Stop` once, only when strict mode is on and a guard script crashes or times out.
+
+The plugin's own workers are never guarded. Every `agy` process the plugin starts gets `CC_AGY_IN_WORKER=1` (set by `build_agy_subprocess_env` in `server/agy_cli.py`), and the adapter returns the host's no-op allow at once when it sees that marker, or when the hook's `cwd` is inside a `.cc-agy-worktrees-` folder. Without this, a worker running with no OS sandbox would load your `~/.gemini/config/hooks.json` and, in strict mode, be denied the very edits it was delegated.
 
 ### Running tests and validation
 

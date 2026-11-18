@@ -575,13 +575,20 @@ def test_doctor_diagnostics_redacts_secrets_and_works_via_mcp_and_cli(
     mcp_payload = json.loads(mcp_text)
     assert mcp_payload["workspace"]["detected_test_runner"]["primary_command"] == "go test ./..."
 
-    # CLI `scripts/session_start.py --doctor`
+    # CLI `scripts/session_start.py --doctor`. The fake HOME moves Python's user site-packages,
+    # so keep the interpreter's real package locations (user site and any PYTHONPATH stub).
+    import os
+    import site
+
     cli_env = {
-        "PATH": __import__("os").environ.get("PATH", ""),
+        "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),
         "GEMINI_API_KEY": secret_key,
         "CC_AGY_DATA_DIR": str(tmp_path / "cli_data"),
+        "PYTHONUSERBASE": os.environ.get("PYTHONUSERBASE") or site.getuserbase(),
     }
+    if os.environ.get("PYTHONPATH"):
+        cli_env["PYTHONPATH"] = os.environ["PYTHONPATH"]
     cli_res = subprocess.run(
         [sys.executable, str(PLUGIN_ROOT / "scripts" / "session_start.py"), "--doctor"],
         cwd=str(repo),

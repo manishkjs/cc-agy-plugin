@@ -157,10 +157,10 @@ def test_timeouts_mirror_hooks_json(harness: Harness) -> None:
 
 
 def test_prefilter_follows_hooks_json_matchers(harness: Harness) -> None:
-    pre = ["read", "edit", "write", "apply_patch", "grep", "glob", "bash", "agy_delegate_start",
+    pre = ["read", "edit", "multiedit", "write", "patch", "apply_patch", "grep", "glob", "bash", "agy_delegate_start",
            "vertex_delegate_continue", "plugin_cc-agy-plugin_vertex_delegate_to_gemini",
            "webfetch", "task", "todowrite", "agy_ask_gemini", "github_create_issue"]
-    post = ["agy_delegate_start", "agy_ask_gemini", "vertex_jobs", "other_delegate_apply",
+    post = ["agy_delegate_start", "agy_ask_gemini", "vertex_jobs", "other_delegate_apply", "cc-agy-plugin_delegate_status",
             "bash", "read", "github_create_issue", "other_delegate_list"]
     out = harness.run(
         f"out.pre = Object.fromEntries({json.dumps(pre)}.map((t) => [t, hooksMod.matchesPreToolUse(t)]));\n"
@@ -170,8 +170,8 @@ def test_prefilter_follows_hooks_json_matchers(harness: Harness) -> None:
         "await hooks['tool.execute.after']({tool: 'bash', sessionID: 's', callID: 'c', args: {}}, {title: '', output: '', metadata: {}});\n"
     )
 
-    assert [t for t, hit in out["pre"].items() if hit] == pre[:10]
-    assert [t for t, hit in out["post"].items() if hit] == post[:4]
+    assert [t for t, hit in out["pre"].items() if hit] == pre[:12]
+    assert [t for t, hit in out["post"].items() if hit] == post[:5]
     assert harness.calls() == [], "tools outside the hooks.json matchers must not spawn Python"
 
 

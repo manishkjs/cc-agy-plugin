@@ -65,6 +65,9 @@ _STRICT_KEYS: tuple[str, ...] = (
     "CC_AGY_USERCFG_STRICT_MODE",
 )
 _DEDUPE_MAX_ENTRIES = 256
+# Set by server.agy_cli.build_agy_subprocess_env on every agy child the plugin spawns.
+WORKER_ENV_MARKER = "CC_AGY_IN_WORKER"
+_WORKTREE_DIR_PREFIXES: tuple[str, ...] = (".cc-agy-worktrees-", "cc-agy-worktrees-")
 
 
 # --------------------------------------------------------------------------- env
@@ -181,8 +184,6 @@ def build_env(host: str, base_env: Mapping[str, str], extra: Mapping[str, Any] |
             if not _usable(env.get(key)):
                 env[str(key)] = str(val)
     env.setdefault("CLAUDE_PLUGIN_ROOT", str(PLUGIN_ROOT))
-    if host == "agy" and _usable(env.get("PLUGIN_DATA")) and not _usable(env.get("CC_AGY_DATA_DIR")):
-        env["CC_AGY_DATA_DIR"] = env["PLUGIN_DATA"]
     env["CC_AGY_HOOK_HOST"] = host
     return env
 
@@ -210,8 +211,8 @@ def redact(text: Any, env: Mapping[str, str] | None = None) -> Any:
 
 
 def data_dir(env: Mapping[str, str]) -> Path:
-    """Return the plugin data dir used for adapter state."""
-    for key in ("CC_AGY_DATA_DIR", "CLAUDE_PLUGIN_DATA", "PLUGIN_DATA"):
+    """Return the adapter state dir (same env keys as `ReceiptStore`; agy `PLUGIN_DATA` is ignored)."""
+    for key in ("CC_AGY_DATA_DIR", "CLAUDE_PLUGIN_DATA"):
         if _usable(env.get(key)):
             return Path(str(env[key]))
     home = Path(env.get("HOME") or os.path.expanduser("~"))
@@ -333,6 +334,26 @@ class HookScriptError(RuntimeError):
     """The mapped CC hook script crashed, timed out, or printed invalid JSON."""
 
 
+def run_pre_tool_guard_inprocess(cc_payload: Mapping[str, Any], env: Mapping[str, str]) -> dict[str, Any] | None:
+    """Run `pre_tool_guard.evaluate_pre_tool_use` in-process; None when it can't be imported.
+
+    Saves one Python start-up per guarded tool call. Import problems fall back to
+    the subprocess path; an exception from the guard itself is a script crash.
+    """
+    try:
+        import pre_tool_guard  # pylint: disable=import-outside-toplevel
+    except Exception:  # noqa: BLE001 - any import failure means "use the subprocess".
+        return None
+    evaluate = getattr(pre_tool_guard, "evaluate_pre_tool_use", None)
+    if not callable(evaluate):
+        return None
+    try:
+        out = evaluate(dict(cc_payload), env=dict(env))
+    except Exception as exc:  # noqa: BLE001
+        raise HookScriptError(f"pre_tool_guard.py raised {type(exc).__name__}: {exc}") from exc
+    return out if isinstance(out, dict) else {}
+
+
 def run_script(script: Path, cc_payload: Mapping[str, Any], env: Mapping[str, str], timeout: int) -> dict[str, Any]:
     """Run a CC hook script with `cc_payload` on stdin and return its parsed JSON output."""
     cwd = str(cc_payload.get("cwd") or "")
@@ -383,9 +404,9 @@ def interpret(event: str, cc_out: Mapping[str, Any]) -> dict[str, Any]:
     if event == "Stop" and cc_out.get("decision") == "block":
         res["block"] = True
         res["reason"] = cc_out.get("reason") or "Blocked by cc-agy-plugin provenance check."
-    ctx = hso.get("additionalContext")
-    if isinstance(ctx, str) and ctx.strip():
-        res["context"] = ctx
+    texts = [t for t in (hso.get("additionalContext"), cc_out.get("systemMessage")) if isinstance(t, str) and t.strip()]
+    if texts:
+        res["context"] = "\n\n".join(texts)
     return res
 
 
@@ -461,13 +482,34 @@ def agy_prompt_is_new(env: Mapping[str, str], session_id: str, prompt: str) -> b
 # ------------------------------------------------------------------------- core
 
 
+def is_worker_context(env: Mapping[str, str], payload: Mapping[str, Any]) -> bool:
+    """Return True when the hook fires inside an agy worker the plugin itself spawned.
+
+    Workers run in plugin-owned worktrees and must not be policed by the
+    orchestrator's guards (strict mode would otherwise deny the worker's own
+    edits). Primary signal: `CC_AGY_IN_WORKER=1`; fallback: a worktree `cwd`.
+    """
+    if str(env.get(WORKER_ENV_MARKER) or "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    cwd = str(_first(payload, "cwd", "directory", "worktree") or "")
+    return any(part.startswith(_WORKTREE_DIR_PREFIXES) for part in Path(cwd).parts)
+
+
+def _stop_active(host: str, payload: Mapping[str, Any]) -> bool:
+    keys = ("continuationActive", "stop_hook_active") if host == "agy" else ("stop_hook_active", "stopHookActive")
+    return bool(_first(payload, *keys))
+
+
 def handle(host: str, event: str, payload: Any, base_env: Mapping[str, str] | None = None) -> dict[str, Any] | None:
     """Run one hook end to end and return the host-native stdout object (None = print nothing)."""
     event = EVENT_ALIASES.get(event, event)
     raw = payload if isinstance(payload, dict) else {}
-    extra = raw.get("env") if host == "opencode" and isinstance(raw.get("env"), dict) else None
-    env = build_env(host, base_env if base_env is not None else os.environ, extra)
     allow = {"deny": False, "block": False, "reason": None, "context": None}
+    source_env = base_env if base_env is not None else os.environ
+    if is_worker_context(source_env, raw):
+        return denormalize(host, event, allow)
+    extra = raw.get("env") if host == "opencode" and isinstance(raw.get("env"), dict) else None
+    env = build_env(host, source_env, extra)
     try:
         cc = normalize(host, event, raw)
         script, timeout, matcher = load_hook_spec(event)
@@ -476,20 +518,28 @@ def handle(host: str, event: str, payload: Any, base_env: Mapping[str, str] | No
         if host == "agy" and event == "UserPromptSubmit":
             if not agy_prompt_is_new(env, str(cc.get("session_id") or ""), str(cc.get("prompt") or "")):
                 return denormalize(host, event, allow)
-        res = interpret(event, run_script(script, cc, env, timeout))
-        if event == "Stop" and cc.get("stop_hook_active"):
-            res["block"] = False  # Re-entry guard: never block a continuation twice.
+        cc_out = run_pre_tool_guard_inprocess(cc, env) if event == "PreToolUse" else None
+        if cc_out is None:
+            cc_out = run_script(script, cc, env, timeout)
+        res = interpret(event, cc_out)
     except Exception as exc:  # noqa: BLE001 - hooks must never crash the host.
         res = dict(allow)
+        detail = f"{type(exc).__name__}: {exc}"
         if event == "PreToolUse" and is_strict(env):
             res["deny"] = True
             res["reason"] = (
-                "cc-agy-plugin strict delegation mode: the PreToolUse guard failed "
-                f"({type(exc).__name__}: {exc}), so this tool call is denied. "
-                "Fix the plugin install (run session_start.py --doctor) or turn strict mode off."
+                f"cc-agy-plugin strict delegation mode: the PreToolUse guard failed ({detail}), "
+                "so this tool call is denied. Fix the plugin install "
+                "(run session_start.py --doctor) or turn strict mode off."
             )
+        elif event == "Stop" and is_strict(env):
+            # Mirrors provenance_check.main(): strict mode blocks on an internal error.
+            res["block"] = True
+            res["reason"] = f"Provenance verification encountered an internal error: {detail}"
         else:
-            sys.stderr.write(redact(f"cc-agy-plugin hook_adapter: {type(exc).__name__}: {exc}\n", env))
+            sys.stderr.write(redact(f"cc-agy-plugin hook_adapter: {detail}\n", env))
+    if event == "Stop" and res.get("block") and _stop_active(host, raw):
+        res["block"] = False  # Re-entry guard: never block a continuation twice.
     for key in ("reason", "context"):
         res[key] = redact(res.get(key), env)
     return denormalize(host, event, res)

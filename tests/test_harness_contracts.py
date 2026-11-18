@@ -930,9 +930,10 @@ def _check_codex_hooks(installed: Callable[..., _InstallRun]) -> None:
     codex_home = run.sandbox.home / ".codex"
     assert run.host["hooks"]["status"] == "installed", run.host.get("hooks")
     hooks = _read_json(codex_home / "hooks.json")["hooks"]
-    assert set(hooks) == _CC_HOOK_EVENTS == set(install.CODEX_HOOK_EVENTS)
-    for event in ("PreToolUse", "PostToolUse"):
-        assert [g.get("matcher") for g in hooks[event]] == ["^Bash$"], hooks[event]
+    # No PostToolUse: Codex only reports Bash, which the delegate ledger matcher never selects.
+    assert set(hooks) == _CC_HOOK_EVENTS - {"PostToolUse"}
+    assert set(hooks) <= set(install.CODEX_HOOK_EVENTS)
+    assert [g.get("matcher") for g in hooks["PreToolUse"]] == ["^Bash$"], hooks["PreToolUse"]
     _assert_commands_run_the_adapter(_hook_commands(hooks), "codex")
     table = _load_toml((codex_home / "config.toml").read_text(encoding="utf-8"))
     assert table["features"]["codex_hooks"] is True

@@ -15,17 +15,46 @@ import venv
 DEFAULT_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _env_path(source: Mapping[str, str], name: str) -> str:
+    value = str(source.get(name) or "").strip()
+    return "" if value.startswith("${") else value
+
+
+def user_home(env: Mapping[str, str] | None = None) -> Path:
+    """Return the user's home directory without ever raising.
+
+    `Path.home()` on Windows ignores `HOME` and raises "Could not determine home directory"
+    when `USERPROFILE` is unset, which happens in scrubbed subprocess environments. So the
+    environment is read first: `USERPROFILE`, `HOME`, then `HOMEDRIVE`+`HOMEPATH` on Windows,
+    and `HOME` elsewhere. Only then is `Path.home()` tried, with the temp dir as a last resort.
+    """
+    source = env if env is not None else os.environ
+    for name in ("USERPROFILE", "HOME") if os.name == "nt" else ("HOME",):
+        value = _env_path(source, name)
+        if value:
+            return Path(value).expanduser()
+    if os.name == "nt":
+        drive, rest = _env_path(source, "HOMEDRIVE"), _env_path(source, "HOMEPATH")
+        if drive and rest:
+            return Path(drive + rest)
+    try:
+        return Path.home()
+    except (RuntimeError, KeyError, OSError):
+        return Path(tempfile.gettempdir())
+
+
 def managed_venv_dir(env: Mapping[str, str] | None = None) -> Path:
     """Return the per-user managed virtualenv directory (`~/.local/share/cc-agy-plugin/venv`)."""
     source = env if env is not None else os.environ
-    explicit = str(source.get("CC_AGY_VENV_DIR") or "").strip()
-    if explicit and not explicit.startswith("${"):
+    explicit = _env_path(source, "CC_AGY_VENV_DIR")
+    if explicit:
         return Path(explicit).expanduser()
     if os.name == "nt":
-        base = Path(str(source.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))).expanduser()
+        local_appdata = _env_path(source, "LOCALAPPDATA")
+        base = Path(local_appdata).expanduser() if local_appdata else user_home(source) / "AppData" / "Local"
         return base / "cc-agy-plugin" / "venv"
-    xdg_data = str(source.get("XDG_DATA_HOME") or "").strip()
-    base = Path(xdg_data).expanduser() if (xdg_data and not xdg_data.startswith("${")) else (Path.home() / ".local" / "share")
+    xdg_data = _env_path(source, "XDG_DATA_HOME")
+    base = Path(xdg_data).expanduser() if xdg_data else user_home(source) / ".local" / "share"
     return base / "cc-agy-plugin" / "venv"
 
 
@@ -266,7 +295,7 @@ def write_plugin_root_pointer(plugin_root: Path, env: Mapping[str, str] | None =
     move the new link *into* the directory the old one points at. Best effort: never raises.
     """
     source = env if env is not None else os.environ
-    data_home = Path(source.get("XDG_DATA_HOME") or Path(source.get("HOME") or Path.home()) / ".local" / "share")
+    data_home = Path(source.get("XDG_DATA_HOME") or user_home(source) / ".local" / "share")
     pointer = data_home / "cc-agy-plugin" / "current"
     try:
         target = plugin_root.resolve()

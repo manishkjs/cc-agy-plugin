@@ -259,6 +259,35 @@ _CMD_HEAD_PREFIX_RE = (
     r"|npx(?:\s+-[A-Za-z0-9-]+)*|bunx|pnpx|bun\s+x|yarn(?:\s+--cwd\s+\S+)?\s+dlx"
     r")\s+)*"
 )
+# Interpreters and test runners a strict-mode command may start with through a quoted
+# literal path, such as `'C:\hostedtoolcache\Python\python.exe' -m pytest` on Windows
+# or `'/tmp/with space/python' -m pytest`.
+_STATIC_HEAD_BASENAME_RE = re.compile(
+    r"^(?:python\d*(?:\.\d+)?|pythonw|pypy\d*(?:\.\d+)?|py|pytest|py\.test|node)(?:\.exe)?$", re.IGNORECASE
+)
+
+
+def _is_static_quoted_path_head(raw_head: str) -> bool:
+    """Return True when `raw_head` is one fully quoted, literal path to an allowed interpreter.
+
+    The whole word must be a single quoted string that shell quote removal turns into exactly
+    its inner text: no `$`, backticks, globs, nested quotes, or escapes that could assemble a
+    different command name (`'c'p`, `"$X"`, `c\\p` all stay blocked). Only interpreters and
+    test runners qualify, so `'/bin/rm'` is still refused.
+    """
+    if len(raw_head) < 3 or raw_head[0] not in "'\"" or raw_head[-1] != raw_head[0]:
+        return False
+    inner = raw_head[1:-1]
+    if any(ch in inner for ch in "'\"$`*?[]{}~\n\r"):
+        return False
+    try:
+        if shlex.split(raw_head) != [inner]:
+            return False
+    except ValueError:
+        return False
+    return bool(_STATIC_HEAD_BASENAME_RE.match(re.split(r"[\\/]", inner)[-1]))
+
+
 _HOST_TEST_RUNNER_RE = re.compile(
     _CMD_HEAD_PREFIX_RE
     + r"(?:"
@@ -992,7 +1021,7 @@ def detect_bash_workspace_mutation(
             raw_head_idx += 1
         if raw_head_idx < len(raw_words):
             raw_head = raw_words[raw_head_idx]
-            if any(ch in raw_head for ch in ("\\", "'", '"', "$", "`")):
+            if any(ch in raw_head for ch in ("\\", "'", '"', "$", "`")) and not _is_static_quoted_path_head(raw_head):
                 return {
                     "blocked": True,
                     "reason": (
@@ -1171,7 +1200,10 @@ def _inspect_segment_tokens(
             "reason": f"Strict orchestrator mode blocked sourcing shell script via `{raw_cmd_tok}`.",
         }, active_cwd
 
-    binary = Path(raw_cmd_tok).name
+    # Windows paths (`C:\...\python.exe`) name the same programs on any OS: compare the bare name.
+    binary = re.split(r"[\\/]", raw_cmd_tok)[-1] or Path(raw_cmd_tok).name
+    if binary.lower().endswith(".exe"):
+        binary = binary[:-4]
     raw_args = tokens[idx + 1 :]
 
     # Block any non-`ls` command from reading, searching, or archiving `out_dir` (.hmac_key / receipts) or `PLUGIN_ROOT`

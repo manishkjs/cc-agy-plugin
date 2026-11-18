@@ -844,7 +844,11 @@ class TestGauntletRound1Bugs:
         assert not any("google-genai" in issue or "google-antigravity" in issue for issue in doc["issues"]), doc[
             "issues"
         ]
-        assert any(str(fake_agy) in rem for rem in doc["remediations"]), doc["remediations"]
+        # Doctor found this agy binary and points the unsigned user at sign-in, not at SDK installs.
+        assert Path(doc["auth"]["agy_cli"]["agy_bin"]).resolve() == fake_agy.resolve()
+        assert any("/cc-agy-plugin:login" in rem and "agy_signin.sh" in rem for rem in doc["remediations"]), doc[
+            "remediations"
+        ]
 
         fake_pip_sentinel = tmp_path / "venv_boot_attempted"
         auto_unsigned_env = {

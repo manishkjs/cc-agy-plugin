@@ -40,7 +40,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from server.regions import GATEWAY_WIRE_CLI_CHOICES  # noqa: E402
-from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python  # noqa: E402
+from server.runtime_env import ensure_sdk_venv, python_has_plugin_sdks, resolve_sdk_python, user_home  # noqa: E402
 
 SERVER_ENTRY = PLUGIN_ROOT / "server" / "main.py"
 CODEX_SKILL_SOURCE = PLUGIN_ROOT / "plugins" / "cc-agy-plugin" / "skills" / "vertex" / "SKILL.md"
@@ -106,6 +106,7 @@ CODEX_FORWARDED_ENV_VARS = (
     "CC_AGY_BIFROST_POLICY_PASSWORD",
     "CC_AGY_BIFROST_AGY_POLICY_MODEL",
     "CC_AGY_WORKER_SANDBOX",
+    "CC_AGY_STRICT_MODE",
 )
 # Worker jobs run for minutes; Codex and OpenCode default MCP tool timeouts are far shorter.
 CODEX_TOOL_TIMEOUT_SEC = 1800
@@ -286,7 +287,7 @@ def resolve_home_dir(env: Mapping[str, str] | None = None) -> Path:
         raw_home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
         if raw_home:
             return Path(raw_home).expanduser()
-    return Path.home()
+    return user_home(env)
 
 
 def expand_path_with_env(raw_path: str | Path, env: Mapping[str, str] | None = None) -> Path:
@@ -457,6 +458,7 @@ def build_codex_server_block(
     blocked_projects: str | None = None,
     extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
+    strict: bool = False,
 ) -> str:
     """Render the `[mcp_servers.<name>]` TOML block for `$CODEX_HOME/config.toml`."""
     _validate_gateway_base_url_no_secrets(base_url)
@@ -493,6 +495,8 @@ def build_codex_server_block(
     env.update(extra_env or {})
     if no_auto_apply:
         env["CC_AGY_AUTO_APPLY_ON_PASS"] = "0"
+    if strict:
+        env["CC_AGY_STRICT_MODE"] = "true"
     forwarded = [v for v in CODEX_FORWARDED_ENV_VARS if v not in env]
     lines = [
         f"[mcp_servers.{name}]",
@@ -615,10 +619,11 @@ def install_codex(
     blocked_projects: str | None = None,
     extra_env: Mapping[str, str] | None = None,
     no_auto_apply: bool = False,
+    strict: bool = False,
     dry_run: bool,
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
-    home = codex_home or Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    home = codex_home or Path(os.environ.get("CODEX_HOME") or (user_home() / ".codex")).expanduser()
     cfg = home / "config.toml"
     block = build_codex_server_block(
         name=name,
@@ -636,6 +641,7 @@ def install_codex(
         blocked_projects=blocked_projects,
         extra_env=extra_env,
         no_auto_apply=no_auto_apply,
+        strict=strict,
     )
     existing = cfg.read_text(encoding="utf-8") if cfg.is_file() else ""
     skill_dst = home / "skills" / PLUGIN_NAME / "SKILL.md"
@@ -1070,7 +1076,7 @@ def install_agy(
 ) -> dict[str, Any]:
     """Register cc-agy-plugin in Antigravity's documented `~/.gemini/config/` MCP, plugin, and skill directories."""
     cfg_dir = agy_config_dir or Path(
-        os.environ.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")
+        os.environ.get("AGY_CONFIG_DIR") or (user_home() / ".gemini" / "config")
     ).expanduser()
     mcp_cfg_path = cfg_dir / "mcp_config.json"
     skill_dst = cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"
@@ -1138,7 +1144,7 @@ def install_agy(
     plugin_manifest = {
         "name": PLUGIN_NAME,
         "displayName": PLUGIN_NAME,
-        "version": "0.4.0",
+        "version": "0.4.1",
         "description": (
             "Delegate coding, multi-file edits, and test loops to fast, low-cost Gemini workers "
             "in isolated git worktrees with signed cost receipts."
@@ -1352,7 +1358,7 @@ def install_codex_hooks(
     0.118 ships hooks behind that "under development" flag. Uninstall leaves the flag,
     since other hooks may rely on it.
     """
-    home = codex_home or Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+    home = codex_home or Path(os.environ.get("CODEX_HOME") or (user_home() / ".codex")).expanduser()
     hooks_path = home / "hooks.json"
     cfg_path = home / "config.toml"
     result: dict[str, Any] = {"host": "codex", "hooks_path": str(hooks_path), "config_path": str(cfg_path)}
@@ -1410,7 +1416,7 @@ def install_agy_hooks(
     if scope not in AGY_HOOK_SCOPES:
         raise ValueError(f"scope must be one of {AGY_HOOK_SCOPES}, got {scope!r}")
     cfg_dir = agy_config_dir or Path(
-        os.environ.get("AGY_CONFIG_DIR") or (Path.home() / ".gemini" / "config")
+        os.environ.get("AGY_CONFIG_DIR") or (user_home() / ".gemini" / "config")
     ).expanduser()
     paths = _agy_hooks_paths(cfg_dir)
     result: dict[str, Any] = {"host": "agy", "scope": None if uninstall else scope, "hooks_path": str(paths[scope])}
@@ -1550,7 +1556,7 @@ def install_cursor(
 ) -> dict[str, Any]:
     """Register cc-agy-plugin in Cursor's `~/.cursor/mcp.json` and `~/.cursor/skills/cc-agy-plugin/SKILL.md`."""
     cfg_dir = cursor_config_dir or Path(
-        os.environ.get("CURSOR_CONFIG_DIR") or (Path.home() / ".cursor")
+        os.environ.get("CURSOR_CONFIG_DIR") or (user_home() / ".cursor")
     ).expanduser()
     mcp_cfg_path = cfg_dir / "mcp.json"
     skill_dst = cfg_dir / "skills" / PLUGIN_NAME / "SKILL.md"
@@ -3268,7 +3274,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-auto-apply", action="store_true",
                         help="Require manual diff review (`get_diff` then `delegate_apply`) before any worker change touches your repo.")
     parser.add_argument("--strict", action="store_true",
-                        help="Enable strict orchestrator mode in Claude Code userConfig.")
+                        help="Enable strict orchestrator mode (Claude Code userConfig; CC_AGY_STRICT_MODE in the Codex, Cursor, OpenCode, and Antigravity MCP env).")
     parser.add_argument("--no-bootstrap", action="store_true",
                         help="Do not automatically install ~/.local/share/cc-agy-plugin/venv or standalone `agy` CLI.")
     parser.add_argument(
@@ -3375,7 +3381,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").is_file() and not args.dry_run:
         # Invoked from an ephemeral wheel (for example `uvx` or `pipx run`): materialize a
         # persistent checkout under ~/.local/share/cc-agy-plugin/repo so host MCP configs stay valid.
-        data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or (user_home() / ".local" / "share"))
         persistent_repo = Path(
             os.environ.get("CC_AGY_INSTALL_REPO_DIR") or (data_home / "cc-agy-plugin" / "repo")
         ).expanduser()
@@ -3497,6 +3503,7 @@ def main(argv: list[str] | None = None) -> int:
                 blocked_projects=args.blocked_projects,
                 extra_env=enterprise_env,
                 no_auto_apply=args.no_auto_apply,
+                strict=args.strict,
                 dry_run=args.dry_run,
             )
         )
@@ -3724,7 +3731,7 @@ def _record_install_choice(auth_mode: Any, *, project: str | None = None, base_u
     picked, so it reads this file instead of guessing (and running Enterprise sign-in for an
     API-key user).
     """
-    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or user_home() / ".local" / "share")
     target = data_home / "cc-agy-plugin" / "last-install.json"
     if not auth_mode or str(auth_mode) in ("missing", "auto", "unconfigured"):
         target.unlink(missing_ok=True)  # Never leave an older run's choice behind.

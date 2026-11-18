@@ -483,9 +483,10 @@ def _ensure_antigravity_sdk_or_fake(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Return real `google.antigravity.types` if installed, or install a faithful fake for `/usr/bin/python3`."""
     try:
         import google.antigravity.types as real_types  # type: ignore
-
-        return real_types
     except ImportError:
+        real_types = None
+    # conftest's bare-interpreter stub provides only the hook types, not the SDK surface used here.
+    if real_types is None or not hasattr(real_types, "ModelType"):
         fake_types = py_types.ModuleType("google.antigravity.types")
 
         class _ModelType:
@@ -638,6 +639,7 @@ def _ensure_antigravity_sdk_or_fake(monkeypatch: pytest.MonkeyPatch) -> Any:
         monkeypatch.setitem(sys.modules, "google.antigravity.types", fake_types)
         monkeypatch.setitem(sys.modules, "google.antigravity.policy", fake_policy)
         return fake_types
+    return real_types
 
 
 def test_antigravity_sdk_gemini_vs_vertex_endpoint_construction_without_ambient_gemini_api_key(

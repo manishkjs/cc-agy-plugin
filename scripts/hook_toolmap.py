@@ -21,6 +21,7 @@ OPENCODE_TOOLS: dict[str, str] = {
     "multiedit": "MultiEdit",
     "write": "Write",
     "patch": "Edit",
+    "apply_patch": "Edit",
     "bash": "Bash",
     "grep": "Grep",
     "glob": "Glob",
@@ -106,6 +107,18 @@ def canonical_mcp_name(name: str) -> str | None:
     return None
 
 
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File:\s*(.+?)\s*$", re.MULTILINE)
+_PATCH_TOOLS: frozenset[str] = frozenset({"patch", "apply_patch"})
+
+
+def patch_target(patch_text: Any) -> str | None:
+    """Return the first `*** Update/Add/Delete File:` path in an apply_patch body."""
+    if not isinstance(patch_text, str):
+        return None
+    match = _PATCH_FILE_RE.search(patch_text)
+    return match.group(1) if match else None
+
+
 def _rename_args(args: Any, table: dict[str, str]) -> dict[str, Any]:
     if not isinstance(args, dict):
         return {}
@@ -140,6 +153,10 @@ def map_tool(host: str, name: str, args: Any) -> tuple[str, dict[str, Any]]:
     if host == "opencode":
         cc_name = OPENCODE_TOOLS.get(name) or canonical_mcp_name(name) or name
         cc_input = _rename_args(args, OPENCODE_ARGS)
+        if name in _PATCH_TOOLS and not cc_input.get("file_path"):
+            target = patch_target(cc_input.get("patchText") or cc_input.get("patch") or cc_input.get("input"))
+            if target:
+                cc_input["file_path"] = target
         return cc_name, cc_input
     if host == "agy":
         raw = args if isinstance(args, dict) else {}

@@ -824,6 +824,11 @@ def build_straitjacket_tools(
 
     for env_k in secret_env_names(os.environ):
         scrubbed_env[env_k] = ""
+    # Re-add the worker marker after the CC_AGY_* blanking above so cc-agy-plugin hooks
+    # (scripts/hook_adapter.py) skip orchestrator guards for this worker's commands.
+    from server.agy_cli import WORKER_ENV_MARKER
+
+    scrubbed_env[WORKER_ENV_MARKER] = "1"
     py_parts = [str(ws_resolved)]
     if (ws_resolved / "src").is_dir():
         py_parts.append(str(ws_resolved / "src"))

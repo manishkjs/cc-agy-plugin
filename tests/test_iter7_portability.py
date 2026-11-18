@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import pytest
 
 from scripts.session_start import REVIEW_AFTER_APPLY_GUIDANCE, REVIEW_BEFORE_APPLY_GUIDANCE
 from server.doctor import run_doctor
+from server.job_git_utils import validate_acceptance
 from server.install import (
     AgyConfigError,
     CodexConfigError,
@@ -333,20 +335,30 @@ def test_codex_upsert_replaces_only_its_own_tables() -> None:
     assert fresh.startswith("[mcp_servers.agy]")
 
 
-def _openai_codex_cli_available() -> bool:
-    if shutil.which("codex") is None:
-        return False
-    try:
-        probe = subprocess.run(
-            ["codex", "mcp", "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return probe.returncode == 0 and "mcp" in (probe.stdout + probe.stderr).lower()
+def _openai_codex_cli() -> str | None:
+    """Absolute path of an OpenAI `codex` CLI whose `codex mcp get` accepts `--json`, or None.
+
+    Another tool can also be called `codex` (one ships in `/usr/bin` on some machines), so every
+    `codex` on PATH is probed and the test then runs the exact binary that passed.
+    """
+    seen: set[str] = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = shutil.which("codex", path=directory) if directory else None
+        if not candidate or os.path.realpath(candidate) in seen:
+            continue
+        seen.add(os.path.realpath(candidate))
+        try:
+            probe = subprocess.run(
+                [candidate, "mcp", "get", "--help"], capture_output=True, text=True, check=False, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and "--json" in probe.stdout + probe.stderr:
+            return candidate
+    return None
+
+
+_OPENAI_CODEX = _openai_codex_cli()
 
 
 def test_codex_server_block_is_valid_toml() -> None:
@@ -361,13 +373,13 @@ def test_codex_server_block_is_valid_toml() -> None:
     assert srv["env"]["CC_AGY_COST_PROFILE"] == "economy"
 
 
-@pytest.mark.skipif(not _openai_codex_cli_available(), reason="OpenAI codex CLI with `codex mcp` not installed")
+@pytest.mark.skipif(_OPENAI_CODEX is None, reason="OpenAI codex CLI with `codex mcp get --json` not installed")
 def test_codex_cli_parses_installed_block(tmp_path: Path) -> None:
     home = tmp_path / "codex_home"
     home.mkdir()
     (home / "config.toml").write_text(build_codex_server_block(name="agy", python_bin="/py", profile="economy"), encoding="utf-8")
     proc = subprocess.run(
-        ["codex", "mcp", "get", "agy", "--json"],
+        [str(_OPENAI_CODEX), "mcp", "get", "agy", "--json"],
         capture_output=True,
         text=True,
         check=False,
@@ -830,3 +842,89 @@ def test_validate_script_passes_end_to_end(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "Validation passed." in proc.stdout
+
+
+# --- Round 10: --strict reaches Codex, Windows home resolution, quoted interpreter heads ---
+
+
+def test_codex_strict_flag_is_written_into_the_mcp_env(tmp_path: Path) -> None:
+    import tomllib
+
+    from server import install
+
+    strict = tomllib.loads(build_codex_server_block(name="agy", python_bin="/py", strict=True))["mcp_servers"]["agy"]
+    relaxed = tomllib.loads(build_codex_server_block(name="agy", python_bin="/py"))["mcp_servers"]["agy"]
+    result = install.install_codex(
+        name="agy", profile="balanced", project=None, location=None, strict=True, dry_run=False,
+        codex_home=tmp_path / "codex",
+    )
+    written = tomllib.loads((tmp_path / "codex" / "config.toml").read_text(encoding="utf-8"))["mcp_servers"]["agy"]
+
+    assert strict["env"]["CC_AGY_STRICT_MODE"] == "true"
+    assert "CC_AGY_STRICT_MODE" not in strict["env_vars"]  # set in the file, so not forwarded twice
+    assert "CC_AGY_STRICT_MODE" not in relaxed["env"]
+    assert "CC_AGY_STRICT_MODE" in relaxed["env_vars"]  # a shell-level strict setting still reaches Codex
+    assert result["status"] == "installed" and written["env"]["CC_AGY_STRICT_MODE"] == "true"
+
+
+@pytest.mark.parametrize("builder", ["agy", "cursor"])
+def test_strict_flag_reaches_the_other_hosts_mcp_env(builder: str) -> None:
+    from server import install
+
+    build = install.build_agy_server_entry if builder == "agy" else install.build_cursor_server_entry
+
+    assert build(python_bin="/py", strict=True)["env"]["CC_AGY_STRICT_MODE"] == "true"
+    assert "CC_AGY_STRICT_MODE" not in build(python_bin="/py")["env"]
+
+
+def test_user_home_and_venv_dir_never_raise_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+    from types import SimpleNamespace
+
+    from server import runtime_env
+
+    monkeypatch.setattr(runtime_env, "os", SimpleNamespace(name="nt", environ={}))
+
+    def no_home() -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(runtime_env.Path, "home", staticmethod(no_home))
+    home_only = {"HOME": "C:\\temp\\h"}
+
+    assert str(runtime_env.user_home(home_only)) == "C:\\temp\\h"
+    assert str(runtime_env.user_home({"USERPROFILE": "C:\\Users\\u", "HOME": "C:\\other"})) == "C:\\Users\\u"
+    assert str(runtime_env.user_home({"HOMEDRIVE": "D:", "HOMEPATH": "\\Users\\d"})) == "D:\\Users\\d"
+    assert runtime_env.user_home({}) == Path(tempfile.gettempdir())
+    assert runtime_env.managed_venv_dir(home_only) == Path("C:\\temp\\h") / "AppData" / "Local" / "cc-agy-plugin" / "venv"
+    assert runtime_env.managed_venv_dir({"LOCALAPPDATA": "C:\\L", **home_only}) == Path("C:\\L") / "cc-agy-plugin" / "venv"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        shlex.quote("/tmp/with space/python") + " -m pytest -q",
+        "'C:\\hostedtoolcache\\windows\\Python\\3.11.9\\x64\\python.exe' -m pytest -q test_shared.py",
+        '"C:\\Python311\\python.exe" -m pytest -q',
+        "'/opt/py/bin/pytest' -q",
+    ],
+)
+def test_acceptance_allows_a_quoted_literal_interpreter_path(command: str, tmp_path: Path) -> None:
+    assert validate_acceptance([command], tmp_path) == [command]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "'/bin/rm' -rf src",  # quoted, but not an interpreter or test runner
+        "'c'p a b",  # quotes splice a different command name
+        '"$PY" -m pytest',  # dynamic head
+        "'/tmp/x`id`/python' -m pytest",  # command substitution inside the quotes
+        "'/tmp/*/python' -m pytest",  # glob
+        "'C:\\Py\\python.exe' -c \"open('x','w').write('1')\"",  # interpreter still inspected
+        "'/tmp/with space/python' -m pytest; rm -rf src",  # later segments still inspected
+        "c\\p a b",  # backslash-obfuscated head
+    ],
+)
+def test_acceptance_still_blocks_obfuscated_or_mutating_heads(command: str, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="refused because it can modify the workspace"):
+        validate_acceptance([command], tmp_path)

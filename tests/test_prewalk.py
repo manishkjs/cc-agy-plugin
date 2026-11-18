@@ -511,6 +511,12 @@ def test_own_prewalk_cancel_is_tolerated_but_timeouts_and_real_cancels_are_not()
         task = asyncio.current_task()
         assert task is not None
         task.cancel()
+        # Python 3.11 keeps a cancel pending until it is delivered at an await, even after
+        # uncancel(); take delivery here so only `cancelling()` still reports the real cancel.
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
         try:
             return _is_own_prewalk_cancel(ag_types.AntigravityCancelledError(), edited)
         finally:

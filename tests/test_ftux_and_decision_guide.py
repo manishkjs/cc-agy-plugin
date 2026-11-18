@@ -130,9 +130,106 @@ if args and args[0] == "acp":
     sys.exit(0)
 sys.exit(0)
 """
+    if os.name == "nt":
+        return _write_windows_console_launcher(script, path.with_suffix(".exe"))
     path.write_text(script, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _windows_console_launcher_bytes() -> bytes:
+    """Return the distlib console-script launcher stub that pip uses for `pytest.exe` and friends."""
+    try:
+        import distlib  # type: ignore[import-not-found]
+    except ImportError:
+        from pip._vendor import distlib  # type: ignore[no-redef]
+    import struct
+    import sysconfig
+
+    bits = "64" if struct.calcsize("P") == 8 else "32"
+    arm = "-arm" if sysconfig.get_platform() == "win-arm64" else ""
+    launcher = Path(distlib.__file__).parent / f"t{bits}{arm}.exe"
+    if not launcher.is_file():
+        pytest.skip(f"distlib console launcher {launcher.name} is unavailable; cannot build a fake agy.exe")
+    return launcher.read_bytes()
+
+
+def _write_windows_console_launcher(
+    script: str, exe_path: Path, launcher: bytes | None = None
+) -> Path:
+    """Build a real `agy.exe`: launcher stub + `#!<python>` line + zip whose `__main__.py` is `script`.
+
+    Windows CreateProcess cannot run a POSIX-shebang file (WinError 193), and the product spawns `agy`
+    directly (CC_AGY_CLI_BIN, `agy --help`, `agy acp --stdio`) and renames installed binaries to
+    `agy.exe`, so a `.cmd` wrapper is not enough. The stub runs `<python> <agy.exe> args...`, and
+    Python executes the appended zip, exactly like a pip-installed console script.
+    """
+    stub = launcher if launcher is not None else _windows_console_launcher_bytes()
+    interpreter = sys.executable
+    if " " in interpreter and not interpreter.startswith('"'):
+        interpreter = f'"{interpreter}"'
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as zf:
+        zf.writestr("__main__.py", script)
+    exe_path.parent.mkdir(parents=True, exist_ok=True)
+    exe_path.write_bytes(stub + f"#!{interpreter}\n".encode("utf-8") + body.getvalue())
+    return exe_path
+
+
+def _is_wsl_bash_stub(path: str) -> bool:
+    lowered = path.replace("/", "\\").lower()
+    return "\\system32\\" in lowered or "\\windowsapps\\" in lowered
+
+
+def _bash_exe() -> str:
+    """Return a bash that can run our scripts: plain `bash` on POSIX, Git Bash on Windows.
+
+    On Windows, CreateProcess resolves a bare `bash` to `C:\\Windows\\System32\\bash.exe` (the WSL
+    launcher, which fails with no distro installed) before it consults PATH, so pass an absolute path.
+    """
+    if os.name != "nt":
+        return "bash"
+    hit = shutil.which("bash")
+    if hit and not _is_wsl_bash_stub(hit):
+        return hit
+    roots: list[Path] = []
+    git = shutil.which("git")
+    if git:
+        git_path = Path(git).resolve()
+        # <Git>\cmd\git.exe, <Git>\bin\git.exe, or <Git>\mingw64\bin\git.exe
+        roots.extend([git_path.parent.parent, git_path.parent.parent.parent])
+    for env_key in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = os.environ.get(env_key)
+        if base:
+            roots.append(Path(base) / "Git")
+    roots.append(Path(r"C:\Program Files\Git"))
+    for root in roots:
+        for rel in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):
+            cand = root.joinpath(*rel)
+            if cand.is_file():
+                return str(cand)
+    pytest.skip("Git Bash not found; only the WSL bash stub (System32\\bash.exe) is available on this host")
+
+
+def _bash_path(path: str | Path) -> str:
+    """Convert a Windows path to the POSIX form Git Bash expects (`C:\\x\\y` -> `/c/x/y`); no-op on POSIX."""
+    raw = str(path)
+    if os.name != "nt":
+        return raw
+    bash_dir = Path(_bash_exe()).parent
+    for cygpath in (bash_dir / "cygpath.exe", bash_dir.parent / "usr" / "bin" / "cygpath.exe"):
+        if cygpath.is_file():
+            res = subprocess.run([str(cygpath), "-u", raw], capture_output=True, text=True, check=False)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+    return _windows_to_msys_path(raw)
+
+
+def _windows_to_msys_path(raw: str) -> str:
+    posix = raw.replace("\\", "/")
+    if len(posix) >= 2 and posix[1] == ":" and posix[0].isalpha():
+        return f"/{posix[0].lower()}{posix[2:]}"
+    return posix
 
 
 def test_ge_pin_fails_closed_against_api_key_project_claude_and_gateway(
@@ -550,7 +647,7 @@ def test_ftux_doctor_host_config_consumer_block_wheel_assets_and_safe_dirs(
 
     repo_root = Path(__file__).resolve().parent.parent
     qs_res = subprocess.run(
-        ["bash", str(repo_root / "scripts" / "quickstart.sh"), "--dry-run"],
+        [_bash_exe(), _bash_path(repo_root / "scripts" / "quickstart.sh"), "--dry-run"],
         env={**os.environ, "CC_AGY_INSTALL_REPO_DIR": str(precious)},
         capture_output=True,
         text=True,
@@ -608,7 +705,7 @@ def test_wheel_bundles_plugin_assets_and_acp_and_cross_platform_helpers(
     built_agy = _make_fake_external_agy(stage_src / "agy", "1.5.8")
     tar_path = tmp_path / "agy_release.tar.gz"
     with tarfile.open(tar_path, "w:gz") as tf:
-        tf.add(built_agy, arcname="agy")
+        tf.add(built_agy, arcname=built_agy.name)
     sha512_hex = hashlib.sha512(tar_path.read_bytes()).hexdigest()
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
@@ -765,7 +862,7 @@ def test_cli_doctor_host_discovery_quickstart_repo_guard_ge_auth_mode_override_a
     user_git_repo = tmp_path / "precious_git_repo"
     _init_git_repo(user_git_repo, {"work.py": "KEEP = True\n"})
     qs_refuse = subprocess.run(
-        ["bash", str(repo_root / "scripts" / "quickstart.sh"), "--host", "opencode", "--auth", "gemini-enterprise"],
+        [_bash_exe(), _bash_path(repo_root / "scripts" / "quickstart.sh"), "--host", "opencode", "--auth", "gemini-enterprise"],
         cwd=str(user_proj),
         env={**clean_cli_env, "CC_AGY_INSTALL_REPO_DIR": str(user_git_repo), "PYTHON_BIN": sys.executable},
         capture_output=True,
@@ -795,8 +892,8 @@ def test_cli_doctor_host_discovery_quickstart_repo_guard_ge_auth_mode_override_a
     qs_checkout = tmp_path / "managed_qs_checkout"
     qs_ok = subprocess.run(
         [
-            "bash",
-            str(staged_origin / "scripts" / "quickstart.sh"),
+            _bash_exe(),
+            _bash_path(staged_origin / "scripts" / "quickstart.sh"),
             "--host",
             "opencode",
             "--auth",
@@ -921,8 +1018,8 @@ def test_quickstart_sha_and_tag_pinning_host_deletion_overlay_and_bifrost_acp_st
     sha_checkout = tmp_path / "sha_checkout"
     qs_sha = subprocess.run(
         [
-            "bash",
-            str(staged_origin / "scripts" / "quickstart.sh"),
+            _bash_exe(),
+            _bash_path(staged_origin / "scripts" / "quickstart.sh"),
             "--host",
             "opencode",
             "--auth",
@@ -946,8 +1043,8 @@ def test_quickstart_sha_and_tag_pinning_host_deletion_overlay_and_bifrost_acp_st
     # 1b. Updating existing managed checkout with an invalid pinned ref fails loudly (`rc != 0`)
     qs_bad_ref = subprocess.run(
         [
-            "bash",
-            str(staged_origin / "scripts" / "quickstart.sh"),
+            _bash_exe(),
+            _bash_path(staged_origin / "scripts" / "quickstart.sh"),
             "--host",
             "opencode",
             "--auth",
@@ -1100,9 +1197,10 @@ def test_quickstart_agent_onboarding_text_runs_no_commands(tmp_path: Path):
     start = script.index("emit_agent_dropdown_onboarding() {")
     end = script.index("\n}\n", start) + 3
     marker = tmp_path / "ran"
-    checkout = f"{tmp_path}/R&D repo/x$y`touch {marker}`"
+    # Git Bash on Windows needs POSIX paths, or the `touch` below (if it ever ran) would miss `marker`.
+    checkout = f"{_bash_path(tmp_path)}/R&D repo/x$y`touch {_bash_path(marker)}`"
     proc = subprocess.run(
-        ["bash", "-c", script[start:end] + '\nemit_agent_dropdown_onboarding "$1" python3 "$2"', "_", checkout, "/w s"],
+        [_bash_exe(), "-c", script[start:end] + '\nemit_agent_dropdown_onboarding "$1" python3 "$2"', "_", checkout, "/w s"],
         capture_output=True,
         text=True,
         timeout=30,

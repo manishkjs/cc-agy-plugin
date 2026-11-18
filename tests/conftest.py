@@ -60,11 +60,33 @@ def _bare_python_agy_sdk_stub(tmp_path_factory: pytest.TempPathFactory) -> Path 
     return stub_root
 
 
+@pytest.fixture(scope="session")
+def _python_shim_dir(tmp_path_factory: pytest.TempPathFactory) -> Path | None:
+    """A PATH directory holding only `python`/`python3` links to the interpreter running pytest.
+
+    Subprocesses that call bare `python3` must get this interpreter. Prepending its whole
+    directory (often `/usr/bin`) would also put every other tool there, such as an unrelated
+    `/usr/bin/codex` or a `node` built without TypeScript, ahead of the user's own PATH.
+    """
+    if not sys.executable or os.name == "nt":
+        return None
+    shim = tmp_path_factory.mktemp("python_shim")
+    exe = Path(sys.executable)
+    names = {"python", "python3", f"python{sys.version_info.major}.{sys.version_info.minor}"}
+    try:
+        for name in names:
+            (shim / name).symlink_to(exe)
+    except OSError:
+        return None
+    return shim
+
+
 @pytest.fixture(autouse=True)
 def _isolated_agy_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _bare_python_agy_sdk_stub: Path | None,
+    _python_shim_dir: Path | None,
 ) -> None:
     """Keep `agy` caches out of the real home directory and pin test-only defaults.
 
@@ -80,10 +102,13 @@ def _isolated_agy_state(
             monkeypatch.setenv("PYTHONPATH", f"{stub_s}{os.pathsep}{cur_pypath}" if cur_pypath else stub_s)
 
     if sys.executable:
-        py_dir = str(Path(sys.executable).resolve().parent)
         cur_path = os.environ.get("PATH", "")
-        if py_dir and not cur_path.startswith(f"{py_dir}{os.pathsep}"):
-            monkeypatch.setenv("PATH", f"{py_dir}{os.pathsep}{cur_path}")
+        if _python_shim_dir is not None:
+            first = str(_python_shim_dir)
+        else:  # Windows: the interpreter's own folder holds only Python itself.
+            first = str(Path(sys.executable).resolve().parent)
+        if first and not cur_path.startswith(f"{first}{os.pathsep}"):
+            monkeypatch.setenv("PATH", f"{first}{os.pathsep}{cur_path}")
     if (os.environ.get("GEMINI_API_KEY") or "").strip() == "dummy-key":
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     gw_base = (os.environ.get("GOOGLE_GEMINI_BASE_URL") or "").strip()

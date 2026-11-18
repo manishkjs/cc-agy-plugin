@@ -24,6 +24,13 @@ def _load(name: str):
 
 ha = _load("hook_adapter")
 tm = _load("hook_toolmap")
+_REAL_INPROC = ha.run_pre_tool_guard_inprocess
+
+
+@pytest.fixture(autouse=True)
+def _subprocess_path_only(monkeypatch):
+    """Route PreToolUse through `run_script` so `_Recorder` sees it; real-guard tests undo this."""
+    monkeypatch.setattr(ha, "run_pre_tool_guard_inprocess", lambda cc, env: None)
 
 
 @pytest.fixture()
@@ -406,3 +413,168 @@ def test_cli_end_to_end_real_scripts(base_env, tmp_path: Path) -> None:
     assert bad.returncode == 0 and json.loads(bad.stdout) == {}
     pre = _cli("agy", "PreToolUse", {"conversationId": "c", "cwd": str(ws), "toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}}, base_env)
     assert pre.returncode == 0 and "decision" not in json.loads(pre.stdout)
+
+
+# ------------------------------------------------------------ round-10 fixes
+
+
+@pytest.mark.parametrize("marker_env", [{"CC_AGY_IN_WORKER": "1"}, {}])
+def test_worker_context_skips_guards_even_in_strict_mode(monkeypatch, base_env, tmp_path, marker_env) -> None:
+    rec = _Recorder(ha.HookScriptError("boom"))
+    monkeypatch.setattr(ha, "run_script", rec)
+    env = dict(base_env, CC_AGY_STRICT_MODE="true", **marker_env)
+    cwd = str(tmp_path / "ws") if marker_env else str(tmp_path / ".cc-agy-worktrees-ab12" / "job1")
+    payload = {"conversationId": "c", "cwd": cwd, "toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}}
+    assert ha.handle("agy", "PreToolUse", payload, env) == {}
+    assert ha.handle("codex", "Stop", {"cwd": cwd}, env) is None
+    assert rec.calls == []
+
+
+def test_strict_without_worker_marker_still_denies(monkeypatch, base_env, tmp_path) -> None:
+    monkeypatch.setattr(ha, "run_script", _Recorder(ha.HookScriptError("boom")))
+    env = dict(base_env, CC_AGY_STRICT_MODE="true")
+    payload = {"conversationId": "c", "cwd": str(tmp_path), "toolCall": {"name": "run_command", "args": {}}}
+    assert ha.handle("agy", "PreToolUse", payload, env)["decision"] == "deny"
+
+
+def test_build_agy_subprocess_env_sets_worker_marker() -> None:
+    sys.path.insert(0, str(ROOT))
+    from server.agy_cli import WORKER_ENV_MARKER, build_agy_subprocess_env
+
+    assert WORKER_ENV_MARKER == ha.WORKER_ENV_MARKER
+    assert build_agy_subprocess_env({"PATH": "/usr/bin", "CC_AGY_IN_WORKER": "0"})[WORKER_ENV_MARKER] == "1"
+
+
+_PLUGIN_FILE = str(ROOT / "server" / "receipts.py")
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("edit", {"filePath": _PLUGIN_FILE, "oldString": "a", "newString": "b"}),
+        ("multiedit", {"filePath": _PLUGIN_FILE, "edits": [{"oldString": "a", "newString": "b"}]}),
+        ("patch", {"patchText": f"*** Begin Patch\n*** Update File: {_PLUGIN_FILE}\n@@\n-a\n+b\n*** End Patch"}),
+        ("apply_patch", {"patchText": f"*** Begin Patch\n*** Add File: {_PLUGIN_FILE}\n+x\n*** End Patch"}),
+    ],
+)
+def test_opencode_edit_family_denied_in_strict_mode(monkeypatch, base_env, tmp_path, tool, args) -> None:
+    monkeypatch.setattr(ha, "run_pre_tool_guard_inprocess", _REAL_INPROC)
+    monkeypatch.setattr(ha, "run_script", _Recorder(AssertionError("guard must run in-process")))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    env = dict(base_env, CC_AGY_STRICT_MODE="true")
+    out = ha.handle("opencode", "PreToolUse", {"tool": tool, "sessionID": "s", "directory": str(ws), "args": args}, env)
+    assert out["action"] == "deny" and out["block"] is True, out
+    assert "Strict orchestrator mode" in out["reason"]
+
+
+def test_apply_patch_target_extraction() -> None:
+    body = "*** Begin Patch\n*** Delete File: a/b.py\n*** Update File: c.py\n*** End Patch"
+    assert tm.map_tool("opencode", "apply_patch", {"patchText": body}) == ("Edit", {"patchText": body, "file_path": "a/b.py"})
+
+
+def test_inprocess_falls_back_to_subprocess(monkeypatch, base_env) -> None:
+    rec = _Recorder(_deny("from subprocess"))
+    monkeypatch.setattr(ha, "run_script", rec)
+    out = ha.handle("codex", "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}, base_env)
+    assert out == _deny("from subprocess") and rec.calls[0][0] == "pre_tool_guard.py"
+
+
+def test_system_message_folds_into_context(monkeypatch, base_env) -> None:
+    out_cc = {"systemMessage": "self-check failed", **_ctx("SessionStart", "guide")}
+    monkeypatch.setattr(ha, "run_script", _Recorder(out_cc))
+    assert ha.handle("agy", "SessionStart", {}, base_env) == {
+        "injectSteps": [{"systemMessage": {"systemMessage": "guide\n\nself-check failed"}}]
+    }
+    monkeypatch.setattr(ha, "run_script", _Recorder({"systemMessage": "only warn"}))
+    assert ha.handle("opencode", "SessionStart", {}, base_env)["additionalContext"] == "only warn"
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "active"),
+    [("codex", {}, False), ("agy", {}, False), ("codex", {"stop_hook_active": True}, True), ("agy", {"continuationActive": True}, True)],
+)
+def test_strict_stop_crash_blocks_once(monkeypatch, base_env, host, payload, active) -> None:
+    monkeypatch.setattr(ha, "run_script", _Recorder(ha.HookScriptError("provenance_check.py timed out after 15s")))
+    out = ha.handle(host, "Stop", payload, dict(base_env, CC_AGY_STRICT_MODE="1"))
+    if active:
+        assert not out
+    else:
+        assert out["decision"] == "block" and "internal error" in out["reason"]
+    assert not ha.handle(host, "Stop", payload, base_env)  # non-strict crash fails open
+
+
+def test_plugin_data_does_not_split_the_data_dir(base_env, tmp_path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    server_env = {"HOME": base_env["HOME"], "PATH": base_env["PATH"], "PLUGIN_DATA": str(tmp_path / "pd")}
+    hook_env = ha.build_env("agy", server_env)
+    assert "CC_AGY_DATA_DIR" not in hook_env
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; "
+        "from server.receipts import ReceiptStore; "
+        "s = ReceiptStore(workspace_root=Path(sys.argv[2])); s.write_receipt if hasattr(s, 'write_receipt') else None; "
+        "print(s.data_dir)"
+    )
+    dirs = [
+        subprocess.run([sys.executable, "-c", probe, str(ROOT), str(ws)], env=e, cwd=str(ws), capture_output=True, text=True, check=True).stdout.strip()
+        for e in (server_env, hook_env)
+    ]
+    assert dirs[0] == dirs[1] and dirs[0]
+    assert ha.data_dir(hook_env) != Path(server_env["PLUGIN_DATA"])
+
+
+def test_post_tool_matcher_covers_agy_server_tools() -> None:
+    _, _, matcher = ha.load_hook_spec("PostToolUse")
+    for name in ("mcp__agy__ask_gemini", "mcp__cc-agy-plugin__delegate_status", "mcp__vertex__x", "mcp__other__delegate_apply"):
+        assert ha.matcher_allows(matcher, name), name
+    assert not ha.matcher_allows(matcher, "mcp__github__create_issue")
+
+
+def test_straitjacket_worker_env_sets_marker(monkeypatch, tmp_path) -> None:
+    pytest.importorskip("ctx.sdk")
+    import asyncio
+
+    sys.path.insert(0, str(ROOT))
+    from server import agy_runner
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setenv("CC_AGY_IN_WORKER", "0")
+    tools, _ = agy_runner.build_straitjacket_tools(ws, timeout_seconds=60.0)
+    run_cmd = next(fn for fn in tools if getattr(fn, "__name__", "") == "run_command")
+    res = json.loads(asyncio.run(run_cmd('echo "marker=$CC_AGY_IN_WORKER"')))
+    assert "marker=1" in json.dumps(res), res
+
+
+def test_straitjacket_session_env_carries_marker_with_stub_sdk(monkeypatch, tmp_path) -> None:
+    """Hermetic twin of the test above: stub `ctx.sdk` and capture the env handed to ToolSession."""
+    import types
+    from unittest import mock
+
+    class _Captured(Exception):
+        pass
+
+    class _ToolSession:
+        def __init__(self, *args: Any, env: dict[str, str] | None = None, **kwargs: Any) -> None:
+            raise _Captured(env)
+
+    ctx_pkg = types.ModuleType("ctx")
+    ctx_cfg = mock.MagicMock(name="ctx.config")
+    ctx_sdk = types.ModuleType("ctx.sdk")
+    ctx_sdk.ToolSession = _ToolSession
+    ctx_pkg.config, ctx_pkg.sdk = ctx_cfg, ctx_sdk
+    monkeypatch.setitem(sys.modules, "ctx", ctx_pkg)
+    monkeypatch.setitem(sys.modules, "ctx.config", ctx_cfg)
+    monkeypatch.setitem(sys.modules, "ctx.sdk", ctx_sdk)
+    monkeypatch.setenv("CC_AGY_IN_WORKER", "0")
+    sys.path.insert(0, str(ROOT))
+    from server import agy_runner
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(_Captured) as captured:
+        agy_runner.build_straitjacket_tools(ws, timeout_seconds=60.0)
+    env = captured.value.args[0]
+    assert env["CC_AGY_IN_WORKER"] == "1"
+    assert env.get("CC_AGY_DATA_DIR", "") == ""  # the CC_AGY_* blanking still applies

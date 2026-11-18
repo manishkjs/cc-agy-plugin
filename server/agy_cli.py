@@ -105,6 +105,9 @@ _SCRUBBED_SUBPROCESS_ENV_KEYS = frozenset(
 )
 # Prefixes of variables that carry git config overrides (credential helpers, URL rewrites).
 _SCRUBBED_SUBPROCESS_ENV_PREFIXES = ("CC_AGY_", "CLAUDE_PLUGIN_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+# Marker every plugin-spawned agy child gets; scripts/hook_adapter.py then skips the
+# orchestrator guards so strict mode never polices the worker's own tool calls.
+WORKER_ENV_MARKER = "CC_AGY_IN_WORKER"
 _SCRUBBED_SECRET_ENV_RE = re.compile(
     r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|CREDENTIAL|CREDENTIALS|PRIVATE_KEY|AUTH_CONFIG)(?:$|_)",
     re.IGNORECASE,
@@ -1792,6 +1795,8 @@ def build_agy_subprocess_env(
             prefix_joined = os.pathsep.join(path_prefixes)
             out["PATH"] = f"{prefix_joined}{os.pathsep}{cur_path}" if cur_path else prefix_joined
     out.pop("_AGY_SPAWN_COOKIE", None)
+    # Lets scripts/hook_adapter.py skip the orchestrator's guards inside plugin-spawned workers.
+    out[WORKER_ENV_MARKER] = "1"
     out["NO_COLOR"] = "1"
     out.setdefault("TERM", "dumb")
     return out

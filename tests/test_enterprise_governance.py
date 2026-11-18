@@ -188,7 +188,10 @@ def test_opt_in_seat_mode_injects_validated_project_location_and_tier(tmp_path: 
     assert sub_env["GOOGLE_CLOUD_LOCATION"] == "eu"
     assert sub_env["BAICODE_USER_TIER"] == "gcp-ge-standard-tier"
     assert "GEMINI_API_KEY" not in sub_env
-    assert not any(key.startswith("CC_AGY_") for key in sub_env)
+    # No plugin setting reaches the worker; the only CC_AGY_ variable is the marker that makes
+    # the plugin's own guard hooks stand down inside its workers.
+    assert {key for key in sub_env if key.startswith("CC_AGY_")} == {"CC_AGY_IN_WORKER"}
+    assert sub_env["CC_AGY_IN_WORKER"] == "1"
     assert AGY_VIRTUAL_KEY not in json.dumps(sub_env)
 
 

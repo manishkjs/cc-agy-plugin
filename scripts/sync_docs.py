@@ -30,7 +30,7 @@ SHARED_ROUTING_DOC_PATHS: tuple[str, ...] = (
 )
 
 _STALE_BUDGET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"default\s+`?40`?\s+on\s+Flash", re.IGNORECASE), "stale Flash tool-call cap 40"),
+    (re.compile(r"default\s+`?40`?\s+on\s+(?:[\w.-]+/)*Flash", re.IGNORECASE), "stale Flash tool-call cap 40"),
     (re.compile(r"\b75\s+calls\b", re.IGNORECASE), "stale Flash tool-call cap 75"),
     (
         re.compile(

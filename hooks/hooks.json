@@ -37,7 +37,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_cc-agy-plugin_vertex__.*|mcp__vertex__.*|mcp__.*__(?:delegate_start|delegate_continue|delegate_result|delegate_to_gemini|delegate_apply)",
+        "matcher": "mcp__plugin_cc-agy-plugin_vertex__.*|mcp__vertex__.*|mcp__agy__.*|mcp__cc-agy-plugin__.*|mcp__cc_agy_plugin__.*|mcp__.*__(?:delegate_start|delegate_continue|delegate_result|delegate_to_gemini|delegate_apply)",
         "hooks": [
           {
             "type": "command",

@@ -70,7 +70,8 @@ def test_template_commands_point_at_the_adapter(template: Path) -> None:
 def test_codex_template_events_matchers_and_timeouts() -> None:
     hooks = _read(install.CODEX_HOOKS_TEMPLATE)["hooks"]
     assert set(hooks) <= set(install.CODEX_HOOK_EVENTS)
-    assert set(hooks) == set(_cc_timeouts())
+    # PostToolUse is omitted on purpose: Codex only reports Bash, which the ledger matcher never selects.
+    assert set(hooks) == set(_cc_timeouts()) - {"PostToolUse"}
     for event, groups in hooks.items():
         (group,) = groups
         if event in ("PreToolUse", "PostToolUse"):
@@ -141,7 +142,7 @@ def test_codex_install_writes_hooks_and_feature_flag(tmp_path: Path) -> None:
     assert cfg["features"]["codex_hooks"] is True
     assert cfg["model"] == "o3" and cfg["mcp_servers"]["agy"]["command"] == "py"
     hooks = _read(home / "hooks.json")["hooks"]
-    assert set(hooks) == set(install.CODEX_HOOK_EVENTS)
+    assert set(hooks) == set(_read(install.CODEX_HOOKS_TEMPLATE)["hooks"])
     pre = hooks["PreToolUse"][0]
     assert pre["matcher"] == "^Bash$"
     assert shlex.split(pre["hooks"][0]["command"]) == [
@@ -175,7 +176,7 @@ def test_codex_reinstall_from_another_checkout_replaces_ours(tmp_path: Path) -> 
     install.install_codex_hooks(codex_home=home, python_bin="/old/python")
     install.install_codex_hooks(codex_home=home, python_bin=PY)
     commands = _commands(_read(home / "hooks.json"))
-    assert len(commands) == len(install.CODEX_HOOK_EVENTS)
+    assert len(commands) == len(_read(install.CODEX_HOOKS_TEMPLATE)["hooks"])
     assert all(shlex.split(c)[0] == PY for c in commands)
 
 
@@ -351,3 +352,14 @@ def test_cli_opt_outs_and_dry_run(tmp_path: Path) -> None:
     report = _run(dry_home, "--host", "codex", "--dry-run")
     assert report["hosts"][0]["hooks"]["status"] == "dry_run"
     assert not (dry_home / ".codex").exists()
+
+
+def test_codex_reinstall_drops_legacy_post_tool_use(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    home.mkdir()
+    legacy_cmd = f"{PY} /old/root/scripts/hook_adapter.py --host codex --event PostToolUse"
+    legacy = {"hooks": {"PostToolUse": [{"matcher": "^Bash$", "hooks": [{"type": "command", "command": legacy_cmd, "timeout": 10}]}]}}
+    (home / "hooks.json").write_text(json.dumps(legacy), encoding="utf-8")
+    install.install_codex_hooks(codex_home=home, python_bin=PY)
+    hooks = _read(home / "hooks.json")["hooks"]
+    assert not any("PostToolUse" in c for c in _commands({"hooks": hooks}))

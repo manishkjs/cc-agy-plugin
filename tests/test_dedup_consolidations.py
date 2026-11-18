@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from types import SimpleNamespace
 from typing import Any
@@ -401,17 +402,21 @@ def test_shared_routing_docs_and_budget_sync_validator(tmp_path: Path) -> None:
     skill_doc = tmp_path / "skills/vertex/SKILL.md"
     skill_doc.write_text(
         skill_doc.read_text(encoding="utf-8")
-        .replace(render_routing_markdown_table(), "| Change | Route |\n|---|---|\n| stale | row |")
-        .replace("default `55` on Flash", "default `40` on Flash"),
+        .replace(render_routing_markdown_table(), "| Change | Route |\n|---|---|\n| stale | row |"),
         encoding="utf-8",
     )
+    # The doc names the Flash cap as "on Flash" or "on Hydrogen/Flash"; age it whichever way it is worded.
+    current_cap = re.compile(r"default `55` on ((?:[\w.-]+/)*)Flash")
+    aged = current_cap.subn(r"default `40` on \1Flash", skill_doc.read_text(encoding="utf-8"))
+    assert aged[1] >= 1, "skills/vertex/SKILL.md no longer states the default Flash tool-call cap"
+    skill_doc.write_text(aged[0], encoding="utf-8")
     errs = sync_routing_blocks(tmp_path, write=False)
     assert any("shared routing table out of sync" in e for e in errs)
     assert any("stale Flash tool-call cap 40" in e for e in errs)
 
     # Restore valid budget text and verify write=True repairs the shared routing block
     skill_doc.write_text(
-        skill_doc.read_text(encoding="utf-8").replace("default `40` on Flash", "default `55` on Flash"),
+        re.sub(r"default `40` on ((?:[\w.-]+/)*)Flash", r"default `55` on \1Flash", skill_doc.read_text(encoding="utf-8")),
         encoding="utf-8",
     )
     assert sync_routing_blocks(tmp_path, write=True) == []
