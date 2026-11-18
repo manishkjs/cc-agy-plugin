@@ -27,23 +27,67 @@ You keep typing prompts and reviewing diffs the way you do today. In our 26-task
 
 ---
 
-## Quick install
+## Install
 
-Paste this into Claude Code or a terminal. It needs Python 3.10 or newer.
+You need `git` and Python 3.10 or newer. On a Mac, Homebrew's Python works (`brew install python@3.13`); the system `python3` is too old.
+
+### One command
+
+Paste this into a terminal (or into Claude Code):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash
 ```
 
-The installer asks how you connect and which model preset you want, handles the Gemini Enterprise sign-in if you chose a seat, and runs `doctor`. In Claude Code, run `/reload-plugins` afterwards.
-
-To skip the questions, pass the host and connection yourself:
+It asks which tool you use and how you connect, signs you in to Gemini Enterprise if you picked a seat, and runs a free `doctor` check. To skip the questions, pass the answers yourself:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manishkjs/cc-agy-plugin/main/scripts/quickstart.sh | bash -s -- --host claude --auth gemini-enterprise
 ```
 
-`--host` takes `claude`, `cursor`, `opencode`, `codex`, `agy`, or `all`. `--auth` takes `gemini-enterprise`, `api-key`, `vertex`, or `gateway`. Manual installs, version pinning, and sign-in fixes are in the [setup guide](guides/setup.md).
+`--host` takes `claude`, `cursor`, `opencode`, `codex`, `agy`, or `all`. `--auth` takes `gemini-enterprise`, `api-key`, `vertex`, or `gateway`.
+
+When it finishes, quit and reopen your tool (in Claude Code, `/reload-plugins` also works for the session you installed from).
+
+### Step by step
+
+The same install, one step at a time, if you want to see each part.
+
+1. **Get the code.**
+   ```bash
+   git clone https://github.com/manishkjs/cc-agy-plugin ~/.local/share/cc-agy-plugin/repo
+   cd ~/.local/share/cc-agy-plugin/repo
+   ```
+2. **Preview what the installer will change** (writes nothing):
+   ```bash
+   sh scripts/py.sh server/install.py --host claude --auth gemini-enterprise --dry-run
+   ```
+   `scripts/py.sh` picks a Python 3.10+ for you. Swap `claude` for your tool.
+3. **Install.**
+   ```bash
+   sh scripts/py.sh server/install.py --host claude --auth gemini-enterprise
+   ```
+   For an AI Studio key, run `export GEMINI_API_KEY="your-key"` first and use `--auth api-key`. For Vertex AI, run `gcloud auth application-default login` and `export GOOGLE_CLOUD_PROJECT="your-project"`, then use `--auth vertex`.
+4. **Sign in** (Gemini Enterprise only):
+   ```bash
+   bash scripts/agy_signin.sh
+   ```
+   On a desktop your browser opens for Google sign-in. Over SSH you get a link: open it, sign in with your work account, click **Copy to Clipboard**, and paste the code back. Add `--force` to sign in again, or `--project <ID>` to pick the seat project.
+5. **Check the setup** (free, no model calls):
+   ```bash
+   sh scripts/py.sh server/install.py --doctor --human --auth gemini-enterprise
+   ```
+6. **Restart your tool and confirm it loaded.** Quit and reopen it from a project folder, then:
+
+   | Tool | Check |
+   |:--|:--|
+   | Claude Code | `/mcp` lists `vertex` as connected, then run `/cc-agy-plugin:doctor` |
+   | OpenCode | `opencode mcp list` shows `agy`, then type `/doctor` |
+   | Cursor | **Cursor Settings → Tools & MCP** shows `agy` |
+   | Codex | Ask: "Run doctor to verify my Gemini setup." |
+   | Antigravity | `agy mcp list` shows `agy` |
+
+Version pinning, gateways (LiteLLM, Bifrost), and sign-in fixes are in the [setup guide](guides/setup.md).
 
 ---
 
