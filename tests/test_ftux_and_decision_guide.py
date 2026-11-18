@@ -1136,8 +1136,7 @@ def test_quickstart_sha_and_tag_pinning_host_deletion_overlay_and_bifrost_acp_st
     assert good_applied["post_merge_verified"] is True
 
     # 3. Recorded `agy 1.5.9 acp --stdio` wire fixture + strict Bifrost `session/set_model` enforcement
-    acp_strict_bin = tmp_path / "fake_agy_acp_159.py"
-    acp_strict_bin.write_text(
+    acp_strict_script = (
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "for raw in sys.stdin:\n"
@@ -1164,10 +1163,14 @@ def test_quickstart_sha_and_tag_pinning_host_deletion_overlay_and_bifrost_acp_st
         "        sys.stdout.flush()\n"
         "    elif m == 'session/set_model':\n"
         "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': mid, 'error': {'code': -32602, 'message': 'model rejected by server'}}) + '\\n')\n"
-        "        sys.stdout.flush()\n",
-        encoding="utf-8",
+        "        sys.stdout.flush()\n"
     )
-    acp_strict_bin.chmod(0o755)
+    if os.name == "nt":
+        acp_strict_bin = _write_windows_console_launcher(acp_strict_script, tmp_path / "fake_agy_acp_159.exe")
+    else:
+        acp_strict_bin = tmp_path / "fake_agy_acp_159.py"
+        acp_strict_bin.write_text(acp_strict_script, encoding="utf-8")
+        acp_strict_bin.chmod(0o755)
 
     res_rej = run_agy_acp_turn(
         agy_bin=str(acp_strict_bin),
