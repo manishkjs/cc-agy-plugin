@@ -572,8 +572,15 @@ class JobApplyMixin:
 
             expected_baseline_sha = baseline_hashes.get(rel_path)
             if dst_raw.exists() and dst_raw.is_file() and not dst_raw.is_symlink():
-                current_host_sha = sha256_bytes(dst_raw.read_bytes())
-                if expected_baseline_sha != current_host_sha:
+                host_bytes = dst_raw.read_bytes()
+                current_host_sha = sha256_bytes(host_bytes)
+                baseline_matches = expected_baseline_sha == current_host_sha or (
+                    expected_baseline_sha is not None
+                    and b"\x00" not in host_bytes[:8192]
+                    and b"\r\n" in host_bytes
+                    and sha256_bytes(host_bytes.replace(b"\r\n", b"\n")) == expected_baseline_sha
+                )
+                if not baseline_matches:
                     # If the worker file already has the exact same bytes as the host file, no merge is needed.
                     if wt_dir.exists():
                         src_raw = wt_dir / rel_path
@@ -617,9 +624,23 @@ class JobApplyMixin:
                     f_cur = mpath / "current"
                     f_base = mpath / "base"
                     f_wrk = mpath / "worker"
-                    f_cur.write_bytes(dst_raw.read_bytes())
-                    f_base.write_bytes(base_show.stdout)
-                    f_wrk.write_bytes(src_raw.read_bytes())
+                    cur_bytes = dst_raw.read_bytes()
+                    base_bytes = base_show.stdout
+                    wrk_bytes = src_raw.read_bytes()
+                    is_text = (
+                        b"\x00" not in cur_bytes[:8192]
+                        and b"\x00" not in base_bytes[:8192]
+                        and b"\x00" not in wrk_bytes[:8192]
+                    )
+                    # On Windows with core.autocrlf=true, `git show` returns LF while working-tree
+                    # files have CRLF; normalize to LF for merge-file and preserve host CRLF.
+                    host_had_crlf = is_text and b"\r\n" in cur_bytes
+                    normalize_crlf = is_text and b"\r\n" not in base_bytes and (
+                        b"\r\n" in cur_bytes or b"\r\n" in wrk_bytes
+                    )
+                    f_cur.write_bytes(cur_bytes.replace(b"\r\n", b"\n") if normalize_crlf else cur_bytes)
+                    f_base.write_bytes(base_bytes)
+                    f_wrk.write_bytes(wrk_bytes.replace(b"\r\n", b"\n") if normalize_crlf else wrk_bytes)
                     merge_res = _git_raw(
                         ["merge-file", "-p", str(f_cur), str(f_base), str(f_wrk)],
                         capture_output=True,
@@ -630,7 +651,10 @@ class JobApplyMixin:
                             f"Conflict detected: host files {conflicted_files} were modified since job "
                             f"'{safe_id}' started and could not be cleanly merged."
                         )
-                    merged_payloads[rel_path] = merge_res.stdout
+                    merged_out = merge_res.stdout
+                    if normalize_crlf and host_had_crlf:
+                        merged_out = merged_out.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                    merged_payloads[rel_path] = merged_out
 
         host_other_changed_files: list[str] = []
         overlaid_host_files: list[str] = []

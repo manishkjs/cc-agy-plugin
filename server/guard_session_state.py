@@ -34,8 +34,10 @@ def _resolve_data_dir_fast(
     legacy_in_tree = (workspace_root / ".cc-agy-data").resolve()
     if legacy_in_tree.exists():
         return legacy_in_tree
+    from server.runtime_env import user_home
+
     ws_slug = hashlib.sha256(str(workspace_root).encode("utf-8")).hexdigest()[:12]
-    return (Path.home() / ".cache" / "cc-agy-plugin" / ws_slug).resolve()
+    return (user_home(source) / ".cache" / "cc-agy-plugin" / ws_slug).resolve()
 
 def receipt_owner_pid_alive(receipt: dict[str, Any]) -> bool:
     """Lazy-imported wrapper around `server.receipts.receipt_owner_pid_alive`."""
@@ -142,9 +144,11 @@ def classify_path(
         if part.startswith(("cc-agy-worktrees-", ".cc-agy-worktrees-")):
             return "out_dir"
 
+    from server.runtime_env import user_home
+
     for data_candidate in (
         ws_resolved / ".cc-agy-data",
-        Path.home() / ".cache" / "cc-agy-plugin",
+        user_home() / ".cache" / "cc-agy-plugin",
     ):
         if resolved.is_relative_to(data_candidate.resolve()):
             return "out_dir"

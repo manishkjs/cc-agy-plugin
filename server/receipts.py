@@ -510,7 +510,9 @@ def scrub_receipt_for_export(
         escaped_ws = json.dumps(norm_ws)[1:-1]
         if escaped_ws:
             raw_json = raw_json.replace(escaped_ws, "/workspace")
-    home_dir = str(Path.home())
+    from server.runtime_env import user_home
+
+    home_dir = str(user_home())
     if home_dir and home_dir != "/":
         escaped_home = json.dumps(home_dir)[1:-1]
         if escaped_home:
@@ -653,8 +655,10 @@ class ReceiptStore:
         legacy_in_tree = (ws / ".cc-agy-data").resolve()
         if legacy_in_tree.exists():
             return legacy_in_tree
+        from server.runtime_env import user_home
+
         ws_slug = sha256_text(str(ws))[:12]
-        return (Path.home() / ".cache" / "cc-agy-plugin" / ws_slug).resolve()
+        return (user_home() / ".cache" / "cc-agy-plugin" / ws_slug).resolve()
 
     def _load_or_create_hmac_key(self) -> bytes:
         lock_path = self.data_dir / ".hmac_key.lock"
