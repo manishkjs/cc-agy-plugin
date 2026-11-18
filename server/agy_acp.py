@@ -381,9 +381,13 @@ def probe_agy_acp_capabilities(
     spawn_cookie = secrets.token_hex(16)
     sub_env["_AGY_SPAWN_COOKIE"] = spawn_cookie
 
+    import tempfile
+
     try:
         proc = subprocess.Popen(
             cmd,
+            # A neutral folder: the probe must never run (or write) inside the user's workspace.
+            cwd=tempfile.gettempdir(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -942,7 +946,9 @@ def run_agy_acp_turn(
                 for m in (modes_block.get("availableModes") or ())
                 if isinstance(m, Mapping) and str(m.get("id") or "").strip()
             }
-            desired_mode = "plan" if read_only else ("accept-edits" if skip_permissions else "")
+            # `accept-edits` makes agy approve workspace writes itself without a
+            # `session/request_permission` callback, which would skip the `allowed_paths` check.
+            desired_mode = "plan" if read_only else ("accept-edits" if skip_permissions and not allowed_paths else "")
             cur_acp_mode = warm_sess.current_mode_id or str(modes_block.get("currentModeId") or "").strip()
             if (
                 resolved_sid

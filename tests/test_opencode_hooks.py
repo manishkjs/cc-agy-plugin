@@ -340,7 +340,7 @@ def test_resolve_python_skips_python39_and_picks_python310_plus(tmp_path: Path) 
         f"console.log(picked);\n"
     )
     proc = subprocess.run(
-        ["node", "--input-type=module", "-e", script],
+        [*NODE_CMD, "--input-type=module", "-e", script],
         capture_output=True,
         text=True,
         check=True,

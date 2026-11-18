@@ -67,6 +67,12 @@ PUBLIC_SETTINGS: tuple[SettingSpec, ...] = (
         "Wire protocol for `agy` workers: `acp` (`agy acp --stdio`, default; falls back to `stream-json` on older `agy` binaries) or `stream-json`.",
     ),
     SettingSpec(
+        "CC_AGY_ACP_SKIP_PERMISSIONS",
+        "Connection & Auth",
+        "0",
+        "Set to `1` to pass `--dangerously-skip-permissions` to `agy acp` workers. Off by default so admin (MDM) and sandbox rules reach the plugin as `session/request_permission` callbacks.",
+    ),
+    SettingSpec(
         "CC_AGY_CLI_MANIFEST_URL",
         "Connection & Auth",
         "(Google CDN manifest)",
